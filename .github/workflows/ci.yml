@@ -84,3 +84,64 @@ jobs:
 
       - name: Cargo clippy
         run: cargo clippy --workspace -- -D warnings
+
+  linux-artifact:
+    name: Linux portable binary (Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: crates/providers/whatsapp/go/go.sum
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-artifact-ubuntu-22.04
+
+      - name: Build glibc binary on Ubuntu 22.04
+        run: cargo build --release -p chat-cli
+
+      - name: Build self-contained musl binary
+        env:
+          CC: x86_64-linux-musl-gcc
+          CC_x86_64_unknown_linux_musl: x86_64-linux-musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-linux-musl-gcc
+          CGO_ENABLED: "1"
+        run: cargo build --release -p chat-cli --target x86_64-unknown-linux-musl
+
+      - name: Package Linux binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/chat-cli-x86_64-linux-gnu dist/chat-cli-x86_64-linux-musl
+          cp target/release/chat-cli dist/chat-cli-x86_64-linux-gnu/chat-cli
+          cp target/x86_64-unknown-linux-musl/release/chat-cli dist/chat-cli-x86_64-linux-musl/chat-cli
+          tar -C dist -czf dist/chat-cli-x86_64-linux-gnu.tar.gz chat-cli-x86_64-linux-gnu
+          tar -C dist -czf dist/chat-cli-x86_64-linux-musl.tar.gz chat-cli-x86_64-linux-musl
+          sha256sum dist/*.tar.gz > dist/SHA256SUMS
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-cli-linux-binaries
+          path: |
+            dist/chat-cli-x86_64-linux-gnu.tar.gz
+            dist/chat-cli-x86_64-linux-musl.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
