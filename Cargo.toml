@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chat-cli",
+    "crates/core",
+    "crates/tui",
+    "crates/storage",
+    "crates/providers/whatsapp",
+    "crates/providers/slack",
+    "crates/mcp",
+    "crates/notify",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+repository = ""
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+arboard = "3"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+directories = "6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+notify-rust = "4"
+open = "5"
+ratatui = "0.30"
+ratatui-textarea = "0.8"
+rmcp = { version = "1.7", features = ["server", "macros"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+rustls = "0.23"
+serde = { version = "1", features = ["derive"] }
+slack-morphism = { version = "2.22", features = ["hyper", "socket-mode"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }

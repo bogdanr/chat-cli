@@ -1,0 +1,16 @@
+[package]
+name = "whatsapp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+
+[build-dependencies]

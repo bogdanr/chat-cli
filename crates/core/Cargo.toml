@@ -1,0 +1,19 @@
+[package]
+name = "core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+directories.workspace = true
+image.workspace = true
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
