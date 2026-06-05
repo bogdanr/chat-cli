@@ -8,8 +8,13 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState},
 };
 use std::collections::HashMap;
+use unicode_width::UnicodeWidthStr;
 
 const CHAT_ROW_HEIGHT: u16 = 2;
+const CHAT_META_WIDTH: usize = 6;
+const CHAT_RIGHT_PADDING: usize = 1;
+const WHATSAPP_GREEN: Color = Color::Rgb(37, 211, 102);
+const SELECTED_CHAT_BG: Color = Color::Rgb(0, 48, 48);
 pub const CHAT_AVATAR_WIDTH: u16 = 4;
 pub const CHAT_AVATAR_ROWS: u16 = CHAT_ROW_HEIGHT;
 pub type AvatarRows = Vec<Vec<Span<'static>>>;
@@ -34,6 +39,7 @@ pub struct ChatListProps<'a> {
 
 pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<'_>) {
     let rows = build_rows(props.chats, props.visible_chat_indices);
+    let inner_width = inner_area(area).width as usize;
     let mut items = rows
         .iter()
         .map(|row| match row {
@@ -41,6 +47,8 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
                 &props.chats[*chat_index],
                 props.avatar_rows.get(chat_index).map(Vec::as_slice),
                 props.theme,
+                inner_width,
+                *chat_index == props.selected_chat_index,
             ),
             ChatListRow::Separator => separator_item(),
         })
@@ -63,7 +71,7 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
                 .borders(Borders::ALL)
                 .border_style(props.theme.focus_border(props.focused)),
         )
-        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_style(Style::default())
         .highlight_symbol("");
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -158,7 +166,7 @@ pub fn chat_at(
 
 pub fn avatar_column_bounds(list_area: Rect) -> (u16, u16) {
     let inner = inner_area(list_area);
-    let start = inner.x.saturating_add(3);
+    let start = inner.x;
     (start, start.saturating_add(CHAT_AVATAR_WIDTH))
 }
 
@@ -226,9 +234,9 @@ fn chat_matches_terms(chat: &Chat, terms: &[String]) -> bool {
 
 fn unread_marker(unread_count: u32) -> String {
     if unread_count > 0 {
-        format!("{:>2} ", unread_count.min(99))
+        unread_count.min(99).to_string()
     } else {
-        "   ".to_owned()
+        String::new()
     }
 }
 
@@ -236,6 +244,8 @@ fn chat_item(
     chat: &Chat,
     avatar_rows: Option<&[Vec<Span<'static>>]>,
     theme: Theme,
+    row_width: usize,
+    selected: bool,
 ) -> ListItem<'static> {
     let unread_marker = unread_marker(chat.unread_count);
     let pinned_marker = if chat.pinned { " [P]" } else { "" };
@@ -245,47 +255,79 @@ fn chat_item(
     } else {
         Style::default()
     };
-    let avatar_fallback = avatar_label(chat);
+    let fallback_avatar = avatar_placeholder(chat, theme);
     let first_avatar_line = avatar_rows
         .and_then(|rows| rows.first().cloned())
-        .unwrap_or_else(|| {
-            vec![Span::styled(
-                avatar_fallback.clone(),
-                Style::default().fg(Color::Cyan),
-            )]
-        });
+        .unwrap_or_else(|| fallback_avatar[0].clone());
     let second_avatar_line = avatar_rows
         .and_then(|rows| rows.get(1).cloned())
-        .unwrap_or_else(|| vec![Span::styled("    ", Style::default().fg(Color::Cyan))]);
+        .unwrap_or_else(|| fallback_avatar[1].clone());
+
+    let selected_bg = selected.then_some(SELECTED_CHAT_BG);
+    let selected_message_style = if selected {
+        Style::default().fg(theme.accent).bg(SELECTED_CHAT_BG)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    let meta_style = style_with_optional_bg(Style::default().fg(theme.muted), selected_bg);
+    let unread_style = style_with_optional_bg(unread_style(), selected_bg);
+    let effective_width = row_width.saturating_sub(CHAT_RIGHT_PADDING);
+    let meta_width = CHAT_META_WIDTH.min(effective_width.saturating_sub(1));
+    let content_width = effective_width.saturating_sub(meta_width);
+    let timestamp = formatted_time(chat);
+    let timestamp_padding = meta_width.saturating_sub(UnicodeWidthStr::width(timestamp.as_str()));
+    let unread_padding = meta_width.saturating_sub(UnicodeWidthStr::width(unread_marker.as_str()));
+
+    let first_prefix_width = CHAT_AVATAR_WIDTH as usize
+        + 1
+        + platform_badge(&chat.platform).len()
+        + pinned_marker.len()
+        + muted_marker.len()
+        + 1;
+    let name_budget = content_width.saturating_sub(first_prefix_width);
+    let name = truncate_to_width(&chat.name, name_budget);
+    let used_first_width = first_prefix_width + UnicodeWidthStr::width(name.as_str());
+    let first_gap = effective_width
+        .saturating_sub(meta_width)
+        .saturating_sub(used_first_width);
+
+    let preview = chat
+        .last_message_preview
+        .as_deref()
+        .unwrap_or("No messages yet");
+    let second_prefix_width = CHAT_AVATAR_WIDTH as usize + 1;
+    let preview_budget = content_width.saturating_sub(second_prefix_width);
+    let preview = truncate_to_width(preview, preview_budget);
+    let used_second_width = second_prefix_width + UnicodeWidthStr::width(preview.as_str());
+    let second_gap = effective_width
+        .saturating_sub(meta_width)
+        .saturating_sub(used_second_width);
 
     ListItem::new(vec![
         Line::from({
-            let mut spans = vec![Span::styled(unread_marker, theme.unread())];
-            spans.extend(first_avatar_line);
+            let mut spans = first_avatar_line;
             spans.extend([
-                Span::raw(" "),
+                styled_raw(" ", selected_bg),
                 Span::styled(
                     platform_badge(&chat.platform),
-                    platform_style(&chat.platform),
+                    style_with_optional_bg(platform_style(&chat.platform), selected_bg),
                 ),
-                Span::raw(format!("{pinned_marker}{muted_marker} ")),
-                Span::styled(chat.name.to_string(), name_style),
-                Span::raw(format!(" {}", formatted_time(chat))),
+                styled_raw(format!("{pinned_marker}{muted_marker} "), selected_bg),
+                Span::styled(name, style_with_optional_bg(name_style, selected_bg)),
+                styled_raw(" ".repeat(first_gap + timestamp_padding), selected_bg),
+                Span::styled(timestamp, meta_style),
+                styled_raw(" ".repeat(CHAT_RIGHT_PADDING), selected_bg),
             ]);
             spans
         }),
         Line::from({
-            let mut spans = vec![Span::raw("   ")];
-            spans.extend(second_avatar_line);
+            let mut spans = second_avatar_line;
             spans.extend([
-                Span::raw(" "),
-                Span::styled(
-                    chat.last_message_preview
-                        .as_deref()
-                        .unwrap_or("No messages yet")
-                        .to_owned(),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                styled_raw(" ", selected_bg),
+                Span::styled(preview, selected_message_style),
+                styled_raw(" ".repeat(second_gap + unread_padding), selected_bg),
+                Span::styled(unread_marker, unread_style),
+                styled_raw(" ".repeat(CHAT_RIGHT_PADDING), selected_bg),
             ]);
             spans
         }),
@@ -347,10 +389,74 @@ fn avatar_label(chat: &Chat) -> String {
         .to_uppercase();
 
     if initials.is_empty() {
-        " ?? ".to_owned()
+        "??".to_owned()
     } else {
-        format!(" {initials:<2} ")
+        format!("{initials:<2}")
     }
+}
+
+fn avatar_placeholder(chat: &Chat, theme: Theme) -> [Vec<Span<'static>>; 2] {
+    let label = avatar_label(chat);
+    let tile_style = Style::default().fg(theme.foreground).bg(avatar_color(chat));
+
+    [
+        vec![Span::styled("    ", tile_style)],
+        vec![Span::styled(format!("{label:^4}"), tile_style)],
+    ]
+}
+
+fn avatar_color(chat: &Chat) -> Color {
+    match chat.platform {
+        Platform::WhatsApp => Color::Rgb(18, 140, 126),
+        Platform::Slack => Color::Magenta,
+        Platform::Discord => Color::Blue,
+        Platform::Unknown(_) => Color::DarkGray,
+    }
+}
+
+fn unread_style() -> Style {
+    Style::default().fg(WHATSAPP_GREEN)
+}
+
+fn style_with_optional_bg(style: Style, bg: Option<Color>) -> Style {
+    if let Some(bg) = bg {
+        style.bg(bg)
+    } else {
+        style
+    }
+}
+
+fn styled_raw(
+    value: impl Into<std::borrow::Cow<'static, str>>,
+    bg: Option<Color>,
+) -> Span<'static> {
+    Span::styled(value, style_with_optional_bg(Style::default(), bg))
+}
+
+fn truncate_to_width(value: &str, max_width: usize) -> String {
+    const ELLIPSIS: &str = "…";
+
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return ELLIPSIS.to_owned();
+    }
+
+    let mut output = String::new();
+    let content_width = max_width - 1;
+    for character in value.chars() {
+        let next_width = UnicodeWidthStr::width(character.to_string().as_str());
+        if UnicodeWidthStr::width(output.as_str()) + next_width > content_width {
+            break;
+        }
+        output.push(character);
+    }
+    output.push_str(ELLIPSIS);
+    output
 }
 
 fn title(filter: &str, filter_mode: bool, account_filter: &str, visible_count: usize) -> String {
@@ -514,12 +620,34 @@ mod tests {
     }
 
     #[test]
-    fn unread_marker_shows_count_without_dot_marker() {
-        assert_eq!(unread_marker(0), "   ");
-        assert_eq!(unread_marker(2), " 2 ");
-        assert_eq!(unread_marker(140), "99 ");
+    fn unread_marker_shows_right_side_badge_text() {
+        assert_eq!(unread_marker(0), "");
+        assert_eq!(unread_marker(2), "2");
+        assert_eq!(unread_marker(140), "99");
         assert!(!unread_marker(2).contains('•'));
         assert!(!unread_marker(2).contains('●'));
+    }
+
+    #[test]
+    fn avatar_placeholder_uses_consistent_two_line_tile() {
+        let chats = sample_chats();
+        let placeholder = avatar_placeholder(&chats[0], Theme::default());
+
+        assert_eq!(placeholder.len(), CHAT_AVATAR_ROWS as usize);
+        assert_eq!(
+            placeholder[0]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    "
+        );
+        assert_eq!(
+            placeholder[1]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " AE "
+        );
     }
 
     #[test]

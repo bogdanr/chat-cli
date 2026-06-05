@@ -3,11 +3,12 @@ use crate::{
     theme::Theme,
     widgets::{chat_list, message_list},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use chat_core::{
-    Account, AuthChallenge, Chat, ChatId, Content, Media, Message, MessageId, PlatformData,
-    Provider, ProviderEvent, ProviderId, Reaction, Sender,
+    Account, AuthChallenge, AuthSubmission, AuthSubmissionMode, Chat, ChatId, Content, Media,
+    Message, MessageId, OutboundCapabilities, Platform, PlatformData, Poll, Provider, ProviderEvent,
+    ProviderId, Reaction, Sender,
 };
 use chrono::Utc;
 use crossterm::{
@@ -37,8 +38,8 @@ use ratatui_image::{
 };
 use ratatui_textarea::{Input as TextAreaInput, Key as TextAreaKey, TextArea};
 use std::{
-    collections::HashMap,
-    io,
+    collections::{HashMap, HashSet},
+    fs, io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -48,16 +49,174 @@ use tokio::sync::broadcast;
 
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const HISTORY_LIMIT: usize = 50;
-const MOUSE_SCROLL_STEP: usize = 3;
+const MOUSE_SCROLL_STEP: usize = 1;
 const MESSAGE_SCROLL_STEP: usize = 3;
 const IMAGE_VIEWER_MAX_WIDTH: u16 = 96;
 const REACTION_OPTIONS: [&str; 6] = ["👍", "❤️", "😂", "🎉", "😮", "🙏"];
+const COMPOSE_EMOTICON_OPTIONS: &[(&str, &str)] = &[
+    ("😊", "smile happy"),
+    ("😂", "joy laugh tears"),
+    ("🤣", "rofl laughing"),
+    ("😍", "heart eyes love"),
+    ("😘", "kiss"),
+    ("🥰", "smiling hearts"),
+    ("😎", "cool sunglasses"),
+    ("🤔", "thinking"),
+    ("😅", "sweat smile"),
+    ("😭", "cry sob"),
+    ("😢", "sad tear"),
+    ("😡", "angry mad"),
+    ("😮", "surprised wow"),
+    ("🙄", "eyeroll"),
+    ("👍", "thumbs up like"),
+    ("👎", "thumbs down dislike"),
+    ("👏", "clap applause"),
+    ("🙌", "raised hands celebrate"),
+    ("🙏", "pray thanks please"),
+    ("💪", "muscle strong"),
+    ("❤️", "heart love"),
+    ("💔", "broken heart"),
+    ("🔥", "fire hot"),
+    ("✨", "sparkles"),
+    ("🎉", "party celebrate tada"),
+    ("✅", "check done"),
+    ("❌", "x no"),
+    ("⭐", "star"),
+    ("💯", "100 perfect"),
+    ("👀", "eyes looking"),
+    ("🤷", "person gesture uncertain"),
+    ("🤦", "facepalm"),
+    ("🚀", "rocket launch"),
+    ("☕", "coffee"),
+    ("🍕", "pizza"),
+    ("🐱", "cat"),
+    ("🐶", "dog"),
+    ("¯\\_(ツ)_/¯", "shrug ascii kaomoji whatever"),
+    ("(╯°□°）╯︵ ┻━┻", "table flip angry rage ascii kaomoji"),
+    ("┬─┬ノ( º _ ºノ)", "table unflip fix calm ascii kaomoji"),
+    ("(ง'̀-'́)ง", "fight angry square up ascii kaomoji"),
+    ("ᕕ( ᐛ )ᕗ", "run happy strut ascii kaomoji"),
+    ("(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧", "magic sparkle excited ascii kaomoji"),
+    ("(づ｡◕‿‿◕｡)づ", "hug cute ascii kaomoji"),
+    ("(｡♥‿♥｡)", "love heart eyes ascii kaomoji"),
+    ("(ಥ﹏ಥ)", "cry sad tears ascii kaomoji"),
+    ("ಠ_ಠ", "disapproval unimpressed judge ascii kaomoji"),
+    ("ಠ‿ಠ", "suspicious smug ascii kaomoji"),
+    ("(¬_¬)", "side eye suspicious ascii kaomoji"),
+    ("( ͡° ͜ʖ ͡°)", "lenny face smirk ascii kaomoji"),
+    ("ʕ•ᴥ•ʔ", "bear cute ascii kaomoji"),
+    ("ᶘ ᵒᴥᵒᶅ", "otter cute ascii kaomoji"),
+    ("(☞ﾟヮﾟ)☞", "point finger right ascii kaomoji"),
+    ("☜(ﾟヮﾟ☜)", "point finger left ascii kaomoji"),
+    ("(☞ﾟヮﾟ)☞ ☜(ﾟヮﾟ☜)", "finger guns ascii kaomoji"),
+    ("ヽ(´▽`)/", "yay happy celebrate ascii kaomoji"),
+    ("ヽ(ಠ_ಠ)ノ", "why annoyed ascii kaomoji"),
+    ("(ノಠ益ಠ)ノ彡┻━┻", "rage table flip ascii kaomoji"),
+    ("┻━┻ ︵ヽ(`Д´)ﾉ︵ ┻━┻", "double table flip rage ascii kaomoji"),
+    ("(╥_╥)", "cry sob ascii kaomoji"),
+    ("(✿◠‿◠)", "flower happy cute ascii kaomoji"),
+    ("(｡◕‿◕｡)", "cute happy smile ascii kaomoji"),
+    ("(ﾉ´ヮ`)ﾉ*: ･ﾟ", "celebrate sparkle ascii kaomoji"),
+    ("٩(◕‿◕｡)۶", "dance happy ascii kaomoji"),
+    ("(￣^￣)ゞ", "salute ascii kaomoji"),
+    ("(－‸ლ)", "facepalm ascii kaomoji"),
+    ("(っ˘ڡ˘ς)", "food yum ascii kaomoji"),
+];
+const COMPOSE_EMOTICON_MAX_SUGGESTIONS: usize = 8;
 const LOCAL_REACTION_SENDER: &str = "me";
 const REACTION_OPTION_CELL_WIDTH: u16 = 6;
 const NOTIFICATION_TICKS: u8 = 16;
 const HELP_PAGE_STEP: usize = 8;
 const HELP_MOUSE_SCROLL_STEP: usize = 3;
 const QR_QUIET_ZONE: usize = 2;
+const MEDIA_SEND_SIZE_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingAttachmentKind {
+    Image,
+    Video,
+    Audio,
+    File,
+    Sticker,
+}
+
+impl PendingAttachmentKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Video => "video",
+            Self::Audio => "audio",
+            Self::File => "file",
+            Self::Sticker => "sticker",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingAttachment {
+    kind: PendingAttachmentKind,
+    media: Media,
+}
+
+impl PendingAttachment {
+    fn to_content(&self, caption: Option<Arc<str>>) -> Content {
+        let mut media = self.media.clone();
+        media.caption = caption;
+        match self.kind {
+            PendingAttachmentKind::Image => Content::Image(media),
+            PendingAttachmentKind::Video => Content::Video(media),
+            PendingAttachmentKind::Audio => Content::Audio(media),
+            PendingAttachmentKind::File => Content::File(media),
+            PendingAttachmentKind::Sticker => Content::Sticker(media),
+        }
+    }
+
+    fn preview(&self) -> String {
+        format!("{}: {}", self.kind.label(), self.media.file_name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachCommandKind {
+    Auto,
+    Image,
+    Sticker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposeAttachMenuItem {
+    Auto,
+    Image,
+    Sticker,
+    Cancel,
+}
+
+impl ComposeAttachMenuItem {
+    const ALL: [Self; 4] = [Self::Auto, Self::Image, Self::Sticker, Self::Cancel];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Attach file from typed path",
+            Self::Image => "Attach image/GIF from typed path",
+            Self::Sticker => "Attach sticker from typed path",
+            Self::Cancel => "Cancel",
+        }
+    }
+
+    fn attach_command(self) -> Option<AttachCommandKind> {
+        match self {
+            Self::Auto => Some(AttachCommandKind::Auto),
+            Self::Image => Some(AttachCommandKind::Image),
+            Self::Sticker => Some(AttachCommandKind::Sticker),
+            Self::Cancel => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ComposeAttachMenu {
+    selected: usize,
+}
 
 pub type ProviderBox = Box<dyn Provider>;
 
@@ -264,16 +423,18 @@ enum ActionMenuItem {
     Reply,
     ViewThread,
     React,
+    VotePoll,
     CopyText,
     OpenImage,
     Cancel,
 }
 
 impl ActionMenuItem {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Reply,
         Self::ViewThread,
         Self::React,
+        Self::VotePoll,
         Self::CopyText,
         Self::OpenImage,
         Self::Cancel,
@@ -284,6 +445,7 @@ impl ActionMenuItem {
             Self::Reply => "Reply",
             Self::ViewThread => "View thread",
             Self::React => "React",
+            Self::VotePoll => "Vote in poll",
             Self::CopyText => "Copy text",
             Self::OpenImage => "Open image",
             Self::Cancel => "Cancel",
@@ -304,6 +466,21 @@ struct ReactionPicker {
 }
 
 #[derive(Clone, Debug, Default)]
+struct ComposeEmoticonPicker {
+    selected: usize,
+    query: String,
+    matches: Vec<usize>,
+    token_char_len: usize,
+}
+
+#[derive(Clone, Debug)]
+struct PollVotePicker {
+    message_id: MessageId,
+    selected: usize,
+    selected_options: HashSet<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
 struct HelpOverlay {
     scroll: usize,
 }
@@ -312,6 +489,337 @@ struct HelpOverlay {
 struct AuthOverlay {
     provider_id: ProviderId,
     challenge: AuthChallenge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlackSetupPhase {
+    ChooseWorkspace,
+    ChooseAuthMode,
+    EnterCredentials,
+    OAuthPrompt,
+    Validating,
+    CapabilityReview,
+    Connected,
+    Failed,
+}
+
+impl SlackSetupPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ChooseWorkspace => "choose workspace",
+            Self::ChooseAuthMode => "choose auth method",
+            Self::EnterCredentials => "enter credentials",
+            Self::OAuthPrompt => "authorize in browser",
+            Self::Validating => "validating",
+            Self::CapabilityReview => "review capabilities",
+            Self::Connected => "connected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlackSetupMode {
+    UserOAuth,
+    ReadOnlyOAuth,
+    BotToken,
+    ImportedToken,
+    ManualApp,
+    Webhook,
+}
+
+impl SlackSetupMode {
+    const ALL: [Self; 6] = [
+        Self::UserOAuth,
+        Self::ReadOnlyOAuth,
+        Self::BotToken,
+        Self::ImportedToken,
+        Self::ManualApp,
+        Self::Webhook,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::UserOAuth => "User OAuth",
+            Self::ReadOnlyOAuth => "User OAuth read-only",
+            Self::BotToken => "Workspace-approved bot/app tokens",
+            Self::ImportedToken => "Existing approved token import",
+            Self::ManualApp => "Manual Slack app setup",
+            Self::Webhook => "Incoming webhook",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::UserOAuth => "Recommended: send as yourself when Slack grants user write scopes.",
+            Self::ReadOnlyOAuth => "Fallback: read conversations when write scopes are blocked.",
+            Self::BotToken => "Approved deployment: bot identity with optional Socket Mode.",
+            Self::ImportedToken => "Advanced: validate a pre-issued user, bot, or app token.",
+            Self::ManualApp => "Advanced: configure client ID, secret, redirect URI, and scopes.",
+            Self::Webhook => "Limited fallback: send-only webhook/app identity, no inbox.",
+        }
+    }
+
+    fn credential_hint(self) -> &'static str {
+        match self {
+            Self::UserOAuth => {
+                "OAuth will request user scopes and then validate the resulting user token."
+            }
+            Self::ReadOnlyOAuth => {
+                "OAuth will request read scopes and continue without write capabilities."
+            }
+            Self::BotToken => {
+                "Enter bot token xoxb-... and optional app token xapp-... for realtime later."
+            }
+            Self::ImportedToken => {
+                "Paste a pre-approved xoxp-, xoxb-, or xapp- token for validation."
+            }
+            Self::ManualApp => "Enter client ID, secret, redirect URI, and scopes before OAuth.",
+            Self::Webhook => "Enter a Slack incoming webhook URL for send-only posting.",
+        }
+    }
+
+    fn to_auth_submission_mode(self) -> AuthSubmissionMode {
+        match self {
+            Self::UserOAuth => AuthSubmissionMode::UserOAuth,
+            Self::ReadOnlyOAuth => AuthSubmissionMode::ReadOnlyOAuth,
+            Self::BotToken => AuthSubmissionMode::BotToken,
+            Self::ImportedToken => AuthSubmissionMode::ImportedToken,
+            Self::ManualApp => AuthSubmissionMode::ManualApp,
+            Self::Webhook => AuthSubmissionMode::Webhook,
+        }
+    }
+
+    fn next_phase(self) -> SlackSetupPhase {
+        match self {
+            Self::UserOAuth | Self::ReadOnlyOAuth | Self::ManualApp => SlackSetupPhase::OAuthPrompt,
+            Self::BotToken | Self::ImportedToken | Self::Webhook => {
+                SlackSetupPhase::EnterCredentials
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SlackSetupCapabilities {
+    can_read_history: bool,
+    can_send_as_user: bool,
+    can_send_as_bot: bool,
+    can_send_webhook: bool,
+    can_react: bool,
+    can_download_files: bool,
+    can_realtime: bool,
+    can_search: bool,
+}
+
+impl SlackSetupCapabilities {
+    fn from_mode(mode: SlackSetupMode) -> Self {
+        match mode {
+            SlackSetupMode::UserOAuth => Self {
+                can_read_history: true,
+                can_send_as_user: true,
+                can_react: true,
+                can_download_files: true,
+                can_search: true,
+                ..Self::default()
+            },
+            SlackSetupMode::ReadOnlyOAuth => Self {
+                can_read_history: true,
+                can_download_files: true,
+                can_search: true,
+                ..Self::default()
+            },
+            SlackSetupMode::BotToken => Self {
+                can_read_history: true,
+                can_send_as_bot: true,
+                can_react: true,
+                can_download_files: true,
+                can_realtime: true,
+                can_search: true,
+                ..Self::default()
+            },
+            SlackSetupMode::ImportedToken | SlackSetupMode::ManualApp => Self {
+                can_read_history: true,
+                can_send_as_user: true,
+                can_send_as_bot: true,
+                can_react: true,
+                can_download_files: true,
+                can_realtime: true,
+                can_search: true,
+                ..Self::default()
+            },
+            SlackSetupMode::Webhook => Self {
+                can_send_webhook: true,
+                ..Self::default()
+            },
+        }
+    }
+
+    fn lines(&self) -> Vec<(&'static str, bool)> {
+        vec![
+            ("read history", self.can_read_history),
+            ("send as user", self.can_send_as_user),
+            ("send as bot", self.can_send_as_bot),
+            ("send via webhook", self.can_send_webhook),
+            ("reactions", self.can_react),
+            ("files", self.can_download_files),
+            ("realtime", self.can_realtime),
+            ("search", self.can_search),
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlackSetupCredentialField {
+    UserToken,
+    BotToken,
+    AppToken,
+    WebhookUrl,
+    ClientId,
+    ClientSecret,
+    RedirectUri,
+    OAuthCode,
+}
+
+impl SlackSetupCredentialField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UserToken => "User token",
+            Self::BotToken => "Bot token",
+            Self::AppToken => "App token",
+            Self::WebhookUrl => "Webhook URL",
+            Self::ClientId => "Client ID",
+            Self::ClientSecret => "Client secret",
+            Self::RedirectUri => "Redirect URI",
+            Self::OAuthCode => "OAuth code",
+        }
+    }
+
+    fn is_secret(self) -> bool {
+        matches!(
+            self,
+            Self::UserToken
+                | Self::BotToken
+                | Self::AppToken
+                | Self::WebhookUrl
+                | Self::ClientSecret
+                | Self::OAuthCode
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SlackSetupCredentials {
+    user_token: String,
+    bot_token: String,
+    app_token: String,
+    webhook_url: String,
+    client_id: String,
+    client_secret: String,
+    redirect_uri: String,
+    oauth_code: String,
+}
+
+impl SlackSetupCredentials {
+    fn value(&self, field: SlackSetupCredentialField) -> &str {
+        match field {
+            SlackSetupCredentialField::UserToken => &self.user_token,
+            SlackSetupCredentialField::BotToken => &self.bot_token,
+            SlackSetupCredentialField::AppToken => &self.app_token,
+            SlackSetupCredentialField::WebhookUrl => &self.webhook_url,
+            SlackSetupCredentialField::ClientId => &self.client_id,
+            SlackSetupCredentialField::ClientSecret => &self.client_secret,
+            SlackSetupCredentialField::RedirectUri => &self.redirect_uri,
+            SlackSetupCredentialField::OAuthCode => &self.oauth_code,
+        }
+    }
+
+    fn value_mut(&mut self, field: SlackSetupCredentialField) -> &mut String {
+        match field {
+            SlackSetupCredentialField::UserToken => &mut self.user_token,
+            SlackSetupCredentialField::BotToken => &mut self.bot_token,
+            SlackSetupCredentialField::AppToken => &mut self.app_token,
+            SlackSetupCredentialField::WebhookUrl => &mut self.webhook_url,
+            SlackSetupCredentialField::ClientId => &mut self.client_id,
+            SlackSetupCredentialField::ClientSecret => &mut self.client_secret,
+            SlackSetupCredentialField::RedirectUri => &mut self.redirect_uri,
+            SlackSetupCredentialField::OAuthCode => &mut self.oauth_code,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SlackSetupOverlay {
+    provider_id: ProviderId,
+    phase: SlackSetupPhase,
+    selected_mode: usize,
+    selected_credential_field: usize,
+    workspace_label: String,
+    credentials: SlackSetupCredentials,
+    oauth_url: Option<String>,
+    status: Option<String>,
+    capabilities: Option<SlackSetupCapabilities>,
+}
+
+impl SlackSetupOverlay {
+    fn new(provider_id: ProviderId, workspace_label: String) -> Self {
+        Self {
+            provider_id,
+            phase: SlackSetupPhase::ChooseWorkspace,
+            selected_mode: 0,
+            selected_credential_field: 0,
+            workspace_label,
+            credentials: SlackSetupCredentials::default(),
+            oauth_url: None,
+            status: Some("Name this Slack workspace, then choose a sign-in method.".to_owned()),
+            capabilities: None,
+        }
+    }
+
+    fn selected_mode(&self) -> SlackSetupMode {
+        SlackSetupMode::ALL
+            .get(self.selected_mode)
+            .copied()
+            .unwrap_or(SlackSetupMode::UserOAuth)
+    }
+
+    fn credential_fields(&self) -> &'static [SlackSetupCredentialField] {
+        match self.selected_mode() {
+            SlackSetupMode::UserOAuth | SlackSetupMode::ReadOnlyOAuth => &[
+                SlackSetupCredentialField::UserToken,
+                SlackSetupCredentialField::OAuthCode,
+            ],
+            SlackSetupMode::BotToken => &[
+                SlackSetupCredentialField::BotToken,
+                SlackSetupCredentialField::AppToken,
+            ],
+            SlackSetupMode::ImportedToken => &[
+                SlackSetupCredentialField::UserToken,
+                SlackSetupCredentialField::BotToken,
+                SlackSetupCredentialField::AppToken,
+            ],
+            SlackSetupMode::ManualApp => &[
+                SlackSetupCredentialField::ClientId,
+                SlackSetupCredentialField::ClientSecret,
+                SlackSetupCredentialField::RedirectUri,
+                SlackSetupCredentialField::UserToken,
+                SlackSetupCredentialField::OAuthCode,
+            ],
+            SlackSetupMode::Webhook => &[SlackSetupCredentialField::WebhookUrl],
+        }
+    }
+
+    fn selected_credential_field(&self) -> Option<SlackSetupCredentialField> {
+        self.credential_fields()
+            .get(self.selected_credential_field)
+            .copied()
+    }
+
+    fn clamp_credential_selection(&mut self) {
+        self.selected_credential_field = self
+            .selected_credential_field
+            .min(self.credential_fields().len().saturating_sub(1));
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -418,16 +926,25 @@ pub struct AppState {
     selected_message_id: Option<MessageId>,
     action_menu: Option<ActionMenu>,
     reaction_picker: Option<ReactionPicker>,
+    compose_emoticon_picker: Option<ComposeEmoticonPicker>,
+    compose_attach_menu: Option<ComposeAttachMenu>,
+    poll_vote_picker: Option<PollVotePicker>,
     help_overlay: Option<HelpOverlay>,
     auth_overlay: Option<AuthOverlay>,
+    slack_setup: Option<SlackSetupOverlay>,
     account_switcher: Option<AccountSwitcher>,
     active_account: Option<ProviderId>,
     notification: Option<NotificationOverlay>,
     account_statuses: HashMap<ProviderId, AccountStatus>,
     reply_to: Option<MessageId>,
+    pending_attachment: Option<PendingAttachment>,
     thread_root: Option<MessageId>,
     image_viewer: Option<ImageViewer>,
     message_scroll: usize,
+    details_scroll: usize,
+    is_loading_older_history: bool,
+    older_history_exhausted: bool,
+    pending_scroll_to_latest: bool,
     frame_area: Rect,
     should_quit: bool,
     status: String,
@@ -454,16 +971,25 @@ impl Default for AppState {
             selected_message_id: None,
             action_menu: None,
             reaction_picker: None,
+            compose_emoticon_picker: None,
+            compose_attach_menu: None,
+            poll_vote_picker: None,
             help_overlay: None,
             auth_overlay: None,
+            slack_setup: None,
             account_switcher: None,
             active_account: None,
             notification: None,
             account_statuses: HashMap::new(),
             reply_to: None,
+            pending_attachment: None,
             thread_root: None,
             image_viewer: None,
             message_scroll: 0,
+            details_scroll: 0,
+            is_loading_older_history: false,
+            older_history_exhausted: false,
+            pending_scroll_to_latest: false,
             frame_area: Rect::default(),
             should_quit: false,
             status: String::new(),
@@ -512,6 +1038,10 @@ impl AppState {
         self.compose_cursor
     }
 
+    fn pending_attachment(&self) -> Option<&PendingAttachment> {
+        self.pending_attachment.as_ref()
+    }
+
     pub fn selected_chat_index(&self) -> usize {
         self.selected_chat
     }
@@ -540,6 +1070,14 @@ impl AppState {
         self.reaction_picker.is_some()
     }
 
+    pub fn compose_emoticon_picker_open(&self) -> bool {
+        self.compose_emoticon_picker.is_some()
+    }
+
+    pub fn compose_attach_menu_open(&self) -> bool {
+        self.compose_attach_menu.is_some()
+    }
+
     pub fn help_overlay_open(&self) -> bool {
         self.help_overlay.is_some()
     }
@@ -550,6 +1088,14 @@ impl AppState {
 
     pub fn account_switcher_open(&self) -> bool {
         self.account_switcher.is_some()
+    }
+
+    pub fn slack_setup_open(&self) -> bool {
+        self.slack_setup.is_some()
+    }
+
+    pub fn slack_setup_phase_label(&self) -> Option<&'static str> {
+        self.slack_setup.as_ref().map(|setup| setup.phase.label())
     }
 
     pub fn active_account(&self) -> Option<&ProviderId> {
@@ -711,6 +1257,9 @@ impl App {
         let layout = AppLayout::for_area(frame.area(), self.compose_height(frame.area()));
         self.state.layout_mode = layout.mode;
         self.state.pane_areas = self.visible_pane_areas(layout);
+        self.clamp_message_scroll();
+        self.clamp_details_scroll();
+        self.apply_pending_scroll_to_latest();
 
         match layout.mode {
             LayoutMode::Compact => self.draw_compact(frame, layout),
@@ -731,9 +1280,13 @@ impl App {
         self.draw_account_switcher(frame, frame.area());
         self.draw_image_viewer(frame, frame.area());
         self.draw_auth_overlay(frame, frame.area());
+        self.draw_slack_setup_overlay(frame, frame.area());
         self.draw_help_overlay(frame, frame.area());
         self.draw_action_menu(frame, frame.area());
         self.draw_reaction_picker(frame, frame.area());
+        self.draw_compose_attach_menu(frame, frame.area());
+        self.draw_compose_emoticon_picker(frame, frame.area());
+        self.draw_poll_vote_picker(frame, frame.area());
     }
 
     fn visible_pane_areas(&self, layout: AppLayout) -> PaneAreas {
@@ -873,6 +1426,7 @@ impl App {
                 self.state.message_scroll,
                 area.height.saturating_sub(2) as usize,
                 self.state.selected_message_id.as_deref(),
+                &self.unread_message_ids(),
                 &mut self.media_preview_cache,
                 self.theme,
             );
@@ -901,6 +1455,7 @@ impl App {
 
         let content_lines = self.state.compose.lines().len() as u16;
         let reply_extra = u16::from(self.state.reply_to.is_some());
+        let attachment_extra = u16::from(self.state.pending_attachment.is_some());
         let wrapped_extra = self
             .state
             .compose
@@ -911,10 +1466,10 @@ impl App {
                 line.chars().count().saturating_div(width)
             })
             .sum::<usize>() as u16;
-        (content_lines + wrapped_extra + reply_extra + 2).clamp(3, 7)
+        (content_lines + wrapped_extra + reply_extra + attachment_extra + 2).clamp(3, 8)
     }
 
-    fn draw_compose(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    fn draw_compose(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         if area.is_empty() {
             return;
         }
@@ -932,30 +1487,54 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let editor_area = if let Some(reply_to) = &self.state.reply_to {
-            let preview = self
-                .message_by_id(reply_to)
-                .map(reply_preview)
-                .unwrap_or_else(|| format!("Replying to {reply_to}"));
-            let [reply_area, editor_area] = *Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(0)])
-                .split(inner)
-            else {
-                return;
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("Replying · ", self.theme.status_key()),
-                    Span::styled(preview, self.theme.muted()),
-                ])),
-                reply_area,
-            );
-            editor_area
-        } else {
-            inner
-        };
+        let editor_area = {
+            let mut constraints = Vec::new();
+            if self.state.reply_to.is_some() {
+                constraints.push(Constraint::Length(1));
+            }
+            if self.state.pending_attachment.is_some() {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.push(Constraint::Min(0));
 
+            let areas = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(inner);
+            let mut area_index = 0;
+
+            if let Some(reply_to) = &self.state.reply_to {
+                let preview = self
+                    .message_by_id(reply_to)
+                    .map(reply_preview)
+                    .unwrap_or_else(|| format!("Replying to {reply_to}"));
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled("Replying · ", self.theme.status_key()),
+                        Span::styled(preview, self.theme.muted()),
+                        Span::raw("  "),
+                        Span::styled("Esc cancels", self.theme.status_key()),
+                    ])),
+                    areas[area_index],
+                );
+                area_index += 1;
+            }
+
+            if let Some(attachment) = self.state.pending_attachment() {
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled("Attached · ", self.theme.status_key()),
+                        Span::styled(attachment.preview(), self.theme.muted()),
+                        Span::raw("  "),
+                        Span::styled("Esc removes", self.theme.status_key()),
+                    ])),
+                    areas[area_index],
+                );
+                area_index += 1;
+            }
+
+            areas[area_index]
+        };
         let mut compose = self.state.compose.clone();
         compose.remove_block();
         compose.set_style(Style::default().fg(self.theme.foreground));
@@ -974,7 +1553,49 @@ impl App {
         frame.render_widget(&compose, editor_area);
     }
 
-    fn draw_details(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    fn draw_compose_attach_menu(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(menu) = &self.state.compose_attach_menu else {
+            return;
+        };
+
+        let modal = self.compose_attach_menu_rect(area);
+        if modal.is_empty() {
+            return;
+        }
+
+        let mut lines = vec![Line::from(Span::styled(
+            "Attach from typed path",
+            self.theme.pane_title(),
+        ))];
+        for (index, item) in ComposeAttachMenuItem::ALL.iter().enumerate() {
+            let selected = index == menu.selected;
+            let prefix = if selected { "› " } else { "  " };
+            let style = if selected {
+                self.theme.status_key()
+            } else {
+                self.theme.status_bar()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{}", item.label()),
+                style,
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Type or paste a path in compose first · Enter selects · Esc cancels",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .title("Attach")
+                .borders(Borders::ALL)
+                .border_style(self.theme.overlay_border()),
+        );
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
+    fn draw_details(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
         if area.is_empty() {
             return;
         }
@@ -985,9 +1606,9 @@ impl App {
         }
 
         if let Some(message_id) = &self.state.selected_message_id
-            && let Some(message) = self.message_by_id(message_id)
+            && let Some(message) = self.message_by_id(message_id).cloned()
         {
-            self.draw_message_details(frame, area, message);
+            self.draw_message_details(frame, area, &message);
             return;
         }
 
@@ -1036,31 +1657,31 @@ impl App {
             Line::from("  Scroll/trackpad: browse"),
             Line::from("  Click compose: type"),
             Line::from("  Enter: send"),
-            Line::from("  Shift/Alt+Enter: newline"),
-            Line::from("  Ctrl+J: newline fallback"),
             Line::from("  Esc: back/close/clear"),
             Line::from("  Ctrl+A: account filter"),
             Line::from("  Ctrl+F: text filter"),
             Line::from("  PageUp/PageDown: faster"),
             Line::from("  Home/End: edges"),
             Line::from("  Ctrl+Q: quit"),
-            Line::from(""),
-            Line::from(format!("Status: {}", self.state.status)),
         ];
-        let paragraph = Paragraph::new(details).block(
-            Block::default()
-                .title("Details")
-                .borders(Borders::ALL)
-                .border_style(
-                    self.theme
-                        .focus_border(self.state.focus == FocusPane::Details),
-                ),
-        );
+        let details_len = details.len();
+        let paragraph = Paragraph::new(details)
+            .block(
+                Block::default()
+                    .title("Details")
+                    .borders(Borders::ALL)
+                    .border_style(
+                        self.theme
+                            .focus_border(self.state.focus == FocusPane::Details),
+                    ),
+            )
+            .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(paragraph, area);
+        self.draw_vertical_scrollbar(frame, area, details_len, self.state.details_scroll);
     }
 
     fn draw_message_details(
-        &self,
+        &mut self,
         frame: &mut Frame<'_>,
         area: ratatui::layout::Rect,
         message: &Message,
@@ -1082,19 +1703,46 @@ impl App {
             .as_ref()
             .map(|id| short_id(id).to_string())
             .unwrap_or_else(|| "none".to_owned());
-        let avatar = message
+        let avatar_rows = message
             .sender
             .avatar
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "not loaded".to_owned());
+            .as_deref()
+            .filter(|path| path.exists())
+            .and_then(|path| {
+                message_list::cached_image_preview_rows(
+                    path,
+                    &mut self.media_preview_cache,
+                    area.width.saturating_sub(4).clamp(1, 16),
+                    6,
+                )
+                .ok()
+            });
+        let avatar_status = if message.sender.avatar.is_some() {
+            "avatar preview"
+        } else {
+            "not loaded"
+        };
         let reactions = if message.reactions.is_empty() {
             "none".to_owned()
         } else {
+            let reaction_sender_names = reaction_sender_names(&self.state.messages);
             message
                 .reactions
                 .iter()
-                .map(|reaction| format!("{} {}", reaction.emoji, reaction.senders.len()))
+                .map(|reaction| {
+                    let senders = reaction
+                        .senders
+                        .iter()
+                        .map(|sender| {
+                            reaction_sender_names
+                                .get(sender)
+                                .cloned()
+                                .unwrap_or_else(|| reaction_sender_fallback(sender))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{} {}", reaction.emoji, senders)
+                })
                 .collect::<Vec<_>>()
                 .join("  ")
         };
@@ -1108,11 +1756,10 @@ impl App {
             Line::from(""),
             Line::from(format!("Chat: {chat_name}")),
             Line::from(format!("Sender: {}", message.sender.display_name)),
-            Line::from(format!("Sender ID: {}", message.sender.platform_id)),
-            Line::from(format!("Avatar: {avatar}")),
+            Line::from(format!("Avatar: {avatar_status}")),
             Line::from(format!(
                 "Time: {}",
-                message.timestamp.format("%Y-%m-%d %H:%M:%S")
+                message_list::format_message_datetime(message.timestamp)
             )),
             Line::from(format!("From me: {}", bool_label(message.is_from_me))),
             Line::from(format!("Message ID: {}", message.id)),
@@ -1123,6 +1770,11 @@ impl App {
             Line::from(Span::styled("Content", self.theme.status_key())),
         ];
 
+        if let Some(avatar_rows) = avatar_rows {
+            lines.extend(avatar_rows.into_iter().map(Line::from));
+            lines.push(Line::from(""));
+        }
+
         let content = content_copy_text(&message.content);
         if content.trim().is_empty() {
             lines.push(Line::from(Span::styled("  attachment", self.theme.muted())));
@@ -1131,7 +1783,20 @@ impl App {
                 lines.push(Line::from(format!("  {line}")));
             }
         }
+        if let Content::Poll(poll) = &message.content {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Poll results",
+                self.theme.status_key(),
+            )));
+            lines.extend(poll_result_lines(
+                poll,
+                &reaction_sender_names(&self.state.messages),
+                self.theme,
+            ));
+        }
 
+        let content_len = lines.len();
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
@@ -1142,8 +1807,10 @@ impl App {
                             .focus_border(self.state.focus == FocusPane::Details),
                     ),
             )
+            .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
+        self.draw_vertical_scrollbar(frame, area, content_len, self.state.details_scroll);
     }
 
     fn draw_thread_details(
@@ -1197,6 +1864,7 @@ impl App {
             }
         }
 
+        let content_len = lines.len();
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
@@ -1207,8 +1875,10 @@ impl App {
                             .focus_border(self.state.focus == FocusPane::Details),
                     ),
             )
+            .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
+        self.draw_vertical_scrollbar(frame, area, content_len, self.state.details_scroll);
     }
 
     fn draw_status_bar(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1280,6 +1950,15 @@ impl App {
             ];
         }
 
+        if self.state.compose_attach_menu.is_some() {
+            return vec![
+                hint("Choose attachment type"),
+                hint("Arrow keys move"),
+                hint("Enter selects"),
+                hint("Esc cancels"),
+            ];
+        }
+
         if self.state.thread_root.is_some() {
             return vec![
                 hint("Thread open"),
@@ -1315,19 +1994,31 @@ impl App {
                 } else {
                     vec![
                         hint("Click messages to select"),
-                        hint("Scroll to browse"),
+                        hint("Scroll/PageUp: browse; top loads older"),
                         hint("Type to reply"),
                         hint("? help"),
                     ]
                 }
             }
-            FocusPane::Compose => vec![
-                hint("Enter sends"),
-                hint("Ctrl+J adds a new line"),
-                hint("F1 help"),
-                hint("Esc returns to messages"),
+            FocusPane::Compose => {
+                let mut hints = vec![
+                    hint("type :emoji"),
+                    hint("paste a file path + Enter attaches"),
+                    hint("Enter sends text otherwise"),
+                    hint("F1 help"),
+                ];
+                if self.state.reply_to.is_some() {
+                    hints.push(hint("Esc cancels reply"));
+                } else {
+                    hints.push(hint("Esc returns to messages"));
+                }
+                hints
+            }
+            FocusPane::Details => vec![
+                hint("Scroll/PageUp/PageDown"),
+                hint("← returns"),
+                hint("? help"),
             ],
-            FocusPane::Details => vec![hint("← returns"), hint("? help"), hint("Ctrl+Q quits")],
         }
     }
 
@@ -1456,6 +2147,281 @@ impl App {
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
+    fn draw_compose_emoticon_picker(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(picker) = &self.state.compose_emoticon_picker else {
+            return;
+        };
+
+        let modal = self.compose_emoticon_picker_rect(area);
+        if modal.is_empty() {
+            return;
+        }
+
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Emoji suggestions ", self.theme.pane_title()),
+            Span::styled(format!(":{}", picker.query), self.theme.status_key()),
+        ])];
+        for (row, option_index) in picker.matches.iter().copied().enumerate() {
+            let (value, label) = COMPOSE_EMOTICON_OPTIONS[option_index];
+            let selected = row == picker.selected;
+            let prefix = if selected { "› " } else { "  " };
+            let style = if selected {
+                self.theme.status_key()
+            } else {
+                self.theme.status_bar()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{value} {label}"),
+                style,
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Enter/Tab inserts · Esc cancels · keep typing to narrow",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .title("Emoji")
+                .borders(Borders::ALL)
+                .border_style(self.theme.overlay_border()),
+        );
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
+    fn draw_poll_vote_picker(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(picker) = &self.state.poll_vote_picker else {
+            return;
+        };
+        let Some(message) = self.message_by_id(&picker.message_id) else {
+            return;
+        };
+        let Content::Poll(poll) = &message.content else {
+            return;
+        };
+
+        let modal = self.poll_vote_picker_rect(area, picker);
+        if modal.is_empty() {
+            return;
+        }
+
+        let selectable = poll.selectable_options_count.unwrap_or(1).max(1) as usize;
+        let mut lines = vec![
+            Line::from(Span::styled(
+                truncate_chars(&poll.question, modal.width.saturating_sub(4) as usize),
+                self.theme.pane_title(),
+            )),
+            Line::from(Span::styled(
+                if selectable == 1 {
+                    "Choose one option"
+                } else {
+                    "Space toggles · Enter submits"
+                },
+                self.theme.muted(),
+            )),
+        ];
+        for (index, option) in poll.options.iter().enumerate() {
+            let under_cursor = index == picker.selected;
+            let checked = picker.selected_options.contains(&index);
+            let marker = if checked { "[x]" } else { "[ ]" };
+            let prefix = if under_cursor { "›" } else { " " };
+            let votes = poll_vote_count(poll, &option.id);
+            let label = format!("{prefix} {marker} {} ({votes})", option.label);
+            let style = if under_cursor {
+                self.theme.status_key()
+            } else if checked {
+                Style::default()
+                    .fg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                self.theme.status_bar()
+            };
+            lines.push(Line::from(Span::styled(label, style)));
+        }
+        lines.push(Line::from(Span::styled(
+            "Enter submits · Esc cancels",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .title("Vote")
+                .borders(Borders::ALL)
+                .border_style(self.theme.overlay_border()),
+        );
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
+    fn draw_slack_setup_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(setup) = &self.state.slack_setup else {
+            return;
+        };
+        if area.width < 44 || area.height < 14 {
+            return;
+        }
+
+        let modal = self.slack_setup_overlay_rect(area);
+        let mut lines = vec![
+            Line::from(Span::styled("Slack sign-in", self.theme.pane_title())),
+            Line::from(format!("Workspace: {}", setup.workspace_label)),
+            Line::from(format!("Provider: {}", setup.provider_id)),
+            Line::from(format!("Step: {}", setup.phase.label())),
+            Line::from(""),
+        ];
+
+        match setup.phase {
+            SlackSetupPhase::ChooseWorkspace => {
+                lines.extend([
+                    Line::from("Name this Slack workspace so multiple workspaces stay separate."),
+                    Line::from(format!("Workspace label: {}", setup.workspace_label)),
+                    Line::from(Span::styled(
+                        "Type to edit · Backspace delete · Enter continue",
+                        self.theme.muted(),
+                    )),
+                ]);
+            }
+            SlackSetupPhase::ChooseAuthMode => {
+                lines.push(Line::from(Span::styled(
+                    "Choose a setup method, ordered by robustness:",
+                    self.theme.status_key(),
+                )));
+                for (index, mode) in SlackSetupMode::ALL.iter().copied().enumerate() {
+                    let selected = index == setup.selected_mode;
+                    let prefix = if selected { "› " } else { "  " };
+                    let style = if selected {
+                        self.theme.status_key()
+                    } else {
+                        self.theme.status_bar()
+                    };
+                    lines.push(Line::from(Span::styled(
+                        format!("{prefix}{}. {}", index + 1, mode.label()),
+                        style,
+                    )));
+                    if selected {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {}", mode.description()),
+                            self.theme.muted(),
+                        )));
+                    }
+                }
+            }
+            SlackSetupPhase::EnterCredentials => {
+                let mode = setup.selected_mode();
+                lines.extend([
+                    Line::from(Span::styled(mode.label(), self.theme.status_key())),
+                    Line::from(mode.credential_hint()),
+                    Line::from(""),
+                    Line::from(Span::styled("Credential fields", self.theme.status_key())),
+                ]);
+                for (index, field) in setup.credential_fields().iter().copied().enumerate() {
+                    let selected = index == setup.selected_credential_field;
+                    let prefix = if selected { "› " } else { "  " };
+                    let style = if selected {
+                        self.theme.status_key()
+                    } else {
+                        self.theme.status_bar()
+                    };
+                    let display_value = slack_setup_display_value(
+                        setup.credentials.value(field),
+                        field.is_secret(),
+                    );
+                    lines.push(Line::from(Span::styled(
+                        format!("{prefix}{}: {display_value}", field.label()),
+                        style,
+                    )));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Type to edit selected field · Tab/↑/↓ switch fields · Backspace delete · Enter validate",
+                    self.theme.muted(),
+                )));
+            }
+            SlackSetupPhase::OAuthPrompt => {
+                lines.push(Line::from(Span::styled(
+                    setup.selected_mode().label(),
+                    self.theme.status_key(),
+                )));
+                if let Some(url) = &setup.oauth_url {
+                    lines.push(Line::from("Open this Slack authorization URL:"));
+                    lines.push(Line::from(truncate_chars(
+                        url,
+                        modal.width.saturating_sub(6) as usize,
+                    )));
+                } else {
+                    lines.push(Line::from(
+                        "OAuth URL will appear here once Slack app settings are available.",
+                    ));
+                }
+                lines.push(Line::from(Span::styled(
+                    "After browser authorization, the setup flow validates the workspace and capabilities.",
+                    self.theme.muted(),
+                )));
+            }
+            SlackSetupPhase::Validating => {
+                lines.extend([
+                    Line::from(Span::styled(
+                        "Validating Slack credentials",
+                        self.theme.status_key(),
+                    )),
+                    Line::from("Checking identity, workspace, and granted capabilities..."),
+                ]);
+            }
+            SlackSetupPhase::CapabilityReview | SlackSetupPhase::Connected => {
+                lines.push(Line::from(Span::styled(
+                    "Capabilities detected for this workspace:",
+                    self.theme.status_key(),
+                )));
+                if let Some(capabilities) = &setup.capabilities {
+                    for (label, enabled) in capabilities.lines() {
+                        let marker = if enabled { "yes" } else { "no" };
+                        lines.push(Line::from(format!("  {label}: {marker}")));
+                    }
+                } else {
+                    lines.push(Line::from("  Waiting for Slack validation results."));
+                }
+            }
+            SlackSetupPhase::Failed => {
+                lines.push(Line::from(Span::styled(
+                    "Slack setup failed",
+                    self.theme.status_key(),
+                )));
+                lines.push(Line::from(
+                    setup
+                        .status
+                        .clone()
+                        .unwrap_or_else(|| "No failure detail was provided.".to_owned()),
+                ));
+            }
+        }
+
+        if let Some(status) = &setup.status
+            && !status.is_empty()
+            && setup.phase != SlackSetupPhase::Failed
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(status.clone(), self.theme.muted())));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "↑/↓ choose · Tab fields · 1-6 quick select · Enter continue · Esc hide",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Slack setup")
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.overlay_border()),
+            )
+            .wrap(Wrap { trim: true });
         frame.render_widget(Clear, modal);
         frame.render_widget(paragraph, modal);
     }
@@ -1656,6 +2622,7 @@ impl App {
             Line::from("  Up/Down: select previous or next message"),
             Line::from("  Enter: open actions for selected message"),
             Line::from("  PageUp/PageDown or scroll: browse message history"),
+            Line::from("  Reaching the top loads older messages when available"),
             Line::from("  Type a letter: start composing a reply"),
             Line::from(""),
             Line::from(Span::styled("Message actions", self.theme.status_key())),
@@ -1666,9 +2633,9 @@ impl App {
             Line::from("  Open image: preview image media"),
             Line::from(""),
             Line::from(Span::styled("Compose", self.theme.status_key())),
-            Line::from("  Enter: send message"),
-            Line::from("  Shift+Enter or Alt+Enter: insert newline"),
-            Line::from("  Ctrl+J: insert newline fallback"),
+            Line::from("  Enter: send text, or attach/send if compose is an existing local file path"),
+            Line::from("  Type :joy, :heart, etc. for emoji suggestions"),
+            Line::from("  Paste a local file path and press Enter to send it as media/file"),
             Line::from("  Backspace/Delete: edit text"),
             Line::from("  Esc: return to messages"),
             Line::from(""),
@@ -1954,22 +2921,49 @@ impl App {
     }
 
     async fn bootstrap(&mut self) -> Result<()> {
-        for provider in &self.providers {
-            let account = provider.account_info();
+        for provider_index in 0..self.providers.len() {
+            let account = self.providers[provider_index].account_info();
             self.state.account_statuses.insert(
                 account.id.clone(),
                 AccountStatus::new(&account, AccountConnection::Connecting),
             );
             self.store.upsert_account(&account, "{}").await?;
-            provider.connect().await?;
+            if let Err(error) = self.providers[provider_index].connect().await {
+                let detail = error.to_string();
+                self.set_account_status(
+                    &account.id,
+                    AccountConnection::Offline,
+                    Some(detail.clone()),
+                );
+                self.state.status = format!("{} setup failed: {detail}", account.display_name);
+                if account.platform == Platform::Slack {
+                    self.open_slack_setup_for_account(&account, Some(detail));
+                    continue;
+                }
+                return Err(error);
+            }
             if let Some(status) = self.state.account_statuses.get_mut(&account.id) {
                 status.connection = AccountConnection::Syncing(0);
                 status.detail = None;
             }
 
-            for chat in provider.chats().await? {
+            if account.platform == Platform::Slack && !self.providers[provider_index].is_connected()
+            {
+                self.set_account_status(
+                    &account.id,
+                    AccountConnection::NeedsAuth,
+                    Some("complete Slack setup".to_owned()),
+                );
+                self.open_slack_setup_for_account(&account, None);
+                continue;
+            }
+
+            for chat in self.providers[provider_index].chats().await? {
                 self.store.upsert_chat(&chat).await?;
-                for message in provider.history(&chat.id, None, HISTORY_LIMIT).await? {
+                for message in self.providers[provider_index]
+                    .history(&chat.id, None, HISTORY_LIMIT)
+                    .await?
+                {
                     self.store.upsert_message(&message).await?;
                 }
             }
@@ -1981,6 +2975,7 @@ impl App {
 
         self.reload_chats().await?;
         self.reload_selected_messages().await?;
+        self.state.pending_scroll_to_latest = true;
         self.state.status = if self.state.chats.is_empty() {
             "ready - no chats loaded".to_owned()
         } else {
@@ -2047,10 +3042,14 @@ impl App {
                     AccountConnection::NeedsAuth,
                     Some(auth_challenge_label(&challenge).to_owned()),
                 );
-                self.state.auth_overlay = Some(AuthOverlay {
-                    provider_id: provider_id.clone(),
-                    challenge,
-                });
+                if self.account_platform(&provider_id) == Some(Platform::Slack) {
+                    self.open_slack_setup_for_provider(&provider_id, Some(&challenge), None);
+                } else {
+                    self.state.auth_overlay = Some(AuthOverlay {
+                        provider_id: provider_id.clone(),
+                        challenge,
+                    });
+                }
                 self.state.status = format!("authentication required for {provider_id}");
             }
             ProviderEvent::AuthSucceeded => {
@@ -2062,6 +3061,7 @@ impl App {
                 {
                     self.state.auth_overlay = None;
                 }
+                self.update_slack_setup_success(&provider_id, SlackSetupPhase::CapabilityReview);
                 self.set_account_status(&provider_id, AccountConnection::Online, None);
                 self.state.status = format!("authenticated {provider_id}");
             }
@@ -2086,6 +3086,7 @@ impl App {
                 {
                     self.state.auth_overlay = None;
                 }
+                self.update_slack_setup_success(&provider_id, SlackSetupPhase::Connected);
                 self.set_account_status(&provider_id, AccountConnection::Online, None);
                 self.state.status = format!("sync complete for {provider_id}");
             }
@@ -2099,6 +3100,9 @@ impl App {
                     self.state.auth_overlay = None;
                 }
                 let detail = reason.as_deref().map(str::to_owned);
+                if self.account_platform(&provider_id) == Some(Platform::Slack) {
+                    self.open_slack_setup_for_provider(&provider_id, None, detail.clone());
+                }
                 self.set_account_status(&provider_id, AccountConnection::Offline, detail.clone());
                 self.state.status = detail
                     .map(|reason| format!("{provider_id} disconnected: {reason}"))
@@ -2212,6 +3216,113 @@ impl App {
         Ok(false)
     }
 
+    fn handle_compose_emoticon_picker_key(&mut self, key: KeyEvent) -> bool {
+        if self.state.compose_emoticon_picker.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.compose_emoticon_picker = None;
+                self.state.status = "emoji suggestions closed".to_owned();
+                true
+            }
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.state.compose_emoticon_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(picker) = &mut self.state.compose_emoticon_picker {
+                    let max = picker.matches.len().saturating_sub(1);
+                    picker.selected = picker.selected.saturating_add(1).min(max);
+                }
+                true
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                self.insert_selected_compose_emoticon();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_compose_attach_menu_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(menu) = &mut self.state.compose_attach_menu else {
+            return Ok(false);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.compose_attach_menu = None;
+                self.state.status = "attach menu closed".to_owned();
+            }
+            KeyCode::Up => {
+                menu.selected = menu.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                menu.selected = menu
+                    .selected
+                    .saturating_add(1)
+                    .min(ComposeAttachMenuItem::ALL.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let item = ComposeAttachMenuItem::ALL[menu.selected];
+                self.state.compose_attach_menu = None;
+                self.perform_compose_attach_menu_item(item)?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    async fn handle_poll_vote_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.state.poll_vote_picker.is_none() {
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.poll_vote_picker = None;
+                self.state.status = "poll vote cancelled".to_owned();
+            }
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.state.poll_vote_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let (message_id, selected) = self
+                    .state
+                    .poll_vote_picker
+                    .as_ref()
+                    .map(|picker| (picker.message_id.clone(), picker.selected))
+                    .expect("picker exists");
+                let max_option = self
+                    .message_by_id(&message_id)
+                    .and_then(|message| match &message.content {
+                        Content::Poll(poll) => poll.options.len().checked_sub(1),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                if let Some(picker) = &mut self.state.poll_vote_picker {
+                    picker.selected = selected.saturating_add(1).min(max_option);
+                }
+            }
+            KeyCode::Char(' ') => {
+                self.toggle_poll_vote_picker_selection();
+            }
+            KeyCode::Enter => {
+                let picker = self.state.poll_vote_picker.take().expect("picker exists");
+                self.apply_poll_vote(picker.message_id, picker.selected_options)
+                    .await?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
     async fn perform_action_menu_item(
         &mut self,
         message_id: MessageId,
@@ -2232,6 +3343,7 @@ impl App {
                 self.state.status = "choose a reaction".to_owned();
             }
             ActionMenuItem::CopyText => self.copy_message_text(&message_id),
+            ActionMenuItem::VotePoll => self.open_poll_vote_picker(message_id),
             ActionMenuItem::OpenImage => {
                 if !self.open_message_image(&message_id) {
                     self.state.status = "selected message has no image preview".to_owned();
@@ -2254,6 +3366,10 @@ impl App {
             return self.handle_account_switcher_key(key);
         }
 
+        if self.state.slack_setup.is_some() {
+            return self.handle_slack_setup_key(key).await;
+        }
+
         if self.state.help_overlay.is_some() {
             return Ok(self.handle_help_overlay_key(key));
         }
@@ -2274,6 +3390,14 @@ impl App {
             return self.handle_reaction_picker_key(key).await;
         }
 
+        if self.state.compose_attach_menu.is_some() {
+            return self.handle_compose_attach_menu_key(key);
+        }
+
+        if self.state.poll_vote_picker.is_some() {
+            return self.handle_poll_vote_picker_key(key).await;
+        }
+
         if self.state.filter_mode {
             return Ok(self.handle_filter_key(key));
         }
@@ -2289,7 +3413,7 @@ impl App {
             return Ok(false);
         }
 
-        if is_ctrl_char(key, 'a') {
+        if self.state.focus != FocusPane::Compose && is_ctrl_char(key, 'a') {
             self.open_account_switcher();
             return Ok(false);
         }
@@ -2316,6 +3440,7 @@ impl App {
 
         let selection_changed = match self.state.focus {
             FocusPane::Messages => self.handle_message_key(key).await?,
+            FocusPane::Details => self.handle_details_key(key),
             _ => match key.code {
                 KeyCode::Esc => self.handle_escape(),
                 KeyCode::Left => {
@@ -2341,6 +3466,240 @@ impl App {
             },
         };
         Ok(selection_changed)
+    }
+
+    fn handle_details_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                if self.state.thread_root.take().is_some() {
+                    self.state.status = "thread closed".to_owned();
+                } else {
+                    self.focus_previous_pane();
+                }
+                false
+            }
+            KeyCode::Left => {
+                self.focus_previous_pane();
+                false
+            }
+            KeyCode::Right => {
+                self.focus_next_pane();
+                false
+            }
+            KeyCode::Down => {
+                self.scroll_details_down(1);
+                false
+            }
+            KeyCode::Up => {
+                self.scroll_details_up(1);
+                false
+            }
+            KeyCode::PageDown => {
+                self.scroll_details_down(self.details_page_step());
+                false
+            }
+            KeyCode::PageUp => {
+                self.scroll_details_up(self.details_page_step());
+                false
+            }
+            KeyCode::Home => {
+                self.state.details_scroll = 0;
+                self.state.status = "details at top".to_owned();
+                false
+            }
+            KeyCode::End => {
+                self.state.details_scroll = self.max_details_scroll();
+                self.state.status = "details at bottom".to_owned();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    async fn handle_slack_setup_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(setup) = &mut self.state.slack_setup else {
+            return Ok(false);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.slack_setup = None;
+                self.state.status = "Slack setup hidden".to_owned();
+            }
+            KeyCode::Char('q')
+                if !matches!(
+                    setup.phase,
+                    SlackSetupPhase::ChooseWorkspace
+                        | SlackSetupPhase::EnterCredentials
+                        | SlackSetupPhase::OAuthPrompt
+                ) =>
+            {
+                self.state.slack_setup = None;
+                self.state.status = "Slack setup hidden".to_owned();
+            }
+            KeyCode::Down | KeyCode::Right | KeyCode::Tab => match setup.phase {
+                SlackSetupPhase::ChooseAuthMode => {
+                    setup.selected_mode = setup
+                        .selected_mode
+                        .saturating_add(1)
+                        .min(SlackSetupMode::ALL.len().saturating_sub(1));
+                    self.state.status = format!("selected {}", setup.selected_mode().label());
+                }
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                    setup.selected_credential_field = setup
+                        .selected_credential_field
+                        .saturating_add(1)
+                        .min(setup.credential_fields().len().saturating_sub(1));
+                    if let Some(field) = setup.selected_credential_field() {
+                        self.state.status = format!("editing Slack {}", field.label());
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Up | KeyCode::Left | KeyCode::BackTab => match setup.phase {
+                SlackSetupPhase::ChooseAuthMode => {
+                    setup.selected_mode = setup.selected_mode.saturating_sub(1);
+                    self.state.status = format!("selected {}", setup.selected_mode().label());
+                }
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                    setup.selected_credential_field =
+                        setup.selected_credential_field.saturating_sub(1);
+                    if let Some(field) = setup.selected_credential_field() {
+                        self.state.status = format!("editing Slack {}", field.label());
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Home => match setup.phase {
+                SlackSetupPhase::ChooseAuthMode => {
+                    setup.selected_mode = 0;
+                    self.state.status = format!("selected {}", setup.selected_mode().label());
+                }
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                    setup.selected_credential_field = 0;
+                    if let Some(field) = setup.selected_credential_field() {
+                        self.state.status = format!("editing Slack {}", field.label());
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::End => match setup.phase {
+                SlackSetupPhase::ChooseAuthMode => {
+                    setup.selected_mode = SlackSetupMode::ALL.len().saturating_sub(1);
+                    self.state.status = format!("selected {}", setup.selected_mode().label());
+                }
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                    setup.selected_credential_field =
+                        setup.credential_fields().len().saturating_sub(1);
+                    if let Some(field) = setup.selected_credential_field() {
+                        self.state.status = format!("editing Slack {}", field.label());
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Backspace => match setup.phase {
+                SlackSetupPhase::ChooseWorkspace => {
+                    setup.workspace_label.pop();
+                    self.state.status = "editing Slack workspace label".to_owned();
+                }
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                    if let Some(field) = setup.selected_credential_field() {
+                        setup.credentials.value_mut(field).pop();
+                        self.state.status = format!("editing Slack {}", field.label());
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Delete => match setup.phase {
+                SlackSetupPhase::ChooseWorkspace => {
+                    setup.workspace_label.clear();
+                    self.state.status = "cleared Slack workspace label".to_owned();
+                }
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                    if let Some(field) = setup.selected_credential_field() {
+                        setup.credentials.value_mut(field).clear();
+                        self.state.status = format!("cleared Slack {}", field.label());
+                    }
+                }
+                _ => {}
+            },
+            KeyCode::Char(value)
+                if setup.phase == SlackSetupPhase::ChooseAuthMode
+                    && ('1'..='6').contains(&value) =>
+            {
+                setup.selected_mode = (value as usize).saturating_sub('1' as usize);
+                self.state.status = format!("selected {}", setup.selected_mode().label());
+            }
+            KeyCode::Enter => {
+                let submit = match setup.phase {
+                    SlackSetupPhase::ChooseWorkspace => {
+                        setup.phase = SlackSetupPhase::ChooseAuthMode;
+                        setup.status =
+                            Some("Choose how this Slack workspace should sign in.".to_owned());
+                        self.state.status = "Slack workspace label accepted".to_owned();
+                        false
+                    }
+                    SlackSetupPhase::ChooseAuthMode => {
+                        let mode = setup.selected_mode();
+                        setup.phase = mode.next_phase();
+                        setup.selected_credential_field = 0;
+                        setup.clamp_credential_selection();
+                        setup.capabilities = Some(SlackSetupCapabilities::from_mode(mode));
+                        setup.status = Some(mode.credential_hint().to_owned());
+                        self.state.status = format!("Slack setup: {}", mode.label());
+                        false
+                    }
+                    SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                        setup.phase = SlackSetupPhase::Validating;
+                        setup.status = Some("Validating Slack setup submission.".to_owned());
+                        self.state.status = "validating Slack setup".to_owned();
+                        true
+                    }
+                    SlackSetupPhase::Validating => {
+                        self.state.status =
+                            "Slack setup is waiting for provider validation".to_owned();
+                        false
+                    }
+                    SlackSetupPhase::CapabilityReview | SlackSetupPhase::Connected => {
+                        self.state.slack_setup = None;
+                        self.state.status = "Slack setup complete".to_owned();
+                        false
+                    }
+                    SlackSetupPhase::Failed => {
+                        setup.phase = SlackSetupPhase::ChooseAuthMode;
+                        setup.status =
+                            Some("Choose another Slack setup method or retry.".to_owned());
+                        self.state.status = "Retry Slack setup".to_owned();
+                        false
+                    }
+                };
+                if submit {
+                    self.submit_current_slack_setup().await?;
+                }
+            }
+            KeyCode::Char(value)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                match setup.phase {
+                    SlackSetupPhase::ChooseWorkspace => {
+                        setup.workspace_label.push(value);
+                        self.state.status = "editing Slack workspace label".to_owned();
+                    }
+                    SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                        if let Some(field) = setup.selected_credential_field() {
+                            setup.credentials.value_mut(field).push(value);
+                            self.state.status = format!("editing Slack {}", field.label());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+
+        Ok(false)
     }
 
     fn handle_help_overlay_key(&mut self, key: KeyEvent) -> bool {
@@ -2466,11 +3825,12 @@ impl App {
                 false
             }
             KeyCode::PageDown => {
-                self.scroll_messages_down(MESSAGE_SCROLL_STEP * 2);
+                self.scroll_messages_down(self.message_page_step());
                 false
             }
             KeyCode::PageUp => {
-                self.scroll_messages_up(MESSAGE_SCROLL_STEP * 2);
+                self.scroll_messages_up(self.message_page_step());
+                self.load_older_messages_if_at_top().await?;
                 false
             }
             _ => false,
@@ -2544,6 +3904,28 @@ impl App {
             return Ok(false);
         }
 
+        if self.state.compose_attach_menu.is_some()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if self.handle_compose_attach_menu_click(mouse) {
+                return Ok(false);
+            }
+            self.state.compose_attach_menu = None;
+            self.state.status = "attach menu closed".to_owned();
+            return Ok(false);
+        }
+
+        if self.state.poll_vote_picker.is_some()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if self.handle_poll_vote_picker_click(mouse).await? {
+                return Ok(false);
+            }
+            self.state.poll_vote_picker = None;
+            self.state.status = "poll vote picker closed".to_owned();
+            return Ok(false);
+        }
+
         if self.state.account_switcher.is_some()
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
@@ -2556,10 +3938,9 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && self.state.focus == FocusPane::ChatList
             && self.status_bar_contains(mouse.column, mouse.row)
+            && self.handle_status_bar_click(mouse)
         {
-            self.open_account_switcher();
             return Ok(false);
         }
 
@@ -2574,7 +3955,7 @@ impl App {
         let changed = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_left_click(pane, mouse),
             MouseEventKind::ScrollDown => self.handle_scroll_down(pane),
-            MouseEventKind::ScrollUp => self.handle_scroll_up(pane),
+            MouseEventKind::ScrollUp => self.handle_scroll_up(pane).await?,
             MouseEventKind::ScrollLeft => {
                 self.focus_previous_pane();
                 false
@@ -2619,11 +4000,75 @@ impl App {
         Ok(true)
     }
 
+    async fn handle_poll_vote_picker_click(&mut self, mouse: MouseEvent) -> Result<bool> {
+        let Some(picker) = self.state.poll_vote_picker.clone() else {
+            return Ok(false);
+        };
+        let Some(index) = self.poll_vote_picker_option_at(mouse.column, mouse.row, &picker) else {
+            return Ok(false);
+        };
+        if let Some(active) = &mut self.state.poll_vote_picker {
+            active.selected = index;
+        }
+        self.toggle_poll_vote_picker_selection();
+        Ok(true)
+    }
+
     fn handle_account_switcher_click(&mut self, mouse: MouseEvent) -> bool {
         let Some(index) = self.account_switcher_option_at(mouse.column, mouse.row) else {
             return false;
         };
         self.apply_account_switcher_selection(index)
+    }
+
+    fn handle_compose_attach_menu_click(&mut self, mouse: MouseEvent) -> bool {
+        let Some(index) = self.compose_attach_menu_item_at(mouse.column, mouse.row) else {
+            return false;
+        };
+        let item = ComposeAttachMenuItem::ALL[index];
+        self.state.compose_attach_menu = None;
+        if let Err(error) = self.perform_compose_attach_menu_item(item) {
+            self.state.status = error.to_string();
+        }
+        true
+    }
+
+    fn handle_status_bar_click(&mut self, _mouse: MouseEvent) -> bool {
+        if self.state.focus == FocusPane::ChatList {
+            self.open_account_switcher();
+            return true;
+        }
+
+        if self.state.focus == FocusPane::Compose {
+            self.open_compose_attach_menu();
+            return true;
+        }
+
+        false
+    }
+
+    fn open_compose_attach_menu(&mut self) {
+        if let Some(capabilities) = self.selected_outbound_capabilities()
+            && !outbound_media_supported(&capabilities)
+        {
+            self.state.status = capabilities
+                .media_note
+                .as_deref()
+                .map(|note| format!("media sending is not available: {note}"))
+                .unwrap_or_else(|| "media sending is not available for this account".to_owned());
+            return;
+        }
+        self.state.compose_attach_menu = Some(ComposeAttachMenu::default());
+        self.state.status = "choose what to attach from the typed path".to_owned();
+    }
+
+    fn perform_compose_attach_menu_item(&mut self, item: ComposeAttachMenuItem) -> Result<()> {
+        if let Some(command) = item.attach_command() {
+            self.attach_from_compose_text(command)?;
+        } else {
+            self.state.status = "attach cancelled".to_owned();
+        }
+        Ok(())
     }
 
     fn handle_left_click(&mut self, pane: FocusPane, mouse: MouseEvent) -> bool {
@@ -2653,6 +4098,7 @@ impl App {
                     return false;
                 }
                 if self.select_message_at(mouse.column, mouse.row) {
+                    self.open_action_menu();
                     return false;
                 }
                 self.state.status = "messages focused".to_owned();
@@ -2676,19 +4122,34 @@ impl App {
                 self.scroll_messages_down(MESSAGE_SCROLL_STEP);
                 false
             }
-            FocusPane::Compose | FocusPane::Details => false,
+            FocusPane::Compose => {
+                self.state.status = "compose focused".to_owned();
+                false
+            }
+            FocusPane::Details => {
+                self.scroll_details_down(MOUSE_SCROLL_STEP);
+                false
+            }
         }
     }
 
-    fn handle_scroll_up(&mut self, pane: FocusPane) -> bool {
-        match pane {
+    async fn handle_scroll_up(&mut self, pane: FocusPane) -> Result<bool> {
+        Ok(match pane {
             FocusPane::ChatList => self.move_chat_selection(-(MOUSE_SCROLL_STEP as isize)),
             FocusPane::Messages => {
                 self.scroll_messages_up(MESSAGE_SCROLL_STEP);
+                self.load_older_messages_if_at_top().await?;
                 false
             }
-            FocusPane::Compose | FocusPane::Details => false,
-        }
+            FocusPane::Compose => {
+                self.state.status = "compose focused".to_owned();
+                false
+            }
+            FocusPane::Details => {
+                self.scroll_details_up(MOUSE_SCROLL_STEP);
+                false
+            }
+        })
     }
 
     fn pane_at(&self, column: u16, row: u16) -> Option<FocusPane> {
@@ -2733,20 +4194,23 @@ impl App {
     }
 
     async fn handle_compose_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.handle_compose_emoticon_picker_key(key) {
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc => {
-                self.state.focus = FocusPane::Messages;
-                self.state.status = "compose closed".to_owned();
+                if self.state.pending_attachment.take().is_some() {
+                    self.state.status = "attachment cancelled".to_owned();
+                } else if self.state.reply_to.take().is_some() {
+                    self.state.status = "reply cancelled".to_owned();
+                } else {
+                    self.state.focus = FocusPane::Messages;
+                    self.state.status = "compose closed".to_owned();
+                }
             }
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-            {
-                self.insert_compose_newline();
-            }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_compose_newline();
+            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
+                self.apply_compose_edit_input(textarea_input(TextAreaKey::Enter, key.modifiers));
             }
             KeyCode::Enter => self.send_composed_message().await?,
             KeyCode::Backspace => {
@@ -2831,15 +4295,115 @@ impl App {
         Ok(false)
     }
 
-    fn apply_compose_edit_input(&mut self, input: TextAreaInput) -> bool {
+    fn attach_from_compose_text(&mut self, command: AttachCommandKind) -> Result<()> {
+        let raw_path = self.state.compose_text.trim();
+        if raw_path.is_empty() {
+            self.state.status = match command {
+                AttachCommandKind::Auto => {
+                    "type or paste a file path, then choose [+ Attach]".to_owned()
+                }
+                AttachCommandKind::Image => {
+                    "type or paste an image/GIF path, then choose [+ Attach]".to_owned()
+                }
+                AttachCommandKind::Sticker => {
+                    "type or paste a sticker path, then choose [+ Attach]".to_owned()
+                }
+            };
+            return Ok(());
+        }
+        if raw_path.lines().count() > 1 {
+            self.state.status = "attachment path must be on one line".to_owned();
+            return Ok(());
+        }
+
+        let attachment = pending_attachment_from_path(raw_path, command)?;
+        let preview = attachment.preview();
+        self.state.pending_attachment = Some(attachment);
+        self.state.compose = new_compose_textarea();
+        self.state.sync_compose_cache();
+        self.state.status = format!("attached {preview}; type an optional caption and press Enter");
+        Ok(())
+    }
+
+    fn update_compose_emoticon_completion(&mut self) {
+        let Some((query, token_char_len)) =
+            compose_emoticon_query(&self.state.compose_text, self.state.compose_cursor)
+        else {
+            self.state.compose_emoticon_picker = None;
+            return;
+        };
+        let query_lower = query.to_ascii_lowercase();
+        let matches = COMPOSE_EMOTICON_OPTIONS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (value, label))| {
+                let label_lower = label.to_ascii_lowercase();
+                (label_lower
+                    .split_whitespace()
+                    .any(|alias| alias.starts_with(&query_lower))
+                    || label_lower.contains(&query_lower)
+                    || value.contains(&query))
+                .then_some(index)
+            })
+            .take(COMPOSE_EMOTICON_MAX_SUGGESTIONS)
+            .collect::<Vec<_>>();
+
+        if matches.is_empty() {
+            self.state.compose_emoticon_picker = None;
+            return;
+        }
+
+        let selected = self
+            .state
+            .compose_emoticon_picker
+            .as_ref()
+            .map(|picker| picker.selected.min(matches.len().saturating_sub(1)))
+            .unwrap_or_default();
+        self.state.compose_emoticon_picker = Some(ComposeEmoticonPicker {
+            selected,
+            query,
+            matches,
+            token_char_len,
+        });
+    }
+
+    fn insert_selected_compose_emoticon(&mut self) {
+        let Some(picker) = self.state.compose_emoticon_picker.take() else {
+            return;
+        };
+        let Some(option_index) = picker.matches.get(picker.selected).copied() else {
+            return;
+        };
+        let value = COMPOSE_EMOTICON_OPTIONS[option_index].0;
+        for _ in 0..picker.token_char_len {
+            self.apply_compose_edit_input_without_completion(textarea_input(
+                TextAreaKey::Backspace,
+                KeyModifiers::NONE,
+            ));
+        }
+        self.insert_compose_text(value);
+        self.state.status = format!("inserted {value}");
+    }
+
+    fn insert_compose_text(&mut self, text: &str) {
+        for value in text.chars() {
+            self.apply_compose_edit_input(textarea_input(
+                TextAreaKey::Char(value),
+                KeyModifiers::NONE,
+            ));
+        }
+    }
+
+    fn apply_compose_edit_input_without_completion(&mut self, input: TextAreaInput) -> bool {
         let modified = self.state.compose.input_without_shortcuts(input);
         self.state.sync_compose_cache();
         modified
     }
 
-    fn insert_compose_newline(&mut self) {
-        self.apply_compose_edit_input(textarea_input(TextAreaKey::Enter, KeyModifiers::NONE));
-        self.state.status = "inserted newline".to_owned();
+    fn apply_compose_edit_input(&mut self, input: TextAreaInput) -> bool {
+        let modified = self.apply_compose_edit_input_without_completion(input);
+        self.update_compose_emoticon_completion();
+        modified
     }
 
     fn apply_compose_navigation_input(&mut self, input: TextAreaInput) -> bool {
@@ -2873,8 +4437,16 @@ impl App {
 
     async fn send_composed_message(&mut self) -> Result<()> {
         let text = self.state.compose_text.trim_end().to_owned();
-        if text.trim().is_empty() {
-            self.state.status = "type a message before sending".to_owned();
+        let auto_attachment = if self.state.pending_attachment.is_none() {
+            self.auto_attachment_from_compose_text(&text)?
+        } else {
+            None
+        };
+        if text.trim().is_empty()
+            && self.state.pending_attachment.is_none()
+            && auto_attachment.is_none()
+        {
+            self.state.status = "type a message or paste a file path before sending".to_owned();
             return Ok(());
         }
 
@@ -2888,7 +4460,34 @@ impl App {
             .find(|provider| provider.id().as_ref() == chat.account.as_ref())
             .ok_or_else(|| anyhow!("no provider registered for {}", chat.account))?;
         let account = provider.account_info();
-        let content = Content::Text(Arc::from(text.as_str()));
+        let content = if let Some(attachment) = self
+            .state
+            .pending_attachment
+            .as_ref()
+            .or(auto_attachment.as_ref())
+        {
+            let caption = (self.state.pending_attachment.is_some() && !text.trim().is_empty())
+                .then(|| Arc::from(text.as_str()));
+            attachment.to_content(caption)
+        } else {
+            Content::Text(Arc::from(text.as_str()))
+        };
+        if let Some(reason) = provider.outbound_capabilities().unsupported_reason(&content) {
+            if self.state.pending_attachment.is_none()
+                && let Some(attachment) = auto_attachment
+            {
+                let preview = attachment.preview();
+                self.state.pending_attachment = Some(attachment);
+                self.state.compose = new_compose_textarea();
+                self.state.sync_compose_cache();
+                self.state.status = format!("{preview} attached, but this account cannot send it yet");
+                return Ok(());
+            }
+
+            self.state.status = format!("{reason}; attachment kept, press Esc to remove it");
+            return Ok(());
+        }
+        let preview = content_send_preview(&content);
         let reply_to = self.state.reply_to.clone();
         let message_id = provider
             .send(&chat.id, content.clone(), reply_to.as_ref())
@@ -2915,8 +4514,10 @@ impl App {
         };
 
         self.store.upsert_message(&message).await?;
-        self.update_chat_after_send(&chat, timestamp, &text).await?;
+        self.update_chat_after_send(&chat, timestamp, &preview)
+            .await?;
         self.state.compose = new_compose_textarea();
+        self.state.pending_attachment = None;
         self.state.reply_to = None;
         self.state.sync_compose_cache();
         self.reload_chats().await?;
@@ -2924,6 +4525,21 @@ impl App {
         self.scroll_messages_to_bottom();
         self.state.status = format!("sent message to {}", chat.name);
         Ok(())
+    }
+
+    fn auto_attachment_from_compose_text(&mut self, text: &str) -> Result<Option<PendingAttachment>> {
+        let raw_path = text.trim();
+        if raw_path.is_empty() || raw_path.lines().count() > 1 {
+            return Ok(None);
+        }
+
+        let path = PathBuf::from(expand_home_path(raw_path));
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                pending_attachment_from_path(raw_path, AttachCommandKind::Auto).map(Some)
+            }
+            Ok(_) | Err(_) => Ok(None),
+        }
     }
 
     async fn update_chat_after_send(
@@ -2949,8 +4565,27 @@ impl App {
         Ok(())
     }
 
+    fn unread_message_ids(&self) -> HashSet<Arc<str>> {
+        let Some(chat) = self.state.selected_chat() else {
+            return HashSet::new();
+        };
+        self.unread_message_ids_for_chat(chat.unread_count)
+    }
+
+    fn unread_message_ids_for_chat(&self, unread_count: u32) -> HashSet<Arc<str>> {
+        self.state
+            .messages
+            .iter()
+            .rev()
+            .filter(|message| !message.is_from_me)
+            .take(unread_count as usize)
+            .map(|message| message.id.clone())
+            .collect()
+    }
+
     fn scroll_messages_to_bottom(&mut self) {
         self.state.message_scroll = self.max_message_scroll();
+        self.state.pending_scroll_to_latest = false;
     }
 
     fn enter_filter_mode(&mut self) -> bool {
@@ -3081,6 +4716,7 @@ impl App {
         self.state.selected_chat = chat_index;
         self.state.focus = FocusPane::Messages;
         self.state.message_scroll = 0;
+        self.state.pending_scroll_to_latest = true;
         if changed {
             self.state.selected_message_id = None;
             self.state.action_menu = None;
@@ -3088,6 +4724,7 @@ impl App {
             self.state.account_switcher = None;
             self.state.reply_to = None;
             self.state.thread_root = None;
+            self.reset_history_window_state();
         }
         self.state.image_viewer = None;
 
@@ -3177,6 +4814,8 @@ impl App {
         self.state.selected_chat = chat_index;
         if changed {
             self.state.message_scroll = 0;
+            self.state.details_scroll = 0;
+            self.state.pending_scroll_to_latest = true;
             self.state.selected_message_id = None;
             self.state.action_menu = None;
             self.state.reaction_picker = None;
@@ -3184,6 +4823,7 @@ impl App {
             self.state.reply_to = None;
             self.state.thread_root = None;
             self.state.image_viewer = None;
+            self.reset_history_window_state();
         }
         changed
             || self
@@ -3246,25 +4886,23 @@ impl App {
     }
 
     fn append_historical_message_to_current_chat(&mut self, message: Message) {
-        if self
+        if let Some(existing) = self
             .state
             .messages
-            .iter()
-            .any(|existing| existing.id == message.id)
+            .iter_mut()
+            .find(|existing| existing.id == message.id)
         {
-            return;
+            *existing = message;
+        } else {
+            self.state.messages.push(message);
         }
-        self.state.messages.push(message);
         self.state.messages.sort_by_key(|message| message.timestamp);
-        let excess = self.state.messages.len().saturating_sub(HISTORY_LIMIT);
-        if excess > 0 {
-            self.state.messages.drain(0..excess);
-        }
         self.clamp_message_scroll();
     }
 
     fn scroll_messages_down(&mut self, amount: usize) {
         let max_scroll = self.max_message_scroll();
+        let previous_scroll = self.state.message_scroll;
         self.state.message_scroll = self
             .state
             .message_scroll
@@ -3272,6 +4910,8 @@ impl App {
             .min(max_scroll);
         self.state.status = if self.state.message_scroll == max_scroll {
             "showing latest messages".to_owned()
+        } else if self.state.message_scroll == previous_scroll {
+            format!("showing message line {}", self.state.message_scroll + 1)
         } else {
             format!("showing message line {}", self.state.message_scroll + 1)
         };
@@ -3279,7 +4919,48 @@ impl App {
 
     fn scroll_messages_up(&mut self, amount: usize) {
         self.state.message_scroll = self.state.message_scroll.saturating_sub(amount);
-        self.state.status = format!("showing message line {}", self.state.message_scroll + 1);
+        self.state.status = if self.state.message_scroll == 0 {
+            "at earliest loaded messages; loading older messages when available".to_owned()
+        } else {
+            format!("showing message line {}", self.state.message_scroll + 1)
+        };
+    }
+
+    fn message_page_step(&self) -> usize {
+        inner_area(self.state.pane_areas.messages)
+            .height
+            .saturating_sub(1)
+            .max(1) as usize
+    }
+
+    fn scroll_details_down(&mut self, amount: usize) {
+        let max_scroll = self.max_details_scroll();
+        self.state.details_scroll = self
+            .state
+            .details_scroll
+            .saturating_add(amount)
+            .min(max_scroll);
+        self.state.status = if self.state.details_scroll == max_scroll {
+            "details at bottom".to_owned()
+        } else {
+            format!("showing details line {}", self.state.details_scroll + 1)
+        };
+    }
+
+    fn scroll_details_up(&mut self, amount: usize) {
+        self.state.details_scroll = self.state.details_scroll.saturating_sub(amount);
+        self.state.status = if self.state.details_scroll == 0 {
+            "details at top".to_owned()
+        } else {
+            format!("showing details line {}", self.state.details_scroll + 1)
+        };
+    }
+
+    fn details_page_step(&self) -> usize {
+        inner_area(self.state.pane_areas.details)
+            .height
+            .saturating_sub(1)
+            .max(1) as usize
     }
 
     fn open_chat_avatar_at(&mut self, column: u16, row: u16) -> bool {
@@ -3454,7 +5135,7 @@ impl App {
         self.state.action_menu = None;
         self.state.reaction_picker = None;
         self.state.thread_root = None;
-        self.state.status = format!("showing details for message {}", short_id(&hit.message_id));
+        self.state.status = format!("selected message {}", short_id(&hit.message_id));
         self.ensure_selected_message_visible();
         true
     }
@@ -3503,6 +5184,7 @@ impl App {
             return;
         };
         self.state.selected_message_id = Some(message.id.clone());
+        self.state.message_scroll = 0;
         self.state.status = "selected first message".to_owned();
         self.ensure_selected_message_visible();
     }
@@ -3513,6 +5195,7 @@ impl App {
             return;
         };
         self.state.selected_message_id = Some(message.id.clone());
+        self.scroll_messages_to_bottom();
         self.state.status = "selected latest message".to_owned();
         self.ensure_selected_message_visible();
     }
@@ -3575,6 +5258,7 @@ impl App {
     fn open_action_menu(&mut self) {
         if let Some(message_id) = self.state.selected_message_id.clone() {
             self.state.reaction_picker = None;
+            self.state.poll_vote_picker = None;
             self.state.action_menu = Some(ActionMenu {
                 message_id,
                 selected: 0,
@@ -3608,21 +5292,154 @@ impl App {
         };
     }
 
-    async fn apply_reaction(&mut self, message_id: MessageId, emoji: &str) -> Result<()> {
+    fn open_poll_vote_picker(&mut self, message_id: MessageId) {
+        let Some(message) = self.message_by_id(&message_id) else {
+            self.state.status = "selected message was not found".to_owned();
+            return;
+        };
+        let Content::Poll(poll) = &message.content else {
+            self.state.status = "selected message is not a poll".to_owned();
+            return;
+        };
+        if poll.options.is_empty() {
+            self.state.status = "poll has no options".to_owned();
+            return;
+        }
+        let selected_options = poll
+            .votes
+            .iter()
+            .find(|vote| vote.sender.as_ref() == LOCAL_REACTION_SENDER)
+            .map(|vote| {
+                poll.options
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, option)| {
+                        vote.options
+                            .iter()
+                            .any(|selected| selected.as_ref() == option.id.as_ref())
+                            .then_some(index)
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .filter(|selected| !selected.is_empty())
+            .unwrap_or_else(|| HashSet::from([0]));
+        let selected = selected_options.iter().copied().min().unwrap_or_default();
+        self.state.poll_vote_picker = Some(PollVotePicker {
+            message_id,
+            selected,
+            selected_options,
+        });
+        self.state.status = "choose poll option".to_owned();
+    }
+
+    fn toggle_poll_vote_picker_selection(&mut self) {
+        let Some(snapshot) = self.state.poll_vote_picker.as_ref().cloned() else {
+            return;
+        };
+        let selectable = self
+            .message_by_id(&snapshot.message_id)
+            .and_then(|message| match &message.content {
+                Content::Poll(poll) => {
+                    Some(poll.selectable_options_count.unwrap_or(1).max(1) as usize)
+                }
+                _ => None,
+            })
+            .unwrap_or(1);
+        let Some(picker) = &mut self.state.poll_vote_picker else {
+            return;
+        };
+        if selectable == 1 {
+            picker.selected_options.clear();
+            picker.selected_options.insert(picker.selected);
+            return;
+        }
+        if !picker.selected_options.remove(&picker.selected) {
+            if picker.selected_options.len() >= selectable
+                && let Some(first) = picker.selected_options.iter().copied().min()
+            {
+                picker.selected_options.remove(&first);
+            }
+            picker.selected_options.insert(picker.selected);
+        }
+    }
+
+    async fn apply_poll_vote(
+        &mut self,
+        message_id: MessageId,
+        selected_indices: HashSet<usize>,
+    ) -> Result<()> {
         let Some(chat) = self.state.selected_chat().cloned() else {
-            self.state.status = "select a chat before reacting".to_owned();
+            self.state.status = "select a chat before voting".to_owned();
             return Ok(());
         };
-        let had_reaction = self.message_by_id(&message_id).is_some_and(|message| {
-            message_reacted_by_sender(message, emoji, LOCAL_REACTION_SENDER)
-        });
+        let Some(target_message) = self.message_by_id(&message_id).cloned() else {
+            self.state.status = "selected message was not found".to_owned();
+            return Ok(());
+        };
+        let Content::Poll(poll) = &target_message.content else {
+            self.state.status = "selected message is not a poll".to_owned();
+            return Ok(());
+        };
+        let mut selected_options = selected_indices
+            .into_iter()
+            .filter_map(|index| poll.options.get(index).map(|option| option.id.clone()))
+            .collect::<Vec<_>>();
+        selected_options.sort();
+        selected_options.dedup();
+        if selected_options.is_empty() {
+            self.state.status = "choose at least one poll option".to_owned();
+            return Ok(());
+        }
 
         if let Some(provider) = self
             .providers
             .iter()
             .find(|provider| provider.id().as_ref() == chat.account.as_ref())
         {
-            provider.react(&chat.id, &message_id, emoji).await?;
+            provider
+                .vote_poll(&chat.id, &target_message, &selected_options)
+                .await?;
+        } else {
+            self.state.status = format!("no provider registered for {}", chat.account);
+            return Ok(());
+        }
+
+        let Some(message) = self.message_by_id_mut(&message_id) else {
+            self.state.status = "selected message was not found".to_owned();
+            return Ok(());
+        };
+        if let Content::Poll(poll) = &mut message.content {
+            poll.votes
+                .retain(|vote| vote.sender.as_ref() != LOCAL_REACTION_SENDER);
+            poll.votes.push(chat_core::PollVote {
+                sender: Arc::from(LOCAL_REACTION_SENDER),
+                options: selected_options,
+                timestamp: Some(Utc::now()),
+            });
+        }
+        let updated = message.clone();
+        self.store.upsert_message(&updated).await?;
+        self.state.status = "poll vote submitted".to_owned();
+        Ok(())
+    }
+
+    async fn apply_reaction(&mut self, message_id: MessageId, emoji: &str) -> Result<()> {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            self.state.status = "select a chat before reacting".to_owned();
+            return Ok(());
+        };
+        let Some(target_message) = self.message_by_id(&message_id).cloned() else {
+            self.state.status = "selected message was not found".to_owned();
+            return Ok(());
+        };
+        let had_reaction = message_reacted_by_sender(&target_message, emoji, LOCAL_REACTION_SENDER);
+
+        if let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == chat.account.as_ref())
+        {
+            provider.react(&chat.id, &target_message, emoji).await?;
         }
 
         let Some(message) = self.message_by_id_mut(&message_id) else {
@@ -3697,6 +5514,145 @@ impl App {
             });
         status.connection = connection;
         status.detail = detail;
+    }
+
+    fn account_for_provider(&self, provider_id: &ProviderId) -> Option<Account> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id() == provider_id)
+            .map(|provider| provider.account_info())
+    }
+
+    fn provider_for_id(&self, provider_id: &ProviderId) -> Option<&dyn Provider> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id() == provider_id)
+            .map(|provider| provider.as_ref())
+    }
+
+    async fn submit_current_slack_setup(&mut self) -> Result<()> {
+        let Some(setup) = self.state.slack_setup.clone() else {
+            return Ok(());
+        };
+        let selected_mode = setup.selected_mode().to_auth_submission_mode();
+        let submission = AuthSubmission {
+            workspace_label: trimmed_option(&setup.workspace_label),
+            mode: Some(selected_mode),
+            client_id: trimmed_option(&setup.credentials.client_id),
+            client_secret: trimmed_option(&setup.credentials.client_secret),
+            redirect_uri: trimmed_option(&setup.credentials.redirect_uri),
+            oauth_code: trimmed_option(&setup.credentials.oauth_code),
+            user_token: trimmed_option(&setup.credentials.user_token),
+            bot_token: trimmed_option(&setup.credentials.bot_token),
+            app_token: trimmed_option(&setup.credentials.app_token),
+            webhook_url: trimmed_option(&setup.credentials.webhook_url),
+        };
+        let result = if let Some(provider) = self.provider_for_id(&setup.provider_id) {
+            provider.submit_auth(submission).await
+        } else {
+            Err(anyhow!(
+                "Slack provider {} is not available",
+                setup.provider_id
+            ))
+        };
+
+        match result {
+            Ok(()) => {
+                self.update_slack_setup_success(
+                    &setup.provider_id,
+                    SlackSetupPhase::CapabilityReview,
+                );
+                self.set_account_status(&setup.provider_id, AccountConnection::Online, None);
+                self.state.status = format!("Slack setup submitted for {}", setup.provider_id);
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.set_account_status(
+                    &setup.provider_id,
+                    AccountConnection::Offline,
+                    Some(detail.clone()),
+                );
+                if let Some(current_setup) = &mut self.state.slack_setup
+                    && current_setup.provider_id == setup.provider_id
+                {
+                    current_setup.phase = SlackSetupPhase::Failed;
+                    current_setup.status = Some(detail.clone());
+                }
+                self.state.status = format!("Slack setup failed: {detail}");
+            }
+        }
+        Ok(())
+    }
+
+    fn account_platform(&self, provider_id: &ProviderId) -> Option<Platform> {
+        self.account_for_provider(provider_id)
+            .map(|account| account.platform)
+    }
+
+    fn open_slack_setup_for_account(&mut self, account: &Account, status: Option<String>) {
+        let mut overlay =
+            SlackSetupOverlay::new(account.id.clone(), account.display_name.to_string());
+        if let Some(status) = status {
+            overlay.phase = SlackSetupPhase::Failed;
+            overlay.status = Some(status);
+        }
+        self.state.slack_setup = Some(overlay);
+    }
+
+    fn open_slack_setup_for_provider(
+        &mut self,
+        provider_id: &ProviderId,
+        challenge: Option<&AuthChallenge>,
+        failure: Option<String>,
+    ) {
+        let account = self.account_for_provider(provider_id);
+        let workspace_label = account
+            .as_ref()
+            .map(|account| account.display_name.to_string())
+            .unwrap_or_else(|| provider_id.to_string());
+        let mut overlay = SlackSetupOverlay::new(provider_id.clone(), workspace_label);
+        if let Some(challenge) = challenge {
+            match challenge {
+                AuthChallenge::OAuthUrl(url) => {
+                    overlay.phase = SlackSetupPhase::OAuthPrompt;
+                    overlay.oauth_url = Some(url.to_string());
+                    overlay.status = Some(
+                        "Open Slack in the browser, authorize, then return for validation."
+                            .to_owned(),
+                    );
+                }
+                AuthChallenge::Waiting => {
+                    overlay.phase = SlackSetupPhase::EnterCredentials;
+                    overlay.status = Some(
+                        "Enter or configure Slack credentials for this setup method.".to_owned(),
+                    );
+                }
+                AuthChallenge::QrCode(_) | AuthChallenge::PairingCode(_) => {
+                    overlay.status = Some(auth_challenge_label(challenge).to_owned());
+                }
+            }
+        }
+        if let Some(failure) = failure {
+            overlay.phase = SlackSetupPhase::Failed;
+            overlay.status = Some(failure);
+        }
+        self.state.slack_setup = Some(overlay);
+    }
+
+    fn update_slack_setup_success(&mut self, provider_id: &ProviderId, phase: SlackSetupPhase) {
+        let Some(setup) = &mut self.state.slack_setup else {
+            return;
+        };
+        if setup.provider_id != *provider_id {
+            return;
+        }
+        let mode = setup.selected_mode();
+        setup.phase = phase;
+        setup.capabilities = Some(SlackSetupCapabilities::from_mode(mode));
+        setup.status = Some(
+            "Slack credentials validated; review actual granted capabilities before loading chats."
+                .to_owned(),
+        );
     }
 
     fn maybe_show_notification(
@@ -3866,6 +5822,28 @@ impl App {
         (index < options.len()).then_some(index)
     }
 
+    fn selected_outbound_capabilities(&self) -> Option<OutboundCapabilities> {
+        let chat = self.state.selected_chat()?;
+        self.providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == chat.account.as_ref())
+            .map(|provider| provider.outbound_capabilities())
+    }
+
+    fn compose_attach_menu_rect(&self, area: Rect) -> Rect {
+        centered_fixed_rect(area, 44, ComposeAttachMenuItem::ALL.len() as u16 + 4)
+    }
+
+    fn compose_attach_menu_item_at(&self, column: u16, row: u16) -> Option<usize> {
+        let modal = self.compose_attach_menu_rect(self.state.frame_area);
+        if !rect_contains(modal, column, row) {
+            return None;
+        }
+        let first_item_row = modal.y.saturating_add(2);
+        let index = row.checked_sub(first_item_row)? as usize;
+        (index < ComposeAttachMenuItem::ALL.len()).then_some(index)
+    }
+
     fn action_menu_rect(&self, area: Rect, message_id: &MessageId) -> Rect {
         self.anchored_message_popup_rect(area, message_id, 34, ActionMenuItem::ALL.len() as u16 + 4)
     }
@@ -3876,6 +5854,35 @@ impl App {
             .saturating_mul(REACTION_OPTION_CELL_WIDTH as usize)
             .saturating_add(4) as u16;
         self.anchored_message_popup_rect(area, message_id, width, 5)
+    }
+
+    fn poll_vote_picker_rect(&self, area: Rect, picker: &PollVotePicker) -> Rect {
+        let option_count = self
+            .message_by_id(&picker.message_id)
+            .and_then(|message| match &message.content {
+                Content::Poll(poll) => Some(poll.options.len()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let height = option_count.saturating_add(5).clamp(6, 14) as u16;
+        let width = area.width.saturating_sub(4).clamp(36, 72);
+        self.anchored_message_popup_rect(area, &picker.message_id, width, height)
+    }
+
+    fn compose_emoticon_picker_rect(&self, area: Rect) -> Rect {
+        let suggestion_count = self
+            .state
+            .compose_emoticon_picker
+            .as_ref()
+            .map(|picker| picker.matches.len())
+            .unwrap_or_default();
+        let height = suggestion_count.saturating_add(4).clamp(4, 12) as u16;
+        let width = area.width.saturating_sub(4).clamp(36, 64);
+        let compose_area = self.state.pane_areas.compose;
+        let x = compose_area.x.min(area.width.saturating_sub(width));
+        let fallback_y = area.height.saturating_sub(height.saturating_add(2));
+        let y = compose_area.y.saturating_sub(height).max(1).min(fallback_y);
+        Rect::new(x, y, width.min(area.width), height.min(area.height))
     }
 
     fn auth_overlay_rect(&self, area: Rect) -> Rect {
@@ -3897,6 +5904,22 @@ impl App {
             .clamp(42, 76)
             .min(area.width.saturating_sub(2).max(1));
         let height = 13.min(area.height.saturating_sub(2).max(1));
+        centered_fixed_rect(area, width, height)
+    }
+
+    fn slack_setup_overlay_rect(&self, area: Rect) -> Rect {
+        let width = area
+            .width
+            .saturating_mul(78)
+            .saturating_div(100)
+            .clamp(48, 92)
+            .min(area.width.saturating_sub(2).max(1));
+        let height = area
+            .height
+            .saturating_mul(72)
+            .saturating_div(100)
+            .clamp(14, 28)
+            .min(area.height.saturating_sub(2).max(1));
         centered_fixed_rect(area, width, height)
     }
 
@@ -4001,8 +6024,81 @@ impl App {
         (option < REACTION_OPTIONS.len()).then_some(option)
     }
 
+    fn poll_vote_picker_option_at(
+        &self,
+        column: u16,
+        row: u16,
+        picker: &PollVotePicker,
+    ) -> Option<usize> {
+        let modal = self.poll_vote_picker_rect(self.state.frame_area, picker);
+        if !rect_contains(modal, column, row) {
+            return None;
+        }
+        let option_count = self
+            .message_by_id(&picker.message_id)
+            .and_then(|message| match &message.content {
+                Content::Poll(poll) => Some(poll.options.len()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let first_option_row = modal.y.saturating_add(4);
+        let index = row.checked_sub(first_option_row)? as usize;
+        (index < option_count).then_some(index)
+    }
+
     fn message_line_count(&self) -> usize {
         message_list::message_line_count(&self.state.messages, self.message_content_width())
+    }
+
+    fn details_line_count(&self) -> usize {
+        if let Some(thread_root) = &self.state.thread_root {
+            return self.thread_details_line_count(thread_root);
+        }
+
+        if let Some(message_id) = &self.state.selected_message_id
+            && let Some(message) = self.message_by_id(message_id)
+        {
+            return self.message_details_line_count(message);
+        }
+
+        self.overview_details_line_count()
+    }
+
+    fn overview_details_line_count(&self) -> usize {
+        19
+    }
+
+    fn message_details_line_count(&self, message: &Message) -> usize {
+        let avatar_rows = message
+            .sender
+            .avatar
+            .as_deref()
+            .filter(|path| path.exists())
+            .map(|_| 7)
+            .unwrap_or_default();
+        let content_rows = content_copy_text(&message.content).lines().count().max(1);
+        let poll_rows = match &message.content {
+            Content::Poll(poll) => 2 + poll.options.len(),
+            _ => 0,
+        };
+        14 + avatar_rows + content_rows + poll_rows
+    }
+
+    fn thread_details_line_count(&self, thread_root: &MessageId) -> usize {
+        let root_rows = self
+            .message_by_id(thread_root)
+            .map(|message| thread_message_lines(message, self.theme).len())
+            .unwrap_or(1);
+        let replies = self.thread_replies(thread_root);
+        let reply_rows = if replies.is_empty() {
+            1
+        } else {
+            replies
+                .iter()
+                .map(|message| thread_message_lines(message, self.theme).len())
+                .sum()
+        };
+        5 + root_rows + reply_rows
     }
 
     fn message_content_width(&self) -> u16 {
@@ -4018,6 +6114,11 @@ impl App {
         let viewport_rows = inner_area(self.state.pane_areas.messages).height as usize;
         let total_lines = self.message_line_count();
         bounded_message_scroll(total_lines, viewport_rows)
+    }
+
+    fn max_details_scroll(&self) -> usize {
+        let viewport_rows = inner_area(self.state.pane_areas.details).height as usize;
+        bounded_message_scroll(self.details_line_count(), viewport_rows)
     }
 
     fn apply_filter(&mut self) -> bool {
@@ -4060,6 +6161,25 @@ impl App {
 
     fn clamp_message_scroll(&mut self) {
         self.state.message_scroll = self.state.message_scroll.min(self.max_message_scroll());
+        if self.state.pending_scroll_to_latest {
+            self.scroll_messages_to_bottom();
+        }
+    }
+
+    fn clamp_details_scroll(&mut self) {
+        self.state.details_scroll = self.state.details_scroll.min(self.max_details_scroll());
+    }
+
+    fn apply_pending_scroll_to_latest(&mut self) {
+        if self.state.pending_scroll_to_latest && !self.state.pane_areas.messages.is_empty() {
+            self.scroll_messages_to_bottom();
+        }
+    }
+
+    fn reset_history_window_state(&mut self) {
+        self.state.is_loading_older_history = false;
+        self.state.older_history_exhausted = false;
+        self.state.pending_scroll_to_latest = true;
     }
 
     fn upsert_chat_in_state(&mut self, chat: Chat) {
@@ -4171,7 +6291,7 @@ impl App {
         if let Some(chat) = self.state.selected_chat() {
             self.state.messages = self
                 .store
-                .get_messages(&chat.id, None, HISTORY_LIMIT)
+                .get_messages_for_chat(&chat.account, &chat.id, None, HISTORY_LIMIT)
                 .await?;
         } else {
             self.state.messages.clear();
@@ -4179,6 +6299,258 @@ impl App {
         self.clamp_message_scroll();
         Ok(())
     }
+
+    async fn load_older_messages_if_at_top(&mut self) -> Result<()> {
+        if self.state.message_scroll != 0
+            || self.state.is_loading_older_history
+            || self.state.older_history_exhausted
+            || self.state.messages.is_empty()
+        {
+            return Ok(());
+        }
+
+        self.state.is_loading_older_history = true;
+        let result = self.load_older_messages().await;
+        self.state.is_loading_older_history = false;
+        result
+    }
+
+    async fn load_older_messages(&mut self) -> Result<()> {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            return Ok(());
+        };
+        let Some(before) = self.state.messages.first().map(|message| message.timestamp) else {
+            return Ok(());
+        };
+
+        let previous_line_count = self.message_line_count();
+        let mut older = self
+            .store
+            .get_messages_for_chat(&chat.account, &chat.id, Some(before), HISTORY_LIMIT)
+            .await?;
+
+        if older.is_empty()
+            && let Some(provider) = self
+                .providers
+                .iter()
+                .find(|provider| provider.id().as_ref() == chat.account.as_ref())
+        {
+            older = provider
+                .history(&chat.id, Some(before), HISTORY_LIMIT)
+                .await?;
+            for message in &older {
+                self.store.upsert_message(message).await?;
+            }
+        }
+
+        if older.is_empty() {
+            self.state.older_history_exhausted = true;
+            self.state.status = format!("no older messages for {}", chat.name);
+            return Ok(());
+        }
+
+        let mut seen = self
+            .state
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<HashSet<_>>();
+        older.retain(|message| seen.insert(message.id.clone()));
+
+        if older.is_empty() {
+            self.state.status = "older messages already loaded".to_owned();
+            return Ok(());
+        }
+
+        let added_count = older.len();
+        older.extend(self.state.messages.iter().cloned());
+        older.sort_by_key(|message| message.timestamp);
+        self.state.messages = older;
+
+        let new_line_count = self.message_line_count();
+        let added_lines = new_line_count.saturating_sub(previous_line_count);
+        self.state.message_scroll = self.state.message_scroll.saturating_add(added_lines);
+        self.clamp_message_scroll();
+        self.state.status = format!("loaded {added_count} older messages for {}", chat.name);
+        Ok(())
+    }
+}
+
+fn pending_attachment_from_path(
+    raw_path: &str,
+    command: AttachCommandKind,
+) -> Result<PendingAttachment> {
+    let path = PathBuf::from(expand_home_path(raw_path));
+    let metadata =
+        fs::metadata(&path).with_context(|| format!("reading attachment {}", path.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!("attachment must be a file: {}", path.display());
+    }
+    if metadata.len() > MEDIA_SEND_SIZE_LIMIT_BYTES {
+        anyhow::bail!(
+            "attachment is too large: {} bytes exceeds {} bytes",
+            metadata.len(),
+            MEDIA_SEND_SIZE_LIMIT_BYTES
+        );
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("attachment path has no file name: {}", path.display()))?;
+    let mime_type = infer_mime_type(&path);
+    let kind = match command {
+        AttachCommandKind::Sticker => PendingAttachmentKind::Sticker,
+        AttachCommandKind::Image => {
+            if mime_type.starts_with("image/") {
+                PendingAttachmentKind::Image
+            } else {
+                anyhow::bail!("expected an image file, got {mime_type}");
+            }
+        }
+        AttachCommandKind::Auto => infer_attachment_kind(&mime_type),
+    };
+
+    let media = Media {
+        id: Arc::from(format!("local:{}", path.display())),
+        file_name: Arc::from(file_name),
+        mime_type: Arc::from(mime_type),
+        size_bytes: Some(metadata.len()),
+        caption: None,
+        local_path: Some(path.clone()),
+        thumbnail: local_thumbnail_for(&path, kind),
+    };
+
+    Ok(PendingAttachment { kind, media })
+}
+
+fn expand_home_path(raw_path: &str) -> String {
+    if raw_path == "~" {
+        std::env::var("HOME").unwrap_or_else(|_| raw_path.to_owned())
+    } else if let Some(rest) = raw_path.strip_prefix("~/") {
+        std::env::var("HOME")
+            .map(|home| format!("{home}/{rest}"))
+            .unwrap_or_else(|_| raw_path.to_owned())
+    } else {
+        raw_path.to_owned()
+    }
+}
+
+fn infer_attachment_kind(mime_type: &str) -> PendingAttachmentKind {
+    if mime_type == "image/webp" {
+        PendingAttachmentKind::Sticker
+    } else if mime_type.starts_with("image/") {
+        PendingAttachmentKind::Image
+    } else if mime_type.starts_with("video/") {
+        PendingAttachmentKind::Video
+    } else if mime_type.starts_with("audio/") {
+        PendingAttachmentKind::Audio
+    } else {
+        PendingAttachmentKind::File
+    }
+}
+
+fn local_thumbnail_for(path: &Path, kind: PendingAttachmentKind) -> Option<PathBuf> {
+    matches!(
+        kind,
+        PendingAttachmentKind::Image | PendingAttachmentKind::Sticker
+    )
+    .then(|| path.to_path_buf())
+}
+
+fn infer_mime_type(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("mp4") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        Some("json") => "application/json",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_owned()
+}
+
+fn compose_emoticon_query(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let before_cursor = text.get(..cursor)?;
+    let token = before_cursor
+        .rsplit(|value: char| value.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    let query = token.strip_prefix(':')?;
+    if query.is_empty() || query.contains(':') {
+        return None;
+    }
+    if !query
+        .chars()
+        .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '-' | '+'))
+    {
+        return None;
+    }
+    Some((query.to_owned(), token.chars().count()))
+}
+
+fn content_send_preview(content: &Content) -> String {
+    match content {
+        Content::Text(text) | Content::Unsupported(text) => text.to_string(),
+        Content::Image(media) => media
+            .caption
+            .as_deref()
+            .map(|caption| format!("Image: {caption}"))
+            .unwrap_or_else(|| format!("Image: {}", media.file_name)),
+        Content::Video(media) => media
+            .caption
+            .as_deref()
+            .map(|caption| format!("Video: {caption}"))
+            .unwrap_or_else(|| format!("Video: {}", media.file_name)),
+        Content::Audio(media) => media
+            .caption
+            .as_deref()
+            .map(|caption| format!("Audio: {caption}"))
+            .unwrap_or_else(|| format!("Audio: {}", media.file_name)),
+        Content::File(media) => media
+            .caption
+            .as_deref()
+            .map(|caption| format!("File: {caption}"))
+            .unwrap_or_else(|| format!("File: {}", media.file_name)),
+        Content::Sticker(media) => media
+            .caption
+            .as_deref()
+            .map(|caption| format!("Sticker: {caption}"))
+            .unwrap_or_else(|| format!("Sticker: {}", media.file_name)),
+        Content::LinkPreview(link) => link
+            .title
+            .as_deref()
+            .unwrap_or(link.url.as_ref())
+            .to_owned(),
+        Content::Poll(poll) => format!("Poll: {}", poll.question),
+        Content::Deleted => "Deleted message".to_owned(),
+    }
+}
+
+fn outbound_media_supported(capabilities: &OutboundCapabilities) -> bool {
+    capabilities.image
+        || capabilities.gif
+        || capabilities.video
+        || capabilities.audio
+        || capabilities.file
+        || capabilities.sticker
 }
 
 fn build_terminal_image_protocol(
@@ -4382,6 +6754,22 @@ fn bool_label(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+fn trimmed_option(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn slack_setup_display_value(value: &str, is_secret: bool) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "not set".to_owned();
+    }
+    if is_secret {
+        return format!("•••••••• ({} chars)", trimmed.chars().count());
+    }
+    truncate_chars(trimmed, 72)
+}
+
 fn short_id(id: &str) -> String {
     id.rsplit(':')
         .next()
@@ -4389,6 +6777,87 @@ fn short_id(id: &str) -> String {
         .chars()
         .take(10)
         .collect()
+}
+
+fn reaction_sender_names(messages: &[Message]) -> HashMap<Arc<str>, String> {
+    let mut names = HashMap::new();
+    for message in messages {
+        names
+            .entry(message.sender.platform_id.clone())
+            .or_insert_with(|| message.sender.display_name.to_string());
+    }
+    names.insert(Arc::from(LOCAL_REACTION_SENDER), "Me".to_owned());
+    names
+}
+
+fn poll_vote_count(poll: &Poll, option_id: &str) -> usize {
+    poll.votes
+        .iter()
+        .filter(|vote| {
+            vote.options
+                .iter()
+                .any(|selected| selected.as_ref() == option_id)
+        })
+        .count()
+}
+
+fn poll_result_lines(
+    poll: &Poll,
+    sender_names: &HashMap<Arc<str>, String>,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if poll.votes.is_empty() {
+        lines.push(Line::from(Span::styled("  No votes yet", theme.muted())));
+        return lines;
+    }
+
+    for option in &poll.options {
+        let voters = poll
+            .votes
+            .iter()
+            .filter(|vote| {
+                vote.options
+                    .iter()
+                    .any(|selected| selected.as_ref() == option.id.as_ref())
+            })
+            .map(|vote| {
+                sender_names
+                    .get(&vote.sender)
+                    .cloned()
+                    .unwrap_or_else(|| reaction_sender_fallback(&vote.sender))
+            })
+            .collect::<Vec<_>>();
+        lines.push(Line::from(format!(
+            "  {} — {} vote{}",
+            option.label,
+            voters.len(),
+            if voters.len() == 1 { "" } else { "s" }
+        )));
+        if voters.is_empty() {
+            lines.push(Line::from(Span::styled("    none", theme.muted())));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", voters.join(", ")),
+                theme.muted(),
+            )));
+        }
+    }
+    lines
+}
+
+fn reaction_sender_fallback(sender: &str) -> String {
+    if sender == LOCAL_REACTION_SENDER {
+        return "Me".to_owned();
+    }
+    let jid = sender
+        .split('@')
+        .next()
+        .unwrap_or(sender)
+        .split(':')
+        .next()
+        .unwrap_or(sender);
+    short_id(jid)
 }
 
 fn account_status_summary(statuses: &HashMap<ProviderId, AccountStatus>) -> String {
@@ -4443,7 +6912,10 @@ fn thread_message_lines(message: &Message, theme: Theme) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(vec![
         Span::styled(message.sender.display_name.to_string(), sender_style),
         Span::styled(
-            format!(" · {}", message.timestamp.format("%H:%M")),
+            format!(
+                " · {}",
+                message_list::format_message_time(message.timestamp)
+            ),
             theme.muted(),
         ),
     ])];
@@ -4495,7 +6967,11 @@ fn content_copy_text(content: &Content) -> String {
         Content::Poll(poll) => {
             let mut text = format!("Poll: {}", poll.question);
             for (index, option) in poll.options.iter().enumerate() {
-                text.push_str(&format!("\n{}. {}", index + 1, option));
+                text.push_str(&format!("\n{}. {}", index + 1, option.label));
+                let votes = poll_vote_count(poll, &option.id);
+                if votes > 0 {
+                    text.push_str(&format!("  ({votes})"));
+                }
             }
             text
         }
@@ -4646,7 +7122,7 @@ mod tests {
     use chat_core::{EventBus, MockProvider, Platform};
     use crossterm::event::{KeyEventKind, KeyEventState, MouseEventKind};
     use ratatui::backend::TestBackend;
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Mutex};
 
     #[tokio::test]
     async fn app_bootstraps_mock_provider_into_chat_list() -> Result<()> {
@@ -5032,9 +7508,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_replaces_visible_historical_message_updates() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = app.state().selected_chat().unwrap().clone();
+        let original = app.state().messages()[0].clone();
+        let mut updated = original.clone();
+        updated.sender.display_name = Arc::from("Updated Sender");
+        updated.reactions = vec![Reaction {
+            emoji: Arc::from("👍"),
+            senders: vec![
+                Arc::from("a"),
+                Arc::from("b"),
+                Arc::from("c"),
+                Arc::from("d"),
+                Arc::from("e"),
+                Arc::from("f"),
+                Arc::from("g"),
+            ],
+        }];
+
+        app.handle_event(AppEvent::Provider(
+            chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: updated,
+                is_historical: true,
+            }),
+        ))
+        .await?;
+
+        let refreshed = app
+            .state()
+            .messages()
+            .iter()
+            .find(|message| message.id == original.id)
+            .unwrap();
+        assert_eq!(refreshed.sender.display_name.as_ref(), "Updated Sender");
+        assert_eq!(refreshed.reactions[0].senders.len(), 7);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_handles_compose_input_editing_and_send_flow() -> Result<()> {
         let mut app = test_app().await?;
-        let chat_id = app.state().selected_chat().unwrap().id.clone();
+        let chat = app.state().selected_chat().unwrap().clone();
+        let chat_id = chat.id.clone();
+        let account_id = chat.account.clone();
         let initial_count = app.state().messages().len();
 
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
@@ -5069,6 +7588,25 @@ mod tests {
             .await?;
         assert_eq!(app.state().compose_text(), "Hello compo!se ✅");
 
+        for value in " :joy".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        assert!(app.state().compose_emoticon_picker_open());
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().compose_emoticon_picker_open());
+        assert_eq!(app.state().compose_text(), "Hello compo!se ✅ 😂");
+
+        for value in " :table".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        assert!(app.state().compose_emoticon_picker_open());
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().compose_text(), "Hello compo!se ✅ 😂 (╯°□°）╯︵ ┻━┻");
+
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
         assert_eq!(app.state().compose_text(), "");
@@ -5082,18 +7620,186 @@ mod tests {
 
         let persisted = app
             .store
-            .get_messages(&chat_id, None, HISTORY_LIMIT)
+            .get_messages_for_chat(&account_id, &chat_id, None, HISTORY_LIMIT)
             .await?;
         assert!(persisted.iter().any(|message| {
             message.is_from_me
-                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅")
+                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅ 😂 (╯°□°）╯︵ ┻━┻")
         }));
         let provider_history = app.providers[0]
             .history(&chat_id, None, HISTORY_LIMIT)
             .await?;
         assert!(provider_history.iter().any(|message| {
             message.is_from_me
-                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅")
+                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅ 😂 (╯°□°）╯︵ ┻━┻")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_sends_single_media_attachment_with_caption() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().focus(), FocusPane::Messages);
+
+        let temp_dir = tempfile::tempdir()?;
+        let image_path = temp_dir.path().join("hello.gif");
+        fs::write(&image_path, b"GIF89a")?;
+
+        for value in image_path.to_string_lossy().chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        assert_eq!(app.state().compose_text(), "");
+        assert!(app.state().pending_attachment().is_none());
+        assert!(app.state().messages().iter().any(|message| {
+            message.is_from_me
+                && matches!(&message.content, Content::Image(media)
+                    if media.file_name.as_ref() == "hello.gif"
+                        && media.mime_type.as_ref() == "image/gif"
+                        && media.caption.is_none()
+                        && media.local_path.as_deref() == Some(image_path.as_path()))
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_sends_pending_media_attachment_with_caption() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().focus(), FocusPane::Messages);
+
+        let temp_dir = tempfile::tempdir()?;
+        let image_path = temp_dir.path().join("captioned.gif");
+        fs::write(&image_path, b"GIF89a")?;
+
+        for value in image_path.to_string_lossy().chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.open_compose_attach_menu();
+        assert!(app.state().compose_attach_menu_open());
+        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().compose_text(), "");
+        assert!(app.state().pending_attachment().is_some());
+
+        for value in "Look at this :)".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        assert_eq!(app.state().compose_text(), "");
+        assert!(app.state().pending_attachment().is_none());
+        assert!(app.state().messages().iter().any(|message| {
+            message.is_from_me
+                && matches!(&message.content, Content::Image(media)
+                    if media.file_name.as_ref() == "captioned.gif"
+                        && media.mime_type.as_ref() == "image/gif"
+                        && media.caption.as_deref() == Some("Look at this :)")
+                        && media.local_path.as_deref() == Some(image_path.as_path()))
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_sends_text_when_compose_path_does_not_exist() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let missing_path = "/tmp/chat-cli-missing-file-for-text-send.log";
+        for value in missing_path.chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        assert!(app.state().pending_attachment().is_none());
+        assert!(app.state().messages().iter().any(|message| {
+            message.is_from_me
+                && matches!(&message.content, Content::Text(text) if text.as_ref() == missing_path)
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_keeps_existing_path_pending_when_provider_cannot_send_files() -> Result<()> {
+        let mock = MockProvider::new();
+        let provider = StaticTestProvider::from_mock("text:only", "Text Only", &mock, "text:only:")?
+            .with_outbound_capabilities(OutboundCapabilities::default());
+        let mut app = test_app_with_providers(vec![Box::new(provider)]).await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let temp_dir = tempfile::tempdir()?;
+        let file_path = temp_dir.path().join("notes.log");
+        fs::write(&file_path, b"hello")?;
+        let file_text = file_path.to_string_lossy().to_string();
+        for value in file_text.chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let attachment = app.state().pending_attachment().expect("pending attachment");
+        assert_eq!(app.state().compose_text(), "");
+        assert_eq!(attachment.media.file_name.as_ref(), "notes.log");
+        assert!(app.state().status().contains("cannot send it yet"));
+        assert!(!app.state().messages().iter().any(|message| {
+            message.is_from_me
+                && matches!(&message.content, Content::Text(text) if text.as_ref() == file_text)
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_sends_sticker_attachment() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let temp_dir = tempfile::tempdir()?;
+        let sticker_path = temp_dir.path().join("ship.webp");
+        fs::write(&sticker_path, b"webp")?;
+
+        for value in sticker_path.to_string_lossy().chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.open_compose_attach_menu();
+        assert!(app.state().compose_attach_menu_open());
+        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        assert!(app.state().messages().iter().any(|message| {
+            message.is_from_me
+                && matches!(&message.content, Content::Sticker(media)
+                    if media.file_name.as_ref() == "ship.webp"
+                        && media.mime_type.as_ref() == "image/webp"
+                        && media.caption.is_none())
         }));
 
         Ok(())
@@ -5109,7 +7815,7 @@ mod tests {
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             40,
-            27,
+            26,
         )))
         .await?;
         assert_eq!(app.state().focus(), FocusPane::Compose);
@@ -5174,7 +7880,7 @@ mod tests {
 
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            2,
+            8,
             3,
         )))
         .await?;
@@ -5189,7 +7895,7 @@ mod tests {
         app.handle_event(AppEvent::Mouse(mouse(MouseEventKind::ScrollDown, 2, 1)))
             .await?;
         assert_eq!(app.state().focus(), FocusPane::ChatList);
-        assert_eq!(app.state().selected_chat_index(), 4);
+        assert_eq!(app.state().selected_chat_index(), 2);
 
         app.handle_event(AppEvent::Mouse(mouse(MouseEventKind::ScrollDown, 50, 2)))
             .await?;
@@ -5249,6 +7955,50 @@ mod tests {
         assert!(content.contains("▀"));
         assert!(content.contains("╭"));
         assert!(content.contains("╰"));
+        assert!(terminal.backend().buffer().content().iter().any(|cell| {
+            matches!(cell.fg, Color::Rgb(_, _, _)) || matches!(cell.bg, Color::Rgb(_, _, _))
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_draws_sender_name_and_avatar_preview_in_details() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(140, 40))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            8,
+            3,
+        )))
+        .await?;
+        assert_eq!(
+            app.state().selected_chat().map(|chat| chat.name.as_ref()),
+            Some("Alice Chen")
+        );
+        terminal.draw(|frame| app.draw(frame))?;
+
+        let message_id = app
+            .state
+            .messages
+            .iter()
+            .find(|message| !message.is_from_me)
+            .unwrap()
+            .id
+            .clone();
+        app.state.selected_message_id = Some(message_id);
+        terminal.draw(|frame| app.draw(frame))?;
+
+        let content = buffer_text(terminal.backend().buffer());
+        for line in content.lines() {
+            println!("{line}");
+        }
+        assert!(content.contains("Sender: Alice Chen"));
+        assert!(!content.contains("Sender ID:"));
+        assert!(!content.contains("mock:user:alice"));
+        assert!(content.contains("Avatar: avatar preview"));
+        assert!(content.contains("▀") || content.contains("▄"));
         assert!(terminal.backend().buffer().content().iter().any(|cell| {
             matches!(cell.fg, Color::Rgb(_, _, _)) || matches!(cell.bg, Color::Rgb(_, _, _))
         }));
@@ -5630,6 +8380,359 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_opens_slack_setup_for_unconfigured_slack_provider() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:engineering", "Engineering Slack");
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        app.drain_provider_events().await?;
+
+        assert!(app.state().slack_setup_open());
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("enter credentials")
+        );
+        assert_eq!(
+            app.state().account_status_summary(),
+            "Engineering Slack auth needed: waiting"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Slack sign-in"));
+        assert!(content.contains("Workspace: Engineering Slack"));
+        assert!(content.contains("Provider: slack:engineering"));
+        assert!(content.contains("Enter or configure Slack credentials"));
+        assert!(!content.contains("xoxp-"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_navigates_slack_setup_methods_in_robustness_order() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:setup", "Slack Setup");
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        app.drain_provider_events().await?;
+
+        app.state.slack_setup = Some(SlackSetupOverlay::new(
+            Arc::from("slack:setup"),
+            "Slack Setup".to_owned(),
+        ));
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("choose workspace")
+        );
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("choose auth method")
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("1. User OAuth"));
+        assert!(content.contains("2. User OAuth read-only"));
+        assert!(content.contains("3. Workspace-approved bot/app tokens"));
+        assert!(content.contains("4. Existing approved token import"));
+        assert!(content.contains("5. Manual Slack app setup"));
+        assert!(content.contains("6. Incoming webhook"));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('6'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("enter credentials")
+        );
+
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Incoming webhook"));
+        assert!(content.contains("send-only"));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().slack_setup_open());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_shows_slack_oauth_prompt_inside_setup_flow() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:oauth", "OAuth Slack");
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        let provider_id: ProviderId = Arc::from("slack:oauth");
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::AuthRequired(AuthChallenge::OAuthUrl(
+                Arc::from("https://slack.com/oauth/v2/authorize?client_id=123"),
+            ))),
+        ))
+        .await?;
+
+        assert!(app.state().slack_setup_open());
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("authorize in browser")
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Slack sign-in"));
+        assert!(content.contains("Open this Slack authorization URL"));
+        assert!(content.contains("https://slack.com/oauth"));
+        assert!(!content.contains("Authentication"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_updates_slack_setup_after_validation_events() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:validated", "Validated Slack");
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        let provider_id: ProviderId = Arc::from("slack:validated");
+        app.handle_event(AppEvent::Provider(
+            provider_id.clone(),
+            Box::new(ProviderEvent::AuthRequired(AuthChallenge::Waiting)),
+        ))
+        .await?;
+
+        app.handle_event(AppEvent::Provider(
+            provider_id.clone(),
+            Box::new(ProviderEvent::AuthSucceeded),
+        ))
+        .await?;
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("review capabilities")
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Capabilities detected"));
+        assert!(content.contains("read history"));
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::SyncComplete),
+        ))
+        .await?;
+        assert_eq!(app.state().slack_setup_phase_label(), Some("connected"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_shows_slack_setup_failure_without_generic_auth_overlay() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:failed", "Failed Slack");
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        let provider_id: ProviderId = Arc::from("slack:failed");
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::Disconnected(Some(Arc::from(
+                "Slack auth.test failed: invalid_auth",
+            )))),
+        ))
+        .await?;
+
+        assert!(app.state().slack_setup_open());
+        assert_eq!(app.state().slack_setup_phase_label(), Some("failed"));
+        assert_eq!(
+            app.state().account_status_summary(),
+            "Failed Slack offline: Slack auth.test failed: invalid_auth"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Slack setup failed"));
+        assert!(content.contains("invalid_auth"));
+        assert!(!content.contains("Authentication"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_submits_slack_setup_selection_to_provider() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:submit", "Submit Slack");
+        let recorder = slack.clone();
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        app.drain_provider_events().await?;
+
+        app.state.slack_setup = Some(SlackSetupOverlay::new(
+            Arc::from("slack:submit"),
+            "Submit Slack".to_owned(),
+        ));
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('6'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("enter credentials")
+        );
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let submissions = recorder.auth_submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(
+            submissions[0].workspace_label.as_deref(),
+            Some("Submit Slack")
+        );
+        assert_eq!(submissions[0].mode, Some(AuthSubmissionMode::Webhook));
+        assert_eq!(
+            app.state().slack_setup_phase_label(),
+            Some("review capabilities")
+        );
+        assert_eq!(app.state().account_status_summary(), "Submit Slack online");
+        assert!(app.state().status().contains("Slack setup submitted"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_edits_and_redacts_slack_webhook_credentials() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:webhook-entry", "Webhook Slack");
+        let recorder = slack.clone();
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        app.drain_provider_events().await?;
+
+        app.state.slack_setup = Some(SlackSetupOverlay::new(
+            Arc::from("slack:webhook-entry"),
+            "Webhook Slack".to_owned(),
+        ));
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('6'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let webhook_url = "https://hooks.slack.com/services/T000/B000/SECRET";
+        for value in webhook_url.chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Webhook URL: ••••••••"));
+        assert!(content.contains(&format!("{} chars", webhook_url.len())));
+        assert!(!content.contains(webhook_url));
+        assert!(!content.contains("SECRET"));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let submissions = recorder.auth_submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].mode, Some(AuthSubmissionMode::Webhook));
+        assert_eq!(submissions[0].webhook_url.as_deref(), Some(webhook_url));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_edits_multiple_slack_token_fields() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:bot-entry", "Bot Slack");
+        let recorder = slack.clone();
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        app.drain_provider_events().await?;
+
+        app.state.slack_setup = Some(SlackSetupOverlay::new(
+            Arc::from("slack:bot-entry"),
+            "Bot Slack".to_owned(),
+        ));
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('3'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let bot_token = "xoxb-secret-bot-token";
+        for value in bot_token.chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Tab, KeyModifiers::NONE)))
+            .await?;
+        let app_token = "xapp-secret-app-token";
+        for value in app_token.chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Bot token: ••••••••"));
+        assert!(content.contains("App token: ••••••••"));
+        assert!(!content.contains(bot_token));
+        assert!(!content.contains(app_token));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let submissions = recorder.auth_submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].mode, Some(AuthSubmissionMode::BotToken));
+        assert_eq!(submissions[0].bot_token.as_deref(), Some(bot_token));
+        assert_eq!(submissions[0].app_token.as_deref(), Some(app_token));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_reports_slack_setup_submission_failure() -> Result<()> {
+        let slack = StaticTestProvider::slack_setup("slack:submit-failed", "Broken Slack")
+            .with_submit_error("Slack setup rejected: invalid_auth");
+        let recorder = slack.clone();
+        let mut app = test_app_with_providers(vec![Box::new(slack)]).await?;
+        app.drain_provider_events().await?;
+
+        app.state.slack_setup = Some(SlackSetupOverlay::new(
+            Arc::from("slack:submit-failed"),
+            "Broken Slack".to_owned(),
+        ));
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('3'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let submissions = recorder.auth_submissions();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].mode, Some(AuthSubmissionMode::BotToken));
+        assert_eq!(app.state().slack_setup_phase_label(), Some("failed"));
+        assert_eq!(
+            app.state().account_status_summary(),
+            "Broken Slack offline: Slack setup rejected: invalid_auth"
+        );
+        assert!(
+            app.state()
+                .status()
+                .contains("Slack setup failed: Slack setup rejected: invalid_auth")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_shows_and_expires_notification_overlay_for_background_messages() -> Result<()> {
         let mut app = test_app().await?;
         let background_chat = app
@@ -5765,7 +8868,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_mouse_click_shows_message_details_without_opening_media() -> Result<()> {
+    async fn app_mouse_click_opens_message_actions_without_opening_media() -> Result<()> {
         let mut app = test_app().await?;
         let mut terminal = Terminal::new(TestBackend::new(140, 40))?;
         terminal.draw(|frame| app.draw(frame))?;
@@ -5794,14 +8897,6 @@ mod tests {
 
         assert_eq!(app.state().focus(), FocusPane::Messages);
         assert_eq!(app.state().selected_message_id(), Some(&hit.message_id));
-        assert!(!app.state().action_menu_open());
-        assert_eq!(
-            app.state().status(),
-            format!("showing details for message {}", short_id(&hit.message_id))
-        );
-
-        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
-            .await?;
         assert!(app.state().action_menu_open());
         assert_eq!(app.state().status(), "message actions opened");
 
@@ -5893,8 +8988,11 @@ mod tests {
         terminal.draw(|frame| app.draw(frame))?;
         let buffer = terminal.backend().buffer();
 
+        let (avatar_start, avatar_end) =
+            chat_list::avatar_column_bounds(app.state().pane_areas.chat_list);
         assert!(
-            (5..9).any(|x| rgb_cell_at(buffer, x, 1)) && (5..9).any(|x| rgb_cell_at(buffer, x, 2)),
+            (avatar_start..avatar_end).any(|x| rgb_cell_at(buffer, x, 1))
+                && (avatar_start..avatar_end).any(|x| rgb_cell_at(buffer, x, 2)),
             "chat list should render a square-ish real PNG avatar in the first visible chat row"
         );
         assert!(
@@ -5928,7 +9026,7 @@ mod tests {
         assert!(content.contains("Click/tap"));
         assert!(content.contains("Click compose"));
         assert!(!content.contains("Click image"));
-        assert!(content.contains("Ctrl+J"));
+        assert!(!content.contains("Ctrl+J"));
         assert!(content.contains("Ctrl+A"));
         assert!(content.contains("Scroll/trackpad"));
         assert!(!content.contains("INSERT MODE"));
@@ -5989,12 +9087,14 @@ mod tests {
     async fn app_draws_status_bar_scrollbars_and_grouped_bubbles() -> Result<()> {
         let mut app = test_app().await?;
         let mut terminal = Terminal::new(TestBackend::new(120, 14))?;
+        app.state.focus = FocusPane::Messages;
+        app.state.pending_scroll_to_latest = false;
+        app.state.message_scroll = 0;
         terminal.draw(|frame| app.draw(frame))?;
         let content = buffer_text(terminal.backend().buffer());
 
         assert!(content.contains("Chats"));
-        assert!(content.contains("↑↓"));
-        assert!(content.contains("choose chat"));
+        assert!(content.contains("Scroll/PageUp") || content.contains("browse"));
         assert!(content.contains("╭─"));
         assert!(!content.contains("continued"));
         assert!(content.contains("╰─"));
@@ -6012,17 +9112,14 @@ mod tests {
             app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
                 .await?;
         }
-        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::SHIFT)))
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::ALT)))
             .await?;
         for value in "Line two".chars() {
             app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
                 .await?;
         }
-        app.handle_event(AppEvent::Key(key(
-            KeyCode::Char('j'),
-            KeyModifiers::CONTROL,
-        )))
-        .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::SHIFT)))
+            .await?;
         for value in "Line three".chars() {
             app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
                 .await?;
@@ -6081,6 +9178,7 @@ mod tests {
             0,
             200,
             None,
+            &HashSet::new(),
             &mut app.media_preview_cache,
             app.theme,
         );
@@ -6122,9 +9220,32 @@ mod tests {
         chats: Vec<Chat>,
         messages: Vec<Message>,
         events: EventBus,
+        auth_submissions: Arc<Mutex<Vec<AuthSubmission>>>,
+        submit_error: Option<Arc<str>>,
+        outbound_capabilities: OutboundCapabilities,
     }
 
     impl StaticTestProvider {
+        fn slack_setup(id: &str, display_name: &str) -> Self {
+            let id = Arc::<str>::from(id);
+            let account = Account {
+                id: id.clone(),
+                platform: Platform::Slack,
+                display_name: Arc::from(display_name),
+                avatar: None,
+            };
+            Self {
+                id,
+                account,
+                chats: Vec::new(),
+                messages: Vec::new(),
+                events: EventBus::new(),
+                auth_submissions: Arc::new(Mutex::new(Vec::new())),
+                submit_error: None,
+                outbound_capabilities: OutboundCapabilities::default(),
+            }
+        }
+
         fn from_mock(
             id: &str,
             display_name: &str,
@@ -6173,7 +9294,24 @@ mod tests {
                 chats,
                 messages,
                 events: EventBus::new(),
+                auth_submissions: Arc::new(Mutex::new(Vec::new())),
+                submit_error: None,
+                outbound_capabilities: OutboundCapabilities::all(),
             })
+        }
+
+        fn with_submit_error(mut self, error: &str) -> Self {
+            self.submit_error = Some(Arc::from(error));
+            self
+        }
+
+        fn auth_submissions(&self) -> Vec<AuthSubmission> {
+            self.auth_submissions.lock().unwrap().clone()
+        }
+
+        fn with_outbound_capabilities(mut self, capabilities: OutboundCapabilities) -> Self {
+            self.outbound_capabilities = capabilities;
+            self
         }
     }
 
@@ -6191,7 +9329,16 @@ mod tests {
             self.account.clone()
         }
 
+        fn outbound_capabilities(&self) -> OutboundCapabilities {
+            self.outbound_capabilities.clone()
+        }
+
         async fn connect(&self) -> Result<()> {
+            if self.account.platform == Platform::Slack && self.chats.is_empty() {
+                self.events
+                    .send(ProviderEvent::AuthRequired(AuthChallenge::Waiting));
+                return Ok(());
+            }
             self.events.send(ProviderEvent::AuthSucceeded);
             self.events.send(ProviderEvent::SyncComplete);
             Ok(())
@@ -6252,12 +9399,17 @@ mod tests {
             Ok(())
         }
 
-        async fn react(
-            &self,
-            _chat_id: &Arc<str>,
-            _message_id: &Arc<str>,
-            _emoji: &str,
-        ) -> Result<()> {
+        async fn react(&self, _chat_id: &Arc<str>, _message: &Message, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn submit_auth(&self, submission: AuthSubmission) -> Result<()> {
+            self.auth_submissions.lock().unwrap().push(submission);
+            if let Some(error) = &self.submit_error {
+                return Err(anyhow!(error.to_string()));
+            }
+            self.events.send(ProviderEvent::AuthSucceeded);
+            self.events.send(ProviderEvent::SyncComplete);
             Ok(())
         }
 

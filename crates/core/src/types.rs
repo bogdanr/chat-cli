@@ -82,8 +82,22 @@ pub enum Content {
 #[derive(Clone, Debug)]
 pub struct Poll {
     pub question: Arc<str>,
-    pub options: Vec<Arc<str>>,
+    pub options: Vec<PollOption>,
     pub selectable_options_count: Option<u32>,
+    pub votes: Vec<PollVote>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PollOption {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PollVote {
+    pub sender: PlatformId,
+    pub options: Vec<Arc<str>>,
+    pub timestamp: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Default)]

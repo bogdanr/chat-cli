@@ -1,5 +1,6 @@
 use crate::theme::Theme;
 use chat_core::{Content, Message, ReceiptKind, Sender};
+use chrono::Local;
 use image::imageops::FilterType;
 use ratatui::{
     Frame,
@@ -9,7 +10,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -95,6 +96,7 @@ pub fn build_message_lines(
     scroll: usize,
     viewport_rows: usize,
     selected_message_id: Option<&str>,
+    unread_message_ids: &HashSet<Arc<str>>,
     media_cache: &mut MediaPreviewCache,
     theme: Theme,
 ) -> MessageListRender {
@@ -137,7 +139,15 @@ pub fn build_message_lines(
         }
 
         let selected = selected_message_id == Some(message.id.as_ref());
-        let message_lines = message_lines(message, &mut context, message_start, selected, grouped);
+        let unread = unread_message_ids.contains(&message.id);
+        let message_lines = message_lines(
+            message,
+            &mut context,
+            message_start,
+            selected,
+            grouped,
+            unread,
+        );
         let line_hits = message_line_hits(&message_lines, message_start, content_width, grouped);
         let avatar_hit = message_avatar_hit(&message_lines, message_start, content_width, grouped);
         let end_line = message_start + message_lines.len().saturating_sub(1);
@@ -327,11 +337,26 @@ pub fn sender_style(theme: Theme, is_from_me: bool) -> Style {
     }
 }
 
-pub fn bubble_accent(theme: Theme, is_from_me: bool) -> Style {
-    if is_from_me {
-        Style::default().fg(theme.outgoing)
+pub fn format_message_time(timestamp: chat_core::Timestamp) -> String {
+    timestamp.with_timezone(&Local).format("%H:%M").to_string()
+}
+
+pub fn format_message_datetime(timestamp: chat_core::Timestamp) -> String {
+    timestamp
+        .with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+pub fn bubble_accent(theme: Theme, is_from_me: bool, unread: bool) -> Style {
+    if unread {
+        if is_from_me {
+            Style::default().fg(theme.outgoing)
+        } else {
+            Style::default().fg(theme.incoming)
+        }
     } else {
-        Style::default().fg(theme.incoming)
+        Style::default().fg(Color::DarkGray)
     }
 }
 
@@ -350,8 +375,9 @@ fn message_lines(
     start_line: usize,
     selected: bool,
     grouped: bool,
+    unread: bool,
 ) -> Vec<Line<'static>> {
-    let accent_style = bubble_accent(context.theme, message.is_from_me);
+    let accent_style = bubble_accent(context.theme, message.is_from_me, unread);
     let mut lines = Vec::new();
 
     if !grouped {
@@ -367,7 +393,7 @@ fn message_lines(
         ]);
         if !message.is_from_me {
             header_spans.push(Span::styled(
-                format!("  {}", message.timestamp.format("%H:%M")),
+                format!("  {}", format_message_time(message.timestamp)),
                 context.theme.muted(),
             ));
         }
@@ -391,14 +417,15 @@ fn message_lines(
         context,
         start_line + lines.len(),
         message.is_from_me,
+        accent_style,
     ));
 
     let receipts = receipt_summary(message);
     if message.is_from_me {
         let status = if receipts.is_empty() {
-            message.timestamp.format("%H:%M").to_string()
+            format_message_time(message.timestamp)
         } else {
-            format!("{} · {receipts}", message.timestamp.format("%H:%M"))
+            format!("{} · {receipts}", format_message_time(message.timestamp))
         };
         lines.push(status_line(&status, context.theme.muted()));
     } else if !receipts.is_empty() {
@@ -445,51 +472,25 @@ fn content_lines(
     context: &mut MessageRenderContext<'_>,
     start_line: usize,
     is_from_me: bool,
+    accent: Style,
 ) -> Vec<Line<'static>> {
     match content {
-        Content::Text(text) => {
-            text_bubble_lines(text, context.content_width, context.theme, is_from_me)
+        Content::Text(text) => text_bubble_lines(text, context.content_width, accent),
+        Content::Image(media) => {
+            media_card_lines("Photo", media, accent, context, start_line, is_from_me)
         }
-        Content::Image(media) => media_card_lines(
-            "Photo",
-            media,
-            Color::DarkGray,
-            context,
-            start_line,
-            is_from_me,
-        ),
-        Content::Video(media) => media_card_lines(
-            "Video",
-            media,
-            Color::LightBlue,
-            context,
-            start_line,
-            is_from_me,
-        ),
-        Content::Audio(media) => media_card_lines(
-            "Voice note",
-            media,
-            Color::LightCyan,
-            context,
-            start_line,
-            is_from_me,
-        ),
-        Content::File(media) => media_card_lines(
-            "File",
-            media,
-            Color::Yellow,
-            context,
-            start_line,
-            is_from_me,
-        ),
-        Content::Sticker(media) => media_card_lines(
-            "Sticker",
-            media,
-            Color::Magenta,
-            context,
-            start_line,
-            is_from_me,
-        ),
+        Content::Video(media) => {
+            media_card_lines("Video", media, accent, context, start_line, is_from_me)
+        }
+        Content::Audio(media) => {
+            media_card_lines("Voice note", media, accent, context, start_line, is_from_me)
+        }
+        Content::File(media) => {
+            media_card_lines("File", media, accent, context, start_line, is_from_me)
+        }
+        Content::Sticker(media) => {
+            media_card_lines("Sticker", media, accent, context, start_line, is_from_me)
+        }
         Content::LinkPreview(link) => {
             let title = link.title.as_deref().unwrap_or("Link preview");
             let description = link
@@ -500,14 +501,13 @@ fn content_lines(
             let mut lines = text_bubble_lines(
                 &format!("LINK PREVIEW: {title} — {}{description}", link.url),
                 context.content_width,
-                context.theme,
-                is_from_me,
+                accent,
             );
             if let Some(image) = &link.image {
                 lines.extend(media_card_lines(
                     "Link image",
                     image,
-                    Color::LightBlue,
+                    accent,
                     context,
                     start_line + lines.len(),
                     is_from_me,
@@ -515,20 +515,12 @@ fn content_lines(
             }
             lines
         }
-        Content::Poll(poll) => {
-            poll_bubble_lines(poll, context.content_width, context.theme, is_from_me)
-        }
-        Content::Deleted => text_bubble_lines(
-            "[deleted]",
-            context.content_width,
-            context.theme,
-            is_from_me,
-        ),
+        Content::Poll(poll) => poll_bubble_lines(poll, context.content_width, accent),
+        Content::Deleted => text_bubble_lines("[deleted]", context.content_width, accent),
         Content::Unsupported(kind) => text_bubble_lines(
             &format!("[unsupported: {kind}]"),
             context.content_width,
-            context.theme,
-            is_from_me,
+            accent,
         ),
     }
 }
@@ -536,17 +528,24 @@ fn content_lines(
 fn poll_bubble_lines(
     poll: &chat_core::Poll,
     content_width: u16,
-    theme: Theme,
-    is_from_me: bool,
+    accent: Style,
 ) -> Vec<Line<'static>> {
-    text_bubble_lines(&poll_text(poll), content_width, theme, is_from_me)
+    text_bubble_lines(&poll_text(poll), content_width, accent)
 }
 
 fn poll_text(poll: &chat_core::Poll) -> String {
     let mut text = format!("POLL: {}", poll.question);
     for (index, option) in poll.options.iter().enumerate() {
         text.push('\n');
-        text.push_str(&format!("{}. {}", index + 1, option));
+        text.push_str(&format!("{}. {}", index + 1, option.label));
+        let votes = poll
+            .votes
+            .iter()
+            .filter(|vote| vote.options.iter().any(|selected| selected == &option.id))
+            .count();
+        if votes > 0 {
+            text.push_str(&format!("  ({votes})"));
+        }
     }
     if let Some(selectable) = poll.selectable_options_count
         && selectable > 0
@@ -561,13 +560,7 @@ fn poll_text(poll: &chat_core::Poll) -> String {
     text
 }
 
-fn text_bubble_lines(
-    text: &str,
-    content_width: u16,
-    theme: Theme,
-    is_from_me: bool,
-) -> Vec<Line<'static>> {
-    let accent = bubble_accent(theme, is_from_me);
+fn text_bubble_lines(text: &str, content_width: u16, accent: Style) -> Vec<Line<'static>> {
     let max_inner_width = bubble_inner_width(content_width);
     let wrapped = wrap_text(text, max_inner_width);
     let inner_width = wrapped
@@ -590,7 +583,7 @@ fn text_bubble_lines(
 fn media_card_lines(
     label: &str,
     media: &chat_core::Media,
-    accent: Color,
+    accent: Style,
     context: &mut MessageRenderContext<'_>,
     start_line: usize,
     is_from_me: bool,
@@ -602,7 +595,7 @@ fn media_card_lines(
         context.media_cache,
         card_width,
         MEDIA_PREVIEW_ROWS,
-        accent,
+        accent.fg.unwrap_or(Color::DarkGray),
     );
     let mut lines = vec![
         card_border_line('╭', '─', '╮', card_width, accent),
@@ -610,7 +603,7 @@ fn media_card_lines(
             accent,
             label,
             card_width,
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            accent.add_modifier(Modifier::BOLD),
         ),
     ];
 
@@ -837,26 +830,26 @@ fn pad_preview_row(
     padded
 }
 
-fn card_preview_line(accent: Color, preview: Vec<Span<'static>>, width: u16) -> Line<'static> {
+fn card_preview_line(accent: Style, preview: Vec<Span<'static>>, width: u16) -> Line<'static> {
     let content_width = preview
         .iter()
         .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
         .sum::<usize>();
     let mut spans = Vec::with_capacity(preview.len() + 3);
-    spans.push(Span::styled("│ ", Style::default().fg(accent)));
+    spans.push(Span::styled("│ ", accent));
     spans.extend(preview);
     spans.push(Span::raw(
         " ".repeat((width as usize).saturating_sub(content_width)),
     ));
-    spans.push(Span::styled(" │", Style::default().fg(accent)));
+    spans.push(Span::styled(" │", accent));
     Line::from(spans)
 }
 
-fn card_text_line(accent: Color, text: &str, width: u16, style: Style) -> Line<'static> {
+fn card_text_line(accent: Style, text: &str, width: u16, style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled("│ ", Style::default().fg(accent)),
+        Span::styled("│ ", accent),
         Span::styled(fit_cell_text(text, width), style),
-        Span::styled(" │", Style::default().fg(accent)),
+        Span::styled(" │", accent),
     ])
 }
 
@@ -865,17 +858,17 @@ fn card_border_line(
     fill: char,
     right: char,
     width: u16,
-    accent: Color,
+    accent: Style,
 ) -> Line<'static> {
     let border = format!(
         "{left}{}{right}",
         std::iter::repeat_n(fill, width as usize + 2).collect::<String>()
     );
-    Line::from(Span::styled(border, Style::default().fg(accent)))
+    Line::from(Span::styled(border, accent))
 }
 
-fn media_card_accent(_accent: Color) -> Color {
-    Color::DarkGray
+fn media_card_accent(accent: Style) -> Style {
+    accent
 }
 
 fn media_card_width(content_width: u16) -> u16 {
@@ -1242,7 +1235,16 @@ mod tests {
         ];
         let mut cache = MediaPreviewCache::default();
 
-        let render = build_message_lines(&messages, 80, 0, 200, None, &mut cache, Theme::default());
+        let render = build_message_lines(
+            &messages,
+            80,
+            0,
+            200,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            Theme::default(),
+        );
         let rendered = render
             .lines
             .iter()
@@ -1255,10 +1257,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        let expected_first_time = format_message_time(messages[0].timestamp);
+        let expected_second_time = format_message_time(messages[1].timestamp);
         assert!(rendered.contains("First outgoing"));
         assert!(rendered.contains("Grouped outgoing"));
-        assert!(rendered.contains("04:11"));
-        assert!(rendered.contains("04:12"));
+        assert!(rendered.contains(&expected_first_time));
+        assert!(rendered.contains(&expected_second_time));
         assert_eq!(rendered.matches("Me (me)").count(), 1);
     }
 
@@ -1304,6 +1308,7 @@ mod tests {
             0,
             40,
             Some("incoming"),
+            &HashSet::new(),
             &mut cache,
             Theme::default(),
         );
@@ -1319,6 +1324,7 @@ mod tests {
             0,
             40,
             Some("outgoing"),
+            &HashSet::new(),
             &mut cache,
             Theme::default(),
         );
@@ -1404,7 +1410,16 @@ mod tests {
         }];
 
         let mut cache = MediaPreviewCache::default();
-        let render = build_message_lines(&[message], 80, 0, 40, None, &mut cache, Theme::default());
+        let render = build_message_lines(
+            &[message],
+            80,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            Theme::default(),
+        );
         let rendered_lines = render
             .lines
             .iter()
@@ -1517,7 +1532,16 @@ mod tests {
         }
 
         let mut cache = MediaPreviewCache::default();
-        let render = build_message_lines(&messages, 80, 0, 8, None, &mut cache, Theme::default());
+        let render = build_message_lines(
+            &messages,
+            80,
+            0,
+            8,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            Theme::default(),
+        );
 
         assert!(render.total_lines > render.lines.len());
         assert!(cache.previews.len() < messages.len());

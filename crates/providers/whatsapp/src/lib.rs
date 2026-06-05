@@ -1,17 +1,17 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chat_core::{
-    Account, AuthChallenge, Chat, ChatId, Content, EventBus, Media, Message, MessageId, Platform,
-    PlatformData, PlatformId, Poll, Provider, ProviderEvent, ProviderId, Reaction, Sender,
-    Timestamp, WhatsAppData,
+    Account, AuthChallenge, Chat, ChatId, Content, EventBus, Media, Message, MessageId,
+    OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider,
+    ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData,
 };
 use chrono::Utc;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -24,6 +24,7 @@ pub mod bridge;
 const PROVIDER_ID: &str = "whatsapp:bridge";
 const INBOX_CHAT_ID: &str = "whatsapp:bridge:inbox";
 const BRIDGE_SENDER_ID: &str = "whatsapp:bridge:sender";
+const LOCAL_REACTION_SENDER: &str = "me";
 
 pub struct WhatsAppProvider {
     handle: bridge::ClientHandle,
@@ -169,6 +170,35 @@ impl WhatsAppProvider {
     }
 }
 
+impl WhatsAppProvider {
+    fn send_media_to_bridge(&self, chat_jid: &str, media: &Media, content_type: &str) -> Result<String> {
+        let local_path = media
+            .local_path
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("WhatsApp media send requires a local file path"))?;
+        let path = local_path.to_string_lossy();
+        let file_name = media.file_name.as_ref();
+        let caption = media.caption.as_deref().unwrap_or_default();
+        log_outbound_media_attempt(
+            self.log_path.as_deref(),
+            chat_jid,
+            local_path.as_path(),
+            media.mime_type.as_ref(),
+            content_type,
+            media.size_bytes,
+        );
+        bridge::send_media(
+            self.handle,
+            chat_jid,
+            &path,
+            media.mime_type.as_ref(),
+            file_name,
+            caption,
+            content_type,
+        )
+    }
+}
+
 impl Drop for WhatsAppProvider {
     fn drop(&mut self) {
         self.stop_message_forwarder();
@@ -188,6 +218,20 @@ impl Provider for WhatsAppProvider {
 
     fn account_info(&self) -> Account {
         self.account.clone()
+    }
+
+    fn outbound_capabilities(&self) -> OutboundCapabilities {
+        OutboundCapabilities {
+            text: true,
+            image: true,
+            gif: true,
+            video: true,
+            audio: true,
+            file: true,
+            sticker: true,
+            max_upload_size: None,
+            media_note: Some(Arc::from("WhatsApp GIFs may be sent as documents depending on format")),
+        }
     }
 
     async fn connect(&self) -> Result<()> {
@@ -260,15 +304,26 @@ impl Provider for WhatsAppProvider {
         content: Content,
         reply_to: Option<&MessageId>,
     ) -> Result<MessageId> {
-        let Content::Text(text) = content else {
-            bail!("WhatsApp bridge currently supports text sends only")
-        };
         let chat_jid = whatsapp_jid_from_chat_id(chat_id);
         if chat_jid.is_empty() {
             bail!("cannot send WhatsApp message to bridge/system chat")
         }
 
-        let raw_response = bridge::send_text(self.handle, &chat_jid, &text)?;
+        let raw_response = match &content {
+            Content::Text(text) => bridge::send_text(self.handle, &chat_jid, text)?,
+            Content::Image(media) if media.mime_type.as_ref() == "image/gif" => {
+                self.send_media_to_bridge(&chat_jid, media, "gif")?
+            }
+            Content::Image(media) => self.send_media_to_bridge(&chat_jid, media, "image")?,
+            Content::Video(media) => self.send_media_to_bridge(&chat_jid, media, "video")?,
+            Content::Audio(media) => self.send_media_to_bridge(&chat_jid, media, "audio")?,
+            Content::File(media) => self.send_media_to_bridge(&chat_jid, media, "file")?,
+            Content::Sticker(media) => self.send_media_to_bridge(&chat_jid, media, "sticker")?,
+            Content::LinkPreview(_) => bail!("WhatsApp link preview sending should be sent as plain text first"),
+            Content::Poll(_) => bail!("WhatsApp poll creation is not wired yet"),
+            Content::Deleted => bail!("cannot send a deleted WhatsApp message"),
+            Content::Unsupported(_) => bail!("cannot send unsupported WhatsApp content"),
+        };
         let event = BridgeEvent::decode(&raw_response)?;
         if event.kind == "error" {
             bail!(
@@ -302,7 +357,7 @@ impl Provider for WhatsAppProvider {
             },
             timestamp,
             edited_at: None,
-            content: Content::Text(text.clone()),
+            content: content.clone(),
             reply_to: reply_to.cloned(),
             thread_id: None,
             reactions: Vec::new(),
@@ -325,7 +380,7 @@ impl Provider for WhatsAppProvider {
                 avatar: None,
                 is_group: event.is_group,
                 timestamp,
-                preview: text,
+                preview: content_preview(&content),
                 increment_unread: false,
             },
         );
@@ -344,8 +399,135 @@ impl Provider for WhatsAppProvider {
         Ok(())
     }
 
-    async fn react(&self, _chat_id: &ChatId, _message_id: &MessageId, _emoji: &str) -> Result<()> {
-        bail!("WhatsApp reactions are not wired yet")
+    async fn react(&self, chat_id: &ChatId, message: &Message, emoji: &str) -> Result<()> {
+        let message_id = message.id.clone();
+        let chat_jid = whatsapp_jid_from_chat_id(chat_id);
+        if chat_jid.is_empty() {
+            bail!("cannot react to messages in the WhatsApp bridge/system chat")
+        }
+
+        let (sender_jid, had_reaction) = {
+            let messages = lock_rw_read(&self.messages);
+            let loaded_message = messages.iter().find(|loaded| loaded.id == message_id);
+            let reaction_target = loaded_message.unwrap_or(message);
+            let sender_jid = if reaction_target.is_from_me {
+                String::new()
+            } else {
+                reaction_target.sender.platform_id.to_string()
+            };
+            let had_reaction =
+                message_reacted_by_sender(reaction_target, emoji, LOCAL_REACTION_SENDER);
+            (sender_jid, had_reaction)
+        };
+        let reaction = if had_reaction { "" } else { emoji };
+        let raw_response = bridge::send_reaction(
+            self.handle,
+            &chat_jid,
+            &sender_jid,
+            message_id.as_ref(),
+            reaction,
+        )?;
+        let event = BridgeEvent::decode(&raw_response)?;
+        if event.kind == "error" {
+            bail!(
+                "{}",
+                event
+                    .message
+                    .unwrap_or_else(|| "WhatsApp reaction failed".to_owned())
+            );
+        }
+
+        let mut changed = None;
+        {
+            let mut messages = lock_rw_write(&self.messages);
+            if let Some(message) = messages.iter_mut().find(|message| message.id == message_id) {
+                if had_reaction {
+                    remove_message_reaction(
+                        message,
+                        &arc_str(emoji),
+                        &arc_str(LOCAL_REACTION_SENDER),
+                    );
+                } else {
+                    add_message_reaction(message, arc_str(emoji), arc_str(LOCAL_REACTION_SENDER));
+                }
+                changed = Some(message.clone());
+            }
+        }
+        if let Some(message) = changed {
+            self.events.send(ProviderEvent::MessageEdited { message });
+        }
+        self.events.send(ProviderEvent::ReactionChanged {
+            chat_id: chat_id.clone(),
+            message_id: message_id.clone(),
+            emoji: arc_str(emoji),
+            added: !had_reaction,
+            sender: arc_str(LOCAL_REACTION_SENDER),
+        });
+        Ok(())
+    }
+
+    async fn vote_poll(
+        &self,
+        chat_id: &ChatId,
+        message: &Message,
+        selected_options: &[Arc<str>],
+    ) -> Result<()> {
+        let message_id = message.id.clone();
+        let chat_jid = whatsapp_jid_from_chat_id(chat_id);
+        if chat_jid.is_empty() {
+            bail!("cannot vote in polls in the WhatsApp bridge/system chat")
+        }
+        let Content::Poll(poll) = &message.content else {
+            bail!("selected WhatsApp message is not a poll")
+        };
+        let sender_jid = if message.is_from_me {
+            String::new()
+        } else {
+            message.sender.platform_id.to_string()
+        };
+        let option_labels = selected_options
+            .iter()
+            .filter_map(|selected| {
+                poll.options
+                    .iter()
+                    .find(|option| option.id.as_ref() == selected.as_ref())
+                    .map(|option| option.label.to_string())
+            })
+            .collect::<Vec<_>>();
+        if option_labels.is_empty() {
+            bail!("select at least one poll option")
+        }
+        let raw_response = bridge::send_poll_vote(
+            self.handle,
+            &chat_jid,
+            &sender_jid,
+            message_id.as_ref(),
+            &option_labels,
+        )?;
+        let event = BridgeEvent::decode(&raw_response)?;
+        if event.kind == "error" {
+            bail!(
+                "{}",
+                event
+                    .message
+                    .unwrap_or_else(|| "WhatsApp poll vote failed".to_owned())
+            );
+        }
+        forward_poll_vote_event(
+            &BridgeForwardContext {
+                account_id: &self.id,
+                inbox_chat: &self.inbox_chat,
+                chats: &self.chats,
+                messages: &self.messages,
+                profiles: &self.profiles,
+                pending_reactions: &self.pending_reactions,
+                log_path: self.log_path.as_ref().as_ref(),
+                events: &self.events,
+                next_message: &self.next_message,
+            },
+            event,
+        );
+        Ok(())
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<Message>> {
@@ -372,6 +554,12 @@ impl Provider for WhatsAppProvider {
             .find(|message| message.sender.platform_id == *platform_id)
             .map(|message| message.sender.clone()))
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct BridgeReaction {
+    emoji: String,
+    senders: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -405,11 +593,20 @@ struct BridgeEvent {
     media_thumbnail_path: Option<PathBuf>,
     caption: Option<String>,
     reaction_message_id: Option<String>,
+    #[serde(default)]
+    reaction_message_from_me: bool,
     reaction_emoji: Option<String>,
+    #[serde(default)]
+    reactions: Vec<BridgeReaction>,
     poll_question: Option<String>,
     #[serde(default)]
     poll_options: Vec<String>,
+    #[serde(default)]
+    poll_option_ids: Vec<String>,
     poll_selectable_options_count: Option<u32>,
+    poll_vote_message_id: Option<String>,
+    #[serde(default)]
+    poll_vote_options: Vec<String>,
 }
 
 impl BridgeEvent {
@@ -444,10 +641,15 @@ impl BridgeEvent {
                 media_thumbnail_path: None,
                 caption: None,
                 reaction_message_id: None,
+                reaction_message_from_me: false,
                 reaction_emoji: None,
+                reactions: Vec::new(),
                 poll_question: None,
                 poll_options: Vec::new(),
+                poll_option_ids: Vec::new(),
                 poll_selectable_options_count: None,
+                poll_vote_message_id: None,
+                poll_vote_options: Vec::new(),
             })
         }
     }
@@ -561,6 +763,9 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         "reaction" => {
             forward_reaction_event(context, event);
         }
+        "poll_vote" => {
+            forward_poll_vote_event(context, event);
+        }
         "disconnected" => {
             context
                 .events
@@ -618,13 +823,17 @@ fn forward_message_event(
         }
         .to_owned()
     });
-    let sender_name = event.sender_name.clone().unwrap_or_else(|| {
-        if event.from_me {
-            "Me".to_owned()
-        } else {
-            sender_name_from_jid(&sender_jid)
-        }
-    });
+    let sender_name = event
+        .sender_name
+        .clone()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            if event.from_me {
+                "Me".to_owned()
+            } else {
+                sender_name_from_jid(&sender_jid)
+            }
+        });
     let sender = upsert_profile(
         context.profiles,
         sender_jid.clone(),
@@ -643,7 +852,7 @@ fn forward_message_event(
         content,
         reply_to: None,
         thread_id: None,
-        reactions: Vec::new(),
+        reactions: reactions_from_event(&event),
         receipts: Vec::new(),
         is_from_me: event.from_me,
         platform_data: PlatformData {
@@ -808,6 +1017,31 @@ fn content_text(content: &Content) -> &str {
     }
 }
 
+fn content_preview(content: &Content) -> Arc<str> {
+    match content {
+        Content::Text(text) => text.clone(),
+        Content::Image(media) => outbound_media_preview("Photo", media),
+        Content::Video(media) => outbound_media_preview("Video", media),
+        Content::Audio(media) => outbound_media_preview("Audio", media),
+        Content::File(media) => outbound_media_preview("File", media),
+        Content::Sticker(_) => arc_str("Sticker"),
+        Content::LinkPreview(preview) => arc_str(preview.title.as_deref().unwrap_or(preview.url.as_ref())),
+        Content::Poll(poll) => arc_str(format!("Poll: {}", poll.question)),
+        Content::Deleted => arc_str("Deleted message"),
+        Content::Unsupported(description) => description.clone(),
+    }
+}
+
+fn outbound_media_preview(label: &str, media: &Media) -> Arc<str> {
+    if let Some(caption) = media.caption.as_deref().filter(|caption| !caption.is_empty()) {
+        arc_str(format!("{label}: {caption}"))
+    } else if !media.file_name.is_empty() {
+        arc_str(format!("{label}: {}", media.file_name))
+    } else {
+        arc_str(label)
+    }
+}
+
 fn content_preview_for_event(event: &BridgeEvent, text: &str) -> Arc<str> {
     match event.content_type.as_deref() {
         Some("image") => media_preview("Photo", event, text),
@@ -853,10 +1087,22 @@ fn content_from_event(event: &BridgeEvent, text: String) -> Content {
             options: event
                 .poll_options
                 .iter()
-                .filter(|option| !option.is_empty())
-                .map(|option| arc_str(option.as_str()))
+                .enumerate()
+                .filter(|(_, option)| !option.is_empty())
+                .map(|(index, option)| PollOption {
+                    id: arc_str(
+                        event
+                            .poll_option_ids
+                            .get(index)
+                            .filter(|id| !id.is_empty())
+                            .map(String::as_str)
+                            .unwrap_or(option.as_str()),
+                    ),
+                    label: arc_str(option.as_str()),
+                })
                 .collect(),
             selectable_options_count: event.poll_selectable_options_count,
+            votes: Vec::new(),
         });
     }
 
@@ -921,16 +1167,25 @@ fn media_default_mime(kind: &str) -> &str {
 }
 
 fn forward_reaction_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
-    let Some(target_id) = event.reaction_message_id.filter(|id| !id.is_empty()) else {
+    let Some(target_id) = event
+        .reaction_message_id
+        .clone()
+        .filter(|id| !id.is_empty())
+    else {
         return;
     };
-    let Some(emoji) = event.reaction_emoji.filter(|emoji| !emoji.is_empty()) else {
+    let Some(emoji) = event
+        .reaction_emoji
+        .clone()
+        .filter(|emoji| !emoji.is_empty())
+    else {
         return;
     };
-    let chat_jid = event.chat_jid.unwrap_or_else(|| INBOX_CHAT_ID.to_owned());
-    let sender = event
-        .sender_jid
-        .unwrap_or_else(|| BRIDGE_SENDER_ID.to_owned());
+    let chat_jid = event
+        .chat_jid
+        .clone()
+        .unwrap_or_else(|| INBOX_CHAT_ID.to_owned());
+    let sender = reaction_sender(&event);
     let chat_id = chat_id_from_jid(&chat_jid);
     let message_id = arc_str(target_id);
     let emoji = arc_str(emoji);
@@ -973,6 +1228,95 @@ fn forward_reaction_event(context: &BridgeForwardContext<'_>, event: BridgeEvent
     });
 }
 
+fn forward_poll_vote_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
+    let Some(target_id) = event
+        .poll_vote_message_id
+        .clone()
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let sender = if event.from_me {
+        LOCAL_REACTION_SENDER.to_owned()
+    } else {
+        event
+            .sender_jid
+            .clone()
+            .filter(|sender| !sender.is_empty())
+            .unwrap_or_else(|| BRIDGE_SENDER_ID.to_owned())
+    };
+    let timestamp = event.timestamp();
+    let selected_options = event
+        .poll_vote_options
+        .iter()
+        .filter(|option| !option.is_empty())
+        .map(arc_str)
+        .collect::<Vec<_>>();
+    if selected_options.is_empty() {
+        return;
+    }
+
+    if let Some(sender_name) = event.sender_name.clone().filter(|name| !name.is_empty()) {
+        upsert_profile(
+            context.profiles,
+            sender.clone(),
+            sender_name,
+            event.avatar_path.clone(),
+        );
+    }
+
+    let message_id = arc_str(target_id);
+    let sender = arc_str(sender);
+    let mut changed = None;
+    {
+        let mut messages = lock_rw_write(context.messages);
+        if let Some(message) = messages.iter_mut().find(|message| message.id == message_id) {
+            apply_poll_vote(message, sender, selected_options, timestamp);
+            changed = Some(message.clone());
+        }
+    }
+    if let Some(message) = changed {
+        context
+            .events
+            .send(ProviderEvent::MessageEdited { message });
+    }
+}
+
+fn apply_poll_vote(
+    message: &mut Message,
+    sender: Arc<str>,
+    selected_options: Vec<Arc<str>>,
+    timestamp: Option<Timestamp>,
+) {
+    let Content::Poll(poll) = &mut message.content else {
+        return;
+    };
+    poll.votes.retain(|vote| vote.sender != sender);
+    poll.votes.push(PollVote {
+        sender,
+        options: selected_options,
+        timestamp,
+    });
+}
+
+fn reactions_from_event(event: &BridgeEvent) -> Vec<Reaction> {
+    event
+        .reactions
+        .iter()
+        .filter(|reaction| !reaction.emoji.is_empty() && !reaction.senders.is_empty())
+        .map(|reaction| Reaction {
+            emoji: arc_str(&reaction.emoji),
+            senders: reaction
+                .senders
+                .iter()
+                .filter(|sender| !sender.is_empty())
+                .map(arc_str)
+                .collect(),
+        })
+        .filter(|reaction| !reaction.senders.is_empty())
+        .collect()
+}
+
 fn apply_pending_reactions(
     pending_reactions: &Arc<RwLock<HashMap<MessageId, Vec<PendingReaction>>>>,
     message: &mut Message,
@@ -987,6 +1331,27 @@ fn apply_pending_reactions(
             }
         }
     }
+}
+
+fn reaction_sender(event: &BridgeEvent) -> String {
+    if event.from_me {
+        return LOCAL_REACTION_SENDER.to_owned();
+    }
+    event
+        .sender_jid
+        .clone()
+        .filter(|sender| !sender.is_empty())
+        .unwrap_or_else(|| BRIDGE_SENDER_ID.to_owned())
+}
+
+fn message_reacted_by_sender(message: &Message, emoji: &str, sender: &str) -> bool {
+    message.reactions.iter().any(|reaction| {
+        reaction.emoji.as_ref() == emoji
+            && reaction
+                .senders
+                .iter()
+                .any(|candidate| candidate.as_ref() == sender)
+    })
 }
 
 fn add_message_reaction(message: &mut Message, emoji: Arc<str>, sender: Arc<str>) {
@@ -1075,11 +1440,15 @@ fn upsert_profile(
     let sender = profiles
         .entry(platform_id.clone())
         .or_insert_with(|| Sender {
-            platform_id,
+            platform_id: platform_id.clone(),
             display_name: arc_str(&display_name),
             avatar: avatar.clone(),
         });
-    if !display_name.is_empty() {
+    let candidate_is_fallback = looks_like_jid_fallback(&display_name)
+        || display_name == sender_name_from_jid(platform_id.as_ref());
+    let current_is_fallback = looks_like_jid_fallback(sender.display_name.as_ref())
+        || sender.display_name.as_ref() == sender_name_from_jid(sender.platform_id.as_ref());
+    if !display_name.is_empty() && (!candidate_is_fallback || current_is_fallback) {
         sender.display_name = arc_str(display_name);
     }
     if avatar.is_some() {
@@ -1168,20 +1537,44 @@ fn normalize_sync_scope(scope: &str) -> String {
 }
 
 fn log_provider_event(log_path: Option<&PathBuf>, raw_event: &str) {
+    append_provider_log(
+        log_path.map(PathBuf::as_path),
+        &format!("{} whatsapp-provider {raw_event}", Utc::now().to_rfc3339()),
+    );
+}
+
+fn log_outbound_media_attempt(
+    log_path: Option<&Path>,
+    chat_jid: &str,
+    path: &Path,
+    mime_type: &str,
+    content_type: &str,
+    size_bytes: Option<u64>,
+) {
+    let size = size_bytes
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    append_provider_log(
+        log_path,
+        &format!(
+            "{} whatsapp-provider sending outbound media chat={chat_jid} path={} mime={mime_type} content_type={content_type} size={size}",
+            Utc::now().to_rfc3339(),
+            path.display()
+        ),
+    );
+}
+
+fn append_provider_log(log_path: Option<&Path>, line: &str) {
     let Some(path) = log_path else {
         return;
     };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = fs::create_dir_all(parent);
     }
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
-    let _ = writeln!(
-        file,
-        "{} whatsapp-provider {raw_event}",
-        Utc::now().to_rfc3339()
-    );
+    let _ = writeln!(file, "{line}");
 }
 
 fn arc_str(value: impl AsRef<str>) -> Arc<str> {
@@ -1253,12 +1646,27 @@ mod tests {
             Some(std::path::Path::new("/tmp/photo.jpg"))
         );
 
+        let reacted_history = BridgeEvent::decode(
+            r#"{"type":"history","id":"reacted","chat_jid":"123@s.whatsapp.net","sender_jid":"123@s.whatsapp.net","text":"reacted","reactions":[{"emoji":"👍","senders":["a@s.whatsapp.net","b@s.whatsapp.net","c@s.whatsapp.net","d@s.whatsapp.net","e@s.whatsapp.net","f@s.whatsapp.net","g@s.whatsapp.net"]}]}"#,
+        )?;
+        let reactions = reactions_from_event(&reacted_history);
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].emoji.as_ref(), "👍");
+        assert_eq!(reactions[0].senders.len(), 7);
+
         let reaction = BridgeEvent::decode(
             r#"{"type":"reaction","chat_jid":"123@s.whatsapp.net","reaction_message_id":"abc","reaction_emoji":"🔥","sender_jid":"456@s.whatsapp.net"}"#,
         )?;
         assert_eq!(reaction.kind, "reaction");
         assert_eq!(reaction.reaction_message_id.as_deref(), Some("abc"));
         assert_eq!(reaction.reaction_emoji.as_deref(), Some("🔥"));
+
+        let own_reaction = BridgeEvent::decode(
+            r#"{"type":"reaction","chat_jid":"123@s.whatsapp.net","from_me":true,"reaction_message_id":"abc","reaction_message_from_me":true,"reaction_emoji":"👍🏻","sender_jid":"36786512371803@lid"}"#,
+        )?;
+        assert_eq!(own_reaction.reaction_message_id.as_deref(), Some("abc"));
+        assert!(own_reaction.reaction_message_from_me);
+        assert_eq!(reaction_sender(&own_reaction), LOCAL_REACTION_SENDER);
 
         let profile = BridgeEvent::decode(
             r#"{"type":"profile","jid":"123@s.whatsapp.net","sender_name":"Ada","avatar_path":"/tmp/ada.jpg"}"#,
@@ -1558,6 +1966,169 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert!(history[0].is_from_me);
         assert_eq!(content_text(&history[0].content), "hello back");
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_sends_media_through_bridge() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("fono-snixembed.log");
+        fs::write(&file_path, b"test log")?;
+        let provider = WhatsAppProvider::new("test:send-media")?;
+        assert!(provider.outbound_capabilities().gif);
+        provider.connect().await?;
+
+        let chat_id = arc_str("whatsapp:123@s.whatsapp.net");
+        let sent_id = provider
+            .send(
+                &chat_id,
+                Content::File(Media {
+                    id: arc_str("file-1"),
+                    file_name: arc_str("fono-snixembed.log"),
+                    mime_type: arc_str("text/plain"),
+                    size_bytes: Some(8),
+                    caption: Some(arc_str("debug log")),
+                    local_path: Some(file_path.clone()),
+                    thumbnail: None,
+                }),
+                None,
+            )
+            .await?;
+        assert!(sent_id.starts_with("test-sent-media-"));
+        let history = provider.history(&chat_id, None, 10).await?;
+        assert_eq!(history.len(), 1);
+        assert!(history[0].is_from_me);
+        match &history[0].content {
+            Content::File(media) => {
+                assert_eq!(media.file_name.as_ref(), "fono-snixembed.log");
+                assert_eq!(media.mime_type.as_ref(), "text/plain");
+                assert_eq!(media.caption.as_deref(), Some("debug log"));
+                assert_eq!(media.local_path.as_deref(), Some(file_path.as_path()));
+            }
+            other => panic!("expected file content, got {other:?}"),
+        }
+        assert!(
+            provider
+                .chats()
+                .await?
+                .iter()
+                .any(|chat| chat.last_message_preview.as_deref() == Some("File: debug log"))
+        );
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_sends_sticker_through_bridge() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let dir = tempfile::tempdir()?;
+        let sticker_path = dir.path().join("shrug.webp");
+        fs::write(&sticker_path, b"webp")?;
+        let provider = WhatsAppProvider::new("test:send-sticker")?;
+        provider.connect().await?;
+
+        let chat_id = arc_str("whatsapp:123@s.whatsapp.net");
+        let sent_id = provider
+            .send(
+                &chat_id,
+                Content::Sticker(Media {
+                    id: arc_str("sticker-1"),
+                    file_name: arc_str("shrug.webp"),
+                    mime_type: arc_str("image/webp"),
+                    size_bytes: Some(4),
+                    caption: None,
+                    local_path: Some(sticker_path.clone()),
+                    thumbnail: None,
+                }),
+                None,
+            )
+            .await?;
+        assert!(sent_id.starts_with("test-sent-media-"));
+        let history = provider.history(&chat_id, None, 10).await?;
+        assert!(matches!(history[0].content, Content::Sticker(_)));
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_media_send_requires_local_path() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:send-media-missing-path")?;
+        provider.connect().await?;
+
+        let error = provider
+            .send(
+                &arc_str("whatsapp:123@s.whatsapp.net"),
+                Content::File(Media {
+                    id: arc_str("file-1"),
+                    file_name: arc_str("missing.log"),
+                    mime_type: arc_str("text/plain"),
+                    ..Media::default()
+                }),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("local file path"));
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_sends_reactions_through_bridge() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:react")?;
+        provider.connect().await?;
+
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"message","id":"react-target","chat_jid":"123@s.whatsapp.net","sender_jid":"123@s.whatsapp.net","sender_name":"Ada","text":"react to this","timestamp":"2026-06-05T12:00:00Z"}"#
+        )?);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let chat_id = arc_str("whatsapp:123@s.whatsapp.net");
+        let message_id = arc_str("react-target");
+        let history = provider.history(&chat_id, None, 10).await?;
+        let message = history
+            .iter()
+            .find(|message| message.id == message_id)
+            .unwrap()
+            .clone();
+        provider.react(&chat_id, &message, "👍").await?;
+        let history = provider.history(&chat_id, None, 10).await?;
+        let message = history
+            .iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        assert!(message_reacted_by_sender(
+            message,
+            "👍",
+            LOCAL_REACTION_SENDER
+        ));
+
+        let history = provider.history(&chat_id, None, 10).await?;
+        let message = history
+            .iter()
+            .find(|message| message.id == message_id)
+            .unwrap()
+            .clone();
+        provider.react(&chat_id, &message, "👍").await?;
+        let history = provider.history(&chat_id, None, 10).await?;
+        let message = history
+            .iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        assert!(!message_reacted_by_sender(
+            message,
+            "👍",
+            LOCAL_REACTION_SENDER
+        ));
 
         provider.disconnect().await?;
         Ok(())

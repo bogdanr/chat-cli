@@ -237,8 +237,30 @@ impl Store {
         Ok(())
     }
 
+    pub async fn get_messages_for_chat(
+        &self,
+        account_id: &ProviderId,
+        chat_id: &ChatId,
+        before: Option<Timestamp>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        self.get_messages_for_chat_internal(Some(account_id), chat_id, before, limit)
+            .await
+    }
+
     pub async fn get_messages(
         &self,
+        chat_id: &ChatId,
+        before: Option<Timestamp>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        self.get_messages_for_chat_internal(None, chat_id, before, limit)
+            .await
+    }
+
+    async fn get_messages_for_chat_internal(
+        &self,
+        account_id: Option<&ProviderId>,
         chat_id: &ChatId,
         before: Option<Timestamp>,
         limit: usize,
@@ -246,15 +268,28 @@ impl Store {
         let conn = self.conn.lock().await;
         let limit = usize_to_i64(limit)?;
         let before = before.map(|t| t.timestamp_millis()).unwrap_or(i64::MAX);
-        let mut stmt = conn.prepare(
-            "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
-                    content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
-             FROM messages WHERE chat_id = ?1 AND timestamp < ?2 ORDER BY timestamp DESC LIMIT ?3",
-        )?;
-        let mut messages = stmt
-            .query_map(params![chat_id.as_ref(), before, limit], message_from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut messages = if let Some(account_id) = account_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
+                        content_type, content_text, content_caption, media_id, media_filename, media_mime,
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+                 FROM messages WHERE account_id = ?1 AND chat_id = ?2 AND timestamp < ?3 ORDER BY timestamp DESC LIMIT ?4",
+            )?;
+            stmt.query_map(
+                params![account_id.as_ref(), chat_id.as_ref(), before, limit],
+                message_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
+                        content_type, content_text, content_caption, media_id, media_filename, media_mime,
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+                 FROM messages WHERE chat_id = ?1 AND timestamp < ?2 ORDER BY timestamp DESC LIMIT ?3",
+            )?;
+            stmt.query_map(params![chat_id.as_ref(), before, limit], message_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
         for msg in &mut messages {
             hydrate_reactions_and_receipts(&conn, msg)?;
         }
@@ -333,24 +368,81 @@ impl Store {
 #[derive(serde::Deserialize, serde::Serialize)]
 struct StoredPoll {
     question: String,
-    options: Vec<String>,
+    options: Vec<StoredPollOption>,
     selectable_options_count: Option<u32>,
+    #[serde(default)]
+    votes: Vec<StoredPollVote>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+enum StoredPollOption {
+    Full { id: String, label: String },
+    Legacy(String),
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredPollVote {
+    sender: String,
+    options: Vec<String>,
+    timestamp: Option<i64>,
 }
 
 impl StoredPoll {
     fn from_poll(poll: &Poll) -> Self {
         Self {
             question: poll.question.to_string(),
-            options: poll.options.iter().map(ToString::to_string).collect(),
+            options: poll
+                .options
+                .iter()
+                .map(|option| StoredPollOption::Full {
+                    id: option.id.to_string(),
+                    label: option.label.to_string(),
+                })
+                .collect(),
             selectable_options_count: poll.selectable_options_count,
+            votes: poll
+                .votes
+                .iter()
+                .map(|vote| StoredPollVote {
+                    sender: vote.sender.to_string(),
+                    options: vote.options.iter().map(ToString::to_string).collect(),
+                    timestamp: vote.timestamp.map(|value| value.timestamp_millis()),
+                })
+                .collect(),
         }
     }
 
     fn into_poll(self) -> Poll {
         Poll {
             question: arc_str(self.question),
-            options: self.options.into_iter().map(arc_str).collect(),
+            options: self
+                .options
+                .into_iter()
+                .map(|option| match option {
+                    StoredPollOption::Full { id, label } => PollOption {
+                        id: arc_str(id),
+                        label: arc_str(label),
+                    },
+                    StoredPollOption::Legacy(label) => PollOption {
+                        id: arc_str(label.clone()),
+                        label: arc_str(label),
+                    },
+                })
+                .collect(),
             selectable_options_count: self.selectable_options_count,
+            votes: self
+                .votes
+                .into_iter()
+                .filter(|vote| !vote.sender.is_empty())
+                .map(|vote| PollVote {
+                    sender: arc_str(vote.sender),
+                    options: vote.options.into_iter().map(arc_str).collect(),
+                    timestamp: vote
+                        .timestamp
+                        .and_then(|timestamp| Utc.timestamp_millis_opt(timestamp).single()),
+                })
+                .collect(),
         }
     }
 }
@@ -576,6 +668,7 @@ fn poll_from_text(text: Option<String>) -> Content {
                 question: arc_str(text),
                 options: Vec::new(),
                 selectable_options_count: None,
+                votes: Vec::new(),
             })
         })
 }
@@ -845,7 +938,9 @@ mod tests {
         refreshed_message.content = Content::Text(arc_str("hello from refreshed sync".to_owned()));
         store.upsert_message(&refreshed_message).await?;
 
-        let messages = store.get_messages(&chat.id, None, 10).await?;
+        let messages = store
+            .get_messages_for_chat(&chat.account, &chat.id, None, 10)
+            .await?;
         assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].timestamp.timestamp_millis(),
@@ -941,7 +1036,9 @@ mod tests {
                 .await?;
         }
 
-        let messages = store.get_messages(&chat_id, None, 10).await?;
+        let messages = store
+            .get_messages_for_chat(&account_id, &chat_id, None, 10)
+            .await?;
         let ids = messages
             .iter()
             .map(|message| message.id.as_ref())

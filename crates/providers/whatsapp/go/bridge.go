@@ -18,9 +18,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -44,12 +47,17 @@ type client struct {
 	cancel    context.CancelFunc
 }
 
+type bridgeReaction struct {
+	Emoji  string   `json:"emoji"`
+	Sender []string `json:"senders"`
+}
+
 type bridgeEvent struct {
 	Type       string `json:"type"`
-	Code       string `json:"code,omitempty"`
 	Event      string `json:"event,omitempty"`
-	Message    string `json:"message,omitempty"`
 	Reason     string `json:"reason,omitempty"`
+	Message    string `json:"message,omitempty"`
+	Code       string `json:"code,omitempty"`
 	JID        string `json:"jid,omitempty"`
 	ID         string `json:"id,omitempty"`
 	ChatJID    string `json:"chat_jid,omitempty"`
@@ -63,24 +71,29 @@ type bridgeEvent struct {
 	IsGroup    bool   `json:"is_group,omitempty"`
 	Progress   uint8  `json:"progress,omitempty"`
 
-	ContentType       string `json:"content_type,omitempty"`
-	MediaID           string `json:"media_id,omitempty"`
-	MediaFileName     string `json:"media_file_name,omitempty"`
-	MediaMime         string `json:"media_mime,omitempty"`
-	MediaSize         uint64 `json:"media_size,omitempty"`
-	MediaLocalPath    string `json:"media_local_path,omitempty"`
-	MediaThumbnail    string `json:"media_thumbnail_path,omitempty"`
-	Caption           string   `json:"caption,omitempty"`
-	ReactionMessageID string   `json:"reaction_message_id,omitempty"`
-	ReactionEmoji     string   `json:"reaction_emoji,omitempty"`
-	PollQuestion      string   `json:"poll_question,omitempty"`
-	PollOptions       []string `json:"poll_options,omitempty"`
-	PollSelectable    uint32   `json:"poll_selectable_options_count,omitempty"`
+	ContentType           string           `json:"content_type,omitempty"`
+	MediaID               string           `json:"media_id,omitempty"`
+	MediaFileName         string           `json:"media_file_name,omitempty"`
+	MediaMime             string           `json:"media_mime,omitempty"`
+	MediaSize             uint64           `json:"media_size,omitempty"`
+	MediaLocalPath        string           `json:"media_local_path,omitempty"`
+	MediaThumbnail        string           `json:"media_thumbnail_path,omitempty"`
+	Caption               string           `json:"caption,omitempty"`
+	ReactionMessageID     string           `json:"reaction_message_id,omitempty"`
+	ReactionMessageFromMe bool             `json:"reaction_message_from_me,omitempty"`
+	ReactionEmoji         string           `json:"reaction_emoji,omitempty"`
+	Reactions             []bridgeReaction `json:"reactions,omitempty"`
+	PollQuestion          string           `json:"poll_question,omitempty"`
+	PollOptions           []string         `json:"poll_options,omitempty"`
+	PollOptionIDs         []string         `json:"poll_option_ids,omitempty"`
+	PollSelectable        uint32           `json:"poll_selectable_options_count,omitempty"`
+	PollVoteMessageID     string           `json:"poll_vote_message_id,omitempty"`
+	PollVoteOptions       []string         `json:"poll_vote_options,omitempty"`
 }
 
 var (
 	mu       sync.Mutex
-	clients  = map[uint64]*client{}
+	clients         = map[uint64]*client{}
 	nextID   uint64 = 1
 	msgCb    C.MessageCallback
 	msgCbCtx unsafe.Pointer
@@ -248,6 +261,260 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char) *C.char {
 	})
 }
 
+//export C_SendMedia
+func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C.char, fileName *C.char, caption *C.char, contentType *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	chatRaw := C.GoString(chatJID)
+	pathRaw := C.GoString(path)
+	mimeRaw := firstNonEmpty(C.GoString(mimeType), mime.TypeByExtension(filepath.Ext(pathRaw)), "application/octet-stream")
+	fileNameRaw := firstNonEmpty(C.GoString(fileName), filepath.Base(pathRaw), "upload")
+	captionRaw := C.GoString(caption)
+	contentRaw := strings.ToLower(strings.TrimSpace(C.GoString(contentType)))
+	contentRaw = normalizeOutboundContentType(contentRaw, mimeRaw)
+	if contentRaw == "" {
+		return cJSON(bridgeEvent{Type: "error", Message: "unsupported WhatsApp media type"})
+	}
+
+	info, err := os.Stat(pathRaw)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("read WhatsApp media file: %v", err)})
+	}
+	if !info.Mode().IsRegular() {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("WhatsApp media path is not a regular file: %s", pathRaw)})
+	}
+
+	c.log("sending WhatsApp media chat=%s path=%s file=%s mime=%s content_type=%s size=%d", chatRaw, pathRaw, fileNameRaw, mimeRaw, contentRaw, info.Size())
+
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{
+			Type:           "sent",
+			ID:             fmt.Sprintf("test-sent-media-%d", time.Now().UnixNano()),
+			ChatJID:        chatRaw,
+			SenderJID:      "test-device@s.whatsapp.net",
+			Text:           captionRaw,
+			Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
+			FromMe:         true,
+			IsGroup:        strings.Contains(chatRaw, "@g.us"),
+			ContentType:    contentRaw,
+			MediaID:        mediaID(pathRaw, fileNameRaw),
+			MediaFileName:  fileNameRaw,
+			MediaMime:      mimeRaw,
+			MediaSize:      uint64(info.Size()),
+			MediaLocalPath: pathRaw,
+			Caption:        captionRaw,
+		})
+	}
+	if c.wa == nil {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	jid, err := types.ParseJID(chatRaw)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
+	}
+	dataPath, messageMime, messageContentType, cleanup, err := prepareOutboundMediaUpload(c, pathRaw, mimeRaw, contentRaw)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: err.Error()})
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	data, err := os.ReadFile(dataPath)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("read WhatsApp media file: %v", err)})
+	}
+	if len(data) == 0 {
+		return cJSON(bridgeEvent{Type: "error", Message: "cannot send an empty WhatsApp media file"})
+	}
+
+	appInfo := outboundMediaType(messageContentType)
+	upload, err := c.wa.Upload(context.Background(), data, appInfo)
+	if err != nil {
+		c.log("upload WhatsApp media failed chat=%s path=%s mime=%s content_type=%s: %v", chatRaw, dataPath, messageMime, messageContentType, err)
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("upload WhatsApp media: %v", err)})
+	}
+	message := outboundMediaMessage(messageContentType, upload, messageMime, fileNameRaw, captionRaw)
+	if message == nil {
+		return cJSON(bridgeEvent{Type: "error", Message: "unsupported WhatsApp media type"})
+	}
+	resp, err := c.wa.SendMessage(context.Background(), jid, message)
+	if err != nil {
+		c.log("send WhatsApp media failed chat=%s path=%s mime=%s content_type=%s: %v", chatRaw, dataPath, messageMime, messageContentType, err)
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp media: %v", err)})
+	}
+	id := resp.ID
+	if id == "" {
+		id = string(whatsmeow.GenerateMessageID())
+	}
+	c.log("sent WhatsApp media id=%s chat=%s path=%s upload_path=%s mime=%s content_type=%s original_content_type=%s", id, jid.String(), pathRaw, dataPath, messageMime, messageContentType, contentRaw)
+	return cJSON(bridgeEvent{
+		Type:           "sent",
+		ID:             id,
+		ChatJID:        jid.String(),
+		SenderJID:      c.ownJID(),
+		Text:           captionRaw,
+		Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
+		FromMe:         true,
+		IsGroup:        strings.HasSuffix(jid.Server, "g.us"),
+		ContentType:    contentRaw,
+		MediaID:        mediaID(id, upload.DirectPath),
+		MediaFileName:  fileNameRaw,
+		MediaMime:      mimeRaw,
+		MediaSize:      uint64(info.Size()),
+		MediaLocalPath: pathRaw,
+		Caption:        captionRaw,
+	})
+}
+
+//export C_SendReaction
+func C_SendReaction(clientID C.uint64_t, chatJID *C.char, senderJID *C.char, messageID *C.char, emoji *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	chatRaw := C.GoString(chatJID)
+	senderRaw := C.GoString(senderJID)
+	targetID := C.GoString(messageID)
+	reaction := C.GoString(emoji)
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{
+			Type:                  "reaction",
+			ID:                    fmt.Sprintf("test-reaction-%d", time.Now().UnixNano()),
+			ChatJID:               chatRaw,
+			SenderJID:             c.ownJID(),
+			Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
+			FromMe:                true,
+			ReactionMessageID:     targetID,
+			ReactionMessageFromMe: senderRaw == "" || senderRaw == c.ownJID(),
+			ReactionEmoji:         reaction,
+		})
+	}
+	if c.wa == nil {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+	if targetID == "" {
+		return cJSON(bridgeEvent{Type: "error", Message: "cannot send WhatsApp reaction without a target message ID"})
+	}
+
+	chat, err := types.ParseJID(chatRaw)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
+	}
+	sender := types.EmptyJID
+	if senderRaw != "" && senderRaw != "me" {
+		if sender, err = types.ParseJID(senderRaw); err != nil {
+			return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp sender JID: %v", err)})
+		}
+	}
+
+	resp, err := c.wa.SendMessage(context.Background(), chat, c.wa.BuildReaction(chat, sender, targetID, reaction))
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp reaction: %v", err)})
+	}
+	id := resp.ID
+	if id == "" {
+		id = string(whatsmeow.GenerateMessageID())
+	}
+	return cJSON(bridgeEvent{
+		Type:                  "reaction",
+		ID:                    id,
+		ChatJID:               chat.String(),
+		SenderJID:             c.ownJID(),
+		Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
+		FromMe:                true,
+		ReactionMessageID:     targetID,
+		ReactionMessageFromMe: sender.IsEmpty() || senderRaw == c.ownJID(),
+		ReactionEmoji:         reaction,
+	})
+}
+
+//export C_SendPollVote
+func C_SendPollVote(clientID C.uint64_t, chatJID *C.char, senderJID *C.char, messageID *C.char, selectedOptionsJSON *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	chatRaw := C.GoString(chatJID)
+	senderRaw := C.GoString(senderJID)
+	targetID := C.GoString(messageID)
+	var selectedOptions []string
+	if err := json.Unmarshal([]byte(C.GoString(selectedOptionsJSON)), &selectedOptions); err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid poll vote options: %v", err)})
+	}
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{
+			Type:              "poll_vote",
+			ID:                fmt.Sprintf("test-poll-vote-%d", time.Now().UnixNano()),
+			ChatJID:           chatRaw,
+			SenderJID:         c.ownJID(),
+			Timestamp:         time.Now().UTC().Format(time.RFC3339Nano),
+			FromMe:            true,
+			PollVoteMessageID: targetID,
+			PollVoteOptions:   selectedOptions,
+		})
+	}
+	if c.wa == nil {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+	if targetID == "" {
+		return cJSON(bridgeEvent{Type: "error", Message: "cannot vote in a WhatsApp poll without a target message ID"})
+	}
+
+	chat, err := types.ParseJID(chatRaw)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
+	}
+	sender := types.EmptyJID
+	if senderRaw != "" && senderRaw != "me" {
+		if sender, err = types.ParseJID(senderRaw); err != nil {
+			return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp sender JID: %v", err)})
+		}
+	}
+	pollInfo := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			Sender:   sender,
+			IsFromMe: sender.IsEmpty() || senderRaw == c.ownJID(),
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+		ID: targetID,
+	}
+	pollVote, err := c.wa.BuildPollVote(context.Background(), pollInfo, selectedOptions)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("build WhatsApp poll vote: %v", err)})
+	}
+	resp, err := c.wa.SendMessage(context.Background(), chat, pollVote)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp poll vote: %v", err)})
+	}
+	id := resp.ID
+	if id == "" {
+		id = string(whatsmeow.GenerateMessageID())
+	}
+	return cJSON(bridgeEvent{
+		Type:              "poll_vote",
+		ID:                id,
+		ChatJID:           chat.String(),
+		SenderJID:         c.ownJID(),
+		Timestamp:         time.Now().UTC().Format(time.RFC3339Nano),
+		FromMe:            true,
+		PollVoteMessageID: targetID,
+		PollVoteOptions:   selectedOptions,
+	})
+}
+
 //export C_FireSyntheticMessage
 func C_FireSyntheticMessage(message *C.char) C.uint8_t {
 	text := C.GoString(message)
@@ -391,6 +658,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	if message == nil {
 		return
 	}
+	ctx := context.Background()
 	chatJID := message.Info.Chat
 	if message.Info.IsIncomingBroadcast() {
 		chatJID = message.Info.Sender
@@ -398,32 +666,40 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	isGroup := message.Info.IsGroup
 	chatName := ""
 	if c != nil {
-		chatName = conversationName(c, context.Background(), chatJID, "")
+		chatName = conversationName(c, ctx, chatJID, "")
 	}
 	if chatName == "" {
 		chatName = message.Info.PushName
 	}
 
 	if chatName == "" && isGroup && c != nil && c.wa != nil {
-		go c.fetchAndEmitGroupInfo(context.Background(), chatJID)
+		go c.fetchAndEmitGroupInfo(ctx, chatJID)
+	}
+
+	senderName := message.Info.PushName
+	if c != nil && !message.Info.Sender.IsEmpty() && !message.Info.IsFromMe {
+		senderName = participantName(c, ctx, message.Info.Sender, message.Info.SenderAlt, senderName)
 	}
 
 	if reaction := message.Message.GetReactionMessage(); reaction != nil {
-		targetID := reaction.GetKey().GetID()
-		if targetID != "" {
-			emit(bridgeEvent{
-				Type:              "reaction",
-				ID:                message.Info.ID,
-				ChatJID:           chatJID.String(),
-				ChatName:          chatName,
-				SenderJID:         message.Info.Sender.String(),
-				SenderName:        message.Info.PushName,
-				Timestamp:         message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
-				FromMe:            message.Info.IsFromMe,
-				IsGroup:           isGroup,
-				ReactionMessageID: targetID,
-				ReactionEmoji:     reaction.GetText(),
-			})
+		emitReactionMessageEvent(message, reaction, chatJID, chatName, senderName, isGroup)
+		return
+	}
+	if message.Message.GetEncReactionMessage() != nil {
+		if c != nil && c.wa != nil {
+			reaction, err := c.wa.DecryptReaction(ctx, message)
+			if err == nil && reaction != nil {
+				emitReactionMessageEvent(message, reaction, chatJID, chatName, senderName, isGroup)
+			}
+		}
+		return
+	}
+	if message.Message.GetPollUpdateMessage() != nil {
+		if c != nil && c.wa != nil {
+			vote, err := c.wa.DecryptPollVote(ctx, message)
+			if err == nil && vote != nil {
+				emitPollVoteEvent(message, vote, chatJID, chatName, senderName, isGroup)
+			}
 		}
 		return
 	}
@@ -434,11 +710,12 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		ChatJID:    chatJID.String(),
 		ChatName:   chatName,
 		SenderJID:  message.Info.Sender.String(),
-		SenderName: message.Info.PushName,
+		SenderName: senderName,
 		Text:       messageText(message.Message),
 		Timestamp:  message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
 		FromMe:     message.Info.IsFromMe,
 		IsGroup:    isGroup,
+		Reactions:  messageReactions(message),
 	}
 	if poll := pollCreation(message.Message); poll != nil {
 		event.ContentType = "poll"
@@ -448,10 +725,15 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		for _, option := range poll.GetOptions() {
 			if name := option.GetOptionName(); name != "" {
 				event.PollOptions = append(event.PollOptions, name)
+				hash := sha256.Sum256([]byte(name))
+				event.PollOptionIDs = append(event.PollOptionIDs, hex.EncodeToString(hash[:]))
 			}
 		}
 	} else {
 		applyMedia(c, message.Info.ID, message.Message, &event)
+	}
+	if shouldSkipUnsupportedDisplayMessage(event) {
+		return
 	}
 	emit(event)
 
@@ -461,37 +743,184 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		profileName := chatName
 		if !isGroup && !message.Info.Sender.IsEmpty() && !message.Info.IsFromMe {
 			profileTarget = message.Info.Sender
-			profileName = message.Info.PushName
+			profileName = senderName
 		}
 		go c.fetchAndEmitProfile(ctx, profileTarget, profileName, isGroup)
 		if isGroup && !message.Info.Sender.IsEmpty() {
-			go c.fetchAndEmitProfile(ctx, message.Info.Sender, message.Info.PushName, false)
+			go c.fetchAndEmitProfile(ctx, message.Info.Sender, senderName, false)
+		}
+		if !message.Info.SenderAlt.IsEmpty() {
+			go c.fetchAndEmitProfile(ctx, message.Info.SenderAlt, senderName, false)
 		}
 	}
 }
 
-func conversationName(c *client, ctx context.Context, jid types.JID, fallback string) string {
-	if fallback != "" {
-		return fallback
+func emitReactionMessageEvent(message *events.Message, reaction *waProto.ReactionMessage, chatJID types.JID, chatName, senderName string, isGroup bool) {
+	if message == nil || reaction == nil {
+		return
 	}
+	targetKey := reaction.GetKey()
+	targetID := targetKey.GetID()
+	if targetID == "" {
+		return
+	}
+	emit(bridgeEvent{
+		Type:                  "reaction",
+		ID:                    message.Info.ID,
+		ChatJID:               chatJID.String(),
+		ChatName:              chatName,
+		SenderJID:             message.Info.Sender.String(),
+		SenderName:            senderName,
+		Timestamp:             message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
+		FromMe:                message.Info.IsFromMe,
+		IsGroup:               isGroup,
+		ReactionMessageID:     targetID,
+		ReactionMessageFromMe: targetKey.GetFromMe(),
+		ReactionEmoji:         reaction.GetText(),
+	})
+}
+
+func emitPollVoteEvent(message *events.Message, vote *waProto.PollVoteMessage, chatJID types.JID, chatName, senderName string, isGroup bool) {
+	if message == nil || vote == nil {
+		return
+	}
+	pollUpdate := message.Message.GetPollUpdateMessage()
+	if pollUpdate == nil || pollUpdate.GetPollCreationMessageKey().GetID() == "" {
+		return
+	}
+	selected := make([]string, 0, len(vote.GetSelectedOptions()))
+	for _, optionHash := range vote.GetSelectedOptions() {
+		if len(optionHash) > 0 {
+			selected = append(selected, hex.EncodeToString(optionHash))
+		}
+	}
+	emit(bridgeEvent{
+		Type:              "poll_vote",
+		ID:                message.Info.ID,
+		ChatJID:           chatJID.String(),
+		ChatName:          chatName,
+		SenderJID:         message.Info.Sender.String(),
+		SenderName:        senderName,
+		Timestamp:         message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
+		FromMe:            message.Info.IsFromMe,
+		IsGroup:           isGroup,
+		PollVoteMessageID: pollUpdate.GetPollCreationMessageKey().GetID(),
+		PollVoteOptions:   selected,
+	})
+}
+
+func messageReactions(message *events.Message) []bridgeReaction {
+	if message == nil || message.SourceWebMsg == nil {
+		return nil
+	}
+	reactions := message.SourceWebMsg.GetReactions()
+	if len(reactions) == 0 {
+		return nil
+	}
+
+	byEmoji := make(map[string]map[string]struct{})
+	for _, reaction := range reactions {
+		if reaction == nil {
+			continue
+		}
+		emoji := reaction.GetText()
+		if emoji == "" {
+			continue
+		}
+		sender := reactionSenderID(reaction.GetKey())
+		if sender == "" {
+			sender = message.Info.Sender.String()
+		}
+		if byEmoji[emoji] == nil {
+			byEmoji[emoji] = make(map[string]struct{})
+		}
+		byEmoji[emoji][sender] = struct{}{}
+	}
+	if len(byEmoji) == 0 {
+		return nil
+	}
+
+	emojis := make([]string, 0, len(byEmoji))
+	for emoji := range byEmoji {
+		emojis = append(emojis, emoji)
+	}
+	sort.Strings(emojis)
+
+	result := make([]bridgeReaction, 0, len(emojis))
+	for _, emoji := range emojis {
+		senders := make([]string, 0, len(byEmoji[emoji]))
+		for sender := range byEmoji[emoji] {
+			senders = append(senders, sender)
+		}
+		sort.Strings(senders)
+		result = append(result, bridgeReaction{Emoji: emoji, Sender: senders})
+	}
+	return result
+}
+
+func reactionSenderID(key *waProto.MessageKey) string {
+	if key == nil {
+		return ""
+	}
+	if participant := key.GetParticipant(); participant != "" {
+		return participant
+	}
+	return key.GetRemoteJID()
+}
+
+func conversationName(c *client, ctx context.Context, jid types.JID, fallback string) string {
 	if jid.Server == types.GroupServer && c != nil && c.wa != nil {
 		if info, err := c.wa.GetGroupInfo(ctx, jid); err == nil && info != nil && info.Name != "" {
 			return info.Name
 		}
 	}
-	if c != nil && c.wa != nil && c.wa.Store != nil && c.wa.Store.Contacts != nil {
-		if contact, err := c.wa.Store.Contacts.GetContact(ctx, jid); err == nil {
-			for _, name := range []string{contact.FullName, contact.FirstName, contact.BusinessName, contact.PushName} {
-				if name != "" {
-					return name
-				}
-			}
-		}
+	if name, ok := contactDisplayName(c, ctx, jid); ok {
+		return name
 	}
 	if fallback != "" {
 		return fallback
 	}
 	return jid.User
+}
+
+func participantName(c *client, ctx context.Context, primary, alternate types.JID, fallback string) string {
+	if name, ok := contactDisplayName(c, ctx, primary); ok {
+		return name
+	}
+	if name, ok := contactDisplayName(c, ctx, alternate); ok {
+		return name
+	}
+	if fallback != "" {
+		return fallback
+	}
+	if !primary.IsEmpty() {
+		return primary.User
+	}
+	return ""
+}
+
+func contactDisplayName(c *client, ctx context.Context, jid types.JID) (string, bool) {
+	if c == nil || c.wa == nil || c.wa.Store == nil || c.wa.Store.Contacts == nil || jid.IsEmpty() {
+		return "", false
+	}
+	if name, ok := contactDisplayNameForJID(c, ctx, jid); ok {
+		return name, true
+	}
+	if alt, err := c.wa.Store.GetAltJID(ctx, jid); err == nil && !alt.IsEmpty() {
+		return contactDisplayNameForJID(c, ctx, alt)
+	}
+	return "", false
+}
+
+func contactDisplayNameForJID(c *client, ctx context.Context, jid types.JID) (string, bool) {
+	if contact, err := c.wa.Store.Contacts.GetContact(ctx, jid); err == nil {
+		for _, name := range []string{contact.FullName, contact.FirstName, contact.BusinessName, contact.PushName} {
+			if name != "" {
+				return name, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (c *client) fetchAndEmitGroupInfo(ctx context.Context, jid types.JID) {
@@ -580,6 +1009,231 @@ func pollCreation(message *waProto.Message) *waProto.PollCreationMessage {
 		}
 	}
 	return nil
+}
+
+func outboundMediaType(contentType string) whatsmeow.MediaType {
+	switch contentType {
+	case "image", "sticker":
+		return whatsmeow.MediaImage
+	case "gif", "video":
+		return whatsmeow.MediaVideo
+	case "audio":
+		return whatsmeow.MediaAudio
+	default:
+		return whatsmeow.MediaDocument
+	}
+}
+
+func prepareOutboundMediaUpload(c *client, pathRaw, mimeRaw, contentRaw string) (string, string, string, func(), error) {
+	if contentRaw != "gif" {
+		return pathRaw, mimeRaw, contentRaw, nil, nil
+	}
+	converted, err := os.CreateTemp("", "chat-cli-whatsapp-gif-*.mp4")
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("prepare WhatsApp GIF conversion: %v", err)
+	}
+	convertedPath := converted.Name()
+	_ = converted.Close()
+	cleanup := func() { _ = os.Remove(convertedPath) }
+	conversionAttempts := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "libx264",
+			args: []string{
+				"-hide_banner",
+				"-loglevel", "error",
+				"-y",
+				"-i", pathRaw,
+				"-an",
+				"-c:v", "libx264",
+				"-preset", "veryfast",
+				"-movflags", "+faststart",
+				"-pix_fmt", "yuv420p",
+				"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+				convertedPath,
+			},
+		},
+		{
+			name: "h264_v4l2m2m",
+			args: []string{
+				"-hide_banner",
+				"-loglevel", "error",
+				"-y",
+				"-i", pathRaw,
+				"-an",
+				"-c:v", "h264_v4l2m2m",
+				"-movflags", "+faststart",
+				"-pix_fmt", "yuv420p",
+				"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+				convertedPath,
+			},
+		},
+		{
+			name: "h264_vulkan",
+			args: []string{
+				"-hide_banner",
+				"-loglevel", "error",
+				"-y",
+				"-i", pathRaw,
+				"-an",
+				"-c:v", "h264_vulkan",
+				"-movflags", "+faststart",
+				"-pix_fmt", "yuv420p",
+				"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+				convertedPath,
+			},
+		},
+	}
+	if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
+		conversionAttempts = append(conversionAttempts, struct {
+			name string
+			args []string
+		}{
+			name: "h264_vaapi",
+			args: []string{
+				"-hide_banner",
+				"-loglevel", "error",
+				"-y",
+				"-vaapi_device", "/dev/dri/renderD128",
+				"-i", pathRaw,
+				"-an",
+				"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=nv12,hwupload",
+				"-c:v", "h264_vaapi",
+				"-movflags", "+faststart",
+				convertedPath,
+			},
+		})
+	}
+	var messages []string
+	for _, attempt := range conversionAttempts {
+		cmd := exec.Command("ffmpeg", attempt.args...)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			if c != nil {
+				c.log("converted WhatsApp GIF path=%s upload_path=%s encoder=%s", pathRaw, convertedPath, attempt.name)
+			}
+			return convertedPath, "video/mp4", "gif", cleanup, nil
+		}
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			message = err.Error()
+		}
+		messages = append(messages, fmt.Sprintf("%s: %s", attempt.name, message))
+		if c != nil {
+			c.log("convert WhatsApp GIF failed path=%s encoder=%s: %s", pathRaw, attempt.name, message)
+		}
+	}
+	cleanup()
+	return "", "", "", nil, fmt.Errorf("convert WhatsApp GIF to playable video: no usable H.264 encoder found. Install an FFmpeg build with libx264 or working H.264 hardware encoding. Attempts: %s", strings.Join(messages, "; "))
+}
+
+func normalizeOutboundContentType(contentType, mimeType string) string {
+	mimeType = strings.ToLower(strings.TrimSpace(mimeType))
+	if mimeType == "image/gif" {
+		return "gif"
+	}
+	switch contentType {
+	case "image", "video", "audio", "file", "sticker":
+		return contentType
+	case "gif":
+		return "gif"
+	}
+	if strings.HasPrefix(mimeType, "image/") {
+		if mimeType == "image/webp" {
+			return "sticker"
+		}
+		return "image"
+	}
+	if strings.HasPrefix(mimeType, "video/") {
+		return "video"
+	}
+	if strings.HasPrefix(mimeType, "audio/") {
+		return "audio"
+	}
+	if mimeType != "" {
+		return "file"
+	}
+	return ""
+}
+
+func outboundMediaMessage(contentType string, upload whatsmeow.UploadResponse, mimeType, fileName, caption string) *waProto.Message {
+	mediaKeyTimestamp := proto.Int64(time.Now().Unix())
+	switch contentType {
+	case "image":
+		return &waProto.Message{ImageMessage: &waProto.ImageMessage{
+			URL:           proto.String(upload.URL),
+			Mimetype:      proto.String(mimeType),
+			Caption:       proto.String(caption),
+			FileSHA256:    upload.FileSHA256,
+			FileLength:    proto.Uint64(upload.FileLength),
+			MediaKey:      upload.MediaKey,
+			FileEncSHA256: upload.FileEncSHA256,
+			DirectPath:    proto.String(upload.DirectPath),
+		}}
+	case "gif":
+		return &waProto.Message{VideoMessage: &waProto.VideoMessage{
+			URL:               proto.String(upload.URL),
+			Mimetype:          proto.String(mimeType),
+			FileSHA256:        upload.FileSHA256,
+			FileLength:        proto.Uint64(upload.FileLength),
+			Seconds:           proto.Uint32(1),
+			MediaKey:          upload.MediaKey,
+			Caption:           proto.String(caption),
+			FileEncSHA256:     upload.FileEncSHA256,
+			DirectPath:        proto.String(upload.DirectPath),
+			MediaKeyTimestamp: mediaKeyTimestamp,
+			GifPlayback:       proto.Bool(true),
+		}}
+	case "video":
+		return &waProto.Message{VideoMessage: &waProto.VideoMessage{
+			URL:               proto.String(upload.URL),
+			Mimetype:          proto.String(mimeType),
+			FileSHA256:        upload.FileSHA256,
+			FileLength:        proto.Uint64(upload.FileLength),
+			MediaKey:          upload.MediaKey,
+			Caption:           proto.String(caption),
+			FileEncSHA256:     upload.FileEncSHA256,
+			DirectPath:        proto.String(upload.DirectPath),
+			MediaKeyTimestamp: mediaKeyTimestamp,
+			GifPlayback:       proto.Bool(false),
+		}}
+	case "audio":
+		return &waProto.Message{AudioMessage: &waProto.AudioMessage{
+			URL:           proto.String(upload.URL),
+			Mimetype:      proto.String(mimeType),
+			FileSHA256:    upload.FileSHA256,
+			FileLength:    proto.Uint64(upload.FileLength),
+			MediaKey:      upload.MediaKey,
+			FileEncSHA256: upload.FileEncSHA256,
+			DirectPath:    proto.String(upload.DirectPath),
+		}}
+	case "sticker":
+		return &waProto.Message{StickerMessage: &waProto.StickerMessage{
+			URL:               proto.String(upload.URL),
+			FileSHA256:        upload.FileSHA256,
+			FileEncSHA256:     upload.FileEncSHA256,
+			MediaKey:          upload.MediaKey,
+			Mimetype:          proto.String(firstNonEmpty(mimeType, "image/webp")),
+			DirectPath:        proto.String(upload.DirectPath),
+			FileLength:        proto.Uint64(upload.FileLength),
+			MediaKeyTimestamp: mediaKeyTimestamp,
+		}}
+	default:
+		return &waProto.Message{DocumentMessage: &waProto.DocumentMessage{
+			URL:           proto.String(upload.URL),
+			Mimetype:      proto.String(mimeType),
+			Title:         proto.String(fileName),
+			FileSHA256:    upload.FileSHA256,
+			FileLength:    proto.Uint64(upload.FileLength),
+			MediaKey:      upload.MediaKey,
+			FileName:      proto.String(fileName),
+			FileEncSHA256: upload.FileEncSHA256,
+			DirectPath:    proto.String(upload.DirectPath),
+			Caption:       proto.String(caption),
+		}}
+	}
 }
 
 func applyMedia(c *client, messageID string, message *waProto.Message, event *bridgeEvent) {
@@ -683,6 +1337,14 @@ func (c *client) writeMediaThumbnail(mediaID string, data []byte, fallbackExt st
 		return ""
 	}
 	return path
+}
+
+func shouldSkipUnsupportedDisplayMessage(event bridgeEvent) bool {
+	return event.Text == "[unsupported WhatsApp message]" &&
+		event.ContentType == "" &&
+		event.MediaID == "" &&
+		event.ReactionMessageID == "" &&
+		len(event.Reactions) == 0
 }
 
 func mediaID(messageID, directPath string) string {

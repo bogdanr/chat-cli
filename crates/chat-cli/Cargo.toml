@@ -9,9 +9,12 @@ repository.workspace = true
 anyhow.workspace = true
 chat-core = { package = "core", path = "../core" }
 clap.workspace = true
+serde.workspace = true
 storage = { path = "../storage" }
 tokio.workspace = true
+toml.workspace = true
 tui = { path = "../tui" }
+slack = { path = "../providers/slack" }
 whatsapp = { path = "../providers/whatsapp" }
 
 [dev-dependencies]

@@ -1,6 +1,8 @@
-use anyhow::{Context, Result};
-use chat_core::MockProvider;
+use anyhow::{Context, Result, anyhow, bail};
+use chat_core::{MockProvider, Provider};
 use clap::Parser;
+use serde::Deserialize;
+use slack::{SlackAuthMode, SlackProvider, SlackProviderOptions};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -10,12 +12,63 @@ use storage::Store;
 use tui::ProviderBox;
 use whatsapp::{WhatsAppProvider, WhatsAppProviderOptions};
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(author, version, about = "Unified terminal chat client")]
 struct Args {
     /// Use synthetic local data for development and demos.
     #[arg(long, env = "CHAT_CLI_MOCK")]
     mock_provider: bool,
+
+    /// Enable the Slack provider setup/integration.
+    #[arg(long, env = "CHAT_CLI_SLACK")]
+    slack: bool,
+
+    /// Slack auth mode, ordered by robustness: user-oauth, read-only-oauth, bot-token, imported-token, manual-app, webhook.
+    #[arg(long, env = "CHAT_CLI_SLACK_AUTH_MODE", default_value = "user-oauth")]
+    slack_auth_mode: SlackAuthMode,
+
+    /// Slack OAuth client ID for user or manual app setup.
+    #[arg(long, env = "CHAT_CLI_SLACK_CLIENT_ID")]
+    slack_client_id: Option<String>,
+
+    /// Slack OAuth client secret for token exchange. Redacted from debug output.
+    #[arg(long, env = "CHAT_CLI_SLACK_CLIENT_SECRET")]
+    slack_client_secret: Option<String>,
+
+    /// Slack OAuth redirect URI.
+    #[arg(long, env = "CHAT_CLI_SLACK_REDIRECT_URI")]
+    slack_redirect_uri: Option<String>,
+
+    /// Existing Slack user token. Redacted from debug output.
+    #[arg(long, env = "CHAT_CLI_SLACK_USER_TOKEN")]
+    slack_user_token: Option<String>,
+
+    /// Existing Slack bot token. Redacted from debug output.
+    #[arg(long, env = "CHAT_CLI_SLACK_BOT_TOKEN")]
+    slack_bot_token: Option<String>,
+
+    /// Slack app-level token for Socket Mode. Redacted from debug output.
+    #[arg(long, env = "CHAT_CLI_SLACK_APP_TOKEN")]
+    slack_app_token: Option<String>,
+
+    /// Slack incoming webhook URL for send-only fallback mode. Redacted from debug output.
+    #[arg(long, env = "CHAT_CLI_SLACK_WEBHOOK_URL")]
+    slack_webhook_url: Option<String>,
+
+    /// Optional Slack workspace label shown in the account list.
+    #[arg(long, env = "CHAT_CLI_SLACK_WORKSPACE")]
+    slack_workspace: Option<String>,
+
+    /// TOML file containing multiple Slack workspace profiles.
+    #[arg(long, env = "CHAT_CLI_SLACK_WORKSPACES_FILE")]
+    slack_workspaces_file: Option<PathBuf>,
+
+    /// Inline Slack workspace profile. Repeat for multiple workspaces. Format: label=team,auth=user-oauth,user_token=xoxp-...
+    #[arg(
+        long = "slack-workspace-profile",
+        env = "CHAT_CLI_SLACK_WORKSPACE_PROFILES"
+    )]
+    slack_workspace_profiles: Vec<String>,
 
     /// Enable the WhatsApp bridge provider.
     #[arg(long, env = "CHAT_CLI_WHATSAPP")]
@@ -77,6 +130,19 @@ fn build_providers(args: &Args) -> Result<Vec<ProviderBox>> {
     if args.mock_provider {
         providers.push(Box::new(MockProvider::new()));
     }
+
+    for options in slack_provider_options(args)? {
+        let provider = SlackProvider::with_options(options)?;
+        let provider_id = provider.id().clone();
+        if providers
+            .iter()
+            .any(|existing| existing.id().as_ref() == provider_id.as_ref())
+        {
+            bail!("duplicate provider id configured: {}", provider_id);
+        }
+        providers.push(Box::new(provider));
+    }
+
     if args.whatsapp {
         providers.push(Box::new(WhatsAppProvider::with_options(
             WhatsAppProviderOptions {
@@ -87,6 +153,134 @@ fn build_providers(args: &Args) -> Result<Vec<ProviderBox>> {
         )?));
     }
     Ok(providers)
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackWorkspacesFile {
+    workspaces: Vec<SlackWorkspaceProfile>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SlackWorkspaceProfile {
+    workspace: Option<String>,
+    label: Option<String>,
+    auth_mode: Option<String>,
+    auth: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    redirect_uri: Option<String>,
+    user_token: Option<String>,
+    bot_token: Option<String>,
+    app_token: Option<String>,
+    webhook_url: Option<String>,
+}
+
+fn slack_provider_options(args: &Args) -> Result<Vec<SlackProviderOptions>> {
+    let mut profiles = Vec::new();
+
+    if let Some(path) = &args.slack_workspaces_file {
+        profiles.extend(read_slack_workspace_profiles(path)?);
+    }
+
+    for profile in &args.slack_workspace_profiles {
+        profiles.push(parse_slack_workspace_profile(profile)?);
+    }
+
+    let mut options = profiles
+        .into_iter()
+        .map(SlackWorkspaceProfile::into_options)
+        .collect::<Result<Vec<_>>>()?;
+
+    if args.slack {
+        options.insert(0, single_slack_options(args));
+    }
+
+    ensure_unique_slack_provider_ids(&options)?;
+    Ok(options)
+}
+
+fn single_slack_options(args: &Args) -> SlackProviderOptions {
+    SlackProviderOptions {
+        auth_mode: args.slack_auth_mode.clone(),
+        client_id: args.slack_client_id.clone(),
+        client_secret: args.slack_client_secret.clone(),
+        redirect_uri: args.slack_redirect_uri.clone(),
+        bot_token: args.slack_bot_token.clone(),
+        app_token: args.slack_app_token.clone(),
+        user_token: args.slack_user_token.clone(),
+        webhook_url: args.slack_webhook_url.clone(),
+        workspace: args.slack_workspace.clone(),
+    }
+}
+
+fn read_slack_workspace_profiles(path: &Path) -> Result<Vec<SlackWorkspaceProfile>> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading Slack workspaces file {}", path.display()))?;
+    let parsed: SlackWorkspacesFile = toml::from_str(&contents)
+        .with_context(|| format!("parsing Slack workspaces file {}", path.display()))?;
+    Ok(parsed.workspaces)
+}
+
+fn parse_slack_workspace_profile(value: &str) -> Result<SlackWorkspaceProfile> {
+    let mut profile = SlackWorkspaceProfile::default();
+    for segment in value.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        let (key, value) = segment
+            .split_once('=')
+            .ok_or_else(|| anyhow!("Slack workspace profile entries must use key=value pairs"))?;
+        let key = key.trim().replace('-', "_");
+        let value = value.trim().to_owned();
+        match key.as_str() {
+            "workspace" | "label" => profile.workspace = Some(value),
+            "auth" | "auth_mode" => profile.auth_mode = Some(value),
+            "client_id" => profile.client_id = Some(value),
+            "client_secret" => profile.client_secret = Some(value),
+            "redirect_uri" => profile.redirect_uri = Some(value),
+            "user_token" => profile.user_token = Some(value),
+            "bot_token" => profile.bot_token = Some(value),
+            "app_token" => profile.app_token = Some(value),
+            "webhook_url" => profile.webhook_url = Some(value),
+            _ => bail!("unsupported Slack workspace profile key '{key}'"),
+        }
+    }
+    Ok(profile)
+}
+
+fn ensure_unique_slack_provider_ids(options: &[SlackProviderOptions]) -> Result<()> {
+    let mut seen = Vec::<String>::new();
+    for options in options {
+        let provider = SlackProvider::with_options(options.clone())?;
+        let id = provider.id().to_string();
+        if seen.iter().any(|existing| existing == &id) {
+            bail!("duplicate Slack workspace provider id '{id}'. Set unique workspace labels.");
+        }
+        seen.push(id);
+    }
+    Ok(())
+}
+
+impl SlackWorkspaceProfile {
+    fn into_options(self) -> Result<SlackProviderOptions> {
+        let auth_mode = match self.auth_mode.or(self.auth) {
+            Some(auth_mode) => auth_mode.parse::<SlackAuthMode>()?,
+            None => SlackAuthMode::UserOAuth,
+        };
+
+        Ok(SlackProviderOptions {
+            auth_mode,
+            client_id: self.client_id,
+            client_secret: self.client_secret,
+            redirect_uri: self.redirect_uri,
+            bot_token: self.bot_token,
+            app_token: self.app_token,
+            user_token: self.user_token,
+            webhook_url: self.webhook_url,
+            workspace: self.workspace.or(self.label),
+        })
+    }
 }
 
 fn cleanup_paths(args: &Args) -> Vec<PathBuf> {
@@ -143,16 +337,36 @@ fn cleanup_database(path: &PathBuf) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn build_providers_can_enable_mock_and_whatsapp_together() -> Result<()> {
-        let args = Args {
-            mock_provider: true,
-            whatsapp: true,
+    fn base_args() -> Args {
+        Args {
+            mock_provider: false,
+            slack: false,
+            slack_auth_mode: SlackAuthMode::UserOAuth,
+            slack_client_id: None,
+            slack_client_secret: None,
+            slack_redirect_uri: None,
+            slack_user_token: None,
+            slack_bot_token: None,
+            slack_app_token: None,
+            slack_webhook_url: None,
+            slack_workspace: None,
+            slack_workspaces_file: None,
+            slack_workspace_profiles: Vec::new(),
+            whatsapp: false,
             whatsapp_db: PathBuf::from(":memory:"),
             whatsapp_sync: "today".to_owned(),
             log_file: None,
             db: None,
             test_cleanup: false,
+        }
+    }
+
+    #[test]
+    fn build_providers_can_enable_mock_and_whatsapp_together() -> Result<()> {
+        let args = Args {
+            mock_provider: true,
+            whatsapp: true,
+            ..base_args()
         };
 
         let providers = build_providers(&args)?;
@@ -165,18 +379,142 @@ mod tests {
     }
 
     #[test]
-    fn build_providers_leaves_provider_list_empty_without_flags() -> Result<()> {
+    fn build_providers_can_enable_slack_alone() -> Result<()> {
         let args = Args {
-            mock_provider: false,
-            whatsapp: false,
-            whatsapp_db: PathBuf::from(":memory:"),
-            whatsapp_sync: "today".to_owned(),
-            log_file: None,
-            db: None,
-            test_cleanup: false,
+            slack: true,
+            slack_auth_mode: SlackAuthMode::ReadOnlyOAuth,
+            slack_user_token: Some("xoxp-user".to_owned()),
+            slack_workspace: Some("example".to_owned()),
+            ..base_args()
         };
 
-        assert!(build_providers(&args)?.is_empty());
+        let providers = build_providers(&args)?;
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id().as_ref(), "slack:example");
+        assert_eq!(providers[0].platform(), chat_core::Platform::Slack);
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_providers_can_enable_all_provider_flags() -> Result<()> {
+        let args = Args {
+            mock_provider: true,
+            slack: true,
+            slack_auth_mode: SlackAuthMode::Webhook,
+            slack_webhook_url: Some("https://hooks.slack.com/services/T000/B000/secret".to_owned()),
+            whatsapp: true,
+            ..base_args()
+        };
+
+        let providers = build_providers(&args)?;
+
+        assert_eq!(providers.len(), 3);
+        assert_eq!(providers[0].id().as_ref(), "mock:local");
+        assert_eq!(providers[1].id().as_ref(), "slack:setup");
+        assert_eq!(providers[2].id().as_ref(), "whatsapp:bridge");
+
+        Ok(())
+    }
+
+    #[test]
+    fn build_providers_can_enable_multiple_inline_slack_workspaces() -> Result<()> {
+        let args = Args {
+            slack_workspace_profiles: vec![
+                "label=Team Alpha,auth=user-oauth,user_token=xoxp-alpha".to_owned(),
+                "label=Team Beta,auth=bot-token,bot_token=xoxb-beta".to_owned(),
+            ],
+            ..base_args()
+        };
+
+        let providers = build_providers(&args)?;
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].id().as_ref(), "slack:team-alpha");
+        assert_eq!(providers[1].id().as_ref(), "slack:team-beta");
+        assert!(
+            providers
+                .iter()
+                .all(|provider| provider.platform() == chat_core::Platform::Slack)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_providers_can_combine_single_and_profile_slack_workspaces() -> Result<()> {
+        let args = Args {
+            slack: true,
+            slack_workspace: Some("Primary".to_owned()),
+            slack_user_token: Some("xoxp-primary".to_owned()),
+            slack_workspace_profiles: vec![
+                "label=Team Alpha,auth=user-oauth,user_token=xoxp-alpha".to_owned(),
+                "label=Team Beta,auth=webhook,webhook_url=https://hooks.slack.com/services/T000/B000/secret".to_owned(),
+            ],
+            ..base_args()
+        };
+
+        let providers = build_providers(&args)?;
+
+        assert_eq!(providers.len(), 3);
+        assert_eq!(providers[0].id().as_ref(), "slack:primary");
+        assert_eq!(providers[1].id().as_ref(), "slack:team-alpha");
+        assert_eq!(providers[2].id().as_ref(), "slack:team-beta");
+        Ok(())
+    }
+
+    #[test]
+    fn build_providers_reads_multiple_slack_workspaces_from_toml_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("slack-workspaces.toml");
+        fs::write(
+            &path,
+            r#"
+[[workspaces]]
+workspace = "Engineering"
+auth_mode = "read-only-oauth"
+user_token = "xoxp-engineering"
+
+[[workspaces]]
+workspace = "Ops"
+auth_mode = "bot-token"
+bot_token = "xoxb-ops"
+"#,
+        )?;
+        let args = Args {
+            slack_workspaces_file: Some(path),
+            ..base_args()
+        };
+
+        let providers = build_providers(&args)?;
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].id().as_ref(), "slack:engineering");
+        assert_eq!(providers[1].id().as_ref(), "slack:ops");
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_slack_workspace_labels_are_rejected() {
+        let args = Args {
+            slack_workspace_profiles: vec![
+                "label=Team Alpha,user_token=xoxp-alpha".to_owned(),
+                "label=Team Alpha,user_token=xoxp-alpha-2".to_owned(),
+            ],
+            ..base_args()
+        };
+
+        let error = match build_providers(&args) {
+            Ok(_) => panic!("expected duplicate Slack workspace labels to be rejected"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains("duplicate Slack workspace provider id"));
+    }
+
+    #[test]
+    fn build_providers_leaves_provider_list_empty_without_flags() -> Result<()> {
+        assert!(build_providers(&base_args())?.is_empty());
 
         Ok(())
     }
@@ -184,13 +522,11 @@ mod tests {
     #[test]
     fn cleanup_paths_include_explicit_app_db_and_enabled_whatsapp_db() {
         let args = Args {
-            mock_provider: false,
             whatsapp: true,
             whatsapp_db: PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
-            whatsapp_sync: "today".to_owned(),
-            log_file: None,
             db: Some(PathBuf::from("/tmp/chat-cli-app-cleanup.sqlite")),
             test_cleanup: true,
+            ..base_args()
         };
 
         assert_eq!(
@@ -207,13 +543,9 @@ mod tests {
     #[test]
     fn cleanup_paths_do_not_remove_default_or_disabled_whatsapp_db() {
         let args = Args {
-            mock_provider: false,
-            whatsapp: false,
             whatsapp_db: PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
-            whatsapp_sync: "today".to_owned(),
-            log_file: None,
-            db: None,
             test_cleanup: true,
+            ..base_args()
         };
 
         assert!(cleanup_paths(&args).is_empty());

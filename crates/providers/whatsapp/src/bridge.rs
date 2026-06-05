@@ -16,6 +16,29 @@ unsafe extern "C" {
     fn C_Connect(client_id: u64) -> u8;
     fn C_SetMessageCallback(cb: Option<MessageCallback>, user_data: *mut c_void);
     fn C_SendText(client_id: u64, chat_jid: *const c_char, text: *const c_char) -> *mut c_char;
+    fn C_SendMedia(
+        client_id: u64,
+        chat_jid: *const c_char,
+        path: *const c_char,
+        mime_type: *const c_char,
+        file_name: *const c_char,
+        caption: *const c_char,
+        content_type: *const c_char,
+    ) -> *mut c_char;
+    fn C_SendReaction(
+        client_id: u64,
+        chat_jid: *const c_char,
+        sender_jid: *const c_char,
+        message_id: *const c_char,
+        emoji: *const c_char,
+    ) -> *mut c_char;
+    fn C_SendPollVote(
+        client_id: u64,
+        chat_jid: *const c_char,
+        sender_jid: *const c_char,
+        message_id: *const c_char,
+        selected_options_json: *const c_char,
+    ) -> *mut c_char;
     fn C_FireSyntheticMessage(message: *const c_char) -> u8;
     fn C_FreeString(value: *mut c_char);
     fn C_Disconnect(client_id: u64);
@@ -62,6 +85,85 @@ pub fn send_text(handle: ClientHandle, chat_jid: &str, text: &str) -> anyhow::Re
     let chat_jid = CString::new(chat_jid)?;
     let text = CString::new(text)?;
     let response = unsafe { C_SendText(handle, chat_jid.as_ptr(), text.as_ptr()) };
+    take_c_string(response)
+}
+
+pub fn send_media(
+    handle: ClientHandle,
+    chat_jid: &str,
+    path: &str,
+    mime_type: &str,
+    file_name: &str,
+    caption: &str,
+    content_type: &str,
+) -> anyhow::Result<String> {
+    let chat_jid = CString::new(chat_jid)?;
+    let path = CString::new(path)?;
+    let mime_type = CString::new(mime_type)?;
+    let file_name = CString::new(file_name)?;
+    let caption = CString::new(caption)?;
+    let content_type = CString::new(content_type)?;
+    let response = unsafe {
+        C_SendMedia(
+            handle,
+            chat_jid.as_ptr(),
+            path.as_ptr(),
+            mime_type.as_ptr(),
+            file_name.as_ptr(),
+            caption.as_ptr(),
+            content_type.as_ptr(),
+        )
+    };
+    take_c_string(response)
+}
+
+pub fn send_reaction(
+    handle: ClientHandle,
+    chat_jid: &str,
+    sender_jid: &str,
+    message_id: &str,
+    emoji: &str,
+) -> anyhow::Result<String> {
+    let chat_jid = CString::new(chat_jid)?;
+    let sender_jid = CString::new(sender_jid)?;
+    let message_id = CString::new(message_id)?;
+    let emoji = CString::new(emoji)?;
+    let response = unsafe {
+        C_SendReaction(
+            handle,
+            chat_jid.as_ptr(),
+            sender_jid.as_ptr(),
+            message_id.as_ptr(),
+            emoji.as_ptr(),
+        )
+    };
+    take_c_string(response)
+}
+
+pub fn send_poll_vote(
+    handle: ClientHandle,
+    chat_jid: &str,
+    sender_jid: &str,
+    message_id: &str,
+    selected_options: &[String],
+) -> anyhow::Result<String> {
+    let chat_jid = CString::new(chat_jid)?;
+    let sender_jid = CString::new(sender_jid)?;
+    let message_id = CString::new(message_id)?;
+    let selected_options_json = CString::new(serde_json::to_string(selected_options)?)?;
+    let response = unsafe {
+        C_SendPollVote(
+            handle,
+            chat_jid.as_ptr(),
+            sender_jid.as_ptr(),
+            message_id.as_ptr(),
+            selected_options_json.as_ptr(),
+        )
+    };
+    take_c_string(response)
+}
+
+fn take_c_string(response: *mut c_char) -> anyhow::Result<String> {
     if response.is_null() {
         return Ok(String::new());
     }

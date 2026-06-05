@@ -93,6 +93,10 @@ impl Provider for MockProvider {
         self.account.clone()
     }
 
+    fn outbound_capabilities(&self) -> crate::OutboundCapabilities {
+        crate::OutboundCapabilities::all()
+    }
+
     async fn connect(&self) -> Result<()> {
         self.ensure_mock_assets()?;
         self.events.send(ProviderEvent::AuthSucceeded);
@@ -181,7 +185,8 @@ impl Provider for MockProvider {
         Ok(())
     }
 
-    async fn react(&self, chat_id: &ChatId, message_id: &MessageId, emoji: &str) -> Result<()> {
+    async fn react(&self, chat_id: &ChatId, message: &Message, emoji: &str) -> Result<()> {
+        let message_id = message.id.clone();
         let sender = arc_str("me");
         let mut added = false;
         let mut updated = false;
@@ -189,7 +194,7 @@ impl Provider for MockProvider {
             let mut messages = self.write_messages();
             if let Some(message) = messages
                 .iter_mut()
-                .find(|message| message.chat_id == *chat_id && message.id == *message_id)
+                .find(|candidate| candidate.chat_id == *chat_id && candidate.id == message_id)
             {
                 added = toggle_mock_reaction(message, emoji, sender.clone());
                 updated = true;
@@ -207,6 +212,41 @@ impl Provider for MockProvider {
             Ok(())
         } else {
             bail!("mock message not found for reaction: {message_id}")
+        }
+    }
+
+    async fn vote_poll(
+        &self,
+        chat_id: &ChatId,
+        message: &Message,
+        selected_options: &[Arc<str>],
+    ) -> Result<()> {
+        let message_id = message.id.clone();
+        let mut changed = None;
+        {
+            let mut messages = self.write_messages();
+            if let Some(message) = messages
+                .iter_mut()
+                .find(|candidate| candidate.chat_id == *chat_id && candidate.id == message_id)
+            {
+                let Content::Poll(poll) = &mut message.content else {
+                    bail!("mock message is not a poll: {message_id}")
+                };
+                poll.votes.retain(|vote| vote.sender.as_ref() != "me");
+                poll.votes.push(crate::PollVote {
+                    sender: arc_str("me"),
+                    options: selected_options.to_vec(),
+                    timestamp: Some(Utc::now()),
+                });
+                changed = Some(message.clone());
+            }
+        }
+
+        if let Some(message) = changed {
+            self.events.send(ProviderEvent::MessageEdited { message });
+            Ok(())
+        } else {
+            bail!("mock message not found for poll vote: {message_id}")
         }
     }
 
