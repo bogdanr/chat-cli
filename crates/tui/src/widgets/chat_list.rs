@@ -156,6 +156,12 @@ pub fn chat_at(
     }
 }
 
+pub fn avatar_column_bounds(list_area: Rect) -> (u16, u16) {
+    let inner = inner_area(list_area);
+    let start = inner.x.saturating_add(3);
+    (start, start.saturating_add(CHAT_AVATAR_WIDTH))
+}
+
 pub fn rendered_chat_indices(
     chats: &[Chat],
     visible_chat_indices: &[usize],
@@ -218,16 +224,20 @@ fn chat_matches_terms(chat: &Chat, terms: &[String]) -> bool {
     terms.iter().all(|term| haystack.contains(term))
 }
 
+fn unread_marker(unread_count: u32) -> String {
+    if unread_count > 0 {
+        format!("{:>2} ", unread_count.min(99))
+    } else {
+        "   ".to_owned()
+    }
+}
+
 fn chat_item(
     chat: &Chat,
     avatar_rows: Option<&[Vec<Span<'static>>]>,
     theme: Theme,
 ) -> ListItem<'static> {
-    let unread_marker = if chat.unread_count > 0 {
-        format!("●{} ", chat.unread_count)
-    } else {
-        "   ".to_owned()
-    };
+    let unread_marker = unread_marker(chat.unread_count);
     let pinned_marker = if chat.pinned { " [P]" } else { "" };
     let muted_marker = if chat.muted { " [M]" } else { "" };
     let name_style = if chat.unread_count > 0 {
@@ -501,6 +511,15 @@ mod tests {
             ]
         );
         assert_eq!(selected_row_position(&rows, 2), Some(3));
+    }
+
+    #[test]
+    fn unread_marker_shows_count_without_dot_marker() {
+        assert_eq!(unread_marker(0), "   ");
+        assert_eq!(unread_marker(2), " 2 ");
+        assert_eq!(unread_marker(140), "99 ");
+        assert!(!unread_marker(2).contains('•'));
+        assert!(!unread_marker(2).contains('●'));
     }
 
     #[test]

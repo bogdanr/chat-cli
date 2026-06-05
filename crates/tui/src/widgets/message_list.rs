@@ -55,6 +55,7 @@ pub struct MessageHit {
     pub end_line: usize,
     pub message_id: Arc<str>,
     pub line_hits: Vec<MessageLineHit>,
+    pub avatar_hit: Option<MessageLineHit>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -92,10 +93,17 @@ pub fn build_message_lines(
     messages: &[Message],
     content_width: u16,
     scroll: usize,
+    viewport_rows: usize,
     selected_message_id: Option<&str>,
     media_cache: &mut MediaPreviewCache,
     theme: Theme,
 ) -> MessageListRender {
+    let total_lines = message_line_count(messages, content_width);
+    let render_start = scroll.saturating_sub(1);
+    let render_end = scroll
+        .saturating_add(viewport_rows.max(1))
+        .saturating_add(1)
+        .min(total_lines);
     let mut all_lines = Vec::new();
     let mut media_hits = Vec::new();
     let mut message_hits = Vec::new();
@@ -112,26 +120,46 @@ pub fn build_message_lines(
         reply_previews,
     };
 
+    let mut line_cursor: usize = 0;
     for message in messages {
-        let start_line = all_lines.len();
+        let grouped = context
+            .previous_sender
+            .as_ref()
+            .is_some_and(|previous| previous == &message.sender.platform_id);
+        let line_count = message_lines_len(message, grouped, content_width);
+        let message_start = line_cursor;
+        let message_end_exclusive = message_start.saturating_add(line_count);
+        context.previous_sender = Some(message.sender.platform_id.clone());
+        line_cursor = message_end_exclusive;
+
+        if message_end_exclusive <= render_start || message_start >= render_end {
+            continue;
+        }
+
         let selected = selected_message_id == Some(message.id.as_ref());
-        let message_lines = message_lines(message, &mut context, start_line, selected);
-        let line_hits = message_line_hits(&message_lines, start_line, content_width);
-        all_lines.extend(message_lines);
-        let end_line = all_lines.len().saturating_sub(1);
-        if end_line >= start_line {
+        let message_lines = message_lines(message, &mut context, message_start, selected, grouped);
+        let line_hits = message_line_hits(&message_lines, message_start, content_width, grouped);
+        let avatar_hit = message_avatar_hit(&message_lines, message_start, content_width, grouped);
+        let end_line = message_start + message_lines.len().saturating_sub(1);
+        if end_line >= message_start {
             message_hits.push(MessageHit {
-                start_line,
+                start_line: message_start,
                 end_line,
                 message_id: message.id.clone(),
                 line_hits,
+                avatar_hit,
             });
+        }
+        for (offset, line) in message_lines.into_iter().enumerate() {
+            let line_index = message_start + offset;
+            if line_index >= scroll && line_index < render_end {
+                all_lines.push(line);
+            }
         }
     }
 
-    let total_lines = all_lines.len();
     MessageListRender {
-        lines: all_lines.into_iter().skip(scroll).collect(),
+        lines: all_lines,
         media_hits,
         message_hits,
         total_lines,
@@ -142,21 +170,20 @@ fn message_line_hits(
     lines: &[Line<'static>],
     start_line: usize,
     content_width: u16,
+    grouped: bool,
 ) -> Vec<MessageLineHit> {
     lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| is_clickable_message_content_line(line))
+        .filter(|(index, line)| {
+            (*index == 0 && !grouped) || is_clickable_message_content_line(line)
+        })
         .filter_map(|(index, line)| {
             let width = line_width(line).min(content_width as usize) as u16;
             if width == 0 {
                 return None;
             }
-            let start_col = match line.alignment.unwrap_or(Alignment::Left) {
-                Alignment::Right => content_width.saturating_sub(width),
-                Alignment::Center => content_width.saturating_sub(width) / 2,
-                Alignment::Left => 0,
-            };
+            let start_col = aligned_line_start_col(line, width, content_width);
             Some(MessageLineHit {
                 line: start_line + index,
                 start_col,
@@ -164,6 +191,43 @@ fn message_line_hits(
             })
         })
         .collect()
+}
+
+fn message_avatar_hit(
+    lines: &[Line<'static>],
+    start_line: usize,
+    content_width: u16,
+    grouped: bool,
+) -> Option<MessageLineHit> {
+    if grouped {
+        return None;
+    }
+    let header = lines.first()?;
+    let width = line_width(header).min(content_width as usize) as u16;
+    if width == 0 {
+        return None;
+    }
+    let start_col = aligned_line_start_col(header, width, content_width);
+    let selected_prefix = header
+        .spans
+        .first()
+        .filter(|span| span.content.as_ref() == "▏ ")
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+        .unwrap_or_default();
+    let avatar_start = start_col.saturating_add(selected_prefix);
+    Some(MessageLineHit {
+        line: start_line,
+        start_col: avatar_start,
+        end_col: avatar_start.saturating_add(MESSAGE_AVATAR_WIDTH),
+    })
+}
+
+fn aligned_line_start_col(line: &Line<'_>, width: u16, content_width: u16) -> u16 {
+    match line.alignment.unwrap_or(Alignment::Left) {
+        Alignment::Right => content_width.saturating_sub(width),
+        Alignment::Center => content_width.saturating_sub(width) / 2,
+        Alignment::Left => 0,
+    }
 }
 
 fn is_clickable_message_content_line(line: &Line<'_>) -> bool {
@@ -221,6 +285,22 @@ pub fn cached_image_preview_rows(
         .clone()
 }
 
+pub fn image_cell_size(path: &Path, max_width: u16, max_rows: u16) -> Result<(u16, u16), String> {
+    let reader = image::ImageReader::open(path)
+        .map_err(|error| format!("opening {}: {error}", path.display()))?
+        .with_guessed_format()
+        .map_err(|error| format!("detecting {}: {error}", path.display()))?;
+    let dimensions = reader
+        .into_dimensions()
+        .map_err(|error| format!("reading dimensions for {}: {error}", path.display()))?;
+    Ok(fit_halfblock_cell_size(
+        dimensions.0,
+        dimensions.1,
+        max_width,
+        max_rows,
+    ))
+}
+
 pub fn fallback_preview_rows(
     width: u16,
     rows: u16,
@@ -269,13 +349,8 @@ fn message_lines(
     context: &mut MessageRenderContext<'_>,
     start_line: usize,
     selected: bool,
+    grouped: bool,
 ) -> Vec<Line<'static>> {
-    let grouped = context
-        .previous_sender
-        .as_ref()
-        .is_some_and(|previous| previous == &message.sender.platform_id);
-    context.previous_sender = Some(message.sender.platform_id.clone());
-
     let accent_style = bubble_accent(context.theme, message.is_from_me);
     let mut lines = Vec::new();
 
@@ -440,6 +515,9 @@ fn content_lines(
             }
             lines
         }
+        Content::Poll(poll) => {
+            poll_bubble_lines(poll, context.content_width, context.theme, is_from_me)
+        }
         Content::Deleted => text_bubble_lines(
             "[deleted]",
             context.content_width,
@@ -453,6 +531,34 @@ fn content_lines(
             is_from_me,
         ),
     }
+}
+
+fn poll_bubble_lines(
+    poll: &chat_core::Poll,
+    content_width: u16,
+    theme: Theme,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    text_bubble_lines(&poll_text(poll), content_width, theme, is_from_me)
+}
+
+fn poll_text(poll: &chat_core::Poll) -> String {
+    let mut text = format!("POLL: {}", poll.question);
+    for (index, option) in poll.options.iter().enumerate() {
+        text.push('\n');
+        text.push_str(&format!("{}. {}", index + 1, option));
+    }
+    if let Some(selectable) = poll.selectable_options_count
+        && selectable > 0
+    {
+        text.push('\n');
+        if selectable == 1 {
+            text.push_str("Choose one option");
+        } else {
+            text.push_str(&format!("Choose up to {selectable} options"));
+        }
+    }
+    text
 }
 
 fn text_bubble_lines(
@@ -623,7 +729,7 @@ fn is_supported_image(media: &chat_core::Media, path: &Path) -> bool {
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| {
-                ["png", "jpg", "jpeg", "webp"]
+                ["gif", "png", "jpg", "jpeg", "webp"]
                     .iter()
                     .any(|candidate| extension.eq_ignore_ascii_case(candidate))
             })
@@ -641,20 +747,27 @@ fn decode_image_preview_rows(
     let image = reader
         .decode()
         .map_err(|error| format!("decoding {}: {error}", path.display()))?;
+    let (fit_width, fit_rows) =
+        fit_halfblock_cell_size(image.width(), image.height(), width.max(1), rows.max(1));
     let resized = image
         .resize_exact(
-            u32::from(width.max(1)),
-            u32::from(rows.max(1)) * 2,
+            u32::from(fit_width.max(1)),
+            u32::from(fit_rows.max(1)) * 2,
             FilterType::Triangle,
         )
         .to_rgba8();
+    let top_padding = rows.saturating_sub(fit_rows) / 2;
+    let bottom_padding = rows.saturating_sub(fit_rows).saturating_sub(top_padding);
 
     let mut rendered_rows = Vec::with_capacity(rows as usize);
-    for row in 0..rows {
+    for _ in 0..top_padding {
+        rendered_rows.push(empty_preview_row(width));
+    }
+    for row in 0..fit_rows {
         let top_y = u32::from(row) * 2;
         let bottom_y = top_y + 1;
-        let mut spans = Vec::with_capacity(width as usize);
-        for column in 0..width {
+        let mut spans = Vec::with_capacity(fit_width as usize);
+        for column in 0..fit_width {
             let x = u32::from(column);
             let top = resized.get_pixel(x, top_y);
             let bottom = resized.get_pixel(x, bottom_y);
@@ -665,10 +778,63 @@ fn decode_image_preview_rows(
                     .bg(rgba_to_color(bottom.0)),
             ));
         }
-        rendered_rows.push(spans);
+        rendered_rows.push(pad_preview_row(spans, fit_width, width));
+    }
+    for _ in 0..bottom_padding {
+        rendered_rows.push(empty_preview_row(width));
     }
 
     Ok(rendered_rows)
+}
+
+fn fit_halfblock_cell_size(
+    image_width: u32,
+    image_height: u32,
+    max_width: u16,
+    max_rows: u16,
+) -> (u16, u16) {
+    if image_width == 0 || image_height == 0 {
+        return (max_width.max(1), max_rows.max(1));
+    }
+
+    let max_pixel_width = f64::from(max_width.max(1));
+    let max_pixel_height = f64::from(max_rows.max(1)) * 2.0;
+    let scale = (max_pixel_width / image_width as f64)
+        .min(max_pixel_height / image_height as f64)
+        .max(f64::MIN_POSITIVE);
+    let fitted_width = ((image_width as f64 * scale).floor() as u16)
+        .max(1)
+        .min(max_width.max(1));
+    let fitted_pixel_height = ((image_height as f64 * scale).floor() as u16)
+        .max(1)
+        .min(max_rows.max(1).saturating_mul(2));
+    let fitted_rows = fitted_pixel_height.div_ceil(2).max(1).min(max_rows.max(1));
+
+    (fitted_width, fitted_rows)
+}
+
+fn empty_preview_row(width: u16) -> Vec<Span<'static>> {
+    vec![Span::raw(" ".repeat(width as usize))]
+}
+
+fn pad_preview_row(
+    spans: Vec<Span<'static>>,
+    content_width: u16,
+    target_width: u16,
+) -> Vec<Span<'static>> {
+    let left_padding = target_width.saturating_sub(content_width) / 2;
+    let right_padding = target_width
+        .saturating_sub(content_width)
+        .saturating_sub(left_padding);
+    let mut padded = Vec::with_capacity(spans.len() + 2);
+    if left_padding > 0 {
+        padded.push(Span::raw(" ".repeat(left_padding as usize)));
+    }
+    padded.extend(spans);
+    if right_padding > 0 {
+        padded.push(Span::raw(" ".repeat(right_padding as usize)));
+    }
+    padded
 }
 
 fn card_preview_line(accent: Color, preview: Vec<Span<'static>>, width: u16) -> Line<'static> {
@@ -826,10 +992,17 @@ fn fit_cell_text(text: &str, width: u16) -> String {
 }
 
 fn rgba_to_color([red, green, blue, alpha]: [u8; 4]) -> Color {
-    if alpha == 0 {
-        Color::Reset
-    } else {
-        Color::Rgb(red, green, blue)
+    match alpha {
+        0 => Color::Reset,
+        255 => Color::Rgb(red, green, blue),
+        _ => {
+            let alpha = u16::from(alpha);
+            let blend = |channel: u8| {
+                let channel = u16::from(channel);
+                ((channel * alpha + 12 * (255 - alpha)) / 255) as u8
+            };
+            Color::Rgb(blend(red), blend(green), blend(blue))
+        }
     }
 }
 
@@ -954,6 +1127,7 @@ fn content_preview_text(content: &Content) -> String {
             let title = link.title.as_deref().unwrap_or("Link");
             format!("{title}: {}", link.url)
         }
+        Content::Poll(poll) => format!("Poll: {}", poll.question),
         Content::Deleted => String::new(),
         Content::Unsupported(kind) => format!("Unsupported message: {kind}"),
     }
@@ -991,9 +1165,7 @@ fn content_lines_len(content: &Content, content_width: u16) -> usize {
     match content {
         Content::Text(text) => text_bubble_line_count(text, content_width),
         Content::Deleted => text_bubble_line_count("[deleted]", content_width),
-        Content::Unsupported(kind) => {
-            text_bubble_line_count(&format!("[unsupported: {kind}]"), content_width)
-        }
+        Content::Poll(poll) => text_bubble_line_count(&poll_text(poll), content_width),
         Content::Image(media)
         | Content::Video(media)
         | Content::Audio(media)
@@ -1015,6 +1187,9 @@ fn content_lines_len(content: &Content, content_width: u16) -> usize {
                 .map(media_card_line_count)
                 .unwrap_or_default()
         }
+        Content::Unsupported(kind) => {
+            text_bubble_line_count(&format!("[unsupported: {kind}]"), content_width)
+        }
     }
 }
 
@@ -1032,6 +1207,7 @@ mod tests {
     use chat_core::PlatformData;
     use chrono::{TimeZone, Utc};
     use ratatui::{Terminal, backend::TestBackend};
+    use std::path::PathBuf;
 
     #[test]
     fn grouped_outgoing_messages_render_a_timestamp_per_bubble() {
@@ -1066,7 +1242,7 @@ mod tests {
         ];
         let mut cache = MediaPreviewCache::default();
 
-        let render = build_message_lines(&messages, 80, 0, None, &mut cache, Theme::default());
+        let render = build_message_lines(&messages, 80, 0, 200, None, &mut cache, Theme::default());
         let rendered = render
             .lines
             .iter()
@@ -1126,6 +1302,7 @@ mod tests {
             &[incoming],
             80,
             0,
+            40,
             Some("incoming"),
             &mut cache,
             Theme::default(),
@@ -1140,6 +1317,7 @@ mod tests {
             &[outgoing],
             80,
             0,
+            40,
             Some("outgoing"),
             &mut cache,
             Theme::default(),
@@ -1193,6 +1371,70 @@ mod tests {
     }
 
     #[test]
+    fn media_messages_render_reactions_attached_to_the_card() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:media");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let mut message = text_message(
+            "image-with-reaction",
+            &chat_id,
+            &account,
+            sender,
+            "",
+            10,
+            0,
+            false,
+        );
+        message.content = Content::Image(chat_core::Media {
+            id: Arc::<str>::from("media-1"),
+            file_name: Arc::<str>::from("photo.jpg"),
+            mime_type: Arc::<str>::from("image/jpeg"),
+            size_bytes: Some(2048),
+            caption: Some(Arc::<str>::from("last image")),
+            local_path: Some(PathBuf::from("/tmp/missing-photo.jpg")),
+            thumbnail: None,
+        });
+        message.reactions = vec![chat_core::Reaction {
+            emoji: Arc::<str>::from("🔥"),
+            senders: vec![Arc::<str>::from("bob")],
+        }];
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(&[message], 80, 0, 40, None, &mut cache, Theme::default());
+        let rendered_lines = render
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        let media_line = rendered_lines
+            .iter()
+            .position(|line| line.contains("photo.jpg"))
+            .expect("media card file line");
+        let reaction_line = rendered_lines
+            .iter()
+            .position(|line| line.contains("🔥1"))
+            .expect("reaction line");
+        assert!(reaction_line > media_line);
+        assert_eq!(
+            rendered_lines
+                .iter()
+                .filter(|line| line.contains("🔥1"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn message_list_clears_stale_cells_when_redrawing_shorter_content() {
         let backend = TestBackend::new(48, 8);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -1239,6 +1481,47 @@ mod tests {
         assert!(rendered.contains('❤'));
         assert!(!rendered.contains("caption:"));
         assert!(!rendered.contains("Picnic photos"));
+    }
+
+    #[test]
+    fn build_message_lines_only_decodes_visible_media_previews() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:media");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let mut messages = Vec::new();
+        for index in 0..40 {
+            let mut message = text_message(
+                &format!("message-{index}"),
+                &chat_id,
+                &account,
+                sender.clone(),
+                "hello",
+                10,
+                0,
+                false,
+            );
+            message.content = Content::Image(chat_core::Media {
+                id: Arc::<str>::from(format!("media-{index}")),
+                file_name: Arc::<str>::from(format!("photo-{index}.jpg")),
+                mime_type: Arc::<str>::from("image/jpeg"),
+                size_bytes: Some(42),
+                caption: Some(Arc::<str>::from("photo")),
+                local_path: Some(PathBuf::from(format!("/tmp/missing-photo-{index}.jpg"))),
+                thumbnail: None,
+            });
+            messages.push(message);
+        }
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(&messages, 80, 0, 8, None, &mut cache, Theme::default());
+
+        assert!(render.total_lines > render.lines.len());
+        assert!(cache.previews.len() < messages.len());
+        assert!(!render.lines.is_empty());
     }
 
     fn reaction_pill_test_line(emoji: &str, count: usize, _theme: Theme) -> Line<'static> {

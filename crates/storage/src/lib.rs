@@ -330,6 +330,31 @@ impl Store {
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredPoll {
+    question: String,
+    options: Vec<String>,
+    selectable_options_count: Option<u32>,
+}
+
+impl StoredPoll {
+    fn from_poll(poll: &Poll) -> Self {
+        Self {
+            question: poll.question.to_string(),
+            options: poll.options.iter().map(ToString::to_string).collect(),
+            selectable_options_count: poll.selectable_options_count,
+        }
+    }
+
+    fn into_poll(self) -> Poll {
+        Poll {
+            question: arc_str(self.question),
+            options: self.options.into_iter().map(arc_str).collect(),
+            selectable_options_count: self.selectable_options_count,
+        }
+    }
+}
+
 struct StoredContent {
     kind: &'static str,
     text: Option<String>,
@@ -347,6 +372,13 @@ impl StoredContent {
         match content {
             Content::Text(text) => Self::text("text", Some(text.to_string())),
             Content::Unsupported(text) => Self::text("unsupported", Some(text.to_string())),
+            Content::Poll(poll) => Self::text(
+                "poll",
+                Some(
+                    serde_json::to_string(&StoredPoll::from_poll(poll))
+                        .unwrap_or_else(|_| poll.question.to_string()),
+                ),
+            ),
             Content::Deleted => Self::text("deleted", None),
             Content::LinkPreview(link) => Self {
                 kind: "link",
@@ -477,6 +509,7 @@ fn content_from_parts(parts: ContentParts<'_>) -> Content {
     match kind {
         "text" => Content::Text(arc_str(text.unwrap_or_default())),
         "unsupported" => Content::Unsupported(arc_str(text.unwrap_or_default())),
+        "poll" => poll_from_text(text),
         "deleted" => Content::Deleted,
         "link" => Content::LinkPreview(LinkPreview {
             url: arc_str(text.unwrap_or_default()),
@@ -531,6 +564,20 @@ fn content_from_parts(parts: ContentParts<'_>) -> Content {
         )),
         other => Content::Unsupported(arc_str(other.to_owned())),
     }
+}
+
+fn poll_from_text(text: Option<String>) -> Content {
+    let text = text.unwrap_or_default();
+    serde_json::from_str::<StoredPoll>(&text)
+        .map(StoredPoll::into_poll)
+        .map(Content::Poll)
+        .unwrap_or_else(|_| {
+            Content::Poll(Poll {
+                question: arc_str(text),
+                options: Vec::new(),
+                selectable_options_count: None,
+            })
+        })
 }
 
 fn media_from_parts(

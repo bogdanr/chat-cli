@@ -25,10 +25,11 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 directories = "6"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png"] }
 notify-rust = "4"
 open = "5"
 ratatui = "0.30"
+ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 ratatui-textarea = "0.8"
 rmcp = { version = "1.7", features = ["server", "macros"] }
 rusqlite = { version = "0.34", features = ["bundled"] }
@@ -42,4 +43,5 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-width = "0.2"
+qrcode = "0.14"
 uuid = { version = "1", features = ["v4"] }

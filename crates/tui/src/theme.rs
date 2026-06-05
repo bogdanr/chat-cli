@@ -86,4 +86,8 @@ impl Theme {
     pub fn overlay_border(self) -> Style {
         Style::default().fg(self.overlay)
     }
+
+    pub fn help_overlay_border(self) -> Style {
+        Style::default().fg(self.muted)
+    }
 }

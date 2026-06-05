@@ -12,3 +12,7 @@ clap.workspace = true
 storage = { path = "../storage" }
 tokio.workspace = true
 tui = { path = "../tui" }
+whatsapp = { path = "../providers/whatsapp" }
+
+[dev-dependencies]
+tempfile.workspace = true

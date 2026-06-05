@@ -6,8 +6,8 @@ use crate::{
 use anyhow::{Result, anyhow};
 use arboard::Clipboard;
 use chat_core::{
-    Account, AuthChallenge, Chat, Content, Media, Message, MessageId, PlatformData, Provider,
-    ProviderEvent, ProviderId, Reaction, Sender,
+    Account, AuthChallenge, Chat, ChatId, Content, Media, Message, MessageId, PlatformData,
+    Provider, ProviderEvent, ProviderId, Reaction, Sender,
 };
 use chrono::Utc;
 use crossterm::{
@@ -19,15 +19,21 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use qrcode::{EcLevel, QrCode, types::Color as QrColor};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
+};
+use ratatui_image::{
+    FilterType, Image as TerminalImage, Resize,
+    picker::{Picker, ProtocolType},
+    protocol::Protocol,
 };
 use ratatui_textarea::{Input as TextAreaInput, Key as TextAreaKey, TextArea};
 use std::{
@@ -49,12 +55,16 @@ const REACTION_OPTIONS: [&str; 6] = ["👍", "❤️", "😂", "🎉", "😮", "
 const LOCAL_REACTION_SENDER: &str = "me";
 const REACTION_OPTION_CELL_WIDTH: u16 = 6;
 const NOTIFICATION_TICKS: u8 = 16;
+const HELP_PAGE_STEP: usize = 8;
+const HELP_MOUSE_SCROLL_STEP: usize = 3;
+const QR_QUIET_ZONE: usize = 2;
 
 pub type ProviderBox = Box<dyn Provider>;
 
 pub async fn run(store: Arc<Store>, providers: Vec<ProviderBox>) -> Result<()> {
     let mut app = App::new(store, providers).await?;
     let mut terminal = init_terminal()?;
+    app.initialize_image_renderer();
     let result = run_app_loop(&mut terminal, &mut app).await;
     restore_terminal(&mut terminal)?;
     result
@@ -242,6 +252,13 @@ struct ImageViewer {
     caption: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ImageProtocolKey {
+    path: PathBuf,
+    width: u16,
+    height: u16,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActionMenuItem {
     Reply,
@@ -284,6 +301,17 @@ struct ActionMenu {
 struct ReactionPicker {
     message_id: MessageId,
     selected: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HelpOverlay {
+    scroll: usize,
+}
+
+#[derive(Clone, Debug)]
+struct AuthOverlay {
+    provider_id: ProviderId,
+    challenge: AuthChallenge,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -390,6 +418,8 @@ pub struct AppState {
     selected_message_id: Option<MessageId>,
     action_menu: Option<ActionMenu>,
     reaction_picker: Option<ReactionPicker>,
+    help_overlay: Option<HelpOverlay>,
+    auth_overlay: Option<AuthOverlay>,
     account_switcher: Option<AccountSwitcher>,
     active_account: Option<ProviderId>,
     notification: Option<NotificationOverlay>,
@@ -401,6 +431,7 @@ pub struct AppState {
     frame_area: Rect,
     should_quit: bool,
     status: String,
+    pending_history_sync_chat: Option<(ProviderId, ChatId)>,
 }
 
 impl Default for AppState {
@@ -423,6 +454,8 @@ impl Default for AppState {
             selected_message_id: None,
             action_menu: None,
             reaction_picker: None,
+            help_overlay: None,
+            auth_overlay: None,
             account_switcher: None,
             active_account: None,
             notification: None,
@@ -434,6 +467,7 @@ impl Default for AppState {
             frame_area: Rect::default(),
             should_quit: false,
             status: String::new(),
+            pending_history_sync_chat: None,
         };
         state.sync_compose_cache();
         state
@@ -506,6 +540,14 @@ impl AppState {
         self.reaction_picker.is_some()
     }
 
+    pub fn help_overlay_open(&self) -> bool {
+        self.help_overlay.is_some()
+    }
+
+    pub fn help_overlay_scroll(&self) -> Option<usize> {
+        self.help_overlay.as_ref().map(|help| help.scroll)
+    }
+
     pub fn account_switcher_open(&self) -> bool {
         self.account_switcher.is_some()
     }
@@ -569,6 +611,8 @@ pub struct App {
     store: Arc<Store>,
     state: AppState,
     media_preview_cache: message_list::MediaPreviewCache,
+    image_picker: Option<Picker>,
+    image_protocol_cache: HashMap<ImageProtocolKey, Result<Protocol, String>>,
     theme: Theme,
 }
 
@@ -584,6 +628,8 @@ impl App {
             store,
             state: AppState::default(),
             media_preview_cache: message_list::MediaPreviewCache::default(),
+            image_picker: None,
+            image_protocol_cache: HashMap::new(),
             theme: Theme::default(),
         };
         app.bootstrap().await?;
@@ -594,19 +640,28 @@ impl App {
         &self.state
     }
 
+    fn initialize_image_renderer(&mut self) {
+        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        if picker.protocol_type() == ProtocolType::Halfblocks {
+            self.state.status =
+                "terminal image protocols unavailable; using block image previews".to_owned();
+        }
+        self.image_picker = Some(picker);
+    }
+
     pub async fn handle_event(&mut self, event: AppEvent) -> Result<()> {
         match event {
             AppEvent::Key(key) => {
                 self.dismiss_notification();
                 if self.handle_key(key).await? {
-                    self.reload_selected_messages().await?;
+                    self.reload_selected_messages_after_navigation().await?;
                     self.scroll_messages_to_bottom();
                 }
             }
             AppEvent::Mouse(mouse) => {
                 self.dismiss_notification();
                 if self.handle_mouse(mouse).await? {
-                    self.reload_selected_messages().await?;
+                    self.reload_selected_messages_after_navigation().await?;
                     self.scroll_messages_to_bottom();
                     if self.state.focus == FocusPane::Messages {
                         self.mark_selected_chat_read().await?;
@@ -615,6 +670,7 @@ impl App {
             }
             AppEvent::Resize(width, height) => {
                 self.dismiss_notification();
+                self.image_protocol_cache.clear();
                 self.state.status = format!("terminal resized to {width}x{height}");
             }
             AppEvent::Tick => self.handle_tick(),
@@ -674,6 +730,8 @@ impl App {
         self.draw_notification_overlay(frame, frame.area());
         self.draw_account_switcher(frame, frame.area());
         self.draw_image_viewer(frame, frame.area());
+        self.draw_auth_overlay(frame, frame.area());
+        self.draw_help_overlay(frame, frame.area());
         self.draw_action_menu(frame, frame.area());
         self.draw_reaction_picker(frame, frame.area());
     }
@@ -805,7 +863,7 @@ impl App {
         let lines = if self.state.messages.is_empty() {
             self.state.media_hits.clear();
             vec![Line::from(Span::styled(
-                "No messages loaded. Start with --mock to seed sample chats.",
+                "No messages yet. Open or click this chat to sync today's messages.",
                 self.theme.muted(),
             ))]
         } else {
@@ -813,6 +871,7 @@ impl App {
                 &self.state.messages,
                 area.width.saturating_sub(2),
                 self.state.message_scroll,
+                area.height.saturating_sub(2) as usize,
                 self.state.selected_message_id.as_deref(),
                 &mut self.media_preview_cache,
                 self.theme,
@@ -925,6 +984,13 @@ impl App {
             return;
         }
 
+        if let Some(message_id) = &self.state.selected_message_id
+            && let Some(message) = self.message_by_id(message_id)
+        {
+            self.draw_message_details(frame, area, message);
+            return;
+        }
+
         let selected_chat = self
             .state
             .selected_chat()
@@ -990,6 +1056,93 @@ impl App {
                         .focus_border(self.state.focus == FocusPane::Details),
                 ),
         );
+        frame.render_widget(paragraph, area);
+    }
+
+    fn draw_message_details(
+        &self,
+        frame: &mut Frame<'_>,
+        area: ratatui::layout::Rect,
+        message: &Message,
+    ) {
+        let chat_name = self
+            .state
+            .chats
+            .iter()
+            .find(|chat| chat.id == message.chat_id && chat.account == message.account)
+            .map(|chat| chat.name.as_ref())
+            .unwrap_or("Unknown chat");
+        let reply = message
+            .reply_to
+            .as_ref()
+            .map(|id| short_id(id).to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        let thread = message
+            .thread_id
+            .as_ref()
+            .map(|id| short_id(id).to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        let avatar = message
+            .sender
+            .avatar
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not loaded".to_owned());
+        let reactions = if message.reactions.is_empty() {
+            "none".to_owned()
+        } else {
+            message
+                .reactions
+                .iter()
+                .map(|reaction| format!("{} {}", reaction.emoji, reaction.senders.len()))
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+
+        let mut lines = vec![
+            Line::from(Span::styled("Message", self.theme.pane_title())),
+            Line::from(Span::styled(
+                "Click avatar to preview · Enter opens actions",
+                self.theme.muted(),
+            )),
+            Line::from(""),
+            Line::from(format!("Chat: {chat_name}")),
+            Line::from(format!("Sender: {}", message.sender.display_name)),
+            Line::from(format!("Sender ID: {}", message.sender.platform_id)),
+            Line::from(format!("Avatar: {avatar}")),
+            Line::from(format!(
+                "Time: {}",
+                message.timestamp.format("%Y-%m-%d %H:%M:%S")
+            )),
+            Line::from(format!("From me: {}", bool_label(message.is_from_me))),
+            Line::from(format!("Message ID: {}", message.id)),
+            Line::from(format!("Reply to: {reply}")),
+            Line::from(format!("Thread: {thread}")),
+            Line::from(format!("Reactions: {reactions}")),
+            Line::from(""),
+            Line::from(Span::styled("Content", self.theme.status_key())),
+        ];
+
+        let content = content_copy_text(&message.content);
+        if content.trim().is_empty() {
+            lines.push(Line::from(Span::styled("  attachment", self.theme.muted())));
+        } else {
+            for line in content.lines() {
+                lines.push(Line::from(format!("  {line}")));
+            }
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Details")
+                    .borders(Borders::ALL)
+                    .border_style(
+                        self.theme
+                            .focus_border(self.state.focus == FocusPane::Details),
+                    ),
+            )
+            .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
 
@@ -1088,6 +1241,14 @@ impl App {
     fn status_hints(&self) -> Vec<Span<'static>> {
         let hint = |value: &'static str| Span::styled(value, self.theme.status_bar());
 
+        if self.state.help_overlay.is_some() {
+            return vec![
+                hint("Help"),
+                hint("Scroll or PageUp/PageDown"),
+                hint("Esc closes"),
+            ];
+        }
+
         if self.state.image_viewer.is_some() {
             return vec![hint("Click anywhere or press Esc to close")];
         }
@@ -1141,6 +1302,7 @@ impl App {
                 hint("Enter or click opens"),
                 hint("Ctrl+A account filter"),
                 hint("Ctrl+F text filter"),
+                hint("? help"),
             ],
             FocusPane::Messages => {
                 if self.state.selected_message_id.is_some() {
@@ -1148,21 +1310,24 @@ impl App {
                         hint("↑↓ selects messages"),
                         hint("Enter opens actions"),
                         hint("Esc clears selection"),
+                        hint("? help"),
                     ]
                 } else {
                     vec![
                         hint("Click messages to select"),
                         hint("Scroll to browse"),
                         hint("Type to reply"),
+                        hint("? help"),
                     ]
                 }
             }
             FocusPane::Compose => vec![
                 hint("Enter sends"),
                 hint("Ctrl+J adds a new line"),
+                hint("F1 help"),
                 hint("Esc returns to messages"),
             ],
-            FocusPane::Details => vec![hint("← returns"), hint("Ctrl+Q quits")],
+            FocusPane::Details => vec![hint("← returns"), hint("? help"), hint("Ctrl+Q quits")],
         }
     }
 
@@ -1295,6 +1460,226 @@ impl App {
         frame.render_widget(paragraph, modal);
     }
 
+    fn draw_auth_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(overlay) = &self.state.auth_overlay else {
+            return;
+        };
+        if area.width < 34 || area.height < 10 {
+            return;
+        }
+
+        let modal = self.auth_overlay_rect(area);
+        let mut lines = Vec::new();
+        let inner_height = modal.height.saturating_sub(2) as usize;
+        match &overlay.challenge {
+            AuthChallenge::QrCode(code) => {
+                lines.extend([
+                    Line::from(Span::styled(
+                        "WhatsApp QR login required",
+                        self.theme.status_key(),
+                    )),
+                    Line::from("Open WhatsApp > Linked devices > Link a device, then scan below."),
+                ]);
+
+                match render_qr_lines(code.as_ref(), modal.width.saturating_sub(4) as usize) {
+                    Some(qr_lines) if qr_lines.len() + lines.len() + 4 <= inner_height => {
+                        lines.extend(qr_lines);
+                        lines.push(Line::from(Span::styled(
+                            "Esc, Enter, q, or click outside hides this prompt.",
+                            self.theme.muted(),
+                        )));
+                    }
+                    Some(qr_lines) if qr_lines.len() + lines.len() + 2 <= inner_height => {
+                        lines.extend(qr_lines);
+                    }
+                    _ => {
+                        lines.extend([
+                            Line::from(Span::styled(
+                                "QR is too large for this terminal; enlarge the window or use the payload below.",
+                                self.theme.status_key(),
+                            )),
+                            Line::from(Span::styled("QR payload", self.theme.status_key())),
+                            Line::from(truncate_chars(
+                                code.as_ref(),
+                                modal.width.saturating_sub(6) as usize,
+                            )),
+                            Line::from(Span::styled(
+                                "Esc, Enter, q, or click outside hides this prompt.",
+                                self.theme.muted(),
+                            )),
+                        ]);
+                    }
+                }
+            }
+            AuthChallenge::PairingCode(code) => {
+                lines.extend([
+                    Line::from(Span::styled("Pairing code", self.theme.status_key())),
+                    Line::from(code.as_ref().to_owned()),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Esc, Enter, q, or click outside hides this prompt.",
+                        self.theme.muted(),
+                    )),
+                ]);
+            }
+            AuthChallenge::OAuthUrl(url) => {
+                lines.extend([
+                    Line::from(Span::styled("Open this URL", self.theme.status_key())),
+                    Line::from(truncate_chars(
+                        url.as_ref(),
+                        modal.width.saturating_sub(6) as usize,
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Esc, Enter, q, or click outside hides this prompt.",
+                        self.theme.muted(),
+                    )),
+                ]);
+            }
+            AuthChallenge::Waiting => {
+                lines.extend([
+                    Line::from(Span::styled(
+                        "Waiting for provider authentication",
+                        self.theme.status_key(),
+                    )),
+                    Line::from("The provider will update this prompt when a QR or code is ready."),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "Esc, Enter, q, or click outside hides this prompt.",
+                        self.theme.muted(),
+                    )),
+                ]);
+            }
+        }
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Authentication")
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.overlay_border()),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
+    fn draw_help_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(help) = &self.state.help_overlay else {
+            return;
+        };
+        if area.width < 28 || area.height < 10 {
+            return;
+        }
+
+        let modal = self.help_overlay_rect(area);
+        let lines = self.help_overlay_lines();
+        let scroll_max = help_scroll_max(lines.len(), modal);
+        let scroll = help.scroll.min(scroll_max);
+        let title = format!(
+            "Help {}/{}",
+            scroll.saturating_add(1),
+            scroll_max.saturating_add(1)
+        );
+        let backdrop = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+        let backdrop_widget =
+            Paragraph::new("").style(Style::default().fg(self.theme.muted).bg(Color::Black));
+        let paragraph = Paragraph::new(lines.clone())
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.help_overlay_border()),
+            )
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false });
+
+        frame.render_widget(Clear, backdrop);
+        frame.render_widget(backdrop_widget, backdrop);
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+        self.draw_vertical_scrollbar(frame, modal, lines.len(), scroll);
+    }
+
+    fn help_overlay_lines(&self) -> Vec<Line<'static>> {
+        let focus = self.state.focus.label();
+        let selected_chat = self
+            .state
+            .selected_chat()
+            .map(|chat| chat.name.to_string())
+            .unwrap_or_else(|| "No chat selected".to_owned());
+        let selected_message = self
+            .state
+            .selected_message_id
+            .as_ref()
+            .map(|id| short_id(id).to_string())
+            .unwrap_or_else(|| "none".to_owned());
+        let account_filter = self.account_filter_label();
+        let filter = if self.state.filter.is_empty() {
+            "none".to_owned()
+        } else {
+            self.state.filter.clone()
+        };
+
+        vec![
+            Line::from(Span::styled("chat-cli help", self.theme.pane_title())),
+            Line::from(Span::styled(
+                "Press Esc, ?, F1, or q to close. Scroll to see more.",
+                self.theme.muted(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled("Current context", self.theme.status_key())),
+            Line::from(format!("  Focus: {focus}")),
+            Line::from(format!("  Chat: {selected_chat}")),
+            Line::from(format!("  Selected message: {selected_message}")),
+            Line::from(format!("  Account filter: {account_filter}")),
+            Line::from(format!("  Text filter: {filter}")),
+            Line::from(""),
+            Line::from(Span::styled("Everywhere", self.theme.status_key())),
+            Line::from("  F1: open or close this help"),
+            Line::from("  ?: open or close this help outside compose"),
+            Line::from("  Ctrl+Q: quit"),
+            Line::from("  Esc: close popup, cancel reply, or move back"),
+            Line::from("  Left/Right: move between panes"),
+            Line::from("  Mouse/touchpad: click to focus, scroll to browse"),
+            Line::from(""),
+            Line::from(Span::styled("Chats", self.theme.status_key())),
+            Line::from("  Up/Down: choose a chat"),
+            Line::from("  Enter or click: open selected chat"),
+            Line::from("  PageUp/PageDown: jump through chats"),
+            Line::from("  Home/End: first or last chat"),
+            Line::from("  Ctrl+F: filter chats by text"),
+            Line::from("  Ctrl+A: filter by account"),
+            Line::from(""),
+            Line::from(Span::styled("Messages", self.theme.status_key())),
+            Line::from("  Click/tap a message: select and open actions"),
+            Line::from("  Up/Down: select previous or next message"),
+            Line::from("  Enter: open actions for selected message"),
+            Line::from("  PageUp/PageDown or scroll: browse message history"),
+            Line::from("  Type a letter: start composing a reply"),
+            Line::from(""),
+            Line::from(Span::styled("Message actions", self.theme.status_key())),
+            Line::from("  Reply: quote the selected message in compose"),
+            Line::from("  View thread: open replies in the details pane"),
+            Line::from("  React: choose an emoji reaction"),
+            Line::from("  Copy text: copy message text when clipboard is available"),
+            Line::from("  Open image: preview image media"),
+            Line::from(""),
+            Line::from(Span::styled("Compose", self.theme.status_key())),
+            Line::from("  Enter: send message"),
+            Line::from("  Shift+Enter or Alt+Enter: insert newline"),
+            Line::from("  Ctrl+J: insert newline fallback"),
+            Line::from("  Backspace/Delete: edit text"),
+            Line::from("  Esc: return to messages"),
+            Line::from(""),
+            Line::from(Span::styled("Popups", self.theme.status_key())),
+            Line::from("  Arrow keys: move inside action, reaction, and account popups"),
+            Line::from("  Enter: apply selected popup option"),
+            Line::from("  Click outside: close most popups"),
+            Line::from("  Scroll in help: move this page"),
+        ]
+    }
+
     fn draw_notification_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
         let Some(notification) = &self.state.notification else {
             return;
@@ -1388,7 +1773,7 @@ impl App {
     }
 
     fn draw_image_viewer(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let Some(viewer) = &self.state.image_viewer else {
+        let Some(viewer) = self.state.image_viewer.clone() else {
             return;
         };
 
@@ -1397,19 +1782,136 @@ impl App {
             return;
         }
 
-        let preview_area = inner_area(modal);
-        let preview_width = preview_area.width.clamp(1, IMAGE_VIEWER_MAX_WIDTH);
-        let preview_rows = preview_area.height.saturating_sub(4).max(1);
+        let block = Block::default()
+            .title(format!("Image Preview - {}", viewer.title))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = block.inner(modal);
+        let caption_rows = u16::from(viewer.caption.is_some());
+        let footer_rows = caption_rows.saturating_add(1);
+        let image_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(1).saturating_sub(footer_rows),
+        );
+        let footer_y = image_area.y.saturating_add(image_area.height);
+
+        frame.render_widget(Clear, modal);
+        frame.render_widget(block, modal);
+        self.render_overlay_line(
+            frame,
+            Rect::new(inner.x, inner.y, inner.width, 1),
+            Line::from(Span::styled(
+                truncate_chars(&viewer.path.display().to_string(), inner.width as usize),
+                Style::default().fg(Color::DarkGray),
+            )),
+        );
+
+        let rendered_terminal_image = self.render_terminal_image(frame, image_area, &viewer.path);
+        if let Err(error) = rendered_terminal_image {
+            self.render_halfblock_image(frame, image_area, &viewer.path, Some(error));
+        }
+
+        if let Some(caption) = &viewer.caption {
+            self.render_overlay_line(
+                frame,
+                Rect::new(inner.x, footer_y, inner.width, 1),
+                Line::from(truncate_chars(
+                    &format!("Caption: {caption}"),
+                    inner.width as usize,
+                )),
+            );
+        }
+        self.render_overlay_line(
+            frame,
+            Rect::new(
+                inner.x,
+                footer_y.saturating_add(caption_rows),
+                inner.width,
+                1,
+            ),
+            Line::from(Span::styled(
+                "Click anywhere or press Esc to close",
+                Style::default().fg(Color::DarkGray),
+            )),
+        );
+    }
+
+    fn render_terminal_image(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        path: &Path,
+    ) -> std::result::Result<(), String> {
+        if area.is_empty() {
+            return Err("image area is too small".to_owned());
+        }
+        let Some(protocol) =
+            self.cached_terminal_image_protocol(path, Size::new(area.width, area.height))
+        else {
+            return Err("terminal image protocol unavailable".to_owned());
+        };
+        let protocol = protocol?;
+        let image_size = protocol.size();
+        let image_area = centered_fixed_rect(
+            area,
+            image_size.width.min(area.width),
+            image_size.height.min(area.height),
+        );
+        if protocol.needs_placeholder(image_area).is_some() {
+            return Err("terminal image protocol needs a larger placeholder".to_owned());
+        }
+
+        let image = TerminalImage::new(&protocol).allow_clipping(true);
+        frame.render_widget(image, image_area);
+        Ok(())
+    }
+
+    fn cached_terminal_image_protocol(
+        &mut self,
+        path: &Path,
+        size: Size,
+    ) -> Option<std::result::Result<Protocol, String>> {
+        let picker = self.image_picker.as_ref()?;
+        if picker.protocol_type() == ProtocolType::Halfblocks {
+            return None;
+        }
+
+        let key = ImageProtocolKey {
+            path: path.to_path_buf(),
+            width: size.width,
+            height: size.height,
+        };
+        let picker = picker.clone();
+        Some(
+            self.image_protocol_cache
+                .entry(key)
+                .or_insert_with(|| build_terminal_image_protocol(&picker, path, size))
+                .clone(),
+        )
+    }
+
+    fn render_halfblock_image(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        path: &Path,
+        protocol_error: Option<String>,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        let preview_width = area.width.clamp(1, IMAGE_VIEWER_MAX_WIDTH);
+        let preview_rows = area.height.max(1);
+        let preview_area = centered_fixed_rect(area, preview_width, preview_rows);
         let preview = message_list::cached_image_preview_rows(
-            &viewer.path,
+            path,
             &mut self.media_preview_cache,
             preview_width,
             preview_rows,
         );
-        let mut lines = vec![Line::from(Span::styled(
-            truncate_chars(&viewer.path.display().to_string(), preview_width as usize),
-            Style::default().fg(Color::DarkGray),
-        ))];
+        let mut lines = Vec::new();
 
         match preview {
             Ok(preview_rows) => lines.extend(preview_rows.into_iter().map(Line::from)),
@@ -1431,24 +1933,24 @@ impl App {
             }
         }
 
-        if let Some(caption) = &viewer.caption {
-            lines.push(Line::from(format!("Caption: {caption}")));
+        if let Some(protocol_error) = protocol_error {
+            lines.push(Line::from(Span::styled(
+                protocol_error,
+                Style::default().fg(Color::DarkGray),
+            )));
         }
-        lines.push(Line::from(Span::styled(
-            "Click anywhere or press Esc to close",
-            Style::default().fg(Color::DarkGray),
-        )));
 
-        let paragraph = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title(format!("Image Preview - {}", viewer.title))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(Clear, modal);
-        frame.render_widget(paragraph, modal);
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            preview_area,
+        );
+    }
+
+    fn render_overlay_line(&self, frame: &mut Frame<'_>, area: Rect, line: Line<'static>) {
+        if area.is_empty() {
+            return;
+        }
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     async fn bootstrap(&mut self) -> Result<()> {
@@ -1498,20 +2000,30 @@ impl App {
                 is_historical,
             } => {
                 let selected_chat_id = self.state.selected_chat().map(|chat| chat.id.clone());
-                let should_reload = selected_chat_id.as_ref() == Some(&message.chat_id);
+                let should_update_selected = selected_chat_id.as_ref() == Some(&message.chat_id);
                 self.store.upsert_message(&message).await?;
-                if should_reload {
-                    self.reload_selected_messages().await?;
+                if should_update_selected {
+                    if is_historical {
+                        self.append_historical_message_to_current_chat(message.clone());
+                    } else {
+                        self.reload_selected_messages().await?;
+                    }
                 }
-                self.reload_chats().await?;
+                if !is_historical {
+                    self.reload_chats().await?;
+                }
                 self.maybe_show_notification(&message, selected_chat_id.as_ref(), is_historical);
-                if !self
+                if self
                     .state
                     .notification
                     .as_ref()
-                    .is_some_and(|notification| notification.message_id == message.id)
+                    .is_none_or(|notification| notification.message_id != message.id)
                 {
-                    self.state.status = format!("message event from {provider_id}");
+                    self.state.status = if is_historical {
+                        format!("historical message from {provider_id}")
+                    } else {
+                        format!("message event from {provider_id}")
+                    };
                 }
             }
             ProviderEvent::MessageEdited { message } => {
@@ -1526,7 +2038,7 @@ impl App {
             }
             ProviderEvent::ChatUpdated(chat) => {
                 self.store.upsert_chat(&chat).await?;
-                self.reload_chats().await?;
+                self.upsert_chat_in_state(chat);
                 self.state.status = format!("chat updated from {provider_id}");
             }
             ProviderEvent::AuthRequired(challenge) => {
@@ -1535,21 +2047,57 @@ impl App {
                     AccountConnection::NeedsAuth,
                     Some(auth_challenge_label(&challenge).to_owned()),
                 );
+                self.state.auth_overlay = Some(AuthOverlay {
+                    provider_id: provider_id.clone(),
+                    challenge,
+                });
                 self.state.status = format!("authentication required for {provider_id}");
             }
             ProviderEvent::AuthSucceeded => {
+                if self
+                    .state
+                    .auth_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.provider_id == provider_id)
+                {
+                    self.state.auth_overlay = None;
+                }
                 self.set_account_status(&provider_id, AccountConnection::Online, None);
                 self.state.status = format!("authenticated {provider_id}");
             }
             ProviderEvent::SyncProgress(progress) => {
+                if self
+                    .state
+                    .auth_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.provider_id == provider_id)
+                {
+                    self.state.auth_overlay = None;
+                }
                 self.set_account_status(&provider_id, AccountConnection::Syncing(progress), None);
                 self.state.status = format!("sync {provider_id}: {progress}%");
             }
             ProviderEvent::SyncComplete => {
+                if self
+                    .state
+                    .auth_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.provider_id == provider_id)
+                {
+                    self.state.auth_overlay = None;
+                }
                 self.set_account_status(&provider_id, AccountConnection::Online, None);
                 self.state.status = format!("sync complete for {provider_id}");
             }
             ProviderEvent::Disconnected(reason) => {
+                if self
+                    .state
+                    .auth_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.provider_id == provider_id)
+                {
+                    self.state.auth_overlay = None;
+                }
                 let detail = reason.as_deref().map(str::to_owned);
                 self.set_account_status(&provider_id, AccountConnection::Offline, detail.clone());
                 self.state.status = detail
@@ -1557,6 +2105,14 @@ impl App {
                     .unwrap_or_else(|| format!("{provider_id} disconnected"));
             }
             ProviderEvent::Reconnecting => {
+                if self
+                    .state
+                    .auth_overlay
+                    .as_ref()
+                    .is_some_and(|overlay| overlay.provider_id == provider_id)
+                {
+                    self.state.auth_overlay = None;
+                }
                 self.set_account_status(&provider_id, AccountConnection::Reconnecting, None);
                 self.state.status = format!("reconnecting {provider_id}");
             }
@@ -1698,6 +2254,18 @@ impl App {
             return self.handle_account_switcher_key(key);
         }
 
+        if self.state.help_overlay.is_some() {
+            return Ok(self.handle_help_overlay_key(key));
+        }
+
+        if self.state.auth_overlay.is_some()
+            && matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q'))
+        {
+            self.state.auth_overlay = None;
+            self.state.status = "authentication prompt hidden".to_owned();
+            return Ok(false);
+        }
+
         if self.state.action_menu.is_some() {
             return self.handle_action_menu_key(key).await;
         }
@@ -1708,6 +2276,17 @@ impl App {
 
         if self.state.filter_mode {
             return Ok(self.handle_filter_key(key));
+        }
+
+        if matches!(key.code, KeyCode::F(1))
+            || (self.state.focus != FocusPane::Compose
+                && matches!(key.code, KeyCode::Char('?'))
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+        {
+            self.open_help_overlay();
+            return Ok(false);
         }
 
         if is_ctrl_char(key, 'a') {
@@ -1762,6 +2341,44 @@ impl App {
             },
         };
         Ok(selection_changed)
+    }
+
+    fn handle_help_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) | KeyCode::Char('?')
+        ) {
+            self.close_help_overlay();
+            return false;
+        }
+
+        let scroll_max = self.help_scroll_max();
+        let Some(help) = &mut self.state.help_overlay else {
+            return false;
+        };
+
+        match key.code {
+            KeyCode::Down => {
+                help.scroll = help.scroll.saturating_add(1).min(scroll_max);
+            }
+            KeyCode::Up => {
+                help.scroll = help.scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                help.scroll = help.scroll.saturating_add(HELP_PAGE_STEP).min(scroll_max);
+            }
+            KeyCode::PageUp => {
+                help.scroll = help.scroll.saturating_sub(HELP_PAGE_STEP);
+            }
+            KeyCode::Home => {
+                help.scroll = 0;
+            }
+            KeyCode::End => {
+                help.scroll = scroll_max;
+            }
+            _ => {}
+        }
+        false
     }
 
     fn handle_account_switcher_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -1866,6 +2483,42 @@ impl App {
             && self.state.image_viewer.is_some()
         {
             self.close_image_viewer();
+            return Ok(false);
+        }
+
+        if self.state.help_overlay.is_some() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if !rect_contains(
+                        self.help_overlay_rect(self.state.frame_area),
+                        mouse.column,
+                        mouse.row,
+                    ) {
+                        self.close_help_overlay();
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_help_overlay(HELP_MOUSE_SCROLL_STEP as isize)
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scroll_help_overlay(-(HELP_MOUSE_SCROLL_STEP as isize))
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if self.state.auth_overlay.is_some()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if !rect_contains(
+                self.auth_overlay_rect(self.state.frame_area),
+                mouse.column,
+                mouse.row,
+            ) {
+                self.state.auth_overlay = None;
+                self.state.status = "authentication prompt hidden".to_owned();
+            }
             return Ok(false);
         }
 
@@ -1976,6 +2629,9 @@ impl App {
     fn handle_left_click(&mut self, pane: FocusPane, mouse: MouseEvent) -> bool {
         match pane {
             FocusPane::ChatList => {
+                if self.open_chat_avatar_at(mouse.column, mouse.row) {
+                    return false;
+                }
                 if let Some(chat_index) = chat_list::chat_at(
                     &self.state.chats,
                     &self.state.visible_chat_indices,
@@ -1993,8 +2649,10 @@ impl App {
                 if self.open_media_at(mouse.column, mouse.row) {
                     return false;
                 }
+                if self.open_message_avatar_at(mouse.column, mouse.row) {
+                    return false;
+                }
                 if self.select_message_at(mouse.column, mouse.row) {
-                    self.open_action_menu();
                     return false;
                 }
                 self.state.status = "messages focused".to_owned();
@@ -2302,7 +2960,38 @@ impl App {
         false
     }
 
+    fn open_help_overlay(&mut self) {
+        self.state.help_overlay = Some(HelpOverlay::default());
+        self.state.action_menu = None;
+        self.state.reaction_picker = None;
+        self.state.account_switcher = None;
+        self.state.status = "help opened".to_owned();
+    }
+
+    fn close_help_overlay(&mut self) {
+        self.state.help_overlay = None;
+        self.state.status = "help closed".to_owned();
+    }
+
+    fn scroll_help_overlay(&mut self, delta: isize) {
+        let scroll_max = self.help_scroll_max();
+        let Some(help) = &mut self.state.help_overlay else {
+            return;
+        };
+        help.scroll = help.scroll.saturating_add_signed(delta).min(scroll_max);
+    }
+
+    fn help_scroll_max(&self) -> usize {
+        let modal = self.help_overlay_rect(self.state.frame_area);
+        help_scroll_max(self.help_overlay_lines().len(), modal)
+    }
+
     fn handle_escape(&mut self) -> bool {
+        if self.state.help_overlay.is_some() {
+            self.close_help_overlay();
+            return false;
+        }
+
         if self.state.image_viewer.is_some() {
             self.close_image_viewer();
             return false;
@@ -2377,15 +3066,18 @@ impl App {
 
     fn activate_selected_chat(&mut self) -> bool {
         let had_unread = self.selected_chat_has_unread();
+        let should_sync_if_empty = self.state.messages.is_empty();
         if let Some(chat_name) = self.state.selected_chat().map(|chat| chat.name.to_string()) {
             self.state.focus = FocusPane::Messages;
+            self.request_selected_chat_history_sync();
             self.state.status = format!("opened {chat_name}");
         }
-        had_unread
+        had_unread || should_sync_if_empty
     }
 
     fn activate_chat_index(&mut self, chat_index: usize) -> bool {
         let changed = chat_index != self.state.selected_chat;
+        let should_sync_if_empty = self.state.messages.is_empty();
         self.state.selected_chat = chat_index;
         self.state.focus = FocusPane::Messages;
         self.state.message_scroll = 0;
@@ -2400,10 +3092,12 @@ impl App {
         self.state.image_viewer = None;
 
         if let Some(chat_name) = self.state.selected_chat().map(|chat| chat.name.to_string()) {
+            self.request_selected_chat_history_sync();
             self.state.status = format!("opened {chat_name}");
         }
 
         changed
+            || should_sync_if_empty
             || self
                 .state
                 .chats
@@ -2505,6 +3199,22 @@ impl App {
             .is_some_and(|chat| chat.unread_count > 0)
     }
 
+    fn request_selected_chat_history_sync(&mut self) {
+        self.state.pending_history_sync_chat = self
+            .state
+            .selected_chat()
+            .map(|chat| (chat.account.clone(), chat.id.clone()));
+    }
+
+    fn consume_pending_history_sync_for_selected_chat(&mut self) -> bool {
+        let Some((account, chat_id)) = self.state.pending_history_sync_chat.take() else {
+            return false;
+        };
+        self.state
+            .selected_chat()
+            .is_some_and(|chat| chat.account == account && chat.id == chat_id)
+    }
+
     async fn mark_selected_chat_read(&mut self) -> Result<()> {
         let Some(chat) = self.state.selected_chat().cloned() else {
             return Ok(());
@@ -2535,6 +3245,24 @@ impl App {
         Ok(())
     }
 
+    fn append_historical_message_to_current_chat(&mut self, message: Message) {
+        if self
+            .state
+            .messages
+            .iter()
+            .any(|existing| existing.id == message.id)
+        {
+            return;
+        }
+        self.state.messages.push(message);
+        self.state.messages.sort_by_key(|message| message.timestamp);
+        let excess = self.state.messages.len().saturating_sub(HISTORY_LIMIT);
+        if excess > 0 {
+            self.state.messages.drain(0..excess);
+        }
+        self.clamp_message_scroll();
+    }
+
     fn scroll_messages_down(&mut self, amount: usize) {
         let max_scroll = self.max_message_scroll();
         self.state.message_scroll = self
@@ -2552,6 +3280,39 @@ impl App {
     fn scroll_messages_up(&mut self, amount: usize) {
         self.state.message_scroll = self.state.message_scroll.saturating_sub(amount);
         self.state.status = format!("showing message line {}", self.state.message_scroll + 1);
+    }
+
+    fn open_chat_avatar_at(&mut self, column: u16, row: u16) -> bool {
+        let (avatar_start, avatar_end) =
+            chat_list::avatar_column_bounds(self.state.pane_areas.chat_list);
+        if column < avatar_start || column >= avatar_end {
+            return false;
+        }
+        let Some(chat_index) = chat_list::chat_at(
+            &self.state.chats,
+            &self.state.visible_chat_indices,
+            self.state.selected_chat,
+            self.state.pane_areas.chat_list,
+            column,
+            row,
+        ) else {
+            return false;
+        };
+        let Some(chat) = self.state.chats.get(chat_index) else {
+            return false;
+        };
+        let Some(path) = chat.avatar.as_ref().filter(|path| path.exists()).cloned() else {
+            return false;
+        };
+        self.state.action_menu = None;
+        self.state.reaction_picker = None;
+        self.state.status = format!("viewing avatar {}", path.display());
+        self.state.image_viewer = Some(ImageViewer {
+            path,
+            title: format!("{} avatar", chat.name),
+            caption: None,
+        });
+        true
     }
 
     fn open_media_at(&mut self, column: u16, row: u16) -> bool {
@@ -2594,6 +3355,71 @@ impl App {
         self.state.status = "image preview closed".to_owned();
     }
 
+    fn open_message_avatar_at(&mut self, column: u16, row: u16) -> bool {
+        let content_area = inner_area(self.state.pane_areas.messages);
+        if !rect_contains(content_area, column, row) {
+            return false;
+        }
+
+        let clicked_line = self
+            .state
+            .message_scroll
+            .saturating_add(row.saturating_sub(content_area.y) as usize);
+        let Some(hit) = self
+            .state
+            .message_hits
+            .iter()
+            .find(|hit| {
+                hit.avatar_hit.as_ref().is_some_and(|avatar_hit| {
+                    avatar_hit.line == clicked_line
+                        && clicked_column_in_hit(
+                            content_area,
+                            column,
+                            avatar_hit.start_col,
+                            avatar_hit.end_col,
+                        )
+                })
+            })
+            .cloned()
+        else {
+            return false;
+        };
+
+        let (sender_name, avatar_path) = {
+            let Some(message) = self.message_by_id(&hit.message_id) else {
+                return false;
+            };
+            (
+                message.sender.display_name.clone(),
+                message
+                    .sender
+                    .avatar
+                    .as_ref()
+                    .filter(|path| path.exists())
+                    .cloned(),
+            )
+        };
+        let Some(path) = avatar_path else {
+            self.state.selected_message_id = Some(hit.message_id.clone());
+            self.state.thread_root = None;
+            self.state.status = format!("{sender_name} has no avatar loaded");
+            return true;
+        };
+        let title = format!("{sender_name} avatar");
+
+        self.state.selected_message_id = Some(hit.message_id);
+        self.state.action_menu = None;
+        self.state.reaction_picker = None;
+        self.state.thread_root = None;
+        self.state.status = format!("viewing avatar {}", path.display());
+        self.state.image_viewer = Some(ImageViewer {
+            path,
+            title,
+            caption: None,
+        });
+        true
+    }
+
     fn select_message_at(&mut self, column: u16, row: u16) -> bool {
         let content_area = inner_area(self.state.pane_areas.messages);
         if !rect_contains(content_area, column, row) {
@@ -2625,8 +3451,10 @@ impl App {
         };
 
         self.state.selected_message_id = Some(hit.message_id.clone());
+        self.state.action_menu = None;
         self.state.reaction_picker = None;
-        self.state.status = format!("selected message {}", short_id(&hit.message_id));
+        self.state.thread_root = None;
+        self.state.status = format!("showing details for message {}", short_id(&hit.message_id));
         self.ensure_selected_message_visible();
         true
     }
@@ -2943,6 +3771,7 @@ impl App {
         self.state.selected_message_id = None;
         self.state.action_menu = None;
         self.state.reaction_picker = None;
+        self.state.help_overlay = None;
         self.state.reply_to = None;
         self.state.thread_root = None;
         self.state.image_viewer = None;
@@ -3047,6 +3876,44 @@ impl App {
             .saturating_mul(REACTION_OPTION_CELL_WIDTH as usize)
             .saturating_add(4) as u16;
         self.anchored_message_popup_rect(area, message_id, width, 5)
+    }
+
+    fn auth_overlay_rect(&self, area: Rect) -> Rect {
+        let is_qr = self
+            .state
+            .auth_overlay
+            .as_ref()
+            .is_some_and(|overlay| matches!(overlay.challenge, AuthChallenge::QrCode(_)));
+        if is_qr {
+            let width = area.width.saturating_sub(2).max(1);
+            let height = area.height.saturating_sub(2).max(1);
+            return centered_fixed_rect(area, width, height);
+        }
+
+        let width = area
+            .width
+            .saturating_mul(72)
+            .saturating_div(100)
+            .clamp(42, 76)
+            .min(area.width.saturating_sub(2).max(1));
+        let height = 13.min(area.height.saturating_sub(2).max(1));
+        centered_fixed_rect(area, width, height)
+    }
+
+    fn help_overlay_rect(&self, area: Rect) -> Rect {
+        let width = area
+            .width
+            .saturating_mul(70)
+            .saturating_div(100)
+            .clamp(34, 72)
+            .min(area.width.saturating_sub(2).max(1));
+        let height = area
+            .height
+            .saturating_mul(70)
+            .saturating_div(100)
+            .clamp(10, 24)
+            .min(area.height.saturating_sub(2).max(1));
+        centered_fixed_rect(area, width, height)
     }
 
     fn anchored_message_popup_rect(
@@ -3195,6 +4062,38 @@ impl App {
         self.state.message_scroll = self.state.message_scroll.min(self.max_message_scroll());
     }
 
+    fn upsert_chat_in_state(&mut self, chat: Chat) {
+        let selected_chat = self
+            .state
+            .selected_chat()
+            .map(|chat| (chat.id.clone(), chat.account.clone()));
+        if let Some(existing) = self
+            .state
+            .chats
+            .iter_mut()
+            .find(|existing| existing.id == chat.id && existing.account == chat.account)
+        {
+            *existing = chat;
+        } else {
+            self.state.chats.push(chat);
+        }
+        self.state.chats.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| b.last_message_at.cmp(&a.last_message_at))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        if let Some((selected_chat_id, selected_account)) = selected_chat
+            && let Some(index) =
+                self.state.chats.iter().position(|chat| {
+                    chat.id == selected_chat_id && chat.account == selected_account
+                })
+        {
+            self.state.selected_chat = index;
+        }
+        self.apply_filter();
+    }
+
     fn filter_status(&self) -> String {
         if self.state.filter.is_empty() {
             "filter cleared".to_owned()
@@ -3230,6 +4129,44 @@ impl App {
         Ok(())
     }
 
+    async fn reload_selected_messages_after_navigation(&mut self) -> Result<()> {
+        let should_sync_history = self.consume_pending_history_sync_for_selected_chat();
+        self.reload_selected_messages().await?;
+        if should_sync_history && self.state.messages.is_empty() {
+            self.sync_selected_chat_history().await?;
+        }
+        Ok(())
+    }
+
+    async fn sync_selected_chat_history(&mut self) -> Result<()> {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            return Ok(());
+        };
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == chat.account.as_ref())
+        else {
+            self.state.status = format!("no provider registered for {}", chat.account);
+            return Ok(());
+        };
+
+        self.state.status = format!("syncing today's messages for {}", chat.name);
+        let messages = provider.history(&chat.id, None, HISTORY_LIMIT).await?;
+        if messages.is_empty() {
+            self.state.status = format!("no messages found for {} today", chat.name);
+            return Ok(());
+        }
+
+        for message in messages {
+            self.store.upsert_message(&message).await?;
+        }
+        self.reload_chats().await?;
+        self.reload_selected_messages().await?;
+        self.state.status = format!("synced today's messages for {}", chat.name);
+        Ok(())
+    }
+
     async fn reload_selected_messages(&mut self) -> Result<()> {
         if let Some(chat) = self.state.selected_chat() {
             self.state.messages = self
@@ -3242,6 +4179,25 @@ impl App {
         self.clamp_message_scroll();
         Ok(())
     }
+}
+
+fn build_terminal_image_protocol(
+    picker: &Picker,
+    path: &Path,
+    size: Size,
+) -> std::result::Result<Protocol, String> {
+    if size.width == 0 || size.height == 0 {
+        return Err("image area is too small".to_owned());
+    }
+    let image = image::ImageReader::open(path)
+        .map_err(|error| format!("opening {}: {error}", path.display()))?
+        .with_guessed_format()
+        .map_err(|error| format!("detecting {}: {error}", path.display()))?
+        .decode()
+        .map_err(|error| format!("decoding {}: {error}", path.display()))?;
+    picker
+        .new_protocol(image, size, Resize::Fit(Some(FilterType::Triangle)))
+        .map_err(|error| format!("rendering {}: {error}", path.display()))
 }
 
 async fn run_app_loop(
@@ -3412,9 +4368,18 @@ fn centered_fixed_rect(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+fn help_scroll_max(content_len: usize, area: Rect) -> usize {
+    let viewport = inner_area(area).height as usize;
+    content_len.saturating_sub(viewport.max(1))
+}
+
 fn is_ctrl_char(key: KeyEvent, expected: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char(value) if value.eq_ignore_ascii_case(&expected))
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn short_id(id: &str) -> String {
@@ -3527,6 +4492,13 @@ fn content_copy_text(content: &Content) -> String {
                 .unwrap_or_default();
             format!("{title}: {}{description}", link.url)
         }
+        Content::Poll(poll) => {
+            let mut text = format!("Poll: {}", poll.question);
+            for (index, option) in poll.options.iter().enumerate() {
+                text.push_str(&format!("\n{}. {}", index + 1, option));
+            }
+            text
+        }
         Content::Deleted => String::new(),
         Content::Unsupported(kind) => format!("Unsupported message: {kind}"),
     }
@@ -3540,6 +4512,7 @@ fn message_image_preview(content: &Content) -> Option<(PathBuf, String, Option<S
         | Content::Audio(_)
         | Content::File(_)
         | Content::Text(_)
+        | Content::Poll(_)
         | Content::Deleted
         | Content::Unsupported(_) => None,
     }
@@ -3607,6 +4580,54 @@ fn remove_reaction(message: &mut Message, emoji: &str, sender: &Arc<str>) {
     message
         .reactions
         .retain(|reaction| !reaction.senders.is_empty());
+}
+
+fn render_qr_lines(payload: &str, max_width: usize) -> Option<Vec<Line<'static>>> {
+    let qr = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L).ok()?;
+    let symbol_width = qr.width().saturating_add(QR_QUIET_ZONE.saturating_mul(2));
+    if symbol_width == 0 || symbol_width > max_width {
+        return None;
+    }
+
+    let left_padding = max_width.saturating_sub(symbol_width) / 2;
+    let row_count = symbol_width.div_ceil(2);
+    let mut lines = Vec::with_capacity(row_count);
+    for row in 0..row_count {
+        let top_y = row.saturating_mul(2);
+        let bottom_y = top_y.saturating_add(1);
+        let mut spans = Vec::with_capacity(symbol_width.saturating_add(1));
+        if left_padding > 0 {
+            spans.push(Span::raw(" ".repeat(left_padding)));
+        }
+        for x in 0..symbol_width {
+            let top = qr_module_is_dark(&qr, x, top_y, symbol_width);
+            let bottom =
+                bottom_y < symbol_width && qr_module_is_dark(&qr, x, bottom_y, symbol_width);
+            let cell = match (top, bottom) {
+                (true, true) => "█",
+                (true, false) => "▀",
+                (false, true) => "▄",
+                (false, false) => " ",
+            };
+            spans.push(Span::styled(
+                cell,
+                Style::default().fg(Color::Black).bg(Color::White),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    Some(lines)
+}
+
+fn qr_module_is_dark(qr: &QrCode, x: usize, y: usize, symbol_width: usize) -> bool {
+    if x < QR_QUIET_ZONE
+        || y < QR_QUIET_ZONE
+        || x >= symbol_width.saturating_sub(QR_QUIET_ZONE)
+        || y >= symbol_width.saturating_sub(QR_QUIET_ZONE)
+    {
+        return false;
+    }
+    qr[(x - QR_QUIET_ZONE, y - QR_QUIET_ZONE)] == QrColor::Dark
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -3808,6 +4829,109 @@ mod tests {
         assert_eq!(app.state().active_account(), None);
         assert_eq!(app.state().visible_chat_indices().len(), 20);
         assert!(app.state().status().contains("All accounts"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_opens_scrolls_and_closes_help_overlay() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('?'), KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state().help_overlay_open());
+        assert_eq!(app.state().help_overlay_scroll(), Some(0));
+        assert_eq!(app.state().status(), "help opened");
+
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Help 1/"));
+        assert!(content.contains("chat-cli help"));
+        assert!(content.contains("Current context"));
+        assert!(content.contains("Mouse/touchpad"));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::PageDown, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().help_overlay_scroll(), Some(HELP_PAGE_STEP));
+        terminal.draw(|frame| app.draw(frame))?;
+        let scrolled_content = buffer_text(terminal.backend().buffer());
+        assert!(scrolled_content.contains("Help 9/"));
+        assert!(scrolled_content.contains("Messages"));
+
+        app.handle_event(AppEvent::Mouse(mouse(MouseEventKind::ScrollDown, 60, 18)))
+            .await?;
+        assert_eq!(
+            app.state().help_overlay_scroll(),
+            Some(HELP_PAGE_STEP + HELP_MOUSE_SCROLL_STEP)
+        );
+
+        app.handle_event(AppEvent::Key(key(KeyCode::End, KeyModifiers::NONE)))
+            .await?;
+        let max_scroll = app.help_scroll_max();
+        assert_eq!(app.state().help_overlay_scroll(), Some(max_scroll));
+        app.handle_event(AppEvent::Key(key(KeyCode::PageDown, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().help_overlay_scroll(), Some(max_scroll));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Home, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().help_overlay_scroll(), Some(0));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().help_overlay_open());
+        assert_eq!(app.state().status(), "help closed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_keeps_question_mark_as_compose_text_and_uses_f1_for_help() -> Result<()> {
+        let mut app = test_app().await?;
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().focus(), FocusPane::Messages);
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('H'), KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().focus(), FocusPane::Compose);
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('?'), KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().help_overlay_open());
+        assert_eq!(app.state().compose_text(), "H?");
+
+        app.handle_event(AppEvent::Key(key(KeyCode::F(1), KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state().help_overlay_open());
+        assert_eq!(app.state().compose_text(), "H?");
+
+        app.handle_event(AppEvent::Key(key(KeyCode::F(1), KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().help_overlay_open());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_closes_help_overlay_when_clicking_outside() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+
+        app.handle_event(AppEvent::Key(key(KeyCode::F(1), KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state().help_overlay_open());
+        terminal.draw(|frame| app.draw(frame))?;
+
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            1,
+            1,
+        )))
+        .await?;
+        assert!(!app.state().help_overlay_open());
+        assert_eq!(app.state().status(), "help closed");
 
         Ok(())
     }
@@ -4299,6 +5423,125 @@ mod tests {
         Ok(())
     }
 
+    fn realistic_whatsapp_qr_payload() -> String {
+        format!(
+            "2@{},{}==,{}==,{},{}",
+            "A".repeat(44),
+            "B".repeat(44),
+            "C".repeat(44),
+            "D".repeat(64),
+            "E".repeat(32)
+        )
+    }
+
+    #[test]
+    fn qr_renderer_encodes_payload_when_space_allows() {
+        let lines = render_qr_lines("2@test-whatsapp-qr", 96).expect("qr should render");
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains('█') || rendered.contains('▀') || rendered.contains('▄'));
+        assert!(render_qr_lines("2@test-whatsapp-qr", 8).is_none());
+    }
+
+    #[test]
+    fn qr_renderer_handles_realistic_whatsapp_payload_in_fullscreen_terminal() {
+        let payload = realistic_whatsapp_qr_payload();
+        let lines = render_qr_lines(&payload, 238).expect("realistic WhatsApp QR should render");
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(lines.len() <= 65);
+        assert!(rendered.contains('█') || rendered.contains('▀') || rendered.contains('▄'));
+    }
+
+    #[tokio::test]
+    async fn app_renders_large_auth_qr_overlay_in_fullscreen_terminal() -> Result<()> {
+        let mut app = test_app().await?;
+        let provider_id = app.state().provider_for_selected_chat().unwrap().clone();
+        let payload = realistic_whatsapp_qr_payload();
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::AuthRequired(AuthChallenge::QrCode(
+                Arc::from(payload.as_str()),
+            ))),
+        ))
+        .await?;
+
+        let mut terminal = Terminal::new(TestBackend::new(240, 70))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("WhatsApp QR login required"));
+        assert!(content.contains("Open WhatsApp > Linked devices"));
+        assert!(!content.contains("QR is too large"));
+        assert!(content.contains("█") || content.contains("▀") || content.contains("▄"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_renders_and_dismisses_auth_qr_overlay() -> Result<()> {
+        let mut app = test_app().await?;
+        let provider_id = app.state().provider_for_selected_chat().unwrap().clone();
+
+        app.handle_event(AppEvent::Provider(
+            provider_id.clone(),
+            Box::new(ProviderEvent::AuthRequired(AuthChallenge::QrCode(
+                Arc::from("2@test-whatsapp-qr"),
+            ))),
+        ))
+        .await?;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("WhatsApp QR login required"));
+        assert!(content.contains("Open WhatsApp > Linked devices"));
+        assert!(!content.contains("QR is too large"));
+        assert!(content.contains("█") || content.contains("▀") || content.contains("▄"));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(!content.contains("2@test-whatsapp-qr"));
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::AuthRequired(AuthChallenge::QrCode(
+                Arc::from("2@test-whatsapp-qr-again"),
+            ))),
+        ))
+        .await?;
+        app.handle_event(AppEvent::Provider(
+            Arc::from("mock:local"),
+            Box::new(ProviderEvent::AuthSucceeded),
+        ))
+        .await?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(!content.contains("2@test-whatsapp-qr-again"));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn app_tracks_provider_connection_status_in_status_bar_and_details() -> Result<()> {
         let mut app = test_app().await?;
@@ -4522,7 +5765,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_mouse_click_opens_message_actions_without_opening_media() -> Result<()> {
+    async fn app_mouse_click_shows_message_details_without_opening_media() -> Result<()> {
         let mut app = test_app().await?;
         let mut terminal = Terminal::new(TestBackend::new(140, 40))?;
         terminal.draw(|frame| app.draw(frame))?;
@@ -4541,21 +5784,29 @@ mod tests {
         assert_eq!(app.state().selected_message_id(), None);
         assert!(!app.state().action_menu_open());
 
+        let avatar_hit = hit.avatar_hit.as_ref().unwrap();
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            content_area.x + line_hit.start_col + 1,
+            content_area.x + avatar_hit.end_col + 1,
             content_area.y + line_hit.line as u16,
         )))
         .await?;
 
         assert_eq!(app.state().focus(), FocusPane::Messages);
         assert_eq!(app.state().selected_message_id(), Some(&hit.message_id));
+        assert!(!app.state().action_menu_open());
+        assert_eq!(
+            app.state().status(),
+            format!("showing details for message {}", short_id(&hit.message_id))
+        );
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
         assert!(app.state().action_menu_open());
         assert_eq!(app.state().status(), "message actions opened");
 
         Ok(())
     }
-
     #[tokio::test]
     async fn app_copy_action_reports_clipboard_success_or_friendly_fallback() -> Result<()> {
         let mut app = test_app().await?;
@@ -4828,6 +6079,7 @@ mod tests {
             &messages,
             80,
             0,
+            200,
             None,
             &mut app.media_preview_cache,
             app.theme,

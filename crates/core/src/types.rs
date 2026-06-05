@@ -74,8 +74,16 @@ pub enum Content {
     File(Media),
     Sticker(Media),
     LinkPreview(LinkPreview),
+    Poll(Poll),
     Deleted,
     Unsupported(Arc<str>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Poll {
+    pub question: Arc<str>,
+    pub options: Vec<Arc<str>>,
+    pub selectable_options_count: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default)]
