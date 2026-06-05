@@ -20,6 +20,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use flate2::read::GzDecoder;
 use qrcode::{EcLevel, QrCode, types::Color as QrColor};
 use ratatui::{
     Frame, Terminal,
@@ -45,7 +46,7 @@ use std::{
     time::Duration,
 };
 use storage::Store;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 const HISTORY_LIMIT: usize = 50;
@@ -130,6 +131,14 @@ const HELP_PAGE_STEP: usize = 8;
 const HELP_MOUSE_SCROLL_STEP: usize = 3;
 const QR_QUIET_ZONE: usize = 2;
 const MEDIA_SEND_SIZE_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
+const LINK_METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+const LINK_METADATA_MAX_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Debug)]
+struct LinkMetadataFetchResult {
+    url: Arc<str>,
+    metadata: message_list::LinkMetadata,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingAttachmentKind {
@@ -407,8 +416,6 @@ fn message_compose_split(area: Rect, compose_height: u16) -> [Rect; 2] {
 #[derive(Clone, Debug)]
 struct ImageViewer {
     path: PathBuf,
-    title: String,
-    caption: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1157,6 +1164,10 @@ pub struct App {
     store: Arc<Store>,
     state: AppState,
     media_preview_cache: message_list::MediaPreviewCache,
+    link_metadata_cache: message_list::LinkMetadataCache,
+    pending_link_metadata_fetches: HashSet<Arc<str>>,
+    link_metadata_tx: mpsc::UnboundedSender<LinkMetadataFetchResult>,
+    link_metadata_rx: mpsc::UnboundedReceiver<LinkMetadataFetchResult>,
     image_picker: Option<Picker>,
     image_protocol_cache: HashMap<ImageProtocolKey, Result<Protocol, String>>,
     theme: Theme,
@@ -1168,12 +1179,17 @@ impl App {
             .iter()
             .map(|provider| (provider.id().clone(), provider.events()))
             .collect();
+        let (link_metadata_tx, link_metadata_rx) = mpsc::unbounded_channel();
         let mut app = Self {
             providers,
             provider_receivers,
             store,
             state: AppState::default(),
             media_preview_cache: message_list::MediaPreviewCache::default(),
+            link_metadata_cache: message_list::LinkMetadataCache::default(),
+            pending_link_metadata_fetches: HashSet::new(),
+            link_metadata_tx,
+            link_metadata_rx,
             image_picker: None,
             image_protocol_cache: HashMap::new(),
             theme: Theme::default(),
@@ -1230,6 +1246,37 @@ impl App {
         Ok(())
     }
 
+    fn queue_link_metadata_fetches(&mut self, requests: Vec<message_list::LinkPreviewRequest>) {
+        for request in requests {
+            if self.link_metadata_cache.contains_key(&request.url)
+                || !self.pending_link_metadata_fetches.insert(request.url.clone())
+            {
+                continue;
+            }
+
+            let tx = self.link_metadata_tx.clone();
+            tokio::spawn(async move {
+                let metadata = fetch_link_metadata(request.url.as_ref())
+                    .await
+                    .unwrap_or_default();
+                let _ = tx.send(LinkMetadataFetchResult {
+                    url: request.url,
+                    metadata,
+                });
+            });
+        }
+    }
+
+    fn drain_link_metadata_fetches(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.link_metadata_rx.try_recv() {
+            self.pending_link_metadata_fetches.remove(&result.url);
+            self.link_metadata_cache.insert(result.url, result.metadata);
+            changed = true;
+        }
+        changed
+    }
+
     pub async fn drain_provider_events(&mut self) -> Result<bool> {
         let mut events = Vec::new();
         for (provider_id, receiver) in &mut self.provider_receivers {
@@ -1249,7 +1296,7 @@ impl App {
         for event in events {
             self.handle_event(event).await?;
         }
-        Ok(had_events)
+        Ok(had_events || self.drain_link_metadata_fetches())
     }
 
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
@@ -1428,10 +1475,12 @@ impl App {
                 self.state.selected_message_id.as_deref(),
                 &self.unread_message_ids(),
                 &mut self.media_preview_cache,
+                &self.link_metadata_cache,
                 self.theme,
             );
             self.state.media_hits = render.media_hits;
             self.state.message_hits = render.message_hits;
+            self.queue_link_metadata_fetches(render.link_preview_requests);
             render.lines
         };
         message_list::render_message_list(
@@ -1917,10 +1966,6 @@ impl App {
                 hint("Scroll or PageUp/PageDown"),
                 hint("Esc closes"),
             ];
-        }
-
-        if self.state.image_viewer.is_some() {
-            return vec![hint("Click anywhere or press Esc to close")];
         }
 
         if self.state.account_switcher.is_some() {
@@ -2744,95 +2789,40 @@ impl App {
             return;
         };
 
-        let modal = centered_rect(area, 84, 84);
-        if modal.width < 12 || modal.height < 8 {
+        if area.width < 4 || area.height < 4 {
             return;
         }
 
+        let max_inner_size = Size::new(
+            area.width.saturating_sub(4).min(IMAGE_VIEWER_MAX_WIDTH),
+            area.height.saturating_sub(4),
+        );
+        let protocol = self
+            .cached_terminal_image_protocol(&viewer.path, max_inner_size)
+            .and_then(Result::ok);
+        let inner_size = protocol
+            .as_ref()
+            .map(Protocol::size)
+            .unwrap_or(max_inner_size);
+        let viewer_area = centered_fixed_rect(
+            area,
+            inner_size.width.saturating_add(2),
+            inner_size.height.saturating_add(2),
+        );
         let block = Block::default()
-            .title(format!("Image Preview - {}", viewer.title))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
-        let inner = block.inner(modal);
-        let caption_rows = u16::from(viewer.caption.is_some());
-        let footer_rows = caption_rows.saturating_add(1);
-        let image_area = Rect::new(
-            inner.x,
-            inner.y.saturating_add(1),
-            inner.width,
-            inner.height.saturating_sub(1).saturating_sub(footer_rows),
-        );
-        let footer_y = image_area.y.saturating_add(image_area.height);
+        let image_area = block.inner(viewer_area);
 
-        frame.render_widget(Clear, modal);
-        frame.render_widget(block, modal);
-        self.render_overlay_line(
-            frame,
-            Rect::new(inner.x, inner.y, inner.width, 1),
-            Line::from(Span::styled(
-                truncate_chars(&viewer.path.display().to_string(), inner.width as usize),
-                Style::default().fg(Color::DarkGray),
-            )),
-        );
+        frame.render_widget(Clear, viewer_area);
+        frame.render_widget(block, viewer_area);
 
-        let rendered_terminal_image = self.render_terminal_image(frame, image_area, &viewer.path);
-        if let Err(error) = rendered_terminal_image {
-            self.render_halfblock_image(frame, image_area, &viewer.path, Some(error));
+        if let Some(protocol) = protocol {
+            let image = TerminalImage::new(&protocol).allow_clipping(true);
+            frame.render_widget(image, image_area);
+        } else {
+            self.render_halfblock_image(frame, image_area, &viewer.path, None);
         }
-
-        if let Some(caption) = &viewer.caption {
-            self.render_overlay_line(
-                frame,
-                Rect::new(inner.x, footer_y, inner.width, 1),
-                Line::from(truncate_chars(
-                    &format!("Caption: {caption}"),
-                    inner.width as usize,
-                )),
-            );
-        }
-        self.render_overlay_line(
-            frame,
-            Rect::new(
-                inner.x,
-                footer_y.saturating_add(caption_rows),
-                inner.width,
-                1,
-            ),
-            Line::from(Span::styled(
-                "Click anywhere or press Esc to close",
-                Style::default().fg(Color::DarkGray),
-            )),
-        );
-    }
-
-    fn render_terminal_image(
-        &mut self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        path: &Path,
-    ) -> std::result::Result<(), String> {
-        if area.is_empty() {
-            return Err("image area is too small".to_owned());
-        }
-        let Some(protocol) =
-            self.cached_terminal_image_protocol(path, Size::new(area.width, area.height))
-        else {
-            return Err("terminal image protocol unavailable".to_owned());
-        };
-        let protocol = protocol?;
-        let image_size = protocol.size();
-        let image_area = centered_fixed_rect(
-            area,
-            image_size.width.min(area.width),
-            image_size.height.min(area.height),
-        );
-        if protocol.needs_placeholder(image_area).is_some() {
-            return Err("terminal image protocol needs a larger placeholder".to_owned());
-        }
-
-        let image = TerminalImage::new(&protocol).allow_clipping(true);
-        frame.render_widget(image, image_area);
-        Ok(())
     }
 
     fn cached_terminal_image_protocol(
@@ -2911,13 +2901,6 @@ impl App {
             Paragraph::new(lines).wrap(Wrap { trim: false }),
             preview_area,
         );
-    }
-
-    fn render_overlay_line(&self, frame: &mut Frame<'_>, area: Rect, line: Line<'static>) {
-        if area.is_empty() {
-            return;
-        }
-        frame.render_widget(Paragraph::new(line), area);
     }
 
     async fn bootstrap(&mut self) -> Result<()> {
@@ -4988,11 +4971,7 @@ impl App {
         self.state.action_menu = None;
         self.state.reaction_picker = None;
         self.state.status = format!("viewing avatar {}", path.display());
-        self.state.image_viewer = Some(ImageViewer {
-            path,
-            title: format!("{} avatar", chat.name),
-            caption: None,
-        });
+        self.state.image_viewer = Some(ImageViewer { path });
         true
     }
 
@@ -5023,11 +5002,7 @@ impl App {
         self.state.action_menu = None;
         self.state.reaction_picker = None;
         self.state.status = format!("viewing image {}", hit.path.display());
-        self.state.image_viewer = Some(ImageViewer {
-            path: hit.path,
-            title: hit.title,
-            caption: hit.caption,
-        });
+        self.state.image_viewer = Some(ImageViewer { path: hit.path });
         true
     }
 
@@ -5086,18 +5061,12 @@ impl App {
             self.state.status = format!("{sender_name} has no avatar loaded");
             return true;
         };
-        let title = format!("{sender_name} avatar");
-
         self.state.selected_message_id = Some(hit.message_id);
         self.state.action_menu = None;
         self.state.reaction_picker = None;
         self.state.thread_root = None;
         self.state.status = format!("viewing avatar {}", path.display());
-        self.state.image_viewer = Some(ImageViewer {
-            path,
-            title,
-            caption: None,
-        });
+        self.state.image_viewer = Some(ImageViewer { path });
         true
     }
 
@@ -5484,15 +5453,11 @@ impl App {
         let Some(message) = self.message_by_id(message_id) else {
             return false;
         };
-        let Some((path, title, caption)) = message_image_preview(&message.content) else {
+        let Some((path, _, _)) = message_image_preview(&message.content) else {
             return false;
         };
 
-        self.state.image_viewer = Some(ImageViewer {
-            path: path.clone(),
-            title,
-            caption,
-        });
+        self.state.image_viewer = Some(ImageViewer { path: path.clone() });
         self.state.status = format!("viewing image {}", path.display());
         true
     }
@@ -5694,6 +5659,7 @@ impl App {
     }
 
     fn handle_tick(&mut self) {
+        let metadata_changed = self.drain_link_metadata_fetches();
         let expired = if let Some(notification) = &mut self.state.notification {
             notification.ticks_remaining = notification.ticks_remaining.saturating_sub(1);
             notification.ticks_remaining == 0
@@ -5702,6 +5668,9 @@ impl App {
         };
         if expired {
             self.state.notification = None;
+        }
+        if metadata_changed {
+            self.state.status = "link preview updated".to_owned();
         }
     }
 
@@ -6047,7 +6016,11 @@ impl App {
     }
 
     fn message_line_count(&self) -> usize {
-        message_list::message_line_count(&self.state.messages, self.message_content_width())
+        message_list::message_line_count(
+            &self.state.messages,
+            self.message_content_width(),
+            &self.link_metadata_cache,
+        )
     }
 
     fn details_line_count(&self) -> usize {
@@ -6708,27 +6681,6 @@ fn inner_area(area: Rect) -> Rect {
     Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
 }
 
-fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
-    let width = area
-        .width
-        .saturating_mul(width_percent)
-        .saturating_div(100)
-        .max(1)
-        .min(area.width);
-    let height = area
-        .height
-        .saturating_mul(height_percent)
-        .saturating_div(100)
-        .max(1)
-        .min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
-}
-
 fn centered_fixed_rect(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.max(1).min(area.width);
     let height = height.max(1).min(area.height);
@@ -7006,6 +6958,240 @@ fn media_image_preview(media: &Media) -> Option<(PathBuf, String, Option<String>
         media.file_name.to_string(),
         media.caption.as_deref().map(str::to_owned),
     ))
+}
+
+async fn fetch_link_metadata(url: &str) -> Result<message_list::LinkMetadata> {
+    let client = reqwest::Client::builder()
+        .timeout(LINK_METADATA_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .user_agent("chat-cli/0.1 link-preview")
+        .build()?;
+    let response = client.get(url).send().await?.error_for_status()?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let content_encoding = response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = decode_link_response_body(response.bytes().await?.to_vec(), content_encoding.as_deref())?;
+
+    if is_image_response(url, content_type.as_deref()) {
+        let media = cached_link_image_media(url, content_type.as_deref(), &body)?;
+        return Ok(message_list::LinkMetadata {
+            title: None,
+            description: None,
+            image_url: Some(Arc::<str>::from(url)),
+            image: Some(media),
+        });
+    }
+
+    let body = &body[..body.len().min(LINK_METADATA_MAX_BYTES)];
+    let html = String::from_utf8_lossy(body);
+
+    Ok(message_list::LinkMetadata {
+        title: html_meta_content(&html, "og:title")
+            .or_else(|| html_meta_content(&html, "twitter:title"))
+            .or_else(|| html_title(&html))
+            .map(Arc::<str>::from),
+        description: html_meta_content(&html, "og:description")
+            .or_else(|| html_meta_content(&html, "twitter:description"))
+            .or_else(|| html_meta_name_content(&html, "description"))
+            .map(Arc::<str>::from),
+        image_url: html_meta_content(&html, "og:image")
+            .or_else(|| html_meta_content(&html, "twitter:image"))
+            .map(Arc::<str>::from),
+        image: None,
+    })
+}
+
+fn decode_link_response_body(body: Vec<u8>, content_encoding: Option<&str>) -> Result<Vec<u8>> {
+    if content_encoding.is_some_and(|value| {
+        value
+            .split(',')
+            .any(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
+    }) {
+        let mut decoder = GzDecoder::new(&body[..]);
+        let mut decoded = Vec::new();
+        io::Read::read_to_end(&mut decoder, &mut decoded).context("decoding gzip link preview body")?;
+        return Ok(decoded);
+    }
+    Ok(body)
+}
+
+fn is_image_response(url: &str, content_type: Option<&str>) -> bool {
+    content_type
+        .is_some_and(|content_type| content_type.to_ascii_lowercase().starts_with("image/"))
+        || link_image_extension(url).is_some()
+}
+
+fn cached_link_image_media(
+    url: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Result<Media> {
+    image::load_from_memory(body).with_context(|| format!("decoding link image {url}"))?;
+    let cache_dir = std::env::temp_dir().join("chat-cli-link-previews");
+    fs::create_dir_all(&cache_dir).with_context(|| format!("creating {}", cache_dir.display()))?;
+    let file_name = link_image_file_name(url, content_type);
+    let path = cache_dir.join(&file_name);
+    fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Media {
+        id: Arc::from(format!("link:{url}")),
+        file_name: Arc::from(file_name),
+        mime_type: Arc::from(link_image_mime_type(url, content_type)),
+        size_bytes: Some(body.len() as u64),
+        caption: None,
+        local_path: Some(path),
+        thumbnail: None,
+    })
+}
+
+fn link_image_file_name(url: &str, content_type: Option<&str>) -> String {
+    let extension = link_image_extension(url)
+        .or_else(|| link_image_extension_for_content_type(content_type?))
+        .unwrap_or("jpg");
+    let mut name = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back().map(str::to_owned))
+        })
+        .filter(|segment| !segment.trim().is_empty())
+        .unwrap_or_else(|| "preview".to_owned());
+    name = name
+        .chars()
+        .filter(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_' | '.'))
+        .collect::<String>();
+    if name.is_empty() {
+        name.push_str("preview");
+    }
+    if !name
+        .to_ascii_lowercase()
+        .ends_with(&format!(".{extension}"))
+    {
+        name.push('.');
+        name.push_str(extension);
+    }
+    name
+}
+
+fn link_image_mime_type(url: &str, content_type: Option<&str>) -> String {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| value.starts_with("image/"))
+        .map(str::to_owned)
+        .or_else(|| link_image_extension(url).map(|extension| format!("image/{extension}")))
+        .unwrap_or_else(|| "image/jpeg".to_owned())
+}
+
+fn link_image_extension(url: &str) -> Option<&'static str> {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    ["jpg", "jpeg", "png", "webp", "gif"]
+        .into_iter()
+        .find(|extension| path.ends_with(&format!(".{extension}")))
+}
+
+fn link_image_extension_for_content_type(content_type: &str) -> Option<&'static str> {
+    let content_type = content_type.split(';').next()?.trim().to_ascii_lowercase();
+    match content_type.as_str() {
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        _ => None,
+    }
+}
+
+fn html_title(html: &str) -> Option<String> {
+    let start = html.find("<title")?;
+    let after_start = &html[start..];
+    let content_start = after_start.find('>')? + 1;
+    let after_content_start = &after_start[content_start..];
+    let content_end = after_content_start.to_ascii_lowercase().find("</title>")?;
+    clean_html_text(&after_content_start[..content_end])
+}
+
+fn html_meta_content(html: &str, property: &str) -> Option<String> {
+    html_meta_tag_content(html, &["property", "name"], property)
+}
+
+fn html_meta_name_content(html: &str, name: &str) -> Option<String> {
+    html_meta_tag_content(html, &["name"], name)
+}
+
+fn html_meta_tag_content(html: &str, key_names: &[&str], key_value: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(relative_start) = lower[offset..].find("<meta") {
+        let start = offset + relative_start;
+        let Some(relative_end) = lower[start..].find('>') else {
+            break;
+        };
+        let end = start + relative_end + 1;
+        let tag = &html[start..end];
+        let matches_key = key_names.iter().any(|key| {
+            html_attr_value(tag, key).is_some_and(|value| value.eq_ignore_ascii_case(key_value))
+        });
+        if matches_key
+            && let Some(content) =
+                html_attr_value(tag, "content").and_then(|value| clean_html_text(&value))
+        {
+            return Some(content);
+        }
+        offset = end;
+    }
+    None
+}
+
+fn html_attr_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let needle = name.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(relative_start) = lower[offset..].find(&needle) {
+        let start = offset + relative_start;
+        let after_name = start + needle.len();
+        let mut chars = tag[after_name..].char_indices();
+        let (_, first) = chars.find(|(_, value)| !value.is_whitespace())?;
+        if first != '=' {
+            offset = after_name;
+            continue;
+        }
+        let value_start = after_name + tag[after_name..].find('=')? + 1;
+        let value = tag[value_start..].trim_start();
+        let quote = value.chars().next()?;
+        if quote == '"' || quote == '\'' {
+            let rest = &value[quote.len_utf8()..];
+            let end = rest.find(quote)?;
+            return Some(html_unescape(&rest[..end]));
+        }
+        let end = value
+            .find(|character: char| character.is_whitespace() || character == '>')
+            .unwrap_or(value.len());
+        return Some(html_unescape(&value[..end]));
+    }
+    None
+}
+
+fn clean_html_text(value: &str) -> Option<String> {
+    let text = html_unescape(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn html_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 fn message_reacted_by_sender(message: &Message, emoji: &str, sender: &str) -> bool {
@@ -8936,7 +9122,6 @@ mod tests {
         assert!(app.state().media_hit_count() > 0);
         assert!(!app.state().image_viewer_open());
         let hit = app.state.media_hits.first().cloned().unwrap();
-        let expected_title = format!("Image Preview - {}", hit.title);
         let content_area = inner_area(app.state.pane_areas.messages);
         let click_row = content_area
             .y
@@ -8961,8 +9146,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(content.contains(&expected_title));
-        assert!(content.contains("Click anywhere or press Esc to close"));
+        assert!(!content.contains("Image Preview"));
+        assert!(!content.contains("Click anywhere or press Esc to close"));
         assert!(terminal.backend().buffer().content().iter().any(|cell| {
             matches!(cell.fg, Color::Rgb(_, _, _)) || matches!(cell.bg, Color::Rgb(_, _, _))
         }));
@@ -9180,9 +9365,9 @@ mod tests {
             None,
             &HashSet::new(),
             &mut app.media_preview_cache,
+            &app.link_metadata_cache,
             app.theme,
         );
-
         assert!(render.lines.iter().any(|line| {
             line.alignment == Some(ratatui::layout::Alignment::Right)
                 && line_text(line).contains("Me")
@@ -9196,6 +9381,100 @@ mod tests {
                 && line_text(line).contains("Photo")
         }));
 
+        Ok(())
+    }
+
+    #[test]
+    fn html_metadata_parser_prefers_open_graph_values() {
+        let html = r#"
+            <html>
+              <head>
+                <title>Fallback Title</title>
+                <meta name="description" content="Fallback description">
+                <meta property="og:title" content="Open Graph Title &amp; More">
+                <meta property="og:description" content="Open Graph description">
+                <meta property="og:image" content="https://example.com/card.jpg">
+              </head>
+            </html>
+        "#;
+
+        assert_eq!(
+            html_meta_content(html, "og:title").as_deref(),
+            Some("Open Graph Title & More")
+        );
+        assert_eq!(
+            html_meta_content(html, "og:description").as_deref(),
+            Some("Open Graph description")
+        );
+        assert_eq!(
+            html_meta_content(html, "og:image").as_deref(),
+            Some("https://example.com/card.jpg")
+        );
+        assert_eq!(html_title(html).as_deref(), Some("Fallback Title"));
+    }
+
+    #[test]
+    fn image_response_detection_uses_content_type_or_url_extension() {
+        assert!(is_image_response(
+            "https://cdn.example.com/photo",
+            Some("image/jpeg; charset=binary")
+        ));
+        assert!(is_image_response(
+            "https://cdn.example.com/photo.webp?token=abc",
+            None
+        ));
+        assert!(!is_image_response(
+            "https://example.com/story",
+            Some("text/html")
+        ));
+    }
+
+    #[test]
+    fn cached_link_image_media_preserves_image_file_details() -> Result<()> {
+        let mut bytes = Vec::new();
+        {
+            let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+            let dynamic = image::DynamicImage::ImageRgba8(image);
+            let mut cursor = std::io::Cursor::new(&mut bytes);
+            dynamic.write_to(&mut cursor, image::ImageFormat::Png)?;
+        }
+        let media = cached_link_image_media(
+            "https://cdn.example.com/photos/card.png?signature=abc",
+            Some("image/png"),
+            &bytes,
+        )?;
+
+        assert_eq!(media.file_name.as_ref(), "card.png");
+        assert_eq!(media.mime_type.as_ref(), "image/png");
+        assert_eq!(media.size_bytes, Some(bytes.len() as u64));
+        assert!(media.local_path.as_ref().is_some_and(|path| path.exists()));
+        Ok(())
+    }
+
+    #[test]
+    fn cached_link_image_media_decodes_gzip_encoded_image_body() -> Result<()> {
+        let mut bytes = Vec::new();
+        {
+            let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 255, 0, 255]));
+            let dynamic = image::DynamicImage::ImageRgba8(image);
+            let mut cursor = std::io::Cursor::new(&mut bytes);
+            dynamic.write_to(&mut cursor, image::ImageFormat::Jpeg)?;
+        }
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &bytes)?;
+        let compressed = encoder.finish()?;
+        let decoded = decode_link_response_body(compressed, Some("gzip"))?;
+        let media = cached_link_image_media(
+            "https://cdn.example.com/photos/fono-hellberg-secure.jpg",
+            Some("image/jpg"),
+            &decoded,
+        )?;
+
+        assert_eq!(decoded, bytes);
+        assert_eq!(media.file_name.as_ref(), "fono-hellberg-secure.jpg");
+        assert_eq!(media.mime_type.as_ref(), "image/jpg");
+        assert!(media.local_path.as_ref().is_some_and(|path| path.exists()));
         Ok(())
     }
 

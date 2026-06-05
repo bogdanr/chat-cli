@@ -14,11 +14,13 @@ arboard.workspace = true
 chat-core = { package = "core", path = "../core" }
 chrono.workspace = true
 crossterm.workspace = true
+flate2.workspace = true
 image.workspace = true
 qrcode.workspace = true
 ratatui.workspace = true
 ratatui-image.workspace = true
 ratatui-textarea.workspace = true
+reqwest.workspace = true
 storage = { path = "../storage" }
 tokio.workspace = true
 unicode-width.workspace = true

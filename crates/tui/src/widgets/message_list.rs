@@ -18,6 +18,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MEDIA_PREVIEW_MAX_WIDTH: u16 = 48;
 const MEDIA_PREVIEW_ROWS: u16 = 8;
+const LINK_PREVIEW_CARD_WIDTH: u16 = 42;
+const LINK_PREVIEW_THUMBNAIL_ROWS: u16 = 4;
 const MESSAGE_AVATAR_WIDTH: u16 = 2;
 const MESSAGE_AVATAR_ROWS: u16 = 1;
 const BUBBLE_MAX_PERCENT: u16 = 72;
@@ -30,6 +32,22 @@ pub struct MessageListProps<'a> {
     pub scroll: usize,
     pub focused: bool,
     pub theme: Theme,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LinkMetadata {
+    pub title: Option<Arc<str>>,
+    pub description: Option<Arc<str>>,
+    pub image_url: Option<Arc<str>>,
+    pub image: Option<chat_core::Media>,
+}
+
+pub type LinkMetadataCache = HashMap<Arc<str>, LinkMetadata>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkPreviewRequest {
+    pub message_id: Arc<str>,
+    pub url: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +94,7 @@ pub struct MessageListRender {
     pub media_hits: Vec<MediaHit>,
     pub message_hits: Vec<MessageHit>,
     pub total_lines: usize,
+    pub link_preview_requests: Vec<LinkPreviewRequest>,
 }
 
 pub fn render_message_list(frame: &mut Frame<'_>, area: Rect, props: MessageListProps<'_>) {
@@ -98,9 +117,10 @@ pub fn build_message_lines(
     selected_message_id: Option<&str>,
     unread_message_ids: &HashSet<Arc<str>>,
     media_cache: &mut MediaPreviewCache,
+    link_metadata: &LinkMetadataCache,
     theme: Theme,
 ) -> MessageListRender {
-    let total_lines = message_line_count(messages, content_width);
+    let total_lines = message_line_count(messages, content_width, link_metadata);
     let render_start = scroll.saturating_sub(1);
     let render_end = scroll
         .saturating_add(viewport_rows.max(1))
@@ -109,6 +129,7 @@ pub fn build_message_lines(
     let mut all_lines = Vec::new();
     let mut media_hits = Vec::new();
     let mut message_hits = Vec::new();
+    let mut link_preview_requests = Vec::new();
     let reply_previews = messages
         .iter()
         .map(|message| (message.id.clone(), compact_message_preview(message)))
@@ -120,6 +141,8 @@ pub fn build_message_lines(
         theme,
         previous_sender: None,
         reply_previews,
+        link_metadata,
+        link_preview_requests: &mut link_preview_requests,
     };
 
     let mut line_cursor: usize = 0;
@@ -128,7 +151,7 @@ pub fn build_message_lines(
             .previous_sender
             .as_ref()
             .is_some_and(|previous| previous == &message.sender.platform_id);
-        let line_count = message_lines_len(message, grouped, content_width);
+        let line_count = message_lines_len(message, grouped, content_width, link_metadata);
         let message_start = line_cursor;
         let message_end_exclusive = message_start.saturating_add(line_count);
         context.previous_sender = Some(message.sender.platform_id.clone());
@@ -173,6 +196,7 @@ pub fn build_message_lines(
         media_hits,
         message_hits,
         total_lines,
+        link_preview_requests,
     }
 }
 
@@ -264,7 +288,11 @@ fn line_text(line: &Line<'_>) -> String {
         .collect::<String>()
 }
 
-pub fn message_line_count(messages: &[Message], content_width: u16) -> usize {
+pub fn message_line_count(
+    messages: &[Message],
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+) -> usize {
     let mut previous_sender: Option<&Arc<str>> = None;
     messages
         .iter()
@@ -272,7 +300,7 @@ pub fn message_line_count(messages: &[Message], content_width: u16) -> usize {
             let grouped =
                 previous_sender.is_some_and(|previous| previous == &message.sender.platform_id);
             previous_sender = Some(&message.sender.platform_id);
-            message_lines_len(message, grouped, content_width)
+            message_lines_len(message, grouped, content_width, link_metadata)
         })
         .sum()
 }
@@ -367,6 +395,8 @@ struct MessageRenderContext<'a> {
     theme: Theme,
     previous_sender: Option<Arc<str>>,
     reply_previews: HashMap<Arc<str>, String>,
+    link_metadata: &'a LinkMetadataCache,
+    link_preview_requests: &'a mut Vec<LinkPreviewRequest>,
 }
 
 fn message_lines(
@@ -418,6 +448,7 @@ fn message_lines(
         start_line + lines.len(),
         message.is_from_me,
         accent_style,
+        Some(&message.id),
     ));
 
     let receipts = receipt_summary(message);
@@ -473,9 +504,12 @@ fn content_lines(
     start_line: usize,
     is_from_me: bool,
     accent: Style,
+    message_id: Option<&Arc<str>>,
 ) -> Vec<Line<'static>> {
     match content {
-        Content::Text(text) => text_bubble_lines(text, context.content_width, accent),
+        Content::Text(text) => {
+            text_with_link_preview_lines(text, accent, context, start_line, is_from_me, message_id)
+        }
         Content::Image(media) => {
             media_card_lines("Photo", media, accent, context, start_line, is_from_me)
         }
@@ -492,28 +526,7 @@ fn content_lines(
             media_card_lines("Sticker", media, accent, context, start_line, is_from_me)
         }
         Content::LinkPreview(link) => {
-            let title = link.title.as_deref().unwrap_or("Link preview");
-            let description = link
-                .description
-                .as_deref()
-                .map(|description| format!(" — {description}"))
-                .unwrap_or_default();
-            let mut lines = text_bubble_lines(
-                &format!("LINK PREVIEW: {title} — {}{description}", link.url),
-                context.content_width,
-                accent,
-            );
-            if let Some(image) = &link.image {
-                lines.extend(media_card_lines(
-                    "Link image",
-                    image,
-                    accent,
-                    context,
-                    start_line + lines.len(),
-                    is_from_me,
-                ));
-            }
-            lines
+            link_preview_card_lines(link, accent, context, start_line, is_from_me)
         }
         Content::Poll(poll) => poll_bubble_lines(poll, context.content_width, accent),
         Content::Deleted => text_bubble_lines("[deleted]", context.content_width, accent),
@@ -560,6 +573,116 @@ fn poll_text(poll: &chat_core::Poll) -> String {
     text
 }
 
+fn text_with_link_preview_lines(
+    text: &str,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+    message_id: Option<&Arc<str>>,
+) -> Vec<Line<'static>> {
+    let Some(url) = first_url_in_text(text) else {
+        return text_bubble_lines(text, context.content_width, accent);
+    };
+
+    let url = Arc::<str>::from(url);
+    let metadata = context.link_metadata.get(&url);
+    if metadata.is_none()
+        && let Some(message_id) = message_id
+    {
+        context.link_preview_requests.push(LinkPreviewRequest {
+            message_id: message_id.clone(),
+            url,
+        });
+        return text_bubble_lines(text, context.content_width, accent);
+    }
+
+    let Some(metadata) = metadata else {
+        return text_bubble_lines(text, context.content_width, accent);
+    };
+
+    if !link_metadata_is_useful(metadata) {
+        return text_bubble_lines(text, context.content_width, accent);
+    }
+
+    let mut lines = Vec::new();
+    let text_without_url = remove_first_url_from_text(text);
+    if !text_without_url.is_empty() {
+        lines.extend(text_bubble_lines(&text_without_url, context.content_width, accent));
+    }
+
+    if let Some(image) = &metadata.image {
+        let Some(image_lines) = link_image_card_lines(
+            "Photo",
+            image,
+            accent,
+            context,
+            start_line + lines.len(),
+            is_from_me,
+        ) else {
+            return text_bubble_lines(text, context.content_width, accent);
+        };
+        lines.extend(image_lines);
+    } else {
+        let link = chat_core::LinkPreview {
+            url,
+            title: metadata.title.clone(),
+            description: metadata.description.clone(),
+            image: None,
+        };
+        lines.extend(link_preview_card_lines(
+            &link,
+            accent,
+            context,
+            start_line + lines.len(),
+            is_from_me,
+        ));
+    }
+    lines
+}
+
+fn first_url_in_text(text: &str) -> Option<&str> {
+    text.split_whitespace()
+        .find(|part| part.starts_with("https://") || part.starts_with("http://"))
+        .map(|part| {
+            part.trim_end_matches(|value: char| matches!(value, '.' | ',' | ')' | ']' | '}'))
+        })
+        .filter(|url| !url.is_empty())
+}
+
+fn remove_first_url_from_text(text: &str) -> String {
+    let Some(url) = first_url_in_text(text) else {
+        return text.trim().to_owned();
+    };
+    text.replacen(url, "", 1)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn link_metadata_is_useful(metadata: &LinkMetadata) -> bool {
+    metadata
+        .image
+        .as_ref()
+        .is_some_and(link_metadata_image_is_useful)
+        || link_metadata_has_text(metadata)
+}
+
+fn link_metadata_image_is_useful(media: &chat_core::Media) -> bool {
+    media_preview_source(media).is_some()
+}
+
+fn link_metadata_has_text(metadata: &LinkMetadata) -> bool {
+    metadata
+        .title
+        .as_deref()
+        .is_some_and(|title| !title.trim().is_empty())
+        || metadata
+            .description
+            .as_deref()
+            .is_some_and(|description| !description.trim().is_empty())
+}
+
 fn text_bubble_lines(text: &str, content_width: u16, accent: Style) -> Vec<Line<'static>> {
     let max_inner_width = bubble_inner_width(content_width);
     let wrapped = wrap_text(text, max_inner_width);
@@ -578,6 +701,167 @@ fn text_bubble_lines(text: &str, content_width: u16, accent: Style) -> Vec<Line<
     }
     lines.push(bubble_border_line('╰', '─', '╯', inner_width, accent));
     lines
+}
+
+fn link_preview_card_lines(
+    link: &chat_core::LinkPreview,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    let card_width = link_preview_card_width(context.content_width);
+    let accent = media_card_accent(accent);
+    let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
+
+    if let Some(image) = &link.image {
+        let (preview_rows, source, error) = media_preview_rows(
+            image,
+            context.media_cache,
+            card_width,
+            LINK_PREVIEW_THUMBNAIL_ROWS,
+            accent.fg.unwrap_or(Color::DarkGray),
+        );
+
+        if let (Some(path), None) = (&source, &error) {
+            let hit_width = card_width.saturating_add(4).min(context.content_width);
+            let start_col = if is_from_me {
+                context.content_width.saturating_sub(hit_width)
+            } else {
+                0
+            };
+            context.media_hits.push(MediaHit {
+                start_line: start_line + lines.len(),
+                end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
+                start_col,
+                end_col: start_col.saturating_add(hit_width),
+                path: path.clone(),
+                title: link
+                    .title
+                    .as_deref()
+                    .unwrap_or("Link preview image")
+                    .to_owned(),
+                caption: link.description.as_deref().map(str::to_owned),
+            });
+        }
+
+        lines.extend(
+            preview_rows
+                .into_iter()
+                .map(|row| card_preview_line(accent, row, card_width)),
+        );
+    }
+
+    let title = link.title.as_deref().unwrap_or("Link");
+    let source = link_preview_source_label(link.url.as_ref());
+
+    lines.push(card_text_line(
+        accent,
+        title,
+        card_width,
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if let Some(description) = link.description.as_deref() {
+        lines.push(card_text_line(
+            accent,
+            description,
+            card_width,
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    lines.push(card_text_line(
+        accent,
+        &source,
+        card_width,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(card_border_line('╰', '─', '╯', card_width, accent));
+    lines
+}
+
+fn link_preview_source_label(url: &str) -> String {
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = without_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(without_scheme)
+        .trim_start_matches("www.");
+
+    if host.is_empty() {
+        url.to_owned()
+    } else {
+        host.to_owned()
+    }
+}
+
+fn link_image_card_lines(
+    label: &str,
+    media: &chat_core::Media,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Option<Vec<Line<'static>>> {
+    let card_width = media_card_width(context.content_width);
+    let accent = media_card_accent(accent);
+    let (preview_rows, source, error) = media_preview_rows(
+        media,
+        context.media_cache,
+        card_width,
+        MEDIA_PREVIEW_ROWS,
+        accent.fg.unwrap_or(Color::DarkGray),
+    );
+    let path = source.filter(|_| error.is_none())?;
+    let mut lines = vec![
+        card_border_line('╭', '─', '╮', card_width, accent),
+        card_text_line(
+            accent,
+            label,
+            card_width,
+            accent.add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    let hit_width = card_width.saturating_add(4).min(context.content_width);
+    let start_col = if is_from_me {
+        context.content_width.saturating_sub(hit_width)
+    } else {
+        0
+    };
+    context.media_hits.push(MediaHit {
+        start_line: start_line + lines.len(),
+        end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
+        start_col,
+        end_col: start_col.saturating_add(hit_width),
+        path,
+        title: media.file_name.to_string(),
+        caption: media.caption.as_deref().map(str::to_owned),
+    });
+
+    lines.extend(
+        preview_rows
+            .into_iter()
+            .map(|row| card_preview_line(accent, row, card_width)),
+    );
+    lines.push(card_text_line(
+        accent,
+        &format!("file: {}{}", media.file_name, format_media_size(media)),
+        card_width,
+        Style::default(),
+    ));
+    if let Some(caption) = &media.caption {
+        lines.push(card_text_line(
+            accent,
+            &format!("caption: {caption}"),
+            card_width,
+            Style::default(),
+        ));
+    }
+    lines.push(card_border_line('╰', '─', '╯', card_width, accent));
+    Some(lines)
 }
 
 fn media_card_lines(
@@ -877,6 +1161,12 @@ fn media_card_width(content_width: u16) -> u16 {
         .max(1) as u16
 }
 
+fn link_preview_card_width(content_width: u16) -> u16 {
+    bubble_inner_width(content_width)
+        .min(LINK_PREVIEW_CARD_WIDTH as usize)
+        .max(1) as u16
+}
+
 fn bubble_inner_width(content_width: u16) -> usize {
     let content_width = content_width as usize;
     let max_bubble_width = content_width
@@ -1145,18 +1435,27 @@ fn short_id(id: &str) -> String {
         .collect()
 }
 
-fn message_lines_len(message: &Message, grouped: bool, content_width: u16) -> usize {
+fn message_lines_len(
+    message: &Message,
+    grouped: bool,
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+) -> usize {
     usize::from(!grouped)
         + usize::from(message.reply_to.is_some())
-        + content_lines_len(&message.content, content_width)
+        + content_lines_len(&message.content, content_width, link_metadata)
         + usize::from(message.is_from_me || !receipt_summary(message).is_empty())
         + usize::from(!message.reactions.is_empty())
         + 1
 }
 
-fn content_lines_len(content: &Content, content_width: u16) -> usize {
+fn content_lines_len(
+    content: &Content,
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+) -> usize {
     match content {
-        Content::Text(text) => text_bubble_line_count(text, content_width),
+        Content::Text(text) => text_with_link_preview_line_count(text, content_width, link_metadata),
         Content::Deleted => text_bubble_line_count("[deleted]", content_width),
         Content::Poll(poll) => text_bubble_line_count(&poll_text(poll), content_width),
         Content::Image(media)
@@ -1164,22 +1463,7 @@ fn content_lines_len(content: &Content, content_width: u16) -> usize {
         | Content::Audio(media)
         | Content::File(media)
         | Content::Sticker(media) => media_card_line_count(media),
-        Content::LinkPreview(link) => {
-            let title = link.title.as_deref().unwrap_or("Link preview");
-            let description = link
-                .description
-                .as_deref()
-                .map(|description| format!(" — {description}"))
-                .unwrap_or_default();
-            text_bubble_line_count(
-                &format!("LINK PREVIEW: {title} — {}{description}", link.url),
-                content_width,
-            ) + link
-                .image
-                .as_ref()
-                .map(media_card_line_count)
-                .unwrap_or_default()
-        }
+        Content::LinkPreview(link) => link_preview_card_line_count(link),
         Content::Unsupported(kind) => {
             text_bubble_line_count(&format!("[unsupported: {kind}]"), content_width)
         }
@@ -1190,8 +1474,45 @@ fn text_bubble_line_count(text: &str, content_width: u16) -> usize {
     wrap_text(text, bubble_inner_width(content_width)).len() + 2
 }
 
+fn text_with_link_preview_line_count(
+    text: &str,
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+) -> usize {
+    let Some(url) = first_url_in_text(text) else {
+        return text_bubble_line_count(text, content_width);
+    };
+    let Some(metadata) = link_metadata.get(url) else {
+        return text_bubble_line_count(text, content_width);
+    };
+    if !link_metadata_is_useful(metadata) {
+        return text_bubble_line_count(text, content_width);
+    }
+
+    let text_without_url = remove_first_url_from_text(text);
+    let text_lines = if text_without_url.is_empty() {
+        0
+    } else {
+        text_bubble_line_count(&text_without_url, content_width)
+    };
+
+    if let Some(image) = &metadata.image {
+        text_lines + media_card_line_count(image)
+    } else {
+        text_lines + link_preview_card_line_count_for_image(false, metadata.description.is_some())
+    }
+}
+
 fn media_card_line_count(media: &chat_core::Media) -> usize {
     4 + MEDIA_PREVIEW_ROWS as usize + usize::from(media.caption.is_some())
+}
+
+fn link_preview_card_line_count(link: &chat_core::LinkPreview) -> usize {
+    link_preview_card_line_count_for_image(link.image.is_some(), link.description.is_some())
+}
+
+fn link_preview_card_line_count_for_image(has_image: bool, has_description: bool) -> usize {
+    4 + usize::from(has_description) + usize::from(has_image) * LINK_PREVIEW_THUMBNAIL_ROWS as usize
 }
 
 #[cfg(test)]
@@ -1243,6 +1564,7 @@ mod tests {
             None,
             &HashSet::new(),
             &mut cache,
+            &LinkMetadataCache::default(),
             Theme::default(),
         );
         let rendered = render
@@ -1310,6 +1632,7 @@ mod tests {
             Some("incoming"),
             &HashSet::new(),
             &mut cache,
+            &LinkMetadataCache::default(),
             Theme::default(),
         );
         let incoming_selected =
@@ -1326,6 +1649,7 @@ mod tests {
             Some("outgoing"),
             &HashSet::new(),
             &mut cache,
+            &LinkMetadataCache::default(),
             Theme::default(),
         );
         let outgoing_selected =
@@ -1418,6 +1742,7 @@ mod tests {
             None,
             &HashSet::new(),
             &mut cache,
+            &LinkMetadataCache::default(),
             Theme::default(),
         );
         let rendered_lines = render
@@ -1447,6 +1772,454 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn text_message_with_url_waits_for_useful_metadata_before_preview_card() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let message = text_message(
+            "plain-url",
+            &chat_id,
+            &account,
+            sender,
+            "Check this out https://www.example.com/story?id=42.",
+            10,
+            0,
+            false,
+        );
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+        let card_lines = rendered_lines
+            .iter()
+            .filter(|line| line.starts_with('╭') || line.starts_with('│') || line.starts_with('╰'))
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered_lines
+                .iter()
+                .any(|line| line.contains("Check this out"))
+        );
+        assert!(!rendered_lines.iter().any(|line| line.contains("Link")));
+        assert_eq!(render.link_preview_requests.len(), 1);
+        assert_eq!(
+            render.link_preview_requests[0].url.as_ref(),
+            "https://www.example.com/story?id=42"
+        );
+        assert!(card_lines.len() < 7);
+        assert_eq!(render.total_lines, 5);
+    }
+
+    #[test]
+    fn text_message_with_url_uses_cached_metadata_for_preview_card() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let message = text_message(
+            "plain-url-metadata",
+            &chat_id,
+            &account,
+            sender,
+            "Read https://example.com/story today",
+            10,
+            0,
+            false,
+        );
+        let mut metadata = LinkMetadataCache::default();
+        metadata.insert(
+            Arc::<str>::from("https://example.com/story"),
+            LinkMetadata {
+                title: Some(Arc::<str>::from("Actual article title")),
+                description: Some(Arc::<str>::from("Fetched Open Graph description")),
+                image_url: Some(Arc::<str>::from("https://example.com/preview.jpg")),
+                image: None,
+            },
+        );
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &metadata,
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+
+        assert!(
+            rendered_lines
+                .iter()
+                .any(|line| line.contains("Actual article title"))
+        );
+        assert!(
+            rendered_lines
+                .iter()
+                .any(|line| line.contains("Fetched Open Graph description"))
+        );
+        assert!(
+            !rendered_lines
+                .iter()
+                .any(|line| line.contains("https://example.com/story"))
+        );
+        assert!(render.link_preview_requests.is_empty());
+    }
+
+    #[test]
+    fn direct_image_url_replaces_url_with_image_card_when_ready() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let message = text_message(
+            "plain-image-url",
+            &chat_id,
+            &account,
+            sender,
+            "https://cdn.example.com/photo.jpg",
+            10,
+            0,
+            false,
+        );
+        let image_dir = tempfile::tempdir().expect("image tempdir");
+        let image_path = image_dir.path().join("photo.png");
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .save(&image_path)
+            .expect("write test image");
+        let mut metadata = LinkMetadataCache::default();
+        metadata.insert(
+            Arc::<str>::from("https://cdn.example.com/photo.jpg"),
+            LinkMetadata {
+                title: None,
+                description: None,
+                image_url: Some(Arc::<str>::from("https://cdn.example.com/photo.jpg")),
+                image: Some(chat_core::Media {
+                    id: Arc::<str>::from("link:https://cdn.example.com/photo.jpg"),
+                    file_name: Arc::<str>::from("photo.jpg"),
+                    mime_type: Arc::<str>::from("image/jpeg"),
+                    size_bytes: Some(1024),
+                    caption: None,
+                    local_path: Some(image_path),
+                    thumbnail: None,
+                }),
+            },
+        );
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &metadata,
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+
+        assert!(render.link_preview_requests.is_empty());
+        assert!(rendered_lines.iter().any(|line| line.contains("Photo")));
+        assert!(rendered_lines.iter().any(|line| line.contains("photo.jpg")));
+        assert!(
+            !rendered_lines
+                .iter()
+                .any(|line| line.contains("https://cdn.example.com/photo.jpg"))
+        );
+        assert_eq!(render.total_lines, 14);
+    }
+
+    #[test]
+    fn unusable_long_url_message_stays_visible_after_metadata_fetch_fails() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let url = "https://cdn.example.com/this/path/is/far/too/long/to/be/a/useful/fallback/link/when/preview/metadata/fails.jpg";
+        let message = text_message(
+            "broken-long-url",
+            &chat_id,
+            &account,
+            sender,
+            &format!("Broken {url}"),
+            10,
+            0,
+            false,
+        );
+        let mut metadata = LinkMetadataCache::default();
+        metadata.insert(Arc::<str>::from(url), LinkMetadata::default());
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            60,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &metadata,
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+
+        assert!(rendered_lines.iter().any(|line| line.contains("Broken")));
+        assert!(rendered_lines.iter().any(|line| line.contains("cdn.example.com")));
+        assert!(render.link_preview_requests.is_empty());
+    }
+
+    #[test]
+    fn unusable_single_row_url_message_stays_visible_after_metadata_fetch_fails() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let url = "https://x.co/a";
+        let message = text_message(
+            "broken-short-url",
+            &chat_id,
+            &account,
+            sender,
+            url,
+            10,
+            0,
+            false,
+        );
+        let mut metadata = LinkMetadataCache::default();
+        metadata.insert(Arc::<str>::from(url), LinkMetadata::default());
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &metadata,
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+
+        assert!(rendered_lines.iter().any(|line| line.contains(url)));
+        assert!(render.link_preview_requests.is_empty());
+    }
+
+    #[test]
+    fn undecodable_image_metadata_falls_back_to_original_message() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let url = "https://cdn.example.com/product/fono-hellberg-secure.jpg";
+        let message = text_message(
+            "bad-image-url",
+            &chat_id,
+            &account,
+            sender,
+            url,
+            10,
+            0,
+            false,
+        );
+        let image_dir = tempfile::tempdir().expect("image tempdir");
+        let image_path = image_dir.path().join("bad.jpg");
+        std::fs::write(&image_path, b"not an image").expect("write bad image cache");
+        let mut metadata = LinkMetadataCache::default();
+        metadata.insert(
+            Arc::<str>::from(url),
+            LinkMetadata {
+                title: None,
+                description: None,
+                image_url: Some(Arc::<str>::from(url)),
+                image: Some(chat_core::Media {
+                    id: Arc::<str>::from("link:https://cdn.example.com/product/fono-hellberg-secure.jpg"),
+                    file_name: Arc::<str>::from("bad.jpg"),
+                    mime_type: Arc::<str>::from("image/jpeg"),
+                    size_bytes: Some(12),
+                    caption: None,
+                    local_path: Some(image_path),
+                    thumbnail: None,
+                }),
+            },
+        );
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &metadata,
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+
+        assert!(rendered_lines.iter().any(|line| line.contains(url)));
+        assert!(!rendered_lines.iter().any(|line| line.contains("Photo")));
+        assert!(!rendered_lines.iter().any(|line| line.contains("image decode failed")));
+        assert!(render.link_preview_requests.is_empty());
+    }
+
+    #[test]
+    fn link_preview_renders_as_fixed_size_card() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let mut message =
+            text_message("link-preview", &chat_id, &account, sender, "", 10, 0, false);
+        message.content = Content::LinkPreview(chat_core::LinkPreview {
+            url: Arc::<str>::from(
+                "https://www.example.com/articles/a-very-long-path-that-should-not-expand-the-card",
+            ),
+            title: Some(Arc::<str>::from(
+                "A very long article title that should be truncated instead of growing the preview card",
+            )),
+            description: Some(Arc::<str>::from(
+                "A very long description that should stay on one fixed-width line so the preview never takes over the message pane.",
+            )),
+            image: None,
+        });
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+        let card_lines = rendered_lines
+            .iter()
+            .filter(|line| line.starts_with('╭') || line.starts_with('│') || line.starts_with('╰'))
+            .collect::<Vec<_>>();
+
+        assert_eq!(card_lines.len(), 5);
+        assert!(
+            rendered_lines
+                .iter()
+                .any(|line| line.contains("example.com"))
+        );
+        assert!(
+            !rendered_lines
+                .iter()
+                .any(|line| line.contains("LINK PREVIEW"))
+        );
+        assert!(card_lines.iter().all(|line| line.chars().count() == 46));
+        assert_eq!(render.total_lines, message_line_count(&[], 120, &LinkMetadataCache::default()) + 7);
+    }
+
+    #[test]
+    fn link_preview_with_image_uses_compact_thumbnail_height() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:links");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let mut message = text_message(
+            "link-preview-image",
+            &chat_id,
+            &account,
+            sender,
+            "",
+            10,
+            0,
+            false,
+        );
+        message.content = Content::LinkPreview(chat_core::LinkPreview {
+            url: Arc::<str>::from("https://example.com/story"),
+            title: Some(Arc::<str>::from("Story")),
+            description: Some(Arc::<str>::from("Short description")),
+            image: Some(chat_core::Media {
+                id: Arc::<str>::from("link-image"),
+                file_name: Arc::<str>::from("preview.jpg"),
+                mime_type: Arc::<str>::from("image/jpeg"),
+                size_bytes: Some(1024),
+                caption: None,
+                local_path: Some(PathBuf::from("/tmp/missing-link-preview.jpg")),
+                thumbnail: None,
+            }),
+        });
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+        let preview_unavailable_rows = rendered_lines
+            .iter()
+            .filter(|line| line.contains("no local image"))
+            .count();
+
+        assert_eq!(preview_unavailable_rows, 1);
+        assert_eq!(
+            rendered_lines
+                .iter()
+                .filter(|line| line.starts_with('│'))
+                .count(),
+            7
+        );
+        assert_eq!(render.total_lines, 11);
     }
 
     #[test]
@@ -1540,6 +2313,7 @@ mod tests {
             None,
             &HashSet::new(),
             &mut cache,
+            &LinkMetadataCache::default(),
             Theme::default(),
         );
 
@@ -1559,6 +2333,18 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    fn rendered_lines(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     fn rendered_line_containing(lines: &[Line<'static>], needle: &str) -> String {

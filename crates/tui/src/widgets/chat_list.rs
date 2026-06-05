@@ -1,5 +1,6 @@
 use crate::theme::Theme;
 use chat_core::{Chat, Platform};
+use chrono::Local;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -476,7 +477,7 @@ fn title(filter: &str, filter_mode: bool, account_filter: &str, visible_count: u
 
 fn formatted_time(chat: &Chat) -> String {
     chat.last_message_at
-        .map(|timestamp| timestamp.format("%H:%M").to_string())
+        .map(|timestamp| timestamp.with_timezone(&Local).format("%H:%M").to_string())
         .unwrap_or_else(|| "--:--".to_owned())
 }
 
