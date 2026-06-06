@@ -1,15 +1,19 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chat_core::{MockProvider, Provider};
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use slack::{SlackAuthMode, SlackProvider, SlackProviderOptions};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use storage::Store;
-use tui::ProviderBox;
+use tui::{AccountProviderFactory, AccountProviderKind, ProviderBox, run_with_factory};
 use whatsapp::{WhatsAppProvider, WhatsAppProviderOptions};
 
 #[derive(Parser)]
@@ -116,22 +120,91 @@ async fn main() -> Result<()> {
         Some(path) => Store::open(path).await?,
         None => Store::open_default().await?,
     };
-    let providers = build_providers(&args)?;
+    let persisted_accounts = store.get_account_configs().await?;
+    let providers = build_providers_with_persisted(&args, persisted_accounts)?;
+    let existing_provider_ids = providers
+        .iter()
+        .map(|provider| provider.id().to_string())
+        .collect();
+    let provider_factory = build_account_provider_factory(&args, existing_provider_ids);
 
-    let result = tui::run(Arc::new(store), providers).await;
+    let result = run_with_factory(Arc::new(store), providers, Some(provider_factory)).await;
     if args.test_cleanup {
         cleanup_databases(&cleanup_paths)?;
     }
     result
 }
 
-fn build_providers(args: &Args) -> Result<Vec<ProviderBox>> {
+fn build_account_provider_factory(
+    args: &Args,
+    existing_provider_ids: Vec<String>,
+) -> AccountProviderFactory {
+    let whatsapp_db = args.whatsapp_db.clone();
+    let whatsapp_sync = args.whatsapp_sync.clone();
+    let log_path = args.log_file.clone();
+    let slack_counter = Arc::new(AtomicU64::new(1));
+    let whatsapp_counter = Arc::new(AtomicU64::new(1));
+    let used_slack_provider_ids = Arc::new(Mutex::new(
+        existing_provider_ids
+            .into_iter()
+            .filter(|id| id.starts_with("slack:"))
+            .collect::<HashSet<_>>(),
+    ));
+
+    Arc::new(move |kind| match kind {
+        AccountProviderKind::Slack => loop {
+            let ordinal = slack_counter.fetch_add(1, Ordering::Relaxed);
+            let provider = SlackProvider::with_options(SlackProviderOptions {
+                workspace: Some(format!("Workspace {ordinal}")),
+                ..SlackProviderOptions::new(SlackAuthMode::UserOAuth)
+            })?;
+            let provider_id = provider.id().to_string();
+            let mut used_ids = used_slack_provider_ids
+                .lock()
+                .map_err(|_| anyhow!("Slack provider id registry is unavailable"))?;
+            if used_ids.insert(provider_id) {
+                break Ok(Arc::new(provider) as ProviderBox);
+            }
+        },
+        AccountProviderKind::WhatsApp => {
+            let ordinal = whatsapp_counter.fetch_add(1, Ordering::Relaxed);
+            let db_path = if ordinal == 1 {
+                whatsapp_db.clone()
+            } else {
+                let mut path = whatsapp_db.clone();
+                let extension = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or("db");
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("chat-cli-whatsapp");
+                path.set_file_name(format!("{stem}-{ordinal}.{extension}"));
+                path
+            };
+            Ok(
+                Arc::new(WhatsAppProvider::with_options(WhatsAppProviderOptions {
+                    db_path: db_path.to_string_lossy().to_string(),
+                    sync_scope: whatsapp_sync.clone(),
+                    log_path: log_path.clone(),
+                })?) as ProviderBox,
+            )
+        }
+        AccountProviderKind::Demo => Ok(Arc::new(MockProvider::new()) as ProviderBox),
+    })
+}
+
+fn build_providers_with_persisted(
+    args: &Args,
+    persisted_accounts: Vec<storage::StoredAccountConfig>,
+) -> Result<Vec<ProviderBox>> {
     let mut providers: Vec<ProviderBox> = Vec::new();
     if args.mock_provider {
-        providers.push(Box::new(MockProvider::new()));
+        providers.push(Arc::new(MockProvider::new()));
     }
 
-    for options in slack_provider_options(args)? {
+    for options in slack_provider_options(args, &persisted_accounts)? {
         let provider = SlackProvider::with_options(options)?;
         let provider_id = provider.id().clone();
         if providers
@@ -140,11 +213,11 @@ fn build_providers(args: &Args) -> Result<Vec<ProviderBox>> {
         {
             bail!("duplicate provider id configured: {}", provider_id);
         }
-        providers.push(Box::new(provider));
+        providers.push(Arc::new(provider));
     }
 
     if args.whatsapp {
-        providers.push(Box::new(WhatsAppProvider::with_options(
+        providers.push(Arc::new(WhatsAppProvider::with_options(
             WhatsAppProviderOptions {
                 db_path: args.whatsapp_db.to_string_lossy().to_string(),
                 sync_scope: args.whatsapp_sync.clone(),
@@ -155,12 +228,12 @@ fn build_providers(args: &Args) -> Result<Vec<ProviderBox>> {
     Ok(providers)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SlackWorkspacesFile {
     workspaces: Vec<SlackWorkspaceProfile>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct SlackWorkspaceProfile {
     workspace: Option<String>,
     label: Option<String>,
@@ -175,7 +248,11 @@ struct SlackWorkspaceProfile {
     webhook_url: Option<String>,
 }
 
-fn slack_provider_options(args: &Args) -> Result<Vec<SlackProviderOptions>> {
+fn slack_provider_options(
+    args: &Args,
+    persisted_accounts: &[storage::StoredAccountConfig],
+) -> Result<Vec<SlackProviderOptions>> {
+    let persisted_options = dedupe_persisted_slack_options(persisted_accounts)?;
     let mut profiles = Vec::new();
 
     if let Some(path) = &args.slack_workspaces_file {
@@ -186,16 +263,29 @@ fn slack_provider_options(args: &Args) -> Result<Vec<SlackProviderOptions>> {
         profiles.push(parse_slack_workspace_profile(profile)?);
     }
 
-    let mut options = profiles
-        .into_iter()
-        .map(SlackWorkspaceProfile::into_options)
-        .collect::<Result<Vec<_>>>()?;
-
+    let mut configured_options = Vec::new();
     if args.slack {
-        options.insert(0, single_slack_options(args));
+        configured_options.push(single_slack_options(args));
     }
+    configured_options.extend(
+        profiles
+            .into_iter()
+            .map(SlackWorkspaceProfile::into_options)
+            .collect::<Result<Vec<_>>>()?,
+    );
 
-    ensure_unique_slack_provider_ids(&options)?;
+    ensure_unique_slack_provider_ids(&configured_options)?;
+    let mut seen_ids = slack_provider_id_set(&configured_options)?;
+    let mut options = configured_options;
+    let has_explicit_slack_config = args.slack || !options.is_empty();
+    for persisted in persisted_options {
+        let id = slack_provider_id_for_options(&persisted)?;
+        if seen_ids.insert(id.clone()) {
+            options.push(persisted);
+        } else if !has_explicit_slack_config {
+            eprintln!("ignoring duplicate stored Slack workspace provider id '{id}'");
+        }
+    }
     Ok(options)
 }
 
@@ -250,16 +340,50 @@ fn parse_slack_workspace_profile(value: &str) -> Result<SlackWorkspaceProfile> {
 }
 
 fn ensure_unique_slack_provider_ids(options: &[SlackProviderOptions]) -> Result<()> {
-    let mut seen = Vec::<String>::new();
+    let mut seen = HashSet::<String>::new();
     for options in options {
-        let provider = SlackProvider::with_options(options.clone())?;
-        let id = provider.id().to_string();
-        if seen.iter().any(|existing| existing == &id) {
+        let id = slack_provider_id_for_options(options)?;
+        if !seen.insert(id.clone()) {
             bail!("duplicate Slack workspace provider id '{id}'. Set unique workspace labels.");
         }
-        seen.push(id);
     }
     Ok(())
+}
+
+fn slack_provider_id_set(options: &[SlackProviderOptions]) -> Result<HashSet<String>> {
+    options.iter().map(slack_provider_id_for_options).collect()
+}
+
+fn slack_provider_id_for_options(options: &SlackProviderOptions) -> Result<String> {
+    Ok(SlackProvider::with_options(options.clone())?
+        .id()
+        .to_string())
+}
+
+fn dedupe_persisted_slack_options(
+    persisted_accounts: &[storage::StoredAccountConfig],
+) -> Result<Vec<SlackProviderOptions>> {
+    let mut entries = Vec::<(String, bool, SlackProviderOptions)>::new();
+    for account in persisted_accounts {
+        if account.platform != chat_core::Platform::Slack {
+            continue;
+        }
+        let options: SlackProviderOptions = serde_json::from_str(&account.config_json)
+            .with_context(|| format!("parsing stored Slack account {}", account.id))?;
+        let id = slack_provider_id_for_options(&options)?;
+        let stored_id_matches = account.id.as_ref() == id;
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|(existing_id, _, _)| existing_id == &id)
+        {
+            if !existing.1 && stored_id_matches {
+                *existing = (id, stored_id_matches, options);
+            }
+        } else {
+            entries.push((id, stored_id_matches, options));
+        }
+    }
+    Ok(entries.into_iter().map(|(_, _, options)| options).collect())
 }
 
 impl SlackWorkspaceProfile {
@@ -359,6 +483,24 @@ mod tests {
             db: None,
             test_cleanup: false,
         }
+    }
+
+    fn stored_slack_account(
+        id: &str,
+        workspace: &str,
+        token: &str,
+    ) -> Result<storage::StoredAccountConfig> {
+        let options = SlackProviderOptions {
+            workspace: Some(workspace.to_owned()),
+            user_token: Some(token.to_owned()),
+            ..SlackProviderOptions::new(SlackAuthMode::UserOAuth)
+        };
+        Ok(storage::StoredAccountConfig {
+            id: Arc::from(id),
+            platform: chat_core::Platform::Slack,
+            display_name: Arc::from(format!("Slack ({workspace})")),
+            config_json: serde_json::to_string(&options)?,
+        })
     }
 
     #[test]
@@ -510,6 +652,57 @@ bot_token = "xoxb-ops"
         };
 
         assert!(error.contains("duplicate Slack workspace provider id"));
+    }
+
+    #[test]
+    fn duplicate_persisted_slack_accounts_are_deduped() -> Result<()> {
+        let args = base_args();
+        let providers = build_providers_with_persisted(
+            &args,
+            vec![
+                stored_slack_account("slack:slack-workspace-1", "Slack Workspace 1", "xoxp-one")?,
+                stored_slack_account(
+                    "slack:slack-workspace-1-stale",
+                    "Slack Workspace 1",
+                    "xoxp-two",
+                )?,
+            ],
+        )?;
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id().as_ref(), "slack:slack-workspace-1");
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_slack_profiles_override_matching_persisted_accounts() -> Result<()> {
+        let args = Args {
+            slack_workspace_profiles: vec!["label=Team Alpha,user_token=xoxp-new".to_owned()],
+            ..base_args()
+        };
+        let providers = build_providers_with_persisted(
+            &args,
+            vec![stored_slack_account(
+                "slack:team-alpha",
+                "Team Alpha",
+                "xoxp-old",
+            )?],
+        )?;
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id().as_ref(), "slack:team-alpha");
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_slack_factory_skips_existing_workspace_ordinals() -> Result<()> {
+        let args = base_args();
+        let factory = build_account_provider_factory(&args, vec!["slack:workspace-1".to_owned()]);
+
+        let provider = factory(AccountProviderKind::Slack)?;
+
+        assert_eq!(provider.id().as_ref(), "slack:workspace-2");
+        Ok(())
     }
 
     #[test]

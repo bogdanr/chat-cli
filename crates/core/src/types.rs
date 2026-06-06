@@ -25,6 +25,28 @@ pub struct Account {
     pub avatar: Option<PathBuf>,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ChatKind {
+    #[default]
+    Direct,
+    Group,
+    PublicChannel,
+    PrivateChannel,
+    GroupDirectMessage,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ChatMembership {
+    #[default]
+    Joined,
+    NotJoined,
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 pub struct Chat {
     pub id: ChatId,
@@ -33,6 +55,9 @@ pub struct Chat {
     pub name: Arc<str>,
     pub avatar: Option<PathBuf>,
     pub is_group: bool,
+    pub kind: ChatKind,
+    pub membership: ChatMembership,
+    pub is_shared: bool,
     pub unread_count: u32,
     pub muted: bool,
     pub pinned: bool,

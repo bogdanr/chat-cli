@@ -1,5 +1,5 @@
 use crate::theme::Theme;
-use chat_core::{Chat, Platform};
+use chat_core::{Chat, ChatKind, ChatMembership, Platform};
 use chrono::Local;
 use ratatui::{
     Frame,
@@ -23,7 +23,7 @@ pub type AvatarRows = Vec<Vec<Span<'static>>>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatListRow {
     Chat { chat_index: usize },
-    Separator,
+    Section { title: &'static str },
 }
 
 pub struct ChatListProps<'a> {
@@ -51,7 +51,7 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
                 inner_width,
                 *chat_index == props.selected_chat_index,
             ),
-            ChatListRow::Separator => separator_item(),
+            ChatListRow::Section { title } => section_item(title),
         })
         .collect::<Vec<_>>();
     if items.is_empty() {
@@ -94,16 +94,14 @@ pub fn filter_chat_indices(chats: &[Chat], filter: &str) -> Vec<usize> {
 }
 
 pub fn build_rows(chats: &[Chat], visible_chat_indices: &[usize]) -> Vec<ChatListRow> {
-    let mut rows = Vec::with_capacity(visible_chat_indices.len() + 1);
-    let mut separator_inserted = false;
-    let has_pinned = visible_chat_indices
-        .iter()
-        .any(|index| chats[*index].pinned);
+    let mut rows = Vec::with_capacity(visible_chat_indices.len() + 4);
+    let mut current_section: Option<&'static str> = None;
 
     for &chat_index in visible_chat_indices {
-        if has_pinned && !separator_inserted && !chats[chat_index].pinned {
-            rows.push(ChatListRow::Separator);
-            separator_inserted = true;
+        let section = chat_section(&chats[chat_index]);
+        if current_section != Some(section) {
+            rows.push(ChatListRow::Section { title: section });
+            current_section = Some(section);
         }
         rows.push(ChatListRow::Chat { chat_index });
     }
@@ -198,7 +196,7 @@ pub fn rendered_chat_indices(
         })
         .filter_map(|row| match row {
             ChatListRow::Chat { chat_index } => Some(chat_index),
-            ChatListRow::Separator => None,
+            ChatListRow::Section { .. } => None,
         })
         .collect()
 }
@@ -335,11 +333,30 @@ fn chat_item(
     ])
 }
 
-fn separator_item() -> ListItem<'static> {
+fn section_item(title: &'static str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
-        "── Unpinned ──",
+        format!("── {title} ──"),
         Style::default().fg(Color::DarkGray),
     )))
+}
+
+fn chat_section(chat: &Chat) -> &'static str {
+    if chat.pinned {
+        return "Pinned";
+    }
+    if chat.membership == ChatMembership::NotJoined {
+        return "Browse channels";
+    }
+    if chat.muted {
+        return "Muted";
+    }
+    match (chat.platform.clone(), chat.kind) {
+        (Platform::Slack, ChatKind::PublicChannel | ChatKind::PrivateChannel) => "Channels",
+        (Platform::Slack, ChatKind::Direct) => "Direct messages",
+        (Platform::Slack, ChatKind::GroupDirectMessage) => "Group DMs",
+        _ if chat.is_group => "Groups",
+        _ => "Chats",
+    }
 }
 
 fn empty_state_item(filter: &str, account_filter: &str) -> ListItem<'static> {
@@ -524,7 +541,7 @@ fn scroll_offset(rows: &[ChatListRow], selected_row: Option<usize>, list_height:
 fn row_height(row: &ChatListRow) -> u16 {
     match row {
         ChatListRow::Chat { .. } => CHAT_ROW_HEIGHT,
-        ChatListRow::Separator => 1,
+        ChatListRow::Section { .. } => 1,
     }
 }
 
@@ -604,20 +621,45 @@ mod tests {
     }
 
     #[test]
-    fn rows_insert_separator_between_pinned_and_unpinned_chats() {
+    fn rows_insert_slack_style_sections() {
         let chats = sample_chats();
-        let rows = build_rows(&chats, &[0, 1, 2]);
+        let rows = build_rows(&chats, &[1, 3, 2, 0]);
 
         assert_eq!(
             rows,
             vec![
-                ChatListRow::Chat { chat_index: 0 },
-                ChatListRow::Separator,
+                ChatListRow::Section { title: "Channels" },
                 ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Section {
+                    title: "Direct messages"
+                },
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::Section { title: "Muted" },
                 ChatListRow::Chat { chat_index: 2 },
+                ChatListRow::Section { title: "Pinned" },
+                ChatListRow::Chat { chat_index: 0 },
             ]
         );
-        assert_eq!(selected_row_position(&rows, 2), Some(3));
+        assert_eq!(selected_row_position(&rows, 2), Some(5));
+    }
+
+    #[test]
+    fn rows_keep_a_single_section_when_kinds_are_contiguous() {
+        let chats = sample_chats();
+        let rows = build_rows(&chats, &[1, 4, 3]);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Section { title: "Channels" },
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Chat { chat_index: 4 },
+                ChatListRow::Section {
+                    title: "Direct messages"
+                },
+                ChatListRow::Chat { chat_index: 3 },
+            ]
+        );
     }
 
     #[test]
@@ -665,10 +707,10 @@ mod tests {
         let chats = sample_chats();
         let area = Rect::new(0, 0, 40, 8);
 
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 1), Some(0));
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 3), None);
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 4), Some(1));
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 6), Some(2));
+        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 1), None);
+        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 2), Some(0));
+        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 4), None);
+        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 5), Some(1));
     }
 
     fn sample_chats() -> Vec<Chat> {
@@ -682,6 +724,9 @@ mod tests {
                 name: arc_str("Alice Example"),
                 avatar: None,
                 is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
                 unread_count: 2,
                 muted: false,
                 pinned: true,
@@ -696,6 +741,9 @@ mod tests {
                 name: arc_str("#project-chat-cli"),
                 avatar: None,
                 is_group: true,
+                kind: ChatKind::PublicChannel,
+                membership: ChatMembership::Joined,
+                is_shared: false,
                 unread_count: 0,
                 muted: false,
                 pinned: false,
@@ -705,16 +753,53 @@ mod tests {
             },
             Chat {
                 id: arc_str("media"),
-                account,
+                account: account.clone(),
                 platform: Platform::WhatsApp,
                 name: arc_str("Media Samples"),
                 avatar: None,
                 is_group: true,
+                kind: ChatKind::Group,
+                membership: ChatMembership::Joined,
+                is_shared: false,
                 unread_count: 1,
                 muted: true,
                 pinned: false,
                 last_message_at: Some(now - Duration::hours(1)),
                 last_message_preview: Some(arc_str("Screenshot")),
+                thread_id: None,
+            },
+            Chat {
+                id: arc_str("direct"),
+                account: account.clone(),
+                platform: Platform::Slack,
+                name: arc_str("Dana Example"),
+                avatar: None,
+                is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: Some(now - Duration::minutes(10)),
+                last_message_preview: Some(arc_str("DM preview")),
+                thread_id: None,
+            },
+            Chat {
+                id: arc_str("design"),
+                account,
+                platform: Platform::Slack,
+                name: arc_str("#design"),
+                avatar: None,
+                is_group: true,
+                kind: ChatKind::PublicChannel,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: Some(now - Duration::minutes(15)),
+                last_message_preview: Some(arc_str("Design notes")),
                 thread_id: None,
             },
         ]

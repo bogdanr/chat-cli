@@ -608,7 +608,11 @@ fn text_with_link_preview_lines(
     let mut lines = Vec::new();
     let text_without_url = remove_first_url_from_text(text);
     if !text_without_url.is_empty() {
-        lines.extend(text_bubble_lines(&text_without_url, context.content_width, accent));
+        lines.extend(text_bubble_lines(
+            &text_without_url,
+            context.content_width,
+            accent,
+        ));
     }
 
     if let Some(image) = &metadata.image {
@@ -805,7 +809,8 @@ fn link_image_card_lines(
     start_line: usize,
     is_from_me: bool,
 ) -> Option<Vec<Line<'static>>> {
-    let card_width = media_card_width(context.content_width);
+    let card_width =
+        media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
     let accent = media_card_accent(accent);
     let (preview_rows, source, error) = media_preview_rows(
         media,
@@ -872,7 +877,8 @@ fn media_card_lines(
     start_line: usize,
     is_from_me: bool,
 ) -> Vec<Line<'static>> {
-    let card_width = media_card_width(context.content_width);
+    let card_width =
+        media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
     let accent = media_card_accent(accent);
     let (preview_rows, source, error) = media_preview_rows(
         media,
@@ -1159,6 +1165,31 @@ fn media_card_width(content_width: u16) -> u16 {
     bubble_inner_width(content_width)
         .min(MEDIA_PREVIEW_MAX_WIDTH as usize)
         .max(1) as u16
+}
+
+fn media_card_width_for_media(
+    media: &chat_core::Media,
+    content_width: u16,
+    rows: u16,
+    label: &str,
+) -> u16 {
+    let max_width = media_card_width(content_width);
+    let file_line_width = UnicodeWidthStr::width(
+        format!("file: {}{}", media.file_name, format_media_size(media)).as_str(),
+    );
+    let caption_line_width = media
+        .caption
+        .as_deref()
+        .map(|caption| UnicodeWidthStr::width(format!("caption: {caption}").as_str()))
+        .unwrap_or_default();
+    let min_width = UnicodeWidthStr::width(label)
+        .max(file_line_width)
+        .max(caption_line_width)
+        .max(1) as u16;
+    media_preview_source(media)
+        .and_then(|path| image_cell_size(&path, max_width, rows).ok())
+        .map(|(width, _)| width.max(min_width).min(max_width))
+        .unwrap_or(max_width)
 }
 
 fn link_preview_card_width(content_width: u16) -> u16 {
@@ -1455,7 +1486,9 @@ fn content_lines_len(
     link_metadata: &LinkMetadataCache,
 ) -> usize {
     match content {
-        Content::Text(text) => text_with_link_preview_line_count(text, content_width, link_metadata),
+        Content::Text(text) => {
+            text_with_link_preview_line_count(text, content_width, link_metadata)
+        }
         Content::Deleted => text_bubble_line_count("[deleted]", content_width),
         Content::Poll(poll) => text_bubble_line_count(&poll_text(poll), content_width),
         Content::Image(media)
@@ -1995,7 +2028,11 @@ mod tests {
         let rendered_lines = rendered_lines(&render.lines);
 
         assert!(rendered_lines.iter().any(|line| line.contains("Broken")));
-        assert!(rendered_lines.iter().any(|line| line.contains("cdn.example.com")));
+        assert!(
+            rendered_lines
+                .iter()
+                .any(|line| line.contains("cdn.example.com"))
+        );
         assert!(render.link_preview_requests.is_empty());
     }
 
@@ -2071,7 +2108,9 @@ mod tests {
                 description: None,
                 image_url: Some(Arc::<str>::from(url)),
                 image: Some(chat_core::Media {
-                    id: Arc::<str>::from("link:https://cdn.example.com/product/fono-hellberg-secure.jpg"),
+                    id: Arc::<str>::from(
+                        "link:https://cdn.example.com/product/fono-hellberg-secure.jpg",
+                    ),
                     file_name: Arc::<str>::from("bad.jpg"),
                     mime_type: Arc::<str>::from("image/jpeg"),
                     size_bytes: Some(12),
@@ -2098,7 +2137,11 @@ mod tests {
 
         assert!(rendered_lines.iter().any(|line| line.contains(url)));
         assert!(!rendered_lines.iter().any(|line| line.contains("Photo")));
-        assert!(!rendered_lines.iter().any(|line| line.contains("image decode failed")));
+        assert!(
+            !rendered_lines
+                .iter()
+                .any(|line| line.contains("image decode failed"))
+        );
         assert!(render.link_preview_requests.is_empty());
     }
 
@@ -2156,7 +2199,10 @@ mod tests {
                 .any(|line| line.contains("LINK PREVIEW"))
         );
         assert!(card_lines.iter().all(|line| line.chars().count() == 46));
-        assert_eq!(render.total_lines, message_line_count(&[], 120, &LinkMetadataCache::default()) + 7);
+        assert_eq!(
+            render.total_lines,
+            message_line_count(&[], 120, &LinkMetadataCache::default()) + 7
+        );
     }
 
     #[test]

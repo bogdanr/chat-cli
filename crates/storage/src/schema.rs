@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS chats (
     name         TEXT NOT NULL,
     avatar_path  TEXT,
     is_group     INTEGER NOT NULL DEFAULT 0,
+    kind         TEXT NOT NULL DEFAULT 'direct',
+    membership   TEXT NOT NULL DEFAULT 'joined',
+    is_shared    INTEGER NOT NULL DEFAULT 0,
     unread_count INTEGER NOT NULL DEFAULT 0,
     muted        INTEGER NOT NULL DEFAULT 0,
     pinned       INTEGER NOT NULL DEFAULT 0,
@@ -82,5 +85,11 @@ CREATE TABLE IF NOT EXISTS handles (
     platform_id  TEXT NOT NULL,
     display_name TEXT NOT NULL,
     PRIMARY KEY (account_id, platform_id)
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 "#;

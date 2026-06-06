@@ -1,7 +1,7 @@
 use crate::{
-    Account, Chat, ChatId, Content, EventBus, LinkPreview, Media, Message, MessageId, Platform,
-    PlatformData, PlatformId, Provider, ProviderEvent, ProviderId, Reaction, Receipt, ReceiptKind,
-    Sender, Timestamp,
+    Account, Chat, ChatId, ChatKind, ChatMembership, Content, EventBus, LinkPreview, Media,
+    Message, MessageId, Platform, PlatformData, PlatformId, Provider, ProviderEvent, ProviderId,
+    Reaction, Receipt, ReceiptKind, Sender, Timestamp,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -318,7 +318,7 @@ fn mock_seed_now() -> Timestamp {
 }
 
 fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
-    [
+    let mut chats = [
         ChatSeed {
             id: "mock:chat:family",
             platform: Platform::WhatsApp,
@@ -439,10 +439,17 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             last_seen_minutes_ago: 1500,
             preview: "Next pick: The Design of Everyday Things 📚",
         },
-    ]
-    .into_iter()
-    .map(|seed| chat_from_seed(account, seed, now))
-    .collect()
+    ];
+    chats.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| a.last_seen_minutes_ago.cmp(&b.last_seen_minutes_ago))
+            .then_with(|| a.name.cmp(b.name))
+    });
+    chats
+        .into_iter()
+        .map(|seed| chat_from_seed(account, seed, now))
+        .collect()
 }
 
 fn chat_from_seed(account: &ProviderId, seed: ChatSeed<'_>, now: Timestamp) -> Chat {
@@ -453,6 +460,13 @@ fn chat_from_seed(account: &ProviderId, seed: ChatSeed<'_>, now: Timestamp) -> C
         name: arc_str(seed.name),
         avatar: avatar_path(seed.avatar),
         is_group: seed.is_group,
+        kind: if seed.is_group {
+            ChatKind::Group
+        } else {
+            ChatKind::Direct
+        },
+        membership: ChatMembership::Joined,
+        is_shared: false,
         unread_count: seed.unread_count,
         muted: seed.muted,
         pinned: seed.pinned,

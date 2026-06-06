@@ -97,7 +97,9 @@ impl OutboundCapabilities {
     pub fn supports_content(&self, content: &Content) -> bool {
         match content {
             Content::Text(_) => self.text,
-            Content::Image(media) if media.mime_type.as_ref() == "image/gif" => self.gif || self.image,
+            Content::Image(media) if media.mime_type.as_ref() == "image/gif" => {
+                self.gif || self.image
+            }
             Content::Image(_) => self.image,
             Content::Video(_) => self.video,
             Content::Audio(_) => self.audio,
@@ -145,6 +147,10 @@ pub trait Provider: Send + Sync + 'static {
     fn platform(&self) -> Platform;
 
     fn account_info(&self) -> Account;
+
+    fn config_json(&self) -> Option<String> {
+        None
+    }
 
     fn outbound_capabilities(&self) -> OutboundCapabilities {
         OutboundCapabilities::default()
@@ -209,4 +215,9 @@ pub trait Provider: Send + Sync + 'static {
 
     /// Get contact/user info for a platform ID.
     async fn contact_info(&self, platform_id: &PlatformId) -> anyhow::Result<Option<Sender>>;
+
+    /// List known members/participants for a chat when the provider supports it.
+    async fn chat_members(&self, _chat_id: &ChatId) -> anyhow::Result<Vec<Sender>> {
+        bail!("chat member listing is not supported by this provider")
+    }
 }

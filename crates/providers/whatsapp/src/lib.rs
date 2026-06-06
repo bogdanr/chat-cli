@@ -1,9 +1,9 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chat_core::{
-    Account, AuthChallenge, Chat, ChatId, Content, EventBus, Media, Message, MessageId,
-    OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider,
-    ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData,
+    Account, AuthChallenge, Chat, ChatId, ChatKind, ChatMembership, Content, EventBus, Media,
+    Message, MessageId, OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, PollOption,
+    PollVote, Provider, ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData,
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -93,6 +93,9 @@ impl WhatsAppProvider {
             name: arc_str("WhatsApp Bridge"),
             avatar: None,
             is_group: false,
+            kind: ChatKind::Direct,
+            membership: ChatMembership::Joined,
+            is_shared: false,
             unread_count: 0,
             muted: true,
             pinned: false,
@@ -171,7 +174,12 @@ impl WhatsAppProvider {
 }
 
 impl WhatsAppProvider {
-    fn send_media_to_bridge(&self, chat_jid: &str, media: &Media, content_type: &str) -> Result<String> {
+    fn send_media_to_bridge(
+        &self,
+        chat_jid: &str,
+        media: &Media,
+        content_type: &str,
+    ) -> Result<String> {
         let local_path = media
             .local_path
             .as_ref()
@@ -230,7 +238,9 @@ impl Provider for WhatsAppProvider {
             file: true,
             sticker: true,
             max_upload_size: None,
-            media_note: Some(Arc::from("WhatsApp GIFs may be sent as documents depending on format")),
+            media_note: Some(Arc::from(
+                "WhatsApp GIFs may be sent as documents depending on format",
+            )),
         }
     }
 
@@ -319,7 +329,9 @@ impl Provider for WhatsAppProvider {
             Content::Audio(media) => self.send_media_to_bridge(&chat_jid, media, "audio")?,
             Content::File(media) => self.send_media_to_bridge(&chat_jid, media, "file")?,
             Content::Sticker(media) => self.send_media_to_bridge(&chat_jid, media, "sticker")?,
-            Content::LinkPreview(_) => bail!("WhatsApp link preview sending should be sent as plain text first"),
+            Content::LinkPreview(_) => {
+                bail!("WhatsApp link preview sending should be sent as plain text first")
+            }
             Content::Poll(_) => bail!("WhatsApp poll creation is not wired yet"),
             Content::Deleted => bail!("cannot send a deleted WhatsApp message"),
             Content::Unsupported(_) => bail!("cannot send unsupported WhatsApp content"),
@@ -379,6 +391,7 @@ impl Provider for WhatsAppProvider {
                 name: chat_id_to_name(chat_id),
                 avatar: None,
                 is_group: event.is_group,
+                muted: event.muted,
                 timestamp,
                 preview: content_preview(&content),
                 increment_unread: false,
@@ -583,6 +596,7 @@ struct BridgeEvent {
     from_me: bool,
     #[serde(default)]
     is_group: bool,
+    muted: Option<bool>,
     progress: Option<u8>,
     content_type: Option<String>,
     media_id: Option<String>,
@@ -631,6 +645,7 @@ impl BridgeEvent {
                 timestamp: None,
                 from_me: false,
                 is_group: false,
+                muted: None,
                 progress: None,
                 content_type: None,
                 media_id: None,
@@ -872,6 +887,7 @@ fn forward_message_event(
             name: chat_name_for_event(&event, &sender_jid),
             avatar: event.avatar_path.clone(),
             is_group: event.is_group,
+            muted: event.muted,
             timestamp,
             preview,
             increment_unread: !event.from_me && !is_historical,
@@ -934,6 +950,7 @@ struct ChatPreviewUpdate {
     name: Arc<str>,
     avatar: Option<PathBuf>,
     is_group: bool,
+    muted: Option<bool>,
     timestamp: Timestamp,
     preview: Arc<str>,
     increment_unread: bool,
@@ -952,8 +969,15 @@ fn upsert_chat_preview(
         name: update.name.clone(),
         avatar: update.avatar.clone(),
         is_group: update.is_group,
+        kind: if update.is_group {
+            ChatKind::Group
+        } else {
+            ChatKind::Direct
+        },
+        membership: ChatMembership::Joined,
+        is_shared: false,
         unread_count: 0,
-        muted: false,
+        muted: update.muted.unwrap_or(false),
         pinned: false,
         last_message_at: None,
         last_message_preview: None,
@@ -973,6 +997,9 @@ fn upsert_chat_preview(
         chat.name = update.name;
     }
     chat.is_group = update.is_group;
+    if let Some(muted) = update.muted {
+        chat.muted = muted;
+    }
     if update.increment_unread {
         chat.unread_count = chat.unread_count.saturating_add(1);
     }
@@ -1025,7 +1052,9 @@ fn content_preview(content: &Content) -> Arc<str> {
         Content::Audio(media) => outbound_media_preview("Audio", media),
         Content::File(media) => outbound_media_preview("File", media),
         Content::Sticker(_) => arc_str("Sticker"),
-        Content::LinkPreview(preview) => arc_str(preview.title.as_deref().unwrap_or(preview.url.as_ref())),
+        Content::LinkPreview(preview) => {
+            arc_str(preview.title.as_deref().unwrap_or(preview.url.as_ref()))
+        }
         Content::Poll(poll) => arc_str(format!("Poll: {}", poll.question)),
         Content::Deleted => arc_str("Deleted message"),
         Content::Unsupported(description) => description.clone(),
@@ -1033,7 +1062,11 @@ fn content_preview(content: &Content) -> Arc<str> {
 }
 
 fn outbound_media_preview(label: &str, media: &Media) -> Arc<str> {
-    if let Some(caption) = media.caption.as_deref().filter(|caption| !caption.is_empty()) {
+    if let Some(caption) = media
+        .caption
+        .as_deref()
+        .filter(|caption| !caption.is_empty())
+    {
         arc_str(format!("{label}: {caption}"))
     } else if !media.file_name.is_empty() {
         arc_str(format!("{label}: {}", media.file_name))
@@ -1484,6 +1517,9 @@ fn forward_profile_event(
             if avatar.is_some() {
                 chat.avatar = avatar.clone();
             }
+            if let Some(muted) = event.muted {
+                chat.muted = muted;
+            }
             Some(chat.clone())
         } else if event.is_group {
             let chat = Chat {
@@ -1493,8 +1529,11 @@ fn forward_profile_event(
                 name: arc_str(&name),
                 avatar: avatar.clone(),
                 is_group: true,
+                kind: ChatKind::Group,
+                membership: ChatMembership::Joined,
+                is_shared: false,
                 unread_count: 0,
-                muted: false,
+                muted: event.muted.unwrap_or(false),
                 pinned: false,
                 last_message_at: None,
                 last_message_preview: None,

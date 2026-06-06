@@ -31,7 +31,9 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -69,6 +71,7 @@ type bridgeEvent struct {
 	Timestamp  string `json:"timestamp,omitempty"`
 	FromMe     bool   `json:"from_me,omitempty"`
 	IsGroup    bool   `json:"is_group,omitempty"`
+	Muted      *bool  `json:"muted,omitempty"`
 	Progress   uint8  `json:"progress,omitempty"`
 
 	ContentType           string           `json:"content_type,omitempty"`
@@ -192,6 +195,7 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 
 	if wa.Store.ID != nil {
 		emit(bridgeEvent{Type: "connected", JID: wa.Store.ID.String()})
+		go c.syncChatMuteSettings(context.Background())
 	}
 	emit(bridgeEvent{Type: "sync", Progress: 100})
 	return 1
@@ -569,10 +573,58 @@ func (c *client) ownJID() string {
 	return ""
 }
 
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func isMutedUntilActive(mutedUntil time.Time) bool {
+	return mutedUntil == store.MutedForever || mutedUntil.After(time.Now())
+}
+
+func chatMuted(c *client, ctx context.Context, jid types.JID) bool {
+	if c == nil || c.wa == nil || c.wa.Store == nil || c.wa.Store.ChatSettings == nil || jid.IsEmpty() {
+		return false
+	}
+	settings, err := c.wa.Store.ChatSettings.GetChatSettings(ctx, jid)
+	if err != nil {
+		c.log("load WhatsApp chat settings failed jid=%s: %v", jid.String(), err)
+		return false
+	}
+	return isMutedUntilActive(settings.MutedUntil)
+}
+
+func (c *client) syncChatMuteSettings(ctx context.Context) {
+	if c == nil || c.wa == nil || c.wa.Store == nil || c.wa.Store.ChatSettings == nil || strings.HasPrefix(c.dbPath, "test:") {
+		return
+	}
+	if _, err := c.wa.DangerousInternals().FetchAppState(ctx, appstate.WAPatchRegularHigh, false, true); err != nil {
+		c.log("sync WhatsApp mute app state failed: %v", err)
+	}
+}
+
+func emitMuteEvent(c *client, evt *events.Mute) {
+	if evt == nil || evt.JID.IsEmpty() {
+		return
+	}
+	muted := false
+	if evt.Action != nil && evt.Action.GetMuted() {
+		if evt.Action.GetMuteEndTimestamp() < 0 {
+			muted = true
+		} else {
+			muted = time.UnixMilli(evt.Action.GetMuteEndTimestamp()).After(time.Now())
+		}
+	} else {
+		muted = chatMuted(c, context.Background(), evt.JID)
+	}
+	emit(bridgeEvent{Type: "profile", JID: evt.JID.String(), IsGroup: evt.JID.Server == types.GroupServer, Muted: &muted})
+}
+
 func handleWhatsAppEvent(c *client, evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
 		emitMessageEvent(c, v, "message")
+	case *events.Mute:
+		emitMuteEvent(c, v)
 	case *events.HistorySync:
 		emitHistorySync(c, v)
 	case *events.PushName:
@@ -580,13 +632,15 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 		emit(bridgeEvent{Type: "profile", JID: jid, SenderName: v.NewPushName})
 	case *events.Picture:
 		if v.Remove {
-			emit(bridgeEvent{Type: "profile", JID: v.JID.String()})
+			muted := chatMuted(c, context.Background(), v.JID)
+			emit(bridgeEvent{Type: "profile", JID: v.JID.String(), Muted: &muted})
 		} else {
 			go c.fetchAndEmitProfile(context.Background(), v.JID, "", v.JID.Server == types.GroupServer)
 		}
 	case *events.GroupInfo:
 		if v.Name != nil && v.Name.Name != "" {
-			emit(bridgeEvent{Type: "profile", JID: v.JID.String(), SenderName: v.Name.Name, IsGroup: true})
+			muted := chatMuted(c, context.Background(), v.JID)
+			emit(bridgeEvent{Type: "profile", JID: v.JID.String(), SenderName: v.Name.Name, IsGroup: true, Muted: &muted})
 		}
 	case *events.Connected:
 		emit(bridgeEvent{Type: "connected"})
@@ -631,6 +685,8 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 		}
 		isGroup := chatJID.Server == types.GroupServer
 		chatName := conversationName(c, ctx, chatJID, firstNonEmpty(conv.GetDisplayName(), conv.GetName()))
+		chatMuted := chatMuted(c, ctx, chatJID)
+		emit(bridgeEvent{Type: "profile", JID: chatJID.String(), SenderName: chatName, IsGroup: isGroup, Muted: &chatMuted})
 		go c.fetchAndEmitProfile(ctx, chatJID, chatName, isGroup)
 
 		for _, historyMsg := range conv.GetMessages() {
@@ -715,6 +771,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		Timestamp:  message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
 		FromMe:     message.Info.IsFromMe,
 		IsGroup:    isGroup,
+		Muted:      boolPtr(chatMuted(c, ctx, chatJID)),
 		Reactions:  messageReactions(message),
 	}
 	if poll := pollCreation(message.Message); poll != nil {
@@ -929,7 +986,8 @@ func (c *client) fetchAndEmitGroupInfo(ctx context.Context, jid types.JID) {
 	}
 	info, err := c.wa.GetGroupInfo(ctx, jid)
 	if err == nil && info != nil && info.Name != "" {
-		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: info.Name, IsGroup: true})
+		muted := chatMuted(c, ctx, jid)
+		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: info.Name, IsGroup: true, Muted: &muted})
 	}
 }
 
@@ -943,16 +1001,19 @@ func (c *client) fetchAndEmitProfile(ctx context.Context, jid types.JID, name st
 
 	info, err := c.wa.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: false})
 	if err != nil || info == nil || info.URL == "" {
-		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, IsGroup: isGroup})
+		muted := chatMuted(c, ctx, jid)
+		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, IsGroup: isGroup, Muted: &muted})
 		return
 	}
 
 	path, err := c.downloadProfilePicture(ctx, jid.String(), info.ID, info.URL)
 	if err != nil {
-		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, IsGroup: isGroup})
+		muted := chatMuted(c, ctx, jid)
+		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, IsGroup: isGroup, Muted: &muted})
 		return
 	}
-	emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, AvatarPath: path, IsGroup: isGroup})
+	muted := chatMuted(c, ctx, jid)
+	emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, AvatarPath: path, IsGroup: isGroup, Muted: &muted})
 }
 
 func (c *client) downloadProfilePicture(ctx context.Context, jid, pictureID, url string) (string, error) {

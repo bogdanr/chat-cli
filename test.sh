@@ -1,6 +1,5 @@
 cargo build --workspace
-./target/debug/chat-cli --whatsapp \
-  --whatsapp-sync today \
-  --log-file tmp/chat-cli-whatsapp-debug.log \
-  --db tmp/chat-cli-whatsapp-test.sqlite \
+./target/debug/chat-cli \
+  --log-file tmp/chat-cli-debug.log \
+  --db tmp/chat-cli.sqlite \
   --whatsapp-db tmp/chat-cli-whatsapp-session.db

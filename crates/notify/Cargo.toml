@@ -9,3 +9,6 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
+notify-rust.workspace = true
+

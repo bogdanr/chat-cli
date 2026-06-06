@@ -4,13 +4,44 @@ use anyhow::{Context, Result, anyhow};
 use chat_core::*;
 use chrono::{TimeZone, Utc};
 use directories::ProjectDirs;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, params};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AppSettings {
+    pub desktop_notifications: bool,
+    pub in_app_notifications: bool,
+    pub notification_previews: bool,
+    pub notify_selected_chat: bool,
+    pub notify_muted_chats: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredAccountConfig {
+    pub id: ProviderId,
+    pub platform: Platform,
+    pub display_name: Arc<str>,
+    pub config_json: String,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            desktop_notifications: true,
+            in_app_notifications: true,
+            notification_previews: true,
+            notify_selected_chat: false,
+            notify_muted_chats: false,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -37,6 +68,7 @@ impl Store {
     fn from_connection(conn: Connection) -> Result<Self> {
         conn.execute_batch(schema::V1)
             .context("running storage migrations")?;
+        ensure_chat_metadata_columns(&conn).context("adding chat metadata columns")?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -89,9 +121,92 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub async fn get_account_configs(&self) -> Result<Vec<StoredAccountConfig>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, platform, display_name, config_json FROM accounts ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StoredAccountConfig {
+                id: arc_str(row.get::<_, String>(0)?),
+                platform: platform_from_str(&row.get::<_, String>(1)?),
+                display_name: arc_str(row.get::<_, String>(2)?),
+                config_json: row.get(3)?,
+            })
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub async fn remove_account(&self, id: &ProviderId) -> Result<()> {
         let conn = self.conn.lock().await;
-        conn.execute("DELETE FROM accounts WHERE id = ?1", params![id.as_ref()])?;
+        let transaction = conn.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM reactions WHERE account_id = ?1",
+            params![id.as_ref()],
+        )?;
+        transaction.execute(
+            "DELETE FROM receipts WHERE account_id = ?1",
+            params![id.as_ref()],
+        )?;
+        transaction.execute(
+            "DELETE FROM messages WHERE account_id = ?1",
+            params![id.as_ref()],
+        )?;
+        transaction.execute(
+            "DELETE FROM chats WHERE account_id = ?1",
+            params![id.as_ref()],
+        )?;
+        transaction.execute("DELETE FROM accounts WHERE id = ?1", params![id.as_ref()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub async fn app_settings(&self) -> Result<AppSettings> {
+        self.get_setting("app.settings")
+            .await
+            .map(|settings| settings.unwrap_or_default())
+    }
+
+    pub async fn save_app_settings(&self, settings: &AppSettings) -> Result<()> {
+        self.set_setting("app.settings", settings).await
+    }
+
+    async fn get_setting<T>(&self, key: &str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        let conn = self.conn.lock().await;
+        let value = conn
+            .query_row(
+                "SELECT value_json FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        value
+            .map(|value| {
+                serde_json::from_str(&value).with_context(|| format!("parsing setting {key}"))
+            })
+            .transpose()
+    }
+
+    async fn set_setting<T>(&self, key: &str, value: &T) -> Result<()>
+    where
+        T: Serialize,
+    {
+        let value_json =
+            serde_json::to_string(value).with_context(|| format!("encoding setting {key}"))?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO settings (key, value_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at",
+            params![key, value_json, Utc::now().timestamp_millis()],
+        )?;
         Ok(())
     }
 
@@ -99,14 +214,17 @@ impl Store {
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO chats (
-                id, account_id, platform, name, avatar_path, is_group, unread_count, muted, pinned,
-                last_msg_at, last_preview, thread_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                id, account_id, platform, name, avatar_path, is_group, kind, membership, is_shared,
+                unread_count, muted, pinned, last_msg_at, last_preview, thread_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              ON CONFLICT(id, account_id) DO UPDATE SET
                 platform = excluded.platform,
                 name = excluded.name,
                 avatar_path = excluded.avatar_path,
                 is_group = excluded.is_group,
+                kind = excluded.kind,
+                membership = excluded.membership,
+                is_shared = excluded.is_shared,
                 unread_count = excluded.unread_count,
                 muted = excluded.muted,
                 pinned = excluded.pinned,
@@ -120,6 +238,9 @@ impl Store {
                 chat.name.as_ref(),
                 path_to_string(chat.avatar.as_ref()),
                 chat.is_group,
+                chat_kind_to_str(chat.kind),
+                chat_membership_to_str(chat.membership),
+                chat.is_shared,
                 chat.unread_count,
                 chat.muted,
                 chat.pinned,
@@ -133,26 +254,43 @@ impl Store {
 
     pub async fn get_chats(&self, account_id: &ProviderId) -> Result<Vec<Chat>> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT id, account_id, platform, name, avatar_path, is_group, unread_count, muted, pinned,
-                    last_msg_at, last_preview, thread_id
-             FROM chats WHERE account_id = ?1 ORDER BY pinned DESC, last_msg_at DESC NULLS LAST, name",
-        )?;
-        let rows = stmt.query_map(params![account_id.as_ref()], chat_from_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        load_chats(
+            &conn,
+            "WHERE account_id = ?1",
+            &[&account_id.as_ref() as &dyn ToSql],
+        )
     }
 
     pub async fn get_all_chats(&self) -> Result<Vec<Chat>> {
         let conn = self.conn.lock().await;
-        let mut stmt = conn.prepare(
-            "SELECT id, account_id, platform, name, avatar_path, is_group, unread_count, muted, pinned,
-                    last_msg_at, last_preview, thread_id
-             FROM chats ORDER BY pinned DESC, last_msg_at DESC NULLS LAST, name",
-        )?;
-        let rows = stmt.query_map([], chat_from_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        load_chats(&conn, "", &[])
+    }
+
+    pub async fn delete_chats_not_in(
+        &self,
+        account_id: &ProviderId,
+        chat_ids: &[ChatId],
+    ) -> Result<usize> {
+        let conn = self.conn.lock().await;
+        if chat_ids.is_empty() {
+            let deleted = conn.execute(
+                "DELETE FROM chats WHERE account_id = ?1",
+                params![account_id.as_ref()],
+            )?;
+            return Ok(deleted);
+        }
+
+        let placeholders = std::iter::repeat_n("?", chat_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM chats WHERE account_id = ? AND id NOT IN ({placeholders})");
+        let account_id_ref = account_id.as_ref();
+        let chat_id_refs = chat_ids.iter().map(|id| id.as_ref()).collect::<Vec<_>>();
+        let mut params = Vec::with_capacity(chat_id_refs.len() + 1);
+        params.push(&account_id_ref as &dyn ToSql);
+        params.extend(chat_id_refs.iter().map(|id| id as &dyn ToSql));
+        let deleted = conn.execute(&sql, params.as_slice())?;
+        Ok(deleted)
     }
 
     pub async fn upsert_message(&self, msg: &Message) -> Result<()> {
@@ -520,6 +658,75 @@ impl StoredContent {
     }
 }
 
+fn load_chats(conn: &Connection, where_clause: &str, params: &[&dyn ToSql]) -> Result<Vec<Chat>> {
+    let query = format!(
+        "SELECT id, account_id, platform, name, avatar_path, is_group, kind, membership, is_shared,
+                unread_count, muted, pinned, last_msg_at, last_preview, thread_id
+         FROM chats {where_clause}"
+    );
+    let mut chats = conn
+        .prepare(&query)?
+        .query_map(params, chat_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    sort_chats_for_sidebar(&mut chats);
+    Ok(chats)
+}
+
+fn sort_chats_for_sidebar(chats: &mut [Chat]) {
+    chats.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| chat_sort_bucket(a).cmp(&chat_sort_bucket(b)))
+            .then_with(|| b.unread_count.cmp(&a.unread_count))
+            .then_with(|| b.last_message_at.cmp(&a.last_message_at))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+fn chat_sort_bucket(chat: &Chat) -> u8 {
+    if chat.membership == ChatMembership::NotJoined {
+        return 6;
+    }
+    if chat.muted {
+        return 5;
+    }
+    match (&chat.platform, chat.kind) {
+        (Platform::Slack, ChatKind::PublicChannel | ChatKind::PrivateChannel) => 0,
+        (Platform::Slack, ChatKind::Direct) => 1,
+        (Platform::Slack, ChatKind::GroupDirectMessage) => 2,
+        _ if chat.is_group => 3,
+        _ => 4,
+    }
+}
+
+fn ensure_chat_metadata_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(chats)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+
+    if !columns.contains("kind") {
+        conn.execute(
+            "ALTER TABLE chats ADD COLUMN kind TEXT NOT NULL DEFAULT 'direct'",
+            [],
+        )?;
+    }
+    if !columns.contains("membership") {
+        conn.execute(
+            "ALTER TABLE chats ADD COLUMN membership TEXT NOT NULL DEFAULT 'joined'",
+            [],
+        )?;
+    }
+    if !columns.contains("is_shared") {
+        conn.execute(
+            "ALTER TABLE chats ADD COLUMN is_shared INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
     Ok(Chat {
         id: arc_str(row.get::<_, String>(0)?),
@@ -528,12 +735,15 @@ fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
         name: arc_str(row.get::<_, String>(3)?),
         avatar: string_to_path(row.get::<_, Option<String>>(4)?),
         is_group: row.get(5)?,
-        unread_count: row.get(6)?,
-        muted: row.get(7)?,
-        pinned: row.get(8)?,
-        last_message_at: millis_to_timestamp(row.get(9)?),
-        last_message_preview: row.get::<_, Option<String>>(10)?.map(arc_str),
-        thread_id: row.get::<_, Option<String>>(11)?.map(arc_str),
+        kind: chat_kind_from_str(&row.get::<_, String>(6)?),
+        membership: chat_membership_from_str(&row.get::<_, String>(7)?),
+        is_shared: row.get(8)?,
+        unread_count: row.get(9)?,
+        muted: row.get(10)?,
+        pinned: row.get(11)?,
+        last_message_at: millis_to_timestamp(row.get(12)?),
+        last_message_preview: row.get::<_, Option<String>>(13)?.map(arc_str),
+        thread_id: row.get::<_, Option<String>>(14)?.map(arc_str),
     })
 }
 
@@ -785,6 +995,42 @@ fn platform_from_str(value: &str) -> Platform {
     }
 }
 
+fn chat_kind_to_str(kind: ChatKind) -> &'static str {
+    match kind {
+        ChatKind::Direct => "direct",
+        ChatKind::Group => "group",
+        ChatKind::PublicChannel => "public_channel",
+        ChatKind::PrivateChannel => "private_channel",
+        ChatKind::GroupDirectMessage => "group_direct_message",
+    }
+}
+
+fn chat_kind_from_str(value: &str) -> ChatKind {
+    match value {
+        "group" => ChatKind::Group,
+        "public_channel" => ChatKind::PublicChannel,
+        "private_channel" => ChatKind::PrivateChannel,
+        "group_direct_message" => ChatKind::GroupDirectMessage,
+        _ => ChatKind::Direct,
+    }
+}
+
+fn chat_membership_to_str(membership: ChatMembership) -> &'static str {
+    match membership {
+        ChatMembership::Joined => "joined",
+        ChatMembership::NotJoined => "not_joined",
+        ChatMembership::Unknown => "unknown",
+    }
+}
+
+fn chat_membership_from_str(value: &str) -> ChatMembership {
+    match value {
+        "not_joined" => ChatMembership::NotJoined,
+        "unknown" => ChatMembership::Unknown,
+        _ => ChatMembership::Joined,
+    }
+}
+
 fn receipt_kind_to_str(kind: &ReceiptKind) -> &'static str {
     match kind {
         ReceiptKind::Delivered => "delivered",
@@ -885,6 +1131,9 @@ mod tests {
             name: arc_str("Alice".to_owned()),
             avatar: None,
             is_group: false,
+            kind: ChatKind::Direct,
+            membership: ChatMembership::Joined,
+            is_shared: false,
             unread_count: 1,
             muted: false,
             pinned: true,
@@ -999,6 +1248,9 @@ mod tests {
                 name: arc_str("Alice".to_owned()),
                 avatar: None,
                 is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
                 unread_count: 0,
                 muted: false,
                 pinned: false,
@@ -1045,6 +1297,54 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, ["msg-1", "msg-2", "msg-3"]);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_chats_not_in_prunes_stale_account_chats() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account_id = arc_str("slack:test".to_owned());
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: arc_str("Slack Test".to_owned()),
+            avatar: None,
+        };
+        store.upsert_account(&account, "{}").await?;
+
+        for (id, membership) in [
+            ("CJOINED", ChatMembership::Joined),
+            ("CSTALE", ChatMembership::NotJoined),
+        ] {
+            store
+                .upsert_chat(&Chat {
+                    id: arc_str(id.to_owned()),
+                    account: account_id.clone(),
+                    platform: Platform::Slack,
+                    name: arc_str(id.to_owned()),
+                    avatar: None,
+                    is_group: true,
+                    kind: ChatKind::PublicChannel,
+                    membership,
+                    is_shared: false,
+                    unread_count: 0,
+                    muted: false,
+                    pinned: false,
+                    last_message_at: None,
+                    last_message_preview: None,
+                    thread_id: None,
+                })
+                .await?;
+        }
+
+        let deleted = store
+            .delete_chats_not_in(&account_id, &[arc_str("CJOINED".to_owned())])
+            .await?;
+        let chats = store.get_chats(&account_id).await?;
+
+        assert_eq!(deleted, 1);
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].id.as_ref(), "CJOINED");
         Ok(())
     }
 }
