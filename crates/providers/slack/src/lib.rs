@@ -1,16 +1,27 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::default_constructed_unit_structs,
+    clippy::let_and_return,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chat_core::{
     Account, AuthChallenge, AuthSubmission, AuthSubmissionMode, Chat, ChatId, ChatKind,
-    ChatMembership, Content, EventBus, Media, Message, MessageId, OutboundCapabilities, Platform,
-    PlatformData, PlatformId, Provider, ProviderEvent, ProviderId, Sender, SlackData, Timestamp,
+    ChatMembership, Content, EventBus, Media, Message, MessageId, NetworkActivityDirection,
+    NetworkActivityKind, OutboundCapabilities, Platform, PlatformData, PlatformId, Provider,
+    ProviderEvent, ProviderId, Reaction, Sender, SlackData, Timestamp,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fmt, fs,
+    hash::{Hash, Hasher},
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -218,6 +229,7 @@ pub struct SlackConversation {
     pub is_ext_shared: bool,
     pub is_muted: bool,
     pub is_pinned: bool,
+    pub unread_count: u32,
     pub updated: Option<i64>,
     pub topic: Option<String>,
     pub purpose: Option<String>,
@@ -319,6 +331,8 @@ struct SlackConversationResponse {
     is_ext_shared: Option<bool>,
     is_muted: Option<bool>,
     is_pinned: Option<bool>,
+    unread_count: Option<u32>,
+    unread_count_display: Option<u32>,
     updated: Option<i64>,
     topic: Option<SlackTextValue>,
     purpose: Option<SlackTextValue>,
@@ -330,6 +344,8 @@ struct SlackConversationsHistoryResponse {
     ok: bool,
     error: Option<String>,
     messages: Vec<SlackHistoryMessageResponse>,
+    #[serde(default)]
+    response_metadata: SlackResponseMetadata,
 }
 
 #[derive(Debug, Deserialize)]
@@ -339,10 +355,67 @@ struct SlackHistoryMessageResponse {
     subtype: Option<String>,
     user: Option<String>,
     bot_id: Option<String>,
+    username: Option<String>,
+    icons: Option<SlackMessageIconsResponse>,
+    bot_profile: Option<SlackBotProfileResponse>,
     ts: Option<String>,
     thread_ts: Option<String>,
+    reply_count: Option<u32>,
     text: Option<String>,
+    attachments: Option<Vec<SlackAttachmentResponse>>,
     hidden: Option<bool>,
+    reactions: Option<Vec<SlackReactionResponse>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct SlackMessageIconsResponse {
+    image_36: Option<String>,
+    image_48: Option<String>,
+    image_72: Option<String>,
+    image_original: Option<String>,
+    icon_url: Option<String>,
+    emoji: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct SlackBotProfileResponse {
+    id: Option<String>,
+    name: Option<String>,
+    real_name: Option<String>,
+    icons: Option<SlackMessageIconsResponse>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SlackMessageSenderMetadata {
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct SlackAttachmentResponse {
+    pretext: Option<String>,
+    title: Option<String>,
+    text: Option<String>,
+    fallback: Option<String>,
+    fields: Option<Vec<SlackAttachmentFieldResponse>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct SlackAttachmentFieldResponse {
+    title: Option<String>,
+    value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackReactionResponse {
+    name: Option<String>,
+    users: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackReactionsApiResponse {
+    ok: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -425,7 +498,7 @@ impl SlackUser {
         Sender {
             platform_id: arc_str(&self.id),
             display_name: arc_str(self.best_name()),
-            avatar: None,
+            avatar: self.avatar.as_deref().and_then(slack_avatar_path),
         }
     }
 }
@@ -469,6 +542,22 @@ pub trait SlackApiClient: Send + Sync {
         credential: SlackCredential,
         channel: &str,
     ) -> Result<Vec<String>>;
+
+    async fn add_reaction(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+        timestamp: &str,
+        emoji: &str,
+    ) -> Result<()>;
+
+    async fn remove_reaction(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+        timestamp: &str,
+        emoji: &str,
+    ) -> Result<()>;
 
     async fn history(
         &self,
@@ -521,10 +610,14 @@ struct SlackRealtimeEvent {
     channel: Option<String>,
     user: Option<String>,
     bot_id: Option<String>,
+    username: Option<String>,
+    icons: Option<SlackMessageIconsResponse>,
+    bot_profile: Option<SlackBotProfileResponse>,
     ts: Option<String>,
     event_ts: Option<String>,
     thread_ts: Option<String>,
     text: Option<String>,
+    attachments: Option<Vec<SlackAttachmentResponse>>,
     subtype: Option<String>,
     hidden: Option<bool>,
     deleted_ts: Option<String>,
@@ -539,9 +632,13 @@ struct SlackRealtimeInnerMessage {
     channel: Option<String>,
     user: Option<String>,
     bot_id: Option<String>,
+    username: Option<String>,
+    icons: Option<SlackMessageIconsResponse>,
+    bot_profile: Option<SlackBotProfileResponse>,
     ts: Option<String>,
     thread_ts: Option<String>,
     text: Option<String>,
+    attachments: Option<Vec<SlackAttachmentResponse>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,6 +695,10 @@ impl SlackConversation {
             is_ext_shared: response.is_ext_shared.unwrap_or(false),
             is_muted: response.is_muted.unwrap_or(false),
             is_pinned: response.is_pinned.unwrap_or(false),
+            unread_count: response
+                .unread_count_display
+                .or(response.unread_count)
+                .unwrap_or(0),
             updated: response.updated,
             topic: response
                 .topic
@@ -686,6 +787,26 @@ impl SlackApiClient for SlackWebApiClient {
         channel: &str,
     ) -> Result<Vec<String>> {
         list_web_api_conversation_members(credential, channel).await
+    }
+
+    async fn add_reaction(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+        timestamp: &str,
+        emoji: &str,
+    ) -> Result<()> {
+        post_web_api_reaction("reactions.add", credential, channel, timestamp, emoji).await
+    }
+
+    async fn remove_reaction(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+        timestamp: &str,
+        emoji: &str,
+    ) -> Result<()> {
+        post_web_api_reaction("reactions.remove", credential, channel, timestamp, emoji).await
     }
 
     async fn history(
@@ -1108,6 +1229,53 @@ async fn list_web_api_conversation_members(
     .context("joining Slack conversation members task")?
 }
 
+async fn post_web_api_reaction(
+    method: &'static str,
+    credential: SlackCredential,
+    channel: &str,
+    timestamp: &str,
+    emoji: &str,
+) -> Result<()> {
+    if !matches!(
+        credential.kind,
+        SlackCredentialKind::UserToken
+            | SlackCredentialKind::BotToken
+            | SlackCredentialKind::Unknown
+    ) {
+        bail!("Slack {method} requires a user or bot Web API token");
+    }
+
+    let token = credential.value;
+    let channel = channel.to_owned();
+    let timestamp = timestamp.to_owned();
+    let emoji = normalize_slack_reaction_name(emoji)
+        .ok_or_else(|| anyhow!("Slack reaction emoji cannot be empty"))?;
+    tokio::task::spawn_blocking(move || {
+        let mut response = slack_http_agent()
+            .post(format!("https://slack.com/api/{method}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .send_form([
+                ("channel", channel.as_str()),
+                ("timestamp", timestamp.as_str()),
+                ("name", emoji.as_str()),
+            ])
+            .with_context(|| format!("calling Slack {method}"))?;
+        let result: SlackReactionsApiResponse = response
+            .body_mut()
+            .read_json()
+            .with_context(|| format!("decoding Slack {method} response"))?;
+        if !result.ok {
+            bail!(
+                "Slack {method} failed: {}",
+                result.error.unwrap_or_else(|| "unknown_error".to_owned())
+            );
+        }
+        Ok(())
+    })
+    .await
+    .with_context(|| format!("joining Slack {method} task"))?
+}
+
 async fn list_web_api_history(
     credential: SlackCredential,
     account: &ProviderId,
@@ -1159,24 +1327,115 @@ async fn list_web_api_history(
             );
         }
 
-        let mut messages = history
-            .messages
-            .into_iter()
-            .filter_map(|message| {
-                slack_history_message(
-                    account.clone(),
-                    current_user_id.as_deref(),
-                    chat_id.clone(),
-                    message,
-                    users.as_ref(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        let mut thread_roots = Vec::new();
+        for message in history.messages {
+            let thread_ts = message.thread_ts.clone();
+            let ts = message.ts.clone();
+            let reply_count = message.reply_count.unwrap_or(0);
+            if let Some(message) = slack_history_message(
+                account.clone(),
+                current_user_id.as_deref(),
+                chat_id.clone(),
+                message,
+                users.as_ref(),
+            ) {
+                if reply_count > 0
+                    && thread_ts
+                        .as_deref()
+                        .or(ts.as_deref())
+                        .is_some_and(|thread_ts| thread_ts == message.id.as_ref())
+                {
+                    thread_roots.push(message.id.to_string());
+                }
+                messages.push(message);
+            }
+        }
+
+        let mut seen = messages
+            .iter()
+            .map(|message| message.id.to_string())
+            .collect::<HashSet<_>>();
+        for thread_ts in thread_roots {
+            let replies = fetch_web_api_thread_replies(
+                &token,
+                &account,
+                current_user_id.as_deref(),
+                &chat_id,
+                &thread_ts,
+                users.as_ref(),
+            )?;
+            for reply in replies {
+                if seen.insert(reply.id.to_string()) {
+                    messages.push(reply);
+                }
+            }
+        }
+
         messages.sort_by_key(|message| message.timestamp);
         Ok(messages)
     })
     .await
     .context("joining Slack history task")?
+}
+
+fn fetch_web_api_thread_replies(
+    token: &str,
+    account: &ProviderId,
+    current_user_id: Option<&str>,
+    chat_id: &str,
+    thread_ts: &str,
+    users: Option<&Arc<RwLock<HashMap<String, SlackUser>>>>,
+) -> Result<Vec<Message>> {
+    let mut replies = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let mut request = slack_http_agent()
+            .get("https://slack.com/api/conversations.replies")
+            .header("Authorization", format!("Bearer {token}"))
+            .query("channel", chat_id)
+            .query("ts", thread_ts)
+            .query("limit", "200");
+
+        if let Some(cursor) = cursor.as_deref().filter(|cursor| !cursor.is_empty()) {
+            request = request.query("cursor", cursor);
+        }
+
+        let mut response = request
+            .call()
+            .context("calling Slack conversations.replies")?;
+        let listed: SlackConversationsHistoryResponse = response
+            .body_mut()
+            .read_json()
+            .context("decoding Slack conversations.replies response")?;
+        if !listed.ok {
+            bail!(
+                "Slack conversations.replies failed: {}",
+                listed.error.unwrap_or_else(|| "unknown_error".to_owned())
+            );
+        }
+
+        replies.extend(listed.messages.into_iter().filter_map(|message| {
+            slack_history_message(
+                account.clone(),
+                current_user_id,
+                chat_id.to_owned(),
+                message,
+                users,
+            )
+        }));
+
+        cursor = listed
+            .response_metadata
+            .next_cursor
+            .filter(|cursor| !cursor.trim().is_empty());
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    Ok(replies)
 }
 
 async fn open_socket_mode(app_token: SlackCredential) -> Result<SlackSocketModeConnection> {
@@ -1345,6 +1604,27 @@ impl SlackConnectionState {
 }
 
 impl SlackProvider {
+    fn emit_network_activity(
+        &self,
+        direction: NetworkActivityDirection,
+        kind: NetworkActivityKind,
+    ) {
+        self.events
+            .send(ProviderEvent::NetworkActivity { direction, kind });
+    }
+
+    async fn call_api<T, Fut>(&self, kind: NetworkActivityKind, call: Fut) -> Result<T>
+    where
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.emit_network_activity(NetworkActivityDirection::Tx, kind);
+        let result = call.await;
+        if result.is_ok() {
+            self.emit_network_activity(NetworkActivityDirection::Rx, kind);
+        }
+        result
+    }
+
     pub fn with_options(options: SlackProviderOptions) -> Result<Self> {
         Self::with_api_client(options, Arc::new(SlackWebApiClient::default()))
     }
@@ -1401,7 +1681,12 @@ impl SlackProvider {
         submission: AuthSubmission,
     ) -> Result<SlackCapabilities> {
         let options = self.options_for_submission(submission)?;
-        let validated = Self::validate_options_with_client(&*self.api_client, &options).await;
+        let validated = self
+            .call_api(
+                NetworkActivityKind::Auth,
+                Self::validate_options_with_client(&*self.api_client, &options),
+            )
+            .await;
         match validated {
             Ok(validated) => {
                 *write_lock(&self.options) = options;
@@ -1548,7 +1833,11 @@ impl SlackProvider {
 
     async fn validate_connection(&self) -> Result<SlackValidatedConnection> {
         let options = self.options();
-        Self::validate_options_with_client(&*self.api_client, &options).await
+        self.call_api(
+            NetworkActivityKind::Auth,
+            Self::validate_options_with_client(&*self.api_client, &options),
+        )
+        .await
     }
 
     async fn validate_options_with_client(
@@ -1627,8 +1916,10 @@ impl SlackProvider {
             .read_credential()
             .ok_or_else(|| self.unsupported("conversation listing"))?;
         let conversations = self
-            .api_client
-            .list_conversations(credential.clone())
+            .call_api(
+                NetworkActivityKind::History,
+                self.api_client.list_conversations(credential.clone()),
+            )
             .await
             .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
         let mut chats = conversations
@@ -1651,6 +1942,7 @@ impl SlackProvider {
                 && let Some(user) = read_lock(&self.users).get(user_id)
             {
                 chat.name = arc_str(user.best_name());
+                chat.avatar = user.sender().avatar;
             }
         }
     }
@@ -1675,8 +1967,16 @@ impl SlackProvider {
                 let user = if cached.is_some() {
                     cached
                 } else {
+                    events.send(ProviderEvent::NetworkActivity {
+                        direction: NetworkActivityDirection::Tx,
+                        kind: NetworkActivityKind::Other,
+                    });
                     match api_client.user_info(credential.clone(), &user_id).await {
                         Ok(user) => {
+                            events.send(ProviderEvent::NetworkActivity {
+                                direction: NetworkActivityDirection::Rx,
+                                kind: NetworkActivityKind::Other,
+                            });
                             if let Some(user) = user.as_ref() {
                                 write_lock(&users).insert(user.id.clone(), user.clone());
                             }
@@ -1686,11 +1986,13 @@ impl SlackProvider {
                     }
                 };
 
-                if let Some(user) = user
-                    && chat.name.as_ref() != user.best_name()
-                {
-                    chat.name = arc_str(user.best_name());
-                    events.send(ProviderEvent::ChatUpdated(chat));
+                if let Some(user) = user {
+                    let avatar = user.sender().avatar;
+                    if chat.name.as_ref() != user.best_name() || chat.avatar != avatar {
+                        chat.name = arc_str(user.best_name());
+                        chat.avatar = avatar;
+                        events.send(ProviderEvent::ChatUpdated(chat));
+                    }
                 }
             }
         });
@@ -1710,10 +2012,13 @@ impl SlackProvider {
         }
 
         let user = self
-            .api_client
-            .user_info(credential.clone(), user_id)
+            .call_api(
+                NetworkActivityKind::Other,
+                self.api_client.user_info(credential.clone(), user_id),
+            )
             .await
             .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
+        let user = user.or_else(|| fallback_slack_user(user_id));
         if let Some(user) = user.as_ref() {
             write_lock(&self.users).insert(user.id.clone(), user.clone());
         }
@@ -1734,8 +2039,11 @@ impl SlackProvider {
         }
 
         let members = self
-            .api_client
-            .conversation_members(credential.clone(), chat_id)
+            .call_api(
+                NetworkActivityKind::Other,
+                self.api_client
+                    .conversation_members(credential.clone(), chat_id),
+            )
             .await
             .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
         write_lock(&self.chat_members).insert(chat_id.to_owned(), members.clone());
@@ -1749,8 +2057,6 @@ impl SlackProvider {
         }
 
         let name = conversation_display_name(&conversation);
-        let last_message_at = conversation.updated.and_then(slack_updated_to_timestamp);
-        let last_message_preview = conversation_preview(&conversation).map(arc_str);
         let kind = conversation_chat_kind(&conversation);
         let membership = conversation_membership(&conversation);
 
@@ -1764,11 +2070,11 @@ impl SlackProvider {
             kind,
             membership,
             is_shared: conversation.is_ext_shared,
-            unread_count: 0,
+            unread_count: conversation.unread_count,
             muted: conversation.is_muted,
             pinned: conversation.is_pinned,
-            last_message_at,
-            last_message_preview,
+            last_message_at: None,
+            last_message_preview: None,
             thread_id: None,
         })
     }
@@ -1786,35 +2092,41 @@ impl SlackProvider {
                 let token = connection
                     .user_token
                     .ok_or_else(|| self.unsupported("user sending"))?;
-                self.api_client
-                    .post_message(
+                self.call_api(
+                    NetworkActivityKind::Send,
+                    self.api_client.post_message(
                         SlackCredential::new(SlackCredentialKind::UserToken, token),
                         chat_id.as_ref(),
                         text.as_ref(),
                         reply_to.map(|message_id| message_id.as_ref()),
-                    )
-                    .await
+                    ),
+                )
+                .await
             }
             SlackSendIdentity::Bot => {
                 let token = connection
                     .bot_token
                     .ok_or_else(|| self.unsupported("bot sending"))?;
-                self.api_client
-                    .post_message(
+                self.call_api(
+                    NetworkActivityKind::Send,
+                    self.api_client.post_message(
                         SlackCredential::new(SlackCredentialKind::BotToken, token),
                         chat_id.as_ref(),
                         text.as_ref(),
                         reply_to.map(|message_id| message_id.as_ref()),
-                    )
-                    .await
+                    ),
+                )
+                .await
             }
             SlackSendIdentity::Webhook => {
                 let webhook_url = connection
                     .webhook_url
                     .ok_or_else(|| self.unsupported("webhook sending"))?;
-                self.api_client
-                    .post_webhook(&webhook_url, text.as_ref())
-                    .await
+                self.call_api(
+                    NetworkActivityKind::Send,
+                    self.api_client.post_webhook(&webhook_url, text.as_ref()),
+                )
+                .await
             }
             SlackSendIdentity::None => Err(self.unsupported("sending")),
         };
@@ -1860,23 +2172,27 @@ impl SlackProvider {
                 let token = connection
                     .user_token
                     .ok_or_else(|| self.unsupported("user file upload"))?;
-                self.api_client
-                    .upload_file(
+                self.call_api(
+                    NetworkActivityKind::Media,
+                    self.api_client.upload_file(
                         SlackCredential::new(SlackCredentialKind::UserToken, token),
                         request,
-                    )
-                    .await
+                    ),
+                )
+                .await
             }
             SlackSendIdentity::Bot => {
                 let token = connection
                     .bot_token
                     .ok_or_else(|| self.unsupported("bot file upload"))?;
-                self.api_client
-                    .upload_file(
+                self.call_api(
+                    NetworkActivityKind::Media,
+                    self.api_client.upload_file(
                         SlackCredential::new(SlackCredentialKind::BotToken, token),
                         request,
-                    )
-                    .await
+                    ),
+                )
+                .await
             }
             SlackSendIdentity::Webhook | SlackSendIdentity::None => {
                 Err(self.unsupported("file upload"))
@@ -2356,15 +2672,17 @@ impl Provider for SlackProvider {
                 .as_deref()
                 .or(connection.bot_id.as_deref());
             let mut messages = self
-                .api_client
-                .history(
-                    credential.clone(),
-                    &self.id,
-                    current_user_id,
-                    chat_id,
-                    before,
-                    limit,
-                    Some(Arc::clone(&self.users)),
+                .call_api(
+                    NetworkActivityKind::History,
+                    self.api_client.history(
+                        credential.clone(),
+                        &self.id,
+                        current_user_id,
+                        chat_id,
+                        before,
+                        limit,
+                        Some(Arc::clone(&self.users)),
+                    ),
                 )
                 .await
                 .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
@@ -2423,14 +2741,65 @@ impl Provider for SlackProvider {
         }
     }
 
-    async fn react(&self, _chat_id: &ChatId, _message: &Message, _emoji: &str) -> Result<()> {
-        if self.capabilities().can_react {
-            Err(anyhow!(
-                "Slack reactions are configured but live API updates are not implemented yet"
-            ))
-        } else {
-            Err(self.unsupported("reactions"))
+    async fn react(&self, chat_id: &ChatId, message: &Message, emoji: &str) -> Result<()> {
+        if !self.capabilities().can_react {
+            return Err(self.unsupported("reactions"));
         }
+
+        let connection = read_lock(&self.connection).clone();
+        let credential = connection
+            .read_credential()
+            .ok_or_else(|| self.unsupported("reactions"))?;
+        let slack_data = message
+            .platform_data
+            .slack
+            .as_ref()
+            .ok_or_else(|| anyhow!("selected message is not a Slack message"))?;
+        let channel = slack_data.channel.as_ref();
+        let timestamp = slack_data.ts.as_ref();
+        let emoji = normalize_slack_reaction_name(emoji)
+            .ok_or_else(|| anyhow!("Slack reaction emoji cannot be empty"))?;
+        let current_user_id = connection
+            .user_id
+            .as_deref()
+            .or(connection.bot_id.as_deref());
+        let already_reacted = current_user_id.is_some_and(|current_user_id| {
+            message.reactions.iter().any(|reaction| {
+                slack_reaction_matches(reaction.emoji.as_ref(), &emoji)
+                    && reaction
+                        .senders
+                        .iter()
+                        .any(|sender| sender.as_ref() == current_user_id)
+            })
+        });
+
+        let result = if already_reacted {
+            self.call_api(
+                NetworkActivityKind::Reaction,
+                self.api_client
+                    .remove_reaction(credential, channel, timestamp, &emoji),
+            )
+            .await
+        } else {
+            self.call_api(
+                NetworkActivityKind::Reaction,
+                self.api_client
+                    .add_reaction(credential, channel, timestamp, &emoji),
+            )
+            .await
+        };
+        result.map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
+
+        self.events.send(ProviderEvent::ReactionChanged {
+            chat_id: chat_id.clone(),
+            message_id: message.id.clone(),
+            emoji: arc_str(slack_emoji_display(&emoji)),
+            added: !already_reacted,
+            sender: current_user_id
+                .map(arc_str)
+                .unwrap_or_else(|| arc_str("slack")),
+        });
+        Ok(())
     }
 
     async fn submit_auth(&self, submission: AuthSubmission) -> Result<()> {
@@ -2593,30 +2962,6 @@ fn conversation_display_name(conversation: &SlackConversation) -> String {
     conversation.id.clone()
 }
 
-fn conversation_preview(conversation: &SlackConversation) -> Option<String> {
-    if let Some(topic) = conversation.topic.as_deref() {
-        return Some(topic.to_owned());
-    }
-    if let Some(purpose) = conversation.purpose.as_deref() {
-        return Some(purpose.to_owned());
-    }
-    if conversation.is_ext_shared {
-        return Some("Shared Slack Connect conversation".to_owned());
-    }
-    conversation
-        .num_members
-        .map(|members| format!("{members} members"))
-}
-
-fn slack_updated_to_timestamp(updated: i64) -> Option<Timestamp> {
-    let millis = if updated > 10_000_000_000 {
-        updated
-    } else {
-        updated.saturating_mul(1_000)
-    };
-    DateTime::<Utc>::from_timestamp_millis(millis)
-}
-
 async fn run_socket_mode_loop(
     api_client: Arc<dyn SlackApiClient>,
     events: EventBus,
@@ -2649,12 +2994,20 @@ async fn run_socket_mode_once(
     app_token: String,
     users: Arc<RwLock<HashMap<String, SlackUser>>>,
 ) -> Result<()> {
+    events.send(ProviderEvent::NetworkActivity {
+        direction: NetworkActivityDirection::Tx,
+        kind: NetworkActivityKind::Connect,
+    });
     let connection = api_client
         .open_socket_mode(SlackCredential::new(
             SlackCredentialKind::AppToken,
             app_token,
         ))
         .await?;
+    events.send(ProviderEvent::NetworkActivity {
+        direction: NetworkActivityDirection::Rx,
+        kind: NetworkActivityKind::Connect,
+    });
     let (mut socket, _) = connect_async(&connection.url)
         .await
         .context("connecting Slack Socket Mode WebSocket")?;
@@ -2663,6 +3016,10 @@ async fn run_socket_mode_once(
         let message = message.context("reading Slack Socket Mode frame")?;
         match message {
             WebSocketMessage::Text(text) => {
+                events.send(ProviderEvent::NetworkActivity {
+                    direction: NetworkActivityDirection::Rx,
+                    kind: NetworkActivityKind::Realtime,
+                });
                 if let Some(ack) = handle_socket_mode_text(
                     &events,
                     &account,
@@ -2674,6 +3031,10 @@ async fn run_socket_mode_once(
                         .send(WebSocketMessage::Text(ack.into()))
                         .await
                         .context("acking Slack Socket Mode envelope")?;
+                    events.send(ProviderEvent::NetworkActivity {
+                        direction: NetworkActivityDirection::Tx,
+                        kind: NetworkActivityKind::Realtime,
+                    });
                 }
             }
             WebSocketMessage::Ping(payload) => {
@@ -2681,6 +3042,10 @@ async fn run_socket_mode_once(
                     .send(WebSocketMessage::Pong(payload))
                     .await
                     .context("replying to Slack Socket Mode ping")?;
+                events.send(ProviderEvent::NetworkActivity {
+                    direction: NetworkActivityDirection::Tx,
+                    kind: NetworkActivityKind::Realtime,
+                });
             }
             WebSocketMessage::Close(_) => break,
             _ => {}
@@ -2761,10 +3126,14 @@ fn emit_realtime_message(
                 message.channel.or(event.channel),
                 message.user,
                 message.bot_id,
+                slack_message_sender_metadata(message.username, message.icons, message.bot_profile),
                 message.ts,
                 message.thread_ts,
                 message.text,
+                message.attachments,
+                Vec::new(),
                 Some(users),
+                false,
             )
         }) {
             events.send(ProviderEvent::MessageEdited { message });
@@ -2782,10 +3151,14 @@ fn emit_realtime_message(
         event.channel,
         event.user,
         event.bot_id,
+        slack_message_sender_metadata(event.username, event.icons, event.bot_profile),
         event.ts.or(event.event_ts),
         event.thread_ts,
         event.text,
+        event.attachments,
+        Vec::new(),
         Some(users),
+        false,
     ) {
         events.send(ProviderEvent::Message {
             message,
@@ -2810,7 +3183,7 @@ fn emit_realtime_reaction(events: &EventBus, event: SlackRealtimeEvent) {
     events.send(ProviderEvent::ReactionChanged {
         chat_id: arc_str(channel),
         message_id: arc_str(message_id),
-        emoji: arc_str(emoji),
+        emoji: arc_str(slack_emoji_display(&emoji)),
         added: event.event_type == "reaction_added",
         sender: arc_str(sender),
     });
@@ -2836,16 +3209,21 @@ fn slack_history_message(
         return None;
     }
 
+    let is_thread_root = message.reply_count.unwrap_or(0) > 0;
     slack_message_from_parts(
         &account,
         current_user_id,
         Some(channel),
         message.user,
         message.bot_id,
+        slack_message_sender_metadata(message.username, message.icons, message.bot_profile),
         message.ts,
         message.thread_ts,
         message.text,
+        message.attachments,
+        slack_reactions(message.reactions),
         users,
+        is_thread_root,
     )
 }
 
@@ -2855,24 +3233,30 @@ fn slack_message_from_parts(
     channel: Option<String>,
     user: Option<String>,
     bot_id: Option<String>,
+    sender_metadata: SlackMessageSenderMetadata,
     ts: Option<String>,
     thread_ts: Option<String>,
     text: Option<String>,
+    attachments: Option<Vec<SlackAttachmentResponse>>,
+    reactions: Vec<Reaction>,
     users: Option<&Arc<RwLock<HashMap<String, SlackUser>>>>,
+    is_thread_root: bool,
 ) -> Option<Message> {
     let channel = non_empty_option(&channel)?;
     let ts = non_empty_option(&ts)?;
     let sender_id = non_empty_option(&user)
         .or_else(|| non_empty_option(&bot_id))
         .unwrap_or_else(|| "slack".to_owned());
-    let text = text.unwrap_or_default();
+    let text = slack_message_text(text, attachments);
     let timestamp = slack_ts_to_timestamp(&ts).unwrap_or_else(Utc::now);
-    let thread_id = non_empty_option(&thread_ts).filter(|thread_ts| thread_ts != &ts);
-    let mut sender = Sender {
-        platform_id: arc_str(&sender_id),
-        display_name: arc_str(&sender_id),
-        avatar: None,
-    };
+    let thread_id = non_empty_option(&thread_ts)
+        .filter(|thread_ts| thread_ts != &ts)
+        .or_else(|| is_thread_root.then(|| ts.clone()));
+    let reply_to = thread_id
+        .as_deref()
+        .filter(|thread_id| *thread_id != ts.as_str())
+        .map(arc_str);
+    let mut sender = slack_message_sender(&sender_id, sender_metadata);
     if let Some(users) = users
         && let Some(user) = read_lock(users).get(sender_id.as_str())
     {
@@ -2887,9 +3271,9 @@ fn slack_message_from_parts(
         timestamp,
         edited_at: None,
         content: Content::Text(arc_str(text)),
-        reply_to: thread_id.as_deref().map(arc_str),
+        reply_to,
         thread_id: thread_id.map(arc_str),
-        reactions: Vec::new(),
+        reactions,
         receipts: Vec::new(),
         is_from_me: current_user_id.is_some_and(|current_user_id| current_user_id == sender_id),
         platform_data: PlatformData {
@@ -2903,9 +3287,141 @@ fn slack_message_from_parts(
     })
 }
 
+fn slack_message_text(
+    text: Option<String>,
+    attachments: Option<Vec<SlackAttachmentResponse>>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = text.and_then(non_empty_string) {
+        parts.push(text);
+    }
+
+    for attachment in attachments.unwrap_or_default() {
+        parts.extend(slack_attachment_text_parts(attachment));
+    }
+
+    replace_slack_emoji_codes(&parts.join("\n"))
+}
+
+fn slack_attachment_text_parts(attachment: SlackAttachmentResponse) -> Vec<String> {
+    let mut parts = Vec::new();
+    push_unique_text_part(&mut parts, attachment.pretext);
+    push_unique_text_part(
+        &mut parts,
+        attachment
+            .title
+            .and_then(non_empty_string)
+            .map(|title| format!("**{title}**")),
+    );
+    push_unique_text_part(&mut parts, attachment.text);
+
+    for field in attachment.fields.unwrap_or_default() {
+        match (
+            field.title.and_then(non_empty_string),
+            field.value.and_then(non_empty_string),
+        ) {
+            (Some(title), Some(value)) => {
+                push_unique_text_part(&mut parts, Some(format!("{title}: {value}")))
+            }
+            (Some(title), None) => push_unique_text_part(&mut parts, Some(title)),
+            (None, Some(value)) => push_unique_text_part(&mut parts, Some(value)),
+            (None, None) => {}
+        }
+    }
+
+    if parts.is_empty() {
+        push_unique_text_part(&mut parts, attachment.fallback);
+    }
+
+    parts
+}
+
+fn push_unique_text_part(parts: &mut Vec<String>, value: Option<String>) {
+    let Some(value) = value.and_then(non_empty_string) else {
+        return;
+    };
+    if !parts.iter().any(|existing| existing == &value) {
+        parts.push(value);
+    }
+}
+
+fn slack_message_sender(sender_id: &str, metadata: SlackMessageSenderMetadata) -> Sender {
+    Sender {
+        platform_id: arc_str(sender_id),
+        display_name: arc_str(
+            metadata
+                .display_name
+                .unwrap_or_else(|| sender_id.to_owned()),
+        ),
+        avatar: metadata.avatar_url.as_deref().and_then(slack_avatar_path),
+    }
+}
+
+fn slack_message_sender_metadata(
+    username: Option<String>,
+    icons: Option<SlackMessageIconsResponse>,
+    bot_profile: Option<SlackBotProfileResponse>,
+) -> SlackMessageSenderMetadata {
+    let bot_name = bot_profile.as_ref().and_then(|profile| {
+        profile
+            .real_name
+            .clone()
+            .and_then(non_empty_string)
+            .or_else(|| profile.name.clone().and_then(non_empty_string))
+    });
+    let bot_icons = bot_profile
+        .as_ref()
+        .and_then(|profile| profile.icons.clone());
+    let icons = icons.or(bot_icons);
+
+    SlackMessageSenderMetadata {
+        display_name: bot_name.or_else(|| username.and_then(non_empty_string)),
+        avatar_url: icons.and_then(|icons| icons.best_image_url()),
+    }
+}
+
+impl SlackMessageIconsResponse {
+    fn best_image_url(self) -> Option<String> {
+        self.image_72
+            .and_then(non_empty_string)
+            .or_else(|| self.image_48.and_then(non_empty_string))
+            .or_else(|| self.image_36.and_then(non_empty_string))
+            .or_else(|| self.image_original.and_then(non_empty_string))
+            .or_else(|| self.icon_url.and_then(non_empty_string))
+    }
+}
+
+fn slack_reactions(reactions: Option<Vec<SlackReactionResponse>>) -> Vec<Reaction> {
+    reactions
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|reaction| {
+            let emoji = reaction.name.and_then(non_empty_string)?;
+            let emoji = slack_emoji_display(&emoji);
+            let senders = reaction
+                .users
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(non_empty_string)
+                .map(arc_str)
+                .collect::<Vec<_>>();
+            Some(Reaction {
+                emoji: arc_str(emoji),
+                senders,
+            })
+        })
+        .collect()
+}
+
 fn unresolved_slack_user_ids(messages: &[Message]) -> Vec<String> {
     let mut user_ids = Vec::new();
     for message in messages {
+        for user_id in slack_user_ids_in_text(&content_text(&message.content)) {
+            if !user_ids.iter().any(|existing| existing == &user_id) {
+                user_ids.push(user_id);
+            }
+        }
+
         let user_id = message.sender.platform_id.as_ref();
         if message.sender.display_name.as_ref() == user_id
             && is_slack_user_id(user_id)
@@ -2924,6 +3440,305 @@ fn apply_cached_user_to_message(
     if let Some(user) = read_lock(users).get(message.sender.platform_id.as_ref()) {
         message.sender = user.sender();
     }
+
+    if let Content::Text(text) = &message.content {
+        let replaced = replace_slack_user_mentions(text, users);
+        if replaced != text.as_ref() {
+            message.content = Content::Text(arc_str(replaced));
+        }
+    }
+}
+
+fn content_text(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.to_string(),
+        Content::Image(media)
+        | Content::Video(media)
+        | Content::Audio(media)
+        | Content::File(media)
+        | Content::Sticker(media) => media
+            .caption
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| media.file_name.to_string()),
+        Content::LinkPreview(link) => {
+            let title = link.title.as_deref().unwrap_or("Link");
+            format!("{title}: {}", link.url)
+        }
+        Content::Poll(poll) => format!("Poll: {}", poll.question),
+        Content::Deleted => "deleted message".to_owned(),
+        Content::Unsupported(text) => text.to_string(),
+    }
+}
+
+fn slack_user_ids_in_text(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<@") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('>') else {
+            break;
+        };
+        let token = &rest[..end];
+        let id = token.split('|').next().unwrap_or_default().trim();
+        if is_slack_user_id(id) && !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_owned());
+        }
+        rest = &rest[end + 1..];
+    }
+    ids
+}
+
+fn replace_slack_user_mentions(
+    text: &str,
+    users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+) -> String {
+    let users = read_lock(users);
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<@") {
+        output.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('>') else {
+            output.push_str("<@");
+            output.push_str(rest);
+            return output;
+        };
+        let token = &rest[..end];
+        let id = token.split('|').next().unwrap_or_default().trim();
+        if let Some(user) = users.get(id) {
+            output.push('@');
+            output.push_str(user.best_name());
+        } else if let Some(label) = token
+            .split_once('|')
+            .and_then(|(_, label)| non_empty_string(label.to_owned()))
+        {
+            output.push('@');
+            output.push_str(&label);
+        } else if is_slack_user_id(id) {
+            output.push('@');
+            output.push_str(id);
+        } else {
+            output.push_str("<@");
+            output.push_str(token);
+            output.push('>');
+        }
+        rest = &rest[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn slack_reaction_matches(reaction_emoji: &str, slack_name: &str) -> bool {
+    normalize_slack_reaction_name(reaction_emoji).as_deref() == Some(slack_name)
+        || slack_emoji_display(slack_name) == reaction_emoji
+}
+
+fn normalize_slack_reaction_name(emoji: &str) -> Option<String> {
+    let trimmed = emoji.trim().trim_matches(':').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(slack_unicode_emoji_name(trimmed).unwrap_or_else(|| trimmed.to_owned()))
+}
+
+fn slack_unicode_emoji_name(value: &str) -> Option<String> {
+    emojis::get(value)
+        .and_then(|emoji| emoji.shortcode())
+        .map(str::to_owned)
+}
+
+fn slack_emoji_display(name: &str) -> String {
+    let name = name.trim().trim_matches(':').trim();
+    if name.is_empty() {
+        return String::new();
+    }
+
+    slack_emoji_lookup(name)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format_slack_custom_emoji(name))
+}
+
+fn slack_emoji_lookup(name: &str) -> Option<&'static str> {
+    slack_builtin_emoji_alias(name)
+        .or_else(|| slack_skin_tone_emoji(name))
+        .or_else(|| slack_composite_skin_tone_emoji(name))
+        .or_else(|| emojis::get_by_shortcode(name).map(|emoji| emoji.as_str()))
+        .or_else(|| slack_cldr_name_emoji(name))
+}
+
+fn slack_cldr_name_emoji(name: &str) -> Option<&'static str> {
+    let normalized = name.replace('-', "_").to_ascii_lowercase();
+    emojis::iter().find_map(|emoji| {
+        let emoji_name = emoji.name().replace([' ', '-'], "_").to_ascii_lowercase();
+        (emoji_name == normalized).then_some(emoji.as_str())
+    })
+}
+
+fn slack_composite_skin_tone_emoji(name: &str) -> Option<&'static str> {
+    let (base, tone) = name.split_once("::skin-tone-")?;
+    let base = slack_emoji_lookup(base.trim_matches(':'))?;
+    let tone = slack_skin_tone(tone.trim_matches(':'))?;
+    emojis::get(base)?
+        .with_skin_tone(tone)
+        .map(|emoji| emoji.as_str())
+}
+
+fn slack_skin_tone_emoji(name: &str) -> Option<&'static str> {
+    match name.trim_matches(':') {
+        "skin-tone-2" => Some("🏻"),
+        "skin-tone-3" => Some("🏼"),
+        "skin-tone-4" => Some("🏽"),
+        "skin-tone-5" => Some("🏾"),
+        "skin-tone-6" => Some("🏿"),
+        _ => None,
+    }
+}
+
+fn slack_skin_tone(name: &str) -> Option<emojis::SkinTone> {
+    match name {
+        "2" | "skin-tone-2" => Some(emojis::SkinTone::Light),
+        "3" | "skin-tone-3" => Some(emojis::SkinTone::MediumLight),
+        "4" | "skin-tone-4" => Some(emojis::SkinTone::Medium),
+        "5" | "skin-tone-5" => Some(emojis::SkinTone::MediumDark),
+        "6" | "skin-tone-6" => Some(emojis::SkinTone::Dark),
+        _ => None,
+    }
+}
+
+fn replace_slack_emoji_codes(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find(':') {
+        output.push_str(&rest[..start]);
+        rest = &rest[start + 1..];
+
+        let Some(end) = rest.find(':') else {
+            output.push(':');
+            output.push_str(rest);
+            return output;
+        };
+
+        let candidate = &rest[..end];
+        if is_slack_emoji_name(candidate) {
+            output.push_str(&slack_emoji_display(candidate));
+            rest = &rest[end + 1..];
+        } else {
+            output.push(':');
+            output.push_str(candidate);
+            output.push(':');
+            rest = &rest[end + 1..];
+        }
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn is_slack_emoji_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '+')
+        })
+}
+
+fn format_slack_custom_emoji(name: &str) -> String {
+    format!(":{}:", name.trim().trim_matches(':').trim())
+}
+
+fn slack_builtin_emoji_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "+1" | "thumbsup" => Some("👍"),
+        "-1" | "thumbsdown" => Some("👎"),
+        "white_check_mark" => Some("✅"),
+        "large_green_circle" => Some("🟢"),
+        "large_yellow_circle" => Some("🟡"),
+        "large_orange_circle" => Some("🟠"),
+        "large_red_square" => Some("🟥"),
+        "large_blue_square" => Some("🟦"),
+        "large_green_square" => Some("🟩"),
+        "large_yellow_square" => Some("🟨"),
+        "large_orange_square" => Some("🟧"),
+        "large_purple_square" => Some("🟪"),
+        "large_brown_square" => Some("🟫"),
+        "heavy_check_mark" => Some("✔️"),
+        "heavy_multiplication_x" => Some("✖️"),
+        "heavy_plus_sign" => Some("➕"),
+        "heavy_minus_sign" => Some("➖"),
+        "heavy_division_sign" => Some("➗"),
+        _ => None,
+    }
+}
+
+fn slack_avatar_path(url: &str) -> Option<PathBuf> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("chat-cli")
+        .join("slack")
+        .join("avatars");
+    let extension = url
+        .split('?')
+        .next()
+        .and_then(|path| path.rsplit('.').next())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 5
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .unwrap_or("img");
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    let path = cache_dir.join(format!("{:016x}.{extension}", hasher.finish()));
+
+    if path.exists() {
+        return Some(path);
+    }
+    if fs::create_dir_all(&cache_dir).is_err() {
+        return None;
+    }
+
+    let url = url.to_owned();
+    let path_for_download = path.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let mut response = slack_http_agent()
+                .get(&url)
+                .call()
+                .context("downloading Slack avatar")?;
+            let bytes = response
+                .body_mut()
+                .read_to_vec()
+                .context("reading Slack avatar body")?;
+            fs::write(&path_for_download, bytes).context("writing Slack avatar cache")?;
+            Ok(())
+        })();
+        let _ = result;
+    });
+
+    Some(path)
+}
+
+fn fallback_slack_user(user_id: &str) -> Option<SlackUser> {
+    is_slack_user_id(user_id).then(|| SlackUser {
+        id: user_id.to_owned(),
+        name: Some(user_id.to_owned()),
+        real_name: None,
+        display_name: Some(user_id.to_owned()),
+        avatar: None,
+        is_bot: false,
+        deleted: false,
+    })
 }
 
 fn is_slack_user_id(value: &str) -> bool {
@@ -3147,6 +3962,8 @@ mod tests {
         conversations: Mutex<Vec<SlackConversation>>,
         users: Mutex<HashMap<String, SlackUser>>,
         conversation_members: Mutex<HashMap<String, Vec<String>>>,
+        added_reactions: Mutex<Vec<(String, String, String)>>,
+        removed_reactions: Mutex<Vec<(String, String, String)>>,
         history_calls: Mutex<Vec<(SlackCredentialKind, ChatId, Option<Timestamp>, usize)>>,
         history_messages: Mutex<Vec<Message>>,
     }
@@ -3281,6 +4098,36 @@ mod tests {
                 .unwrap_or_default())
         }
 
+        async fn add_reaction(
+            &self,
+            _credential: SlackCredential,
+            channel: &str,
+            timestamp: &str,
+            emoji: &str,
+        ) -> Result<()> {
+            self.added_reactions.lock().unwrap().push((
+                channel.to_owned(),
+                timestamp.to_owned(),
+                emoji.to_owned(),
+            ));
+            Ok(())
+        }
+
+        async fn remove_reaction(
+            &self,
+            _credential: SlackCredential,
+            channel: &str,
+            timestamp: &str,
+            emoji: &str,
+        ) -> Result<()> {
+            self.removed_reactions.lock().unwrap().push((
+                channel.to_owned(),
+                timestamp.to_owned(),
+                emoji.to_owned(),
+            ));
+            Ok(())
+        }
+
         async fn history(
             &self,
             credential: SlackCredential,
@@ -3346,6 +4193,7 @@ mod tests {
             is_ext_shared: false,
             is_muted: false,
             is_pinned: false,
+            unread_count: 0,
             updated: Some(updated),
             topic: None,
             purpose: None,
@@ -3368,6 +4216,7 @@ mod tests {
             is_ext_shared: false,
             is_muted: false,
             is_pinned: false,
+            unread_count: 0,
             updated: Some(updated),
             topic: None,
             purpose: None,
@@ -3395,6 +4244,17 @@ mod tests {
         );
     }
 
+    async fn next_non_network_event(
+        events: &mut tokio::sync::broadcast::Receiver<ProviderEvent>,
+    ) -> Result<ProviderEvent> {
+        loop {
+            let event = events.recv().await?;
+            if !matches!(event, ProviderEvent::NetworkActivity { .. }) {
+                return Ok(event);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn connect_validates_user_token_and_ignores_bot_fallback_in_user_mode() -> Result<()> {
         let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
@@ -3415,8 +4275,14 @@ mod tests {
             *client.validated_tokens.lock().unwrap(),
             vec![SlackCredentialKind::UserToken]
         );
-        assert!(matches!(events.recv().await?, ProviderEvent::AuthSucceeded));
-        assert!(matches!(events.recv().await?, ProviderEvent::SyncComplete));
+        assert!(matches!(
+            next_non_network_event(&mut events).await?,
+            ProviderEvent::AuthSucceeded
+        ));
+        assert!(matches!(
+            next_non_network_event(&mut events).await?,
+            ProviderEvent::SyncComplete
+        ));
         Ok(())
     }
 
@@ -3505,7 +4371,7 @@ mod tests {
 
         assert!(!provider.is_connected());
         assert!(matches!(
-            events.recv().await?,
+            next_non_network_event(&mut events).await?,
             ProviderEvent::AuthRequired(AuthChallenge::OAuthUrl(_))
         ));
         Ok(())
@@ -3523,7 +4389,7 @@ mod tests {
         assert!(error.contains("<redacted>"));
         assert!(!error.contains("xoxp-invalid-secret"));
         assert!(matches!(
-            events.recv().await?,
+            next_non_network_event(&mut events).await?,
             ProviderEvent::Disconnected(Some(reason))
                 if reason.contains("<redacted>") && !reason.contains("xoxp-invalid-secret")
         ));
@@ -3559,8 +4425,14 @@ mod tests {
             *client.validated_tokens.lock().unwrap(),
             vec![SlackCredentialKind::UserToken]
         );
-        assert!(matches!(events.recv().await?, ProviderEvent::AuthSucceeded));
-        assert!(matches!(events.recv().await?, ProviderEvent::SyncComplete));
+        assert!(matches!(
+            next_non_network_event(&mut events).await?,
+            ProviderEvent::AuthSucceeded
+        ));
+        assert!(matches!(
+            next_non_network_event(&mut events).await?,
+            ProviderEvent::SyncComplete
+        ));
         Ok(())
     }
 
@@ -3610,7 +4482,7 @@ mod tests {
         assert!(!error.contains("xoxp-invalid-submitted-secret"));
         assert!(!provider.is_connected());
         assert!(matches!(
-            events.recv().await?,
+            next_non_network_event(&mut events).await?,
             ProviderEvent::Disconnected(Some(reason))
                 if reason.contains("<redacted>") && !reason.contains("xoxp-invalid-submitted-secret")
         ));
@@ -3774,6 +4646,7 @@ mod tests {
             let mut conversations = client.conversations.lock().unwrap();
             let mut general = channel_conversation("C123", "general", 1_710_000_000);
             general.topic = Some("Company announcements".to_owned());
+            general.unread_count = 3;
             let mut random = channel_conversation("C999", "random", 1_700_000_000);
             random.is_muted = true;
             let mut dm = dm_conversation("D123", "U234", 1_720_000_000_000);
@@ -3800,10 +4673,9 @@ mod tests {
         assert_eq!(chats[1].name.as_ref(), "#general");
         assert_eq!(chats[1].kind, ChatKind::PublicChannel);
         assert_eq!(chats[1].membership, ChatMembership::Joined);
-        assert_eq!(
-            chats[1].last_message_preview.as_deref(),
-            Some("Company announcements")
-        );
+        assert_eq!(chats[1].unread_count, 3);
+        assert_eq!(chats[1].last_message_at, None);
+        assert_eq!(chats[1].last_message_preview, None);
         assert!(chats[1].is_group);
         assert!(chats[2].muted);
         Ok(())
@@ -3983,6 +4855,455 @@ mod tests {
         assert!(error.contains("Slack file upload is not available"));
         assert!(error.contains("webhook"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_mode_reacts_and_toggles_existing_reaction() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client.clone())?;
+        provider.connect().await?;
+
+        let mut message = slack_message_from_parts(
+            provider.id(),
+            Some("U123"),
+            Some("C123".to_owned()),
+            Some("U234".to_owned()),
+            None,
+            SlackMessageSenderMetadata::default(),
+            Some("1710000000.000200".to_owned()),
+            None,
+            Some("hello".to_owned()),
+            None,
+            Vec::new(),
+            None,
+            false,
+        )
+        .expect("message should parse");
+
+        provider
+            .react(&arc_str("C123"), &message, ":thumbsup:")
+            .await?;
+        assert_eq!(
+            *client.added_reactions.lock().unwrap(),
+            vec![(
+                "C123".to_owned(),
+                "1710000000.000200".to_owned(),
+                "thumbsup".to_owned()
+            )]
+        );
+
+        message.reactions.push(Reaction {
+            emoji: arc_str("👍"),
+            senders: vec![arc_str("U123")],
+        });
+        provider
+            .react(&arc_str("C123"), &message, "thumbsup")
+            .await?;
+        assert_eq!(
+            *client.removed_reactions.lock().unwrap(),
+            vec![(
+                "C123".to_owned(),
+                "1710000000.000200".to_owned(),
+                "thumbsup".to_owned()
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slack_message_sender_uses_bot_username_and_icon_metadata() {
+        let sender = slack_message_sender(
+            "B123",
+            slack_message_sender_metadata(
+                Some("Incoming Bot".to_owned()),
+                Some(SlackMessageIconsResponse {
+                    image_72: Some("https://example.com/icon72.png".to_owned()),
+                    image_48: Some("https://example.com/icon48.png".to_owned()),
+                    ..SlackMessageIconsResponse::default()
+                }),
+                None,
+            ),
+        );
+
+        assert_eq!(sender.platform_id.as_ref(), "B123");
+        assert_eq!(sender.display_name.as_ref(), "Incoming Bot");
+        assert!(sender.avatar.is_some());
+    }
+
+    #[test]
+    fn slack_message_sender_prefers_bot_profile_metadata() {
+        let sender = slack_message_sender(
+            "B123",
+            slack_message_sender_metadata(
+                Some("fallback username".to_owned()),
+                None,
+                Some(SlackBotProfileResponse {
+                    id: Some("B123".to_owned()),
+                    name: Some("bot-name".to_owned()),
+                    real_name: Some("Bot Real Name".to_owned()),
+                    icons: Some(SlackMessageIconsResponse {
+                        image_48: Some("https://example.com/bot48.png".to_owned()),
+                        ..SlackMessageIconsResponse::default()
+                    }),
+                }),
+            ),
+        );
+
+        assert_eq!(sender.display_name.as_ref(), "Bot Real Name");
+        assert!(sender.avatar.is_some());
+    }
+
+    #[test]
+    fn historical_slack_message_uses_message_sender_metadata_when_user_is_uncached() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: None,
+                user: None,
+                bot_id: Some("B123".to_owned()),
+                username: Some("Deploy Bot".to_owned()),
+                icons: Some(SlackMessageIconsResponse {
+                    image_72: Some("https://example.com/deploy.png".to_owned()),
+                    ..SlackMessageIconsResponse::default()
+                }),
+                bot_profile: None,
+                ts: Some("1710000002.000200".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: Some("deployed :large_green_circle:".to_owned()),
+                attachments: None,
+                hidden: None,
+                reactions: None,
+            },
+            None,
+        )
+        .expect("message should parse");
+
+        assert_eq!(message.sender.platform_id.as_ref(), "B123");
+        assert_eq!(message.sender.display_name.as_ref(), "Deploy Bot");
+        assert!(message.sender.avatar.is_some());
+        assert_eq!(content_text(&message.content), "deployed 🟢");
+    }
+
+    #[test]
+    fn historical_slack_message_uses_attachment_title_text_and_fields() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: Some("bot_message".to_owned()),
+                user: None,
+                bot_id: Some("BDEPLOY".to_owned()),
+                username: Some("deploy".to_owned()),
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000003.000200".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: None,
+                attachments: Some(vec![SlackAttachmentResponse {
+                    pretext: None,
+                    title: Some("Partition maintenance successful on deploy".to_owned()),
+                    text: Some(
+                        "Script: /var/www/wap/partition_maintenance.sh, Elapsed time: 415 seconds"
+                            .to_owned(),
+                    ),
+                    fallback: Some("fallback should not duplicate content".to_owned()),
+                    fields: None,
+                }]),
+                hidden: None,
+                reactions: None,
+            },
+            None,
+        )
+        .expect("message should parse");
+
+        assert_eq!(message.sender.display_name.as_ref(), "deploy");
+        assert_eq!(
+            content_text(&message.content),
+            "**Partition maintenance successful on deploy**\nScript: /var/www/wap/partition_maintenance.sh, Elapsed time: 415 seconds"
+        );
+    }
+
+    #[test]
+    fn slack_user_mentions_prefer_cache_label_then_id_fallback() {
+        let users = Arc::new(RwLock::new(HashMap::from([(
+            "U123".to_owned(),
+            SlackUser {
+                id: "U123".to_owned(),
+                name: Some("ada".to_owned()),
+                real_name: Some("Ada Lovelace".to_owned()),
+                display_name: Some("Ada".to_owned()),
+                avatar: None,
+                is_bot: false,
+                deleted: false,
+            },
+        )])));
+
+        assert_eq!(
+            replace_slack_user_mentions("hi <@U123> <@U456|Grace> <@U789>", &users),
+            "hi @Ada @Grace @U789"
+        );
+    }
+
+    #[test]
+    fn slack_emoji_display_maps_standard_and_preserves_custom_names() {
+        assert_eq!(slack_emoji_display("eyes"), "👀");
+        assert_eq!(slack_emoji_display("money_with_wings"), "💸");
+        assert_eq!(slack_emoji_display(":white_check_mark:"), "✅");
+        assert_eq!(slack_emoji_display("slightly_smiling_face"), "🙂");
+        assert_eq!(slack_emoji_display("rolling_on_the_floor_laughing"), "🤣");
+        assert_eq!(slack_emoji_display("large_green_circle"), "🟢");
+        assert_eq!(slack_emoji_display("large_orange_square"), "🟧");
+        assert_eq!(slack_emoji_display("party-parrot"), ":party-parrot:");
+    }
+
+    #[test]
+    fn slack_text_replaces_known_codes_and_keeps_custom_codes_readable() {
+        assert_eq!(
+            replace_slack_emoji_codes(
+                "done :white_check_mark: watched :eyes: paid :money_with_wings:"
+            ),
+            "done ✅ watched 👀 paid 💸"
+        );
+        assert_eq!(
+            replace_slack_emoji_codes("custom :party-parrot: and not emoji :hello world:"),
+            "custom :party-parrot: and not emoji :hello world:"
+        );
+    }
+
+    #[test]
+    fn slack_reaction_matching_accepts_unicode_display_and_slack_names() {
+        assert!(slack_reaction_matches("👀", "eyes"));
+        assert!(slack_reaction_matches("💸", "money_with_wings"));
+        assert!(slack_reaction_matches("✅", "white_check_mark"));
+        assert!(slack_reaction_matches(":party-parrot:", "party-parrot"));
+        assert!(!slack_reaction_matches("👀", "money_with_wings"));
+    }
+
+    #[test]
+    fn slack_history_reactions_use_display_icons_with_custom_fallbacks() {
+        let reactions = slack_reactions(Some(vec![
+            SlackReactionResponse {
+                name: Some("eyes".to_owned()),
+                users: Some(vec!["U123".to_owned()]),
+            },
+            SlackReactionResponse {
+                name: Some("money_with_wings".to_owned()),
+                users: Some(vec!["U234".to_owned(), "U345".to_owned()]),
+            },
+            SlackReactionResponse {
+                name: Some("party-parrot".to_owned()),
+                users: Some(vec!["U456".to_owned()]),
+            },
+        ]));
+
+        assert_eq!(reactions.len(), 3);
+        assert_eq!(reactions[0].emoji.as_ref(), "👀");
+        assert_eq!(reactions[0].senders.len(), 1);
+        assert_eq!(reactions[1].emoji.as_ref(), "💸");
+        assert_eq!(reactions[1].senders.len(), 2);
+        assert_eq!(reactions[2].emoji.as_ref(), ":party-parrot:");
+    }
+
+    #[test]
+    fn slack_realtime_reaction_events_emit_display_icons() {
+        let events = EventBus::new();
+        let mut receiver = events.subscribe();
+        emit_realtime_reaction(
+            &events,
+            SlackRealtimeEvent {
+                event_type: "reaction_added".to_owned(),
+                channel: None,
+                user: Some("U123".to_owned()),
+                bot_id: None,
+                username: None,
+                icons: None,
+                bot_profile: None,
+                ts: None,
+                event_ts: None,
+                thread_ts: None,
+                text: None,
+                attachments: None,
+                subtype: None,
+                hidden: None,
+                deleted_ts: None,
+                message: None,
+                reaction: Some("eyes".to_owned()),
+                item: Some(SlackReactionItem {
+                    channel: Some("C123".to_owned()),
+                    ts: Some("1710000000.000200".to_owned()),
+                }),
+                item_user: None,
+            },
+        );
+
+        match receiver.try_recv().expect("event should be emitted") {
+            ProviderEvent::ReactionChanged {
+                chat_id,
+                message_id,
+                emoji,
+                added,
+                sender,
+            } => {
+                assert_eq!(chat_id.as_ref(), "C123");
+                assert_eq!(message_id.as_ref(), "1710000000.000200");
+                assert_eq!(emoji.as_ref(), "👀");
+                assert!(added);
+                assert_eq!(sender.as_ref(), "U123");
+            }
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
+    #[test]
+    fn historical_slack_message_converts_text_emoji_shortcodes() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: None,
+                user: Some("U234".to_owned()),
+                bot_id: None,
+                username: None,
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000000.000200".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: Some("done :white_check_mark: custom :party-parrot:".to_owned()),
+                attachments: None,
+                hidden: None,
+                reactions: None,
+            },
+            None,
+        )
+        .expect("message should parse");
+
+        assert_eq!(
+            content_text(&message.content),
+            "done ✅ custom :party-parrot:"
+        );
+    }
+
+    #[test]
+    fn historical_slack_message_maps_thread_reactions_and_avatar() {
+        let users = Arc::new(RwLock::new(HashMap::from([(
+            "U234".to_owned(),
+            SlackUser {
+                id: "U234".to_owned(),
+                name: Some("alice".to_owned()),
+                real_name: None,
+                display_name: Some("Alice".to_owned()),
+                avatar: Some("https://example.com/alice.png".to_owned()),
+                deleted: false,
+                is_bot: false,
+            },
+        )])));
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: None,
+                user: Some("U234".to_owned()),
+                bot_id: None,
+                username: None,
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000001.000200".to_owned()),
+                thread_ts: Some("1710000000.000100".to_owned()),
+                reply_count: None,
+                text: Some("thread reply".to_owned()),
+                attachments: None,
+                hidden: None,
+                reactions: Some(vec![SlackReactionResponse {
+                    name: Some("eyes".to_owned()),
+                    users: Some(vec!["U123".to_owned(), "U234".to_owned()]),
+                }]),
+            },
+            Some(&users),
+        )
+        .expect("message should parse");
+
+        assert_eq!(message.reply_to.as_deref(), Some("1710000000.000100"));
+        assert_eq!(message.thread_id.as_deref(), Some("1710000000.000100"));
+        assert_eq!(message.sender.display_name.as_ref(), "Alice");
+        assert!(message.sender.avatar.is_some());
+        assert_eq!(message.reactions.len(), 1);
+        assert_eq!(message.reactions[0].emoji.as_ref(), "👀");
+        assert_eq!(message.reactions[0].senders.len(), 2);
+    }
+
+    #[test]
+    fn historical_slack_thread_root_keeps_thread_identity_without_reply_target() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: None,
+                user: Some("U234".to_owned()),
+                bot_id: None,
+                username: None,
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000000.000100".to_owned()),
+                thread_ts: Some("1710000000.000100".to_owned()),
+                reply_count: Some(2),
+                text: Some("thread root".to_owned()),
+                attachments: None,
+                hidden: None,
+                reactions: None,
+            },
+            None,
+        )
+        .expect("thread root should parse");
+
+        assert_eq!(message.id.as_ref(), "1710000000.000100");
+        assert_eq!(message.reply_to, None);
+        assert_eq!(message.thread_id.as_deref(), Some("1710000000.000100"));
+    }
+
+    #[test]
+    fn historical_slack_unthreaded_message_has_no_thread_identity() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: None,
+                user: Some("U234".to_owned()),
+                bot_id: None,
+                username: None,
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000000.000200".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: Some("plain message".to_owned()),
+                attachments: None,
+                hidden: None,
+                reactions: None,
+            },
+            None,
+        )
+        .expect("plain message should parse");
+
+        assert_eq!(message.reply_to, None);
+        assert_eq!(message.thread_id, None);
     }
 
     #[test]

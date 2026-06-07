@@ -16,6 +16,14 @@ unsafe extern "C" {
     fn C_Connect(client_id: u64) -> u8;
     fn C_SetMessageCallback(cb: Option<MessageCallback>, user_data: *mut c_void);
     fn C_SendText(client_id: u64, chat_jid: *const c_char, text: *const c_char) -> *mut c_char;
+    fn C_RequestHistory(
+        client_id: u64,
+        chat_jid: *const c_char,
+        oldest_msg_id: *const c_char,
+        oldest_from_me: u8,
+        oldest_timestamp_unix: i64,
+        count: i32,
+    ) -> *mut c_char;
     fn C_SendMedia(
         client_id: u64,
         chat_jid: *const c_char,
@@ -85,6 +93,30 @@ pub fn send_text(handle: ClientHandle, chat_jid: &str, text: &str) -> anyhow::Re
     let chat_jid = CString::new(chat_jid)?;
     let text = CString::new(text)?;
     let response = unsafe { C_SendText(handle, chat_jid.as_ptr(), text.as_ptr()) };
+    take_c_string(response)
+}
+
+pub fn request_history(
+    handle: ClientHandle,
+    chat_jid: &str,
+    oldest_msg_id: &str,
+    oldest_from_me: bool,
+    oldest_timestamp_unix: i64,
+    count: usize,
+) -> anyhow::Result<String> {
+    let chat_jid = CString::new(chat_jid)?;
+    let oldest_msg_id = CString::new(oldest_msg_id)?;
+    let count = count.min(i32::MAX as usize) as i32;
+    let response = unsafe {
+        C_RequestHistory(
+            handle,
+            chat_jid.as_ptr(),
+            oldest_msg_id.as_ptr(),
+            u8::from(oldest_from_me),
+            oldest_timestamp_unix,
+            count,
+        )
+    };
     take_c_string(response)
 }
 

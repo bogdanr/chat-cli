@@ -33,6 +33,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -55,24 +56,26 @@ type bridgeReaction struct {
 }
 
 type bridgeEvent struct {
-	Type       string `json:"type"`
-	Event      string `json:"event,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	Message    string `json:"message,omitempty"`
-	Code       string `json:"code,omitempty"`
-	JID        string `json:"jid,omitempty"`
-	ID         string `json:"id,omitempty"`
-	ChatJID    string `json:"chat_jid,omitempty"`
-	ChatName   string `json:"chat_name,omitempty"`
-	SenderJID  string `json:"sender_jid,omitempty"`
-	SenderName string `json:"sender_name,omitempty"`
-	AvatarPath string `json:"avatar_path,omitempty"`
-	Text       string `json:"text,omitempty"`
-	Timestamp  string `json:"timestamp,omitempty"`
-	FromMe     bool   `json:"from_me,omitempty"`
-	IsGroup    bool   `json:"is_group,omitempty"`
-	Muted      *bool  `json:"muted,omitempty"`
-	Progress   uint8  `json:"progress,omitempty"`
+	Type         string `json:"type"`
+	Event        string `json:"event,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	Message      string `json:"message,omitempty"`
+	Code         string `json:"code,omitempty"`
+	JID          string `json:"jid,omitempty"`
+	ID           string `json:"id,omitempty"`
+	CanonicalJID string `json:"canonical_jid,omitempty"`
+	AltJID       string `json:"alt_jid,omitempty"`
+	ChatJID      string `json:"chat_jid,omitempty"`
+	ChatName     string `json:"chat_name,omitempty"`
+	SenderJID    string `json:"sender_jid,omitempty"`
+	SenderName   string `json:"sender_name,omitempty"`
+	AvatarPath   string `json:"avatar_path,omitempty"`
+	Text         string `json:"text,omitempty"`
+	Timestamp    string `json:"timestamp,omitempty"`
+	FromMe       bool   `json:"from_me,omitempty"`
+	IsGroup      bool   `json:"is_group,omitempty"`
+	Muted        *bool  `json:"muted,omitempty"`
+	Progress     uint8  `json:"progress,omitempty"`
 
 	ContentType           string           `json:"content_type,omitempty"`
 	MediaID               string           `json:"media_id,omitempty"`
@@ -196,6 +199,7 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 	if wa.Store.ID != nil {
 		emit(bridgeEvent{Type: "connected", JID: wa.Store.ID.String()})
 		go c.syncChatMuteSettings(context.Background())
+		go c.emitJoinedGroups(context.Background())
 	}
 	emit(bridgeEvent{Type: "sync", Progress: 100})
 	return 1
@@ -208,6 +212,78 @@ func C_SetMessageCallback(cb C.MessageCallback, userData unsafe.Pointer) {
 
 	msgCb = cb
 	msgCbCtx = userData
+}
+
+//export C_RequestHistory
+func C_RequestHistory(clientID C.uint64_t, chatJID *C.char, oldestMsgID *C.char, oldestFromMe C.uint8_t, oldestTimestampUnix C.int64_t, count C.int) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "unknown WhatsApp bridge client"})
+	}
+	if strings.HasPrefix(c.dbPath, "test:") {
+		chat := C.GoString(chatJID)
+		messageID := C.GoString(oldestMsgID)
+		requested := int(count)
+		if requested <= 0 {
+			requested = 50
+		}
+		if strings.Contains(c.dbPath, "backfill") {
+			go func() {
+				for i := 0; i < requested && i < 3; i++ {
+					emit(bridgeEvent{
+						Type:       "history",
+						ID:         fmt.Sprintf("test-history-%s-%d", messageID, i),
+						ChatJID:    chat,
+						SenderJID:  chat,
+						SenderName: "Ada",
+						Text:       fmt.Sprintf("test older history %d", i+1),
+						Timestamp:  time.Unix(int64(oldestTimestampUnix)-int64(i+1), 0).UTC().Format(time.RFC3339Nano),
+					})
+				}
+			}()
+		}
+		return cJSON(bridgeEvent{Type: "history_request", ChatJID: chat, ID: messageID})
+	}
+	if c.wa == nil || !c.wa.IsConnected() {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	chat, err := types.ParseJID(C.GoString(chatJID))
+	if err != nil || chat.IsEmpty() {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
+	}
+	messageID := C.GoString(oldestMsgID)
+	if messageID == "" {
+		return cJSON(bridgeEvent{Type: "error", Message: "cannot request WhatsApp history without an anchor message ID"})
+	}
+	requested := int(count)
+	if requested <= 0 {
+		requested = 50
+	}
+	if requested > 100 {
+		requested = 100
+	}
+
+	anchor := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			Sender:   chat,
+			IsFromMe: oldestFromMe != 0,
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+		ID:        messageID,
+		Timestamp: time.Unix(int64(oldestTimestampUnix), 0),
+	}
+	request := c.wa.BuildHistorySyncRequest(anchor, requested)
+	if _, err := c.wa.SendPeerMessage(context.Background(), request); err != nil {
+		c.log("request WhatsApp on-demand history failed chat=%s anchor=%s count=%d: %v", chat.String(), messageID, requested, err)
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("request WhatsApp history: %v", err)})
+	}
+	canonicalChat := canonicalJID(c, context.Background(), chat)
+	c.log("requested WhatsApp on-demand history chat=%s anchor=%s count=%d", chat.String(), messageID, requested)
+	return cJSON(bridgeEvent{Type: "history_request", ChatJID: canonicalChat.String(), ID: messageID})
 }
 
 //export C_SendText
@@ -253,10 +329,11 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char) *C.char {
 	if id == "" {
 		id = string(whatsmeow.GenerateMessageID())
 	}
+	canonicalChat := canonicalJID(c, context.Background(), jid)
 	return cJSON(bridgeEvent{
 		Type:      "sent",
 		ID:        id,
-		ChatJID:   jid.String(),
+		ChatJID:   canonicalChat.String(),
 		SenderJID: c.ownJID(),
 		Text:      body,
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
@@ -357,10 +434,11 @@ func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C
 		id = string(whatsmeow.GenerateMessageID())
 	}
 	c.log("sent WhatsApp media id=%s chat=%s path=%s upload_path=%s mime=%s content_type=%s original_content_type=%s", id, jid.String(), pathRaw, dataPath, messageMime, messageContentType, contentRaw)
+	canonicalChat := canonicalJID(c, context.Background(), jid)
 	return cJSON(bridgeEvent{
 		Type:           "sent",
 		ID:             id,
-		ChatJID:        jid.String(),
+		ChatJID:        canonicalChat.String(),
 		SenderJID:      c.ownJID(),
 		Text:           captionRaw,
 		Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
@@ -428,10 +506,11 @@ func C_SendReaction(clientID C.uint64_t, chatJID *C.char, senderJID *C.char, mes
 	if id == "" {
 		id = string(whatsmeow.GenerateMessageID())
 	}
+	canonicalChat := canonicalJID(c, context.Background(), chat)
 	return cJSON(bridgeEvent{
 		Type:                  "reaction",
 		ID:                    id,
-		ChatJID:               chat.String(),
+		ChatJID:               canonicalChat.String(),
 		SenderJID:             c.ownJID(),
 		Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
 		FromMe:                true,
@@ -507,10 +586,11 @@ func C_SendPollVote(clientID C.uint64_t, chatJID *C.char, senderJID *C.char, mes
 	if id == "" {
 		id = string(whatsmeow.GenerateMessageID())
 	}
+	canonicalChat := canonicalJID(c, context.Background(), chat)
 	return cJSON(bridgeEvent{
 		Type:              "poll_vote",
 		ID:                id,
-		ChatJID:           chat.String(),
+		ChatJID:           canonicalChat.String(),
 		SenderJID:         c.ownJID(),
 		Timestamp:         time.Now().UTC().Format(time.RFC3339Nano),
 		FromMe:            true,
@@ -581,6 +661,49 @@ func isMutedUntilActive(mutedUntil time.Time) bool {
 	return mutedUntil == store.MutedForever || mutedUntil.After(time.Now())
 }
 
+type jidAlias struct {
+	canonical types.JID
+	alternate types.JID
+}
+
+func canonicalJID(c *client, ctx context.Context, jid types.JID) types.JID {
+	alias := canonicalJIDAlias(c, ctx, jid)
+	return alias.canonical
+}
+
+func canonicalJIDAlias(c *client, ctx context.Context, jid types.JID) jidAlias {
+	if c == nil || c.wa == nil || c.wa.Store == nil || jid.IsEmpty() || jid.Server == types.GroupServer {
+		return jidAlias{canonical: jid}
+	}
+	alt, err := c.wa.Store.GetAltJID(ctx, jid)
+	if err != nil || alt.IsEmpty() {
+		return jidAlias{canonical: jid}
+	}
+	canonical := chooseCanonicalJID(jid, alt)
+	alternate := alt
+	if canonical == alt {
+		alternate = jid
+	}
+	return jidAlias{canonical: canonical, alternate: alternate}
+}
+
+func chooseCanonicalJID(jid, alt types.JID) types.JID {
+	if jid.IsEmpty() || jid.Server == types.GroupServer || alt.IsEmpty() {
+		return jid
+	}
+	if jid.Server == types.DefaultUserServer {
+		return jid
+	}
+	if alt.Server == types.DefaultUserServer {
+		return alt
+	}
+	return jid
+}
+
+func canonicalJIDString(c *client, ctx context.Context, jid types.JID) string {
+	return canonicalJID(c, ctx, jid).String()
+}
+
 func chatMuted(c *client, ctx context.Context, jid types.JID) bool {
 	if c == nil || c.wa == nil || c.wa.Store == nil || c.wa.Store.ChatSettings == nil || jid.IsEmpty() {
 		return false
@@ -602,6 +725,16 @@ func (c *client) syncChatMuteSettings(ctx context.Context) {
 	}
 }
 
+func emitProfileEvent(c *client, ctx context.Context, jid types.JID, name string, avatarPath string, isGroup bool, muted *bool) {
+	alias := canonicalJIDAlias(c, ctx, jid)
+	event := bridgeEvent{Type: "profile", JID: alias.canonical.String(), SenderName: name, AvatarPath: avatarPath, IsGroup: isGroup, Muted: muted}
+	if !alias.alternate.IsEmpty() && alias.alternate != alias.canonical {
+		event.CanonicalJID = alias.canonical.String()
+		event.AltJID = alias.alternate.String()
+	}
+	emit(event)
+}
+
 func emitMuteEvent(c *client, evt *events.Mute) {
 	if evt == nil || evt.JID.IsEmpty() {
 		return
@@ -616,7 +749,7 @@ func emitMuteEvent(c *client, evt *events.Mute) {
 	} else {
 		muted = chatMuted(c, context.Background(), evt.JID)
 	}
-	emit(bridgeEvent{Type: "profile", JID: evt.JID.String(), IsGroup: evt.JID.Server == types.GroupServer, Muted: &muted})
+	emitProfileEvent(c, context.Background(), evt.JID, "", "", evt.JID.Server == types.GroupServer, &muted)
 }
 
 func handleWhatsAppEvent(c *client, evt interface{}) {
@@ -628,19 +761,19 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 	case *events.HistorySync:
 		emitHistorySync(c, v)
 	case *events.PushName:
-		jid := v.JID.String()
-		emit(bridgeEvent{Type: "profile", JID: jid, SenderName: v.NewPushName})
+		emitProfileEvent(c, context.Background(), v.JID, v.NewPushName, "", false, nil)
 	case *events.Picture:
 		if v.Remove {
-			muted := chatMuted(c, context.Background(), v.JID)
-			emit(bridgeEvent{Type: "profile", JID: v.JID.String(), Muted: &muted})
+			ctx := context.Background()
+			muted := chatMuted(c, ctx, v.JID)
+			emitProfileEvent(c, ctx, v.JID, "", "", v.JID.Server == types.GroupServer, &muted)
 		} else {
 			go c.fetchAndEmitProfile(context.Background(), v.JID, "", v.JID.Server == types.GroupServer)
 		}
 	case *events.GroupInfo:
 		if v.Name != nil && v.Name.Name != "" {
 			muted := chatMuted(c, context.Background(), v.JID)
-			emit(bridgeEvent{Type: "profile", JID: v.JID.String(), SenderName: v.Name.Name, IsGroup: true, Muted: &muted})
+			emitProfileEvent(c, context.Background(), v.JID, v.Name.Name, "", true, &muted)
 		}
 	case *events.Connected:
 		emit(bridgeEvent{Type: "connected"})
@@ -657,7 +790,8 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 	if evt == nil || evt.Data == nil || c == nil || c.wa == nil {
 		return
 	}
-	if c.syncScope == "none" {
+	isOnDemand := evt.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
+	if c.syncScope == "none" && !isOnDemand {
 		c.log("skipping WhatsApp history sync because sync_scope=none")
 		emit(bridgeEvent{Type: "sync", Progress: 100})
 		return
@@ -674,7 +808,7 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 	for _, pushName := range evt.Data.GetPushnames() {
 		jid, err := types.ParseJID(pushName.GetID())
 		if err == nil {
-			emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: pushName.GetPushname()})
+			emitProfileEvent(c, ctx, jid, pushName.GetPushname(), "", false, nil)
 		}
 	}
 
@@ -686,7 +820,7 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 		isGroup := chatJID.Server == types.GroupServer
 		chatName := conversationName(c, ctx, chatJID, firstNonEmpty(conv.GetDisplayName(), conv.GetName()))
 		chatMuted := chatMuted(c, ctx, chatJID)
-		emit(bridgeEvent{Type: "profile", JID: chatJID.String(), SenderName: chatName, IsGroup: isGroup, Muted: &chatMuted})
+		emitProfileEvent(c, ctx, chatJID, chatName, "", isGroup, &chatMuted)
 		go c.fetchAndEmitProfile(ctx, chatJID, chatName, isGroup)
 
 		for _, historyMsg := range conv.GetMessages() {
@@ -698,7 +832,7 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 			if err != nil {
 				continue
 			}
-			if c.shouldSkipHistoryMessage(message.Info.Timestamp) {
+			if !isOnDemand && c.shouldSkipHistoryMessage(message.Info.Timestamp) {
 				continue
 			}
 			emittedMessages++
@@ -738,14 +872,14 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	}
 
 	if reaction := message.Message.GetReactionMessage(); reaction != nil {
-		emitReactionMessageEvent(message, reaction, chatJID, chatName, senderName, isGroup)
+		emitReactionMessageEvent(c, message, reaction, chatJID, chatName, senderName, isGroup)
 		return
 	}
 	if message.Message.GetEncReactionMessage() != nil {
 		if c != nil && c.wa != nil {
 			reaction, err := c.wa.DecryptReaction(ctx, message)
 			if err == nil && reaction != nil {
-				emitReactionMessageEvent(message, reaction, chatJID, chatName, senderName, isGroup)
+				emitReactionMessageEvent(c, message, reaction, chatJID, chatName, senderName, isGroup)
 			}
 		}
 		return
@@ -754,18 +888,21 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		if c != nil && c.wa != nil {
 			vote, err := c.wa.DecryptPollVote(ctx, message)
 			if err == nil && vote != nil {
-				emitPollVoteEvent(message, vote, chatJID, chatName, senderName, isGroup)
+				emitPollVoteEvent(c, message, vote, chatJID, chatName, senderName, isGroup)
 			}
 		}
 		return
 	}
 
+	canonicalChatAlias := canonicalJIDAlias(c, ctx, chatJID)
+	canonicalSenderJID := canonicalJID(c, ctx, message.Info.Sender)
+
 	event := bridgeEvent{
 		Type:       eventType,
 		ID:         message.Info.ID,
-		ChatJID:    chatJID.String(),
+		ChatJID:    canonicalChatAlias.canonical.String(),
 		ChatName:   chatName,
-		SenderJID:  message.Info.Sender.String(),
+		SenderJID:  canonicalSenderJID.String(),
 		SenderName: senderName,
 		Text:       messageText(message.Message),
 		Timestamp:  message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
@@ -773,6 +910,10 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		IsGroup:    isGroup,
 		Muted:      boolPtr(chatMuted(c, ctx, chatJID)),
 		Reactions:  messageReactions(message),
+	}
+	if !canonicalChatAlias.alternate.IsEmpty() && canonicalChatAlias.alternate != canonicalChatAlias.canonical {
+		event.CanonicalJID = canonicalChatAlias.canonical.String()
+		event.AltJID = canonicalChatAlias.alternate.String()
 	}
 	if poll := pollCreation(message.Message); poll != nil {
 		event.ContentType = "poll"
@@ -812,7 +953,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	}
 }
 
-func emitReactionMessageEvent(message *events.Message, reaction *waProto.ReactionMessage, chatJID types.JID, chatName, senderName string, isGroup bool) {
+func emitReactionMessageEvent(c *client, message *events.Message, reaction *waProto.ReactionMessage, chatJID types.JID, chatName, senderName string, isGroup bool) {
 	if message == nil || reaction == nil {
 		return
 	}
@@ -824,9 +965,9 @@ func emitReactionMessageEvent(message *events.Message, reaction *waProto.Reactio
 	emit(bridgeEvent{
 		Type:                  "reaction",
 		ID:                    message.Info.ID,
-		ChatJID:               chatJID.String(),
+		ChatJID:               canonicalJIDString(c, context.Background(), chatJID),
 		ChatName:              chatName,
-		SenderJID:             message.Info.Sender.String(),
+		SenderJID:             canonicalJIDString(c, context.Background(), message.Info.Sender),
 		SenderName:            senderName,
 		Timestamp:             message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
 		FromMe:                message.Info.IsFromMe,
@@ -837,7 +978,7 @@ func emitReactionMessageEvent(message *events.Message, reaction *waProto.Reactio
 	})
 }
 
-func emitPollVoteEvent(message *events.Message, vote *waProto.PollVoteMessage, chatJID types.JID, chatName, senderName string, isGroup bool) {
+func emitPollVoteEvent(c *client, message *events.Message, vote *waProto.PollVoteMessage, chatJID types.JID, chatName, senderName string, isGroup bool) {
 	if message == nil || vote == nil {
 		return
 	}
@@ -854,9 +995,9 @@ func emitPollVoteEvent(message *events.Message, vote *waProto.PollVoteMessage, c
 	emit(bridgeEvent{
 		Type:              "poll_vote",
 		ID:                message.Info.ID,
-		ChatJID:           chatJID.String(),
+		ChatJID:           canonicalJIDString(c, context.Background(), chatJID),
 		ChatName:          chatName,
-		SenderJID:         message.Info.Sender.String(),
+		SenderJID:         canonicalJIDString(c, context.Background(), message.Info.Sender),
 		SenderName:        senderName,
 		Timestamp:         message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
 		FromMe:            message.Info.IsFromMe,
@@ -991,6 +1132,29 @@ func (c *client) fetchAndEmitGroupInfo(ctx context.Context, jid types.JID) {
 	}
 }
 
+func (c *client) emitJoinedGroups(ctx context.Context) {
+	if c == nil || c.wa == nil || strings.HasPrefix(c.dbPath, "test:") {
+		return
+	}
+	groups, err := c.wa.GetJoinedGroups(ctx)
+	if err != nil {
+		c.log("fetch WhatsApp joined groups failed: %v", err)
+		return
+	}
+	for _, group := range groups {
+		if group == nil || group.JID.IsEmpty() {
+			continue
+		}
+		name := group.Name
+		if name == "" {
+			name = group.JID.User
+		}
+		muted := chatMuted(c, ctx, group.JID)
+		emitProfileEvent(c, ctx, group.JID, name, "", true, &muted)
+	}
+	c.log("emitted WhatsApp joined groups count=%d", len(groups))
+}
+
 func (c *client) fetchAndEmitProfile(ctx context.Context, jid types.JID, name string, isGroup bool) {
 	if c == nil || c.wa == nil || jid.IsEmpty() || strings.HasPrefix(c.dbPath, "test:") {
 		return
@@ -1002,18 +1166,18 @@ func (c *client) fetchAndEmitProfile(ctx context.Context, jid types.JID, name st
 	info, err := c.wa.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: false})
 	if err != nil || info == nil || info.URL == "" {
 		muted := chatMuted(c, ctx, jid)
-		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, IsGroup: isGroup, Muted: &muted})
+		emitProfileEvent(c, ctx, jid, name, "", isGroup, &muted)
 		return
 	}
 
 	path, err := c.downloadProfilePicture(ctx, jid.String(), info.ID, info.URL)
 	if err != nil {
 		muted := chatMuted(c, ctx, jid)
-		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, IsGroup: isGroup, Muted: &muted})
+		emitProfileEvent(c, ctx, jid, name, "", isGroup, &muted)
 		return
 	}
 	muted := chatMuted(c, ctx, jid)
-	emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, AvatarPath: path, IsGroup: isGroup, Muted: &muted})
+	emitProfileEvent(c, ctx, jid, name, path, isGroup, &muted)
 }
 
 func (c *client) downloadProfilePicture(ctx context.Context, jid, pictureID, url string) (string, error) {

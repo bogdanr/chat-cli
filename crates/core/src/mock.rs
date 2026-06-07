@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Duration, Local, Utc};
 use image::{ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use std::{
     fs,
@@ -312,9 +312,12 @@ struct MediaMessageSeed<'a> {
 }
 
 fn mock_seed_now() -> Timestamp {
-    Utc.with_ymd_and_hms(2026, 6, 5, 4, 13, 0)
-        .single()
-        .expect("valid mock seed timestamp")
+    Local::now()
+        .date_naive()
+        .and_hms_opt(12, 0, 0)
+        .and_then(|noon| noon.and_local_timezone(Local).single())
+        .map(|noon| noon.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now)
 }
 
 fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
@@ -436,7 +439,7 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             unread_count: 0,
             muted: false,
             pinned: false,
-            last_seen_minutes_ago: 1500,
+            last_seen_minutes_ago: 4_320,
             preview: "Next pick: The Design of Everyday Things 📚",
         },
     ];
@@ -1854,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_provider_uses_stable_seed_timestamps() {
+    fn mock_provider_uses_current_local_day_seed_timestamps() {
         let first = MockProvider::new();
         let second = MockProvider::new();
 
@@ -1873,6 +1876,10 @@ mod tests {
         assert_eq!(
             first_family.timestamp,
             mock_seed_now() - Duration::minutes(2)
+        );
+        assert_eq!(
+            first_family.timestamp.with_timezone(&Local).date_naive(),
+            Local::now().date_naive()
         );
     }
 

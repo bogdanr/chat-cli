@@ -14,13 +14,58 @@ use std::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatInboxStyle {
+    ActivityFirst,
+    RecentFlat,
+    PeopleFirst,
+    GroupsFirst,
+    AccountSeparated,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiThemePreset {
+    DefaultDark,
+    Light,
+    HighContrast,
+    WhatsApp,
+    Slack,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationPresentationSetting {
+    ProviderNative,
+    #[serde(alias = "unified")]
+    WhatsApp,
+    Slack,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkActivityDisplay {
+    Hidden,
+    CombinedLights,
+    RecentCounts,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct AppSettings {
     pub desktop_notifications: bool,
     pub in_app_notifications: bool,
     pub notification_previews: bool,
     pub notify_selected_chat: bool,
     pub notify_muted_chats: bool,
+    pub chat_inbox_style: ChatInboxStyle,
+    pub ui_theme: UiThemePreset,
+    pub conversation_presentation: ConversationPresentationSetting,
+    pub network_activity: NetworkActivityDisplay,
+    pub show_muted_chats: bool,
+    pub show_browse_channels: bool,
+    pub show_empty_chats: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +76,45 @@ pub struct StoredAccountConfig {
     pub config_json: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct ChatActivityUpdate {
+    pub account_id: ProviderId,
+    pub chat_id: ChatId,
+    pub timestamp: Option<Timestamp>,
+    pub preview: Option<Arc<str>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatLatestMessage {
+    pub account_id: ProviderId,
+    pub chat_id: ChatId,
+    pub message: Message,
+}
+
+impl Default for ChatInboxStyle {
+    fn default() -> Self {
+        Self::ActivityFirst
+    }
+}
+
+impl Default for UiThemePreset {
+    fn default() -> Self {
+        Self::DefaultDark
+    }
+}
+
+impl Default for ConversationPresentationSetting {
+    fn default() -> Self {
+        Self::WhatsApp
+    }
+}
+
+impl Default for NetworkActivityDisplay {
+    fn default() -> Self {
+        Self::CombinedLights
+    }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -39,6 +123,13 @@ impl Default for AppSettings {
             notification_previews: true,
             notify_selected_chat: false,
             notify_muted_chats: false,
+            chat_inbox_style: ChatInboxStyle::ActivityFirst,
+            ui_theme: UiThemePreset::DefaultDark,
+            conversation_presentation: ConversationPresentationSetting::WhatsApp,
+            network_activity: NetworkActivityDisplay::CombinedLights,
+            show_muted_chats: true,
+            show_browse_channels: false,
+            show_empty_chats: true,
         }
     }
 }
@@ -212,43 +303,123 @@ impl Store {
 
     pub async fn upsert_chat(&self, chat: &Chat) -> Result<()> {
         let conn = self.conn.lock().await;
+        upsert_chat_on_conn(&conn, chat)
+    }
+
+    pub async fn set_chat_activities(&self, activities: &[ChatActivityUpdate]) -> Result<()> {
+        if activities.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        for activity in activities {
+            tx.execute(
+                "UPDATE chats
+                 SET last_msg_at = ?3,
+                     last_preview = ?4
+                 WHERE account_id = ?1 AND id = ?2",
+                params![
+                    activity.account_id.as_ref(),
+                    activity.chat_id.as_ref(),
+                    activity.timestamp.map(|t| t.timestamp_millis()),
+                    activity.preview.as_deref(),
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub async fn latest_message_for_each_chat(&self) -> Result<Vec<ChatLatestMessage>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.chat_id, m.account_id, m.sender_id, m.sender_name, m.sender_avatar,
+                    m.timestamp, m.edited_at, m.content_type, m.content_text, m.content_caption,
+                    m.media_id, m.media_filename, m.media_mime, m.media_size, m.media_local,
+                    m.media_thumbnail, m.reply_to_id, m.thread_id, m.is_from_me, m.platform_json
+             FROM messages m
+             JOIN (
+                 SELECT account_id, chat_id, MAX(timestamp) AS timestamp
+                 FROM messages
+                 GROUP BY account_id, chat_id
+             ) latest
+               ON latest.account_id = m.account_id
+              AND latest.chat_id = m.chat_id
+              AND latest.timestamp = m.timestamp
+             WHERE m.id = (
+                 SELECT m2.id
+                 FROM messages m2
+                 WHERE m2.account_id = m.account_id
+                   AND m2.chat_id = m.chat_id
+                   AND m2.timestamp = m.timestamp
+                 ORDER BY m2.id DESC
+                 LIMIT 1
+             )",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut latest_messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            let message = message_from_row(row)?;
+            latest_messages.push(ChatLatestMessage {
+                account_id: message.account.clone(),
+                chat_id: message.chat_id.clone(),
+                message,
+            });
+        }
+        Ok(latest_messages)
+    }
+
+    pub async fn set_chat_activity(
+        &self,
+        account_id: &ProviderId,
+        chat_id: &ChatId,
+        timestamp: Option<Timestamp>,
+        preview: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO chats (
-                id, account_id, platform, name, avatar_path, is_group, kind, membership, is_shared,
-                unread_count, muted, pinned, last_msg_at, last_preview, thread_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-             ON CONFLICT(id, account_id) DO UPDATE SET
-                platform = excluded.platform,
-                name = excluded.name,
-                avatar_path = excluded.avatar_path,
-                is_group = excluded.is_group,
-                kind = excluded.kind,
-                membership = excluded.membership,
-                is_shared = excluded.is_shared,
-                unread_count = excluded.unread_count,
-                muted = excluded.muted,
-                pinned = excluded.pinned,
-                last_msg_at = excluded.last_msg_at,
-                last_preview = excluded.last_preview,
-                thread_id = excluded.thread_id",
+            "UPDATE chats
+             SET last_msg_at = ?3,
+                 last_preview = ?4
+             WHERE account_id = ?1 AND id = ?2",
             params![
-                chat.id.as_ref(),
-                chat.account.as_ref(),
-                platform_to_str(&chat.platform),
-                chat.name.as_ref(),
-                path_to_string(chat.avatar.as_ref()),
-                chat.is_group,
-                chat_kind_to_str(chat.kind),
-                chat_membership_to_str(chat.membership),
-                chat.is_shared,
-                chat.unread_count,
-                chat.muted,
-                chat.pinned,
-                chat.last_message_at.map(|t| t.timestamp_millis()),
-                chat.last_message_preview.as_deref(),
-                chat.thread_id.as_deref(),
+                account_id.as_ref(),
+                chat_id.as_ref(),
+                timestamp.map(|t| t.timestamp_millis()),
+                preview,
             ],
         )?;
+        Ok(())
+    }
+
+    pub async fn merge_chat(
+        &self,
+        account_id: &ProviderId,
+        from_chat_id: &ChatId,
+        to_chat: &Chat,
+    ) -> Result<()> {
+        if from_chat_id == &to_chat.id {
+            self.upsert_chat(to_chat).await?;
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        upsert_chat_on_conn(&tx, to_chat)?;
+        tx.execute(
+            "UPDATE messages SET chat_id = ?1 WHERE account_id = ?2 AND chat_id = ?3",
+            params![
+                to_chat.id.as_ref(),
+                account_id.as_ref(),
+                from_chat_id.as_ref()
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM chats WHERE account_id = ?1 AND id = ?2",
+            params![account_id.as_ref(), from_chat_id.as_ref()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -295,83 +466,20 @@ impl Store {
 
     pub async fn upsert_message(&self, msg: &Message) -> Result<()> {
         let conn = self.conn.lock().await;
-        let content = StoredContent::from_content(&msg.content);
-        let platform_json = platform_data_to_json(&msg.platform_data)?;
+        upsert_message_on_conn(&conn, msg)
+    }
 
-        conn.execute(
-            "INSERT INTO messages (
-                id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
-                content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
-             ON CONFLICT(id, account_id) DO UPDATE SET
-                chat_id = excluded.chat_id,
-                sender_id = excluded.sender_id,
-                sender_name = excluded.sender_name,
-                sender_avatar = excluded.sender_avatar,
-                edited_at = excluded.edited_at,
-                content_type = excluded.content_type,
-                content_text = excluded.content_text,
-                content_caption = excluded.content_caption,
-                media_id = excluded.media_id,
-                media_filename = excluded.media_filename,
-                media_mime = excluded.media_mime,
-                media_size = excluded.media_size,
-                media_local = excluded.media_local,
-                media_thumbnail = excluded.media_thumbnail,
-                reply_to_id = excluded.reply_to_id,
-                thread_id = excluded.thread_id,
-                is_from_me = excluded.is_from_me,
-                platform_json = excluded.platform_json",
-            params![
-                msg.id.as_ref(),
-                msg.chat_id.as_ref(),
-                msg.account.as_ref(),
-                msg.sender.platform_id.as_ref(),
-                msg.sender.display_name.as_ref(),
-                path_to_string(msg.sender.avatar.as_ref()),
-                msg.timestamp.timestamp_millis(),
-                msg.edited_at.map(|t| t.timestamp_millis()),
-                content.kind,
-                content.text,
-                content.caption,
-                content.media_id,
-                content.media_filename,
-                content.media_mime,
-                content.media_size,
-                content.media_local,
-                content.media_thumbnail,
-                msg.reply_to.as_deref(),
-                msg.thread_id.as_deref(),
-                msg.is_from_me,
-                platform_json,
-            ],
-        )?;
-
-        conn.execute(
-            "DELETE FROM reactions WHERE message_id = ?1 AND account_id = ?2",
-            params![msg.id.as_ref(), msg.account.as_ref()],
-        )?;
-        for reaction in &msg.reactions {
-            for sender in &reaction.senders {
-                conn.execute(
-                    "INSERT OR IGNORE INTO reactions (message_id, account_id, emoji, sender_id) VALUES (?1, ?2, ?3, ?4)",
-                    params![msg.id.as_ref(), msg.account.as_ref(), reaction.emoji.as_ref(), sender.as_ref()],
-                )?;
-            }
+    pub async fn upsert_messages(&self, messages: &[Message]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
         }
 
-        conn.execute(
-            "DELETE FROM receipts WHERE message_id = ?1 AND account_id = ?2",
-            params![msg.id.as_ref(), msg.account.as_ref()],
-        )?;
-        for receipt in &msg.receipts {
-            conn.execute(
-                "INSERT OR REPLACE INTO receipts (message_id, account_id, sender_id, kind, at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![msg.id.as_ref(), msg.account.as_ref(), receipt.platform_id.as_ref(), receipt_kind_to_str(&receipt.kind), receipt.at.map(|t| t.timestamp_millis())],
-            )?;
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction()?;
+        for message in messages {
+            upsert_message_on_conn(&tx, message)?;
         }
-
+        tx.commit()?;
         Ok(())
     }
 
@@ -433,6 +541,30 @@ impl Store {
         }
         messages.reverse();
         Ok(messages)
+    }
+
+    pub async fn oldest_message_for_chat(
+        &self,
+        account_id: &ProviderId,
+        chat_id: &ChatId,
+    ) -> Result<Option<Message>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
+                    content_type, content_text, content_caption, media_id, media_filename, media_mime,
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+             FROM messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY timestamp ASC LIMIT 1",
+        )?;
+        let mut message = stmt
+            .query_row(
+                params![account_id.as_ref(), chat_id.as_ref()],
+                message_from_row,
+            )
+            .optional()?;
+        if let Some(message) = &mut message {
+            hydrate_reactions_and_receipts(&conn, message)?;
+        }
+        Ok(message)
     }
 
     pub async fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<Message>> {
@@ -503,6 +635,54 @@ impl Store {
     }
 }
 
+fn upsert_chat_on_conn(conn: &Connection, chat: &Chat) -> Result<()> {
+    conn.execute(
+        "INSERT INTO chats (
+            id, account_id, platform, name, avatar_path, is_group, kind, membership, is_shared,
+            unread_count, muted, pinned, last_msg_at, last_preview, thread_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(id, account_id) DO UPDATE SET
+           platform = excluded.platform,
+           name = excluded.name,
+           avatar_path = excluded.avatar_path,
+           is_group = excluded.is_group,
+           kind = excluded.kind,
+           membership = excluded.membership,
+           is_shared = excluded.is_shared,
+           unread_count = excluded.unread_count,
+           muted = excluded.muted,
+           pinned = excluded.pinned,
+           last_msg_at = CASE
+               WHEN excluded.last_msg_at IS NULL THEN chats.last_msg_at
+               WHEN chats.last_msg_at IS NULL OR excluded.last_msg_at >= chats.last_msg_at THEN excluded.last_msg_at
+               ELSE chats.last_msg_at
+           END,
+           last_preview = CASE
+               WHEN excluded.last_msg_at IS NULL THEN COALESCE(chats.last_preview, excluded.last_preview)
+               WHEN chats.last_msg_at IS NULL OR excluded.last_msg_at >= chats.last_msg_at THEN COALESCE(excluded.last_preview, chats.last_preview)
+               ELSE chats.last_preview
+           END,
+           thread_id = excluded.thread_id",
+        params![
+            chat.id.as_ref(),
+            chat.account.as_ref(),
+            platform_to_str(&chat.platform),
+            chat.name.as_ref(),
+            path_to_string(chat.avatar.as_ref()),
+            chat.is_group,
+            chat_kind_to_str(chat.kind),
+            chat_membership_to_str(chat.membership),
+            chat.is_shared,
+            chat.unread_count,
+            chat.muted,
+            chat.pinned,
+            chat.last_message_at.map(|t| t.timestamp_millis()),
+            chat.last_message_preview.as_deref(),
+            chat.thread_id.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
 #[derive(serde::Deserialize, serde::Serialize)]
 struct StoredPoll {
     question: String,
@@ -1100,6 +1280,87 @@ fn arc_str(value: String) -> Arc<str> {
     Arc::<str>::from(value)
 }
 
+fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
+    let content = StoredContent::from_content(&msg.content);
+    let platform_json = platform_data_to_json(&msg.platform_data)?;
+
+    conn.execute(
+        "INSERT INTO messages (
+                id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
+                content_type, content_text, content_caption, media_id, media_filename, media_mime,
+                media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+             ON CONFLICT(id, account_id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                sender_id = excluded.sender_id,
+                sender_name = excluded.sender_name,
+                sender_avatar = excluded.sender_avatar,
+                edited_at = excluded.edited_at,
+                content_type = excluded.content_type,
+                content_text = excluded.content_text,
+                content_caption = excluded.content_caption,
+                media_id = excluded.media_id,
+                media_filename = excluded.media_filename,
+                media_mime = excluded.media_mime,
+                media_size = excluded.media_size,
+                media_local = excluded.media_local,
+                media_thumbnail = excluded.media_thumbnail,
+                reply_to_id = excluded.reply_to_id,
+                thread_id = excluded.thread_id,
+                is_from_me = excluded.is_from_me,
+                platform_json = excluded.platform_json",
+        params![
+            msg.id.as_ref(),
+            msg.chat_id.as_ref(),
+            msg.account.as_ref(),
+            msg.sender.platform_id.as_ref(),
+            msg.sender.display_name.as_ref(),
+            path_to_string(msg.sender.avatar.as_ref()),
+            msg.timestamp.timestamp_millis(),
+            msg.edited_at.map(|t| t.timestamp_millis()),
+            content.kind,
+            content.text,
+            content.caption,
+            content.media_id,
+            content.media_filename,
+            content.media_mime,
+            content.media_size,
+            content.media_local,
+            content.media_thumbnail,
+            msg.reply_to.as_deref(),
+            msg.thread_id.as_deref(),
+            msg.is_from_me,
+            platform_json,
+        ],
+    )?;
+
+    conn.execute(
+        "DELETE FROM reactions WHERE message_id = ?1 AND account_id = ?2",
+        params![msg.id.as_ref(), msg.account.as_ref()],
+    )?;
+    for reaction in &msg.reactions {
+        for sender in &reaction.senders {
+            conn.execute(
+                "INSERT OR IGNORE INTO reactions (message_id, account_id, emoji, sender_id) VALUES (?1, ?2, ?3, ?4)",
+                params![msg.id.as_ref(), msg.account.as_ref(), reaction.emoji.as_ref(), sender.as_ref()],
+            )?;
+        }
+    }
+
+    conn.execute(
+        "DELETE FROM receipts WHERE message_id = ?1 AND account_id = ?2",
+        params![msg.id.as_ref(), msg.account.as_ref()],
+    )?;
+    for receipt in &msg.receipts {
+        conn.execute(
+            "INSERT OR REPLACE INTO receipts (message_id, account_id, sender_id, kind, at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![msg.id.as_ref(), msg.account.as_ref(), receipt.platform_id.as_ref(), receipt_kind_to_str(&receipt.kind), receipt.at.map(|t| t.timestamp_millis())],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn usize_to_i64(value: usize) -> Result<i64> {
     i64::try_from(value).context("limit does not fit into i64")
 }
@@ -1108,6 +1369,41 @@ fn usize_to_i64(value: usize) -> Result<i64> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn app_settings_roundtrip_includes_ui_preferences() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let settings = AppSettings {
+            ui_theme: UiThemePreset::Slack,
+            conversation_presentation: ConversationPresentationSetting::ProviderNative,
+            ..AppSettings::default()
+        };
+
+        store.save_app_settings(&settings).await?;
+        let loaded = store.app_settings().await?;
+
+        assert_eq!(loaded.ui_theme, UiThemePreset::Slack);
+        assert_eq!(
+            loaded.conversation_presentation,
+            ConversationPresentationSetting::ProviderNative
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_unified_conversation_presentation_maps_to_whatsapp_layout() -> Result<()> {
+        let settings = serde_json::from_str::<AppSettings>(
+            r#"{
+                "conversation_presentation": "unified"
+            }"#,
+        )?;
+
+        assert_eq!(
+            settings.conversation_presentation,
+            ConversationPresentationSetting::WhatsApp
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn account_chat_message_and_person_roundtrip() -> Result<()> {
@@ -1224,6 +1520,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_upsert_keeps_newer_preview_when_provider_metadata_is_stale() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account_id = arc_str("whatsapp:stale".to_owned());
+        let chat_id = arc_str("whatsapp:chat:vlad".to_owned());
+        store
+            .upsert_account(
+                &Account {
+                    id: account_id.clone(),
+                    platform: Platform::WhatsApp,
+                    display_name: arc_str("WhatsApp".to_owned()),
+                    avatar: None,
+                },
+                "{}",
+            )
+            .await?;
+        let newer = Utc
+            .with_ymd_and_hms(2026, 6, 6, 22, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let older = newer - chrono::Duration::days(1);
+
+        store
+            .upsert_chat(&Chat {
+                id: chat_id.clone(),
+                account: account_id.clone(),
+                platform: Platform::WhatsApp,
+                name: arc_str("Vlad Ghenu".to_owned()),
+                avatar: None,
+                is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: Some(newer),
+                last_message_preview: Some(arc_str("yesterday's message".to_owned())),
+                thread_id: None,
+            })
+            .await?;
+        store
+            .upsert_chat(&Chat {
+                id: chat_id.clone(),
+                account: account_id.clone(),
+                platform: Platform::WhatsApp,
+                name: arc_str("Vlad Ghenu".to_owned()),
+                avatar: None,
+                is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: None,
+                last_message_preview: None,
+                thread_id: None,
+            })
+            .await?;
+        store
+            .upsert_chat(&Chat {
+                id: chat_id.clone(),
+                account: account_id.clone(),
+                platform: Platform::WhatsApp,
+                name: arc_str("Vlad Ghenu".to_owned()),
+                avatar: None,
+                is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: Some(older),
+                last_message_preview: Some(arc_str("older provider preview".to_owned())),
+                thread_id: None,
+            })
+            .await?;
+
+        let chat = store.get_chats(&account_id).await?.remove(0);
+        assert_eq!(chat.last_message_at, Some(newer));
+        assert_eq!(
+            chat.last_message_preview.as_deref(),
+            Some("yesterday's message")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn messages_are_returned_chronologically_after_out_of_order_upserts() -> Result<()> {
         let store = Store::open_memory().await?;
         let account_id = arc_str("mock:local".to_owned());
@@ -1297,6 +1682,98 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, ["msg-1", "msg-2", "msg-3"]);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_upsert_messages_persists_messages_chronologically() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account_id = arc_str("mock:batch".to_owned());
+        let chat_id = arc_str("mock:chat:batch".to_owned());
+        let base = Utc
+            .with_ymd_and_hms(2026, 6, 5, 4, 0, 0)
+            .single()
+            .expect("valid timestamp");
+
+        store
+            .upsert_account(
+                &Account {
+                    id: account_id.clone(),
+                    platform: Platform::Unknown("mock".to_owned()),
+                    display_name: arc_str("Mock Account".to_owned()),
+                    avatar: None,
+                },
+                "{}",
+            )
+            .await?;
+        store
+            .upsert_chat(&Chat {
+                id: chat_id.clone(),
+                account: account_id.clone(),
+                platform: Platform::Unknown("mock".to_owned()),
+                name: arc_str("Batch Chat".to_owned()),
+                avatar: None,
+                is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: Some(base + chrono::Duration::minutes(2)),
+                last_message_preview: Some(arc_str("second".to_owned())),
+                thread_id: None,
+            })
+            .await?;
+
+        let sender = Sender {
+            platform_id: arc_str("alice".to_owned()),
+            display_name: arc_str("Alice".to_owned()),
+            avatar: None,
+        };
+        let messages = [
+            Message {
+                id: arc_str("batch-2".to_owned()),
+                chat_id: chat_id.clone(),
+                account: account_id.clone(),
+                sender: sender.clone(),
+                timestamp: base + chrono::Duration::minutes(2),
+                edited_at: None,
+                content: Content::Text(arc_str("second".to_owned())),
+                reply_to: None,
+                thread_id: None,
+                reactions: Vec::new(),
+                receipts: Vec::new(),
+                is_from_me: false,
+                platform_data: PlatformData::default(),
+            },
+            Message {
+                id: arc_str("batch-1".to_owned()),
+                chat_id: chat_id.clone(),
+                account: account_id.clone(),
+                sender,
+                timestamp: base + chrono::Duration::minutes(1),
+                edited_at: None,
+                content: Content::Text(arc_str("first".to_owned())),
+                reply_to: None,
+                thread_id: None,
+                reactions: Vec::new(),
+                receipts: Vec::new(),
+                is_from_me: false,
+                platform_data: PlatformData::default(),
+            },
+        ];
+
+        store.upsert_messages(&messages).await?;
+
+        let persisted = store
+            .get_messages_for_chat(&account_id, &chat_id, None, 10)
+            .await?;
+        let ids = persisted
+            .iter()
+            .map(|message| message.id.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["batch-1", "batch-2"]);
         Ok(())
     }
 

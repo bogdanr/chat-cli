@@ -195,16 +195,22 @@ fn build_account_provider_factory(
     })
 }
 
+#[cfg(test)]
+fn build_providers(args: &Args) -> Result<Vec<ProviderBox>> {
+    build_providers_with_persisted(args, Vec::new())
+}
+
 fn build_providers_with_persisted(
     args: &Args,
     persisted_accounts: Vec<storage::StoredAccountConfig>,
 ) -> Result<Vec<ProviderBox>> {
     let mut providers: Vec<ProviderBox> = Vec::new();
+    let enable_default_providers = !provider_flags_specified(args);
     if args.mock_provider {
         providers.push(Arc::new(MockProvider::new()));
     }
 
-    for options in slack_provider_options(args, &persisted_accounts)? {
+    for options in slack_provider_options(args, &persisted_accounts, enable_default_providers)? {
         let provider = SlackProvider::with_options(options)?;
         let provider_id = provider.id().clone();
         if providers
@@ -216,7 +222,7 @@ fn build_providers_with_persisted(
         providers.push(Arc::new(provider));
     }
 
-    if args.whatsapp {
+    if args.whatsapp || enable_default_providers {
         providers.push(Arc::new(WhatsAppProvider::with_options(
             WhatsAppProviderOptions {
                 db_path: args.whatsapp_db.to_string_lossy().to_string(),
@@ -226,6 +232,14 @@ fn build_providers_with_persisted(
         )?));
     }
     Ok(providers)
+}
+
+fn provider_flags_specified(args: &Args) -> bool {
+    args.mock_provider
+        || args.slack
+        || args.whatsapp
+        || args.slack_workspaces_file.is_some()
+        || !args.slack_workspace_profiles.is_empty()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -251,6 +265,7 @@ struct SlackWorkspaceProfile {
 fn slack_provider_options(
     args: &Args,
     persisted_accounts: &[storage::StoredAccountConfig],
+    enable_default_providers: bool,
 ) -> Result<Vec<SlackProviderOptions>> {
     let persisted_options = dedupe_persisted_slack_options(persisted_accounts)?;
     let mut profiles = Vec::new();
@@ -264,7 +279,7 @@ fn slack_provider_options(
     }
 
     let mut configured_options = Vec::new();
-    if args.slack {
+    if args.slack || (enable_default_providers && persisted_options.is_empty()) {
         configured_options.push(single_slack_options(args));
     }
     configured_options.extend(
@@ -277,7 +292,7 @@ fn slack_provider_options(
     ensure_unique_slack_provider_ids(&configured_options)?;
     let mut seen_ids = slack_provider_id_set(&configured_options)?;
     let mut options = configured_options;
-    let has_explicit_slack_config = args.slack || !options.is_empty();
+    let has_explicit_slack_config = args.slack || !options.is_empty() || enable_default_providers;
     for persisted in persisted_options {
         let id = slack_provider_id_for_options(&persisted)?;
         if seen_ids.insert(id.clone()) {
@@ -412,7 +427,7 @@ fn cleanup_paths(args: &Args) -> Vec<PathBuf> {
     if let Some(path) = &args.db {
         paths.push(path.clone());
     }
-    if args.whatsapp {
+    if args.whatsapp || !provider_flags_specified(args) {
         paths.push(args.whatsapp_db.clone());
         paths.push(whatsapp_avatar_cache_path(&args.whatsapp_db));
         paths.push(whatsapp_media_cache_path(&args.whatsapp_db));
@@ -669,8 +684,9 @@ bot_token = "xoxb-ops"
             ],
         )?;
 
-        assert_eq!(providers.len(), 1);
+        assert_eq!(providers.len(), 2);
         assert_eq!(providers[0].id().as_ref(), "slack:slack-workspace-1");
+        assert_eq!(providers[1].id().as_ref(), "whatsapp:bridge");
         Ok(())
     }
 
@@ -706,10 +722,53 @@ bot_token = "xoxb-ops"
     }
 
     #[test]
-    fn build_providers_leaves_provider_list_empty_without_flags() -> Result<()> {
-        assert!(build_providers(&base_args())?.is_empty());
+    fn build_providers_defaults_to_real_chat_providers_without_flags() -> Result<()> {
+        let providers = build_providers(&base_args())?;
+
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].id().as_ref(), "slack:setup");
+        assert_eq!(providers[0].platform(), chat_core::Platform::Slack);
+        assert_eq!(providers[1].id().as_ref(), "whatsapp:bridge");
+        assert_eq!(providers[1].platform(), chat_core::Platform::WhatsApp);
 
         Ok(())
+    }
+
+    #[test]
+    fn explicit_provider_flag_disables_default_provider_set() -> Result<()> {
+        let args = Args {
+            slack: true,
+            slack_auth_mode: SlackAuthMode::ReadOnlyOAuth,
+            slack_user_token: Some("xoxp-user".to_owned()),
+            slack_workspace: Some("example".to_owned()),
+            ..base_args()
+        };
+
+        let providers = build_providers(&args)?;
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id().as_ref(), "slack:example");
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_paths_include_whatsapp_db_for_default_provider_startup() {
+        let args = Args {
+            whatsapp_db: PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
+            db: Some(PathBuf::from("/tmp/chat-cli-app-cleanup.sqlite")),
+            test_cleanup: true,
+            ..base_args()
+        };
+
+        assert_eq!(
+            cleanup_paths(&args),
+            vec![
+                PathBuf::from("/tmp/chat-cli-app-cleanup.sqlite"),
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.avatars"),
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.media")
+            ]
+        );
     }
 
     #[test]
@@ -734,14 +793,21 @@ bot_token = "xoxb-ops"
     }
 
     #[test]
-    fn cleanup_paths_do_not_remove_default_or_disabled_whatsapp_db() {
+    fn cleanup_paths_include_default_whatsapp_db() {
         let args = Args {
             whatsapp_db: PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
             test_cleanup: true,
             ..base_args()
         };
 
-        assert!(cleanup_paths(&args).is_empty());
+        assert_eq!(
+            cleanup_paths(&args),
+            vec![
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.avatars"),
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.media")
+            ]
+        );
     }
 
     #[test]

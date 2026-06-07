@@ -1,4 +1,5 @@
 use ratatui::style::{Color, Modifier, Style};
+use storage::UiThemePreset;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
@@ -16,22 +17,75 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self {
-            background: Color::Reset,
-            foreground: Color::White,
-            muted: Color::DarkGray,
-            accent: Color::Cyan,
-            incoming: Color::Green,
-            outgoing: Color::LightCyan,
-            unread: Color::Yellow,
-            warning: Color::Yellow,
-            error: Color::Red,
-            overlay: Color::LightMagenta,
-        }
+        Self::from_preset(UiThemePreset::default())
     }
 }
 
 impl Theme {
+    pub fn from_preset(preset: UiThemePreset) -> Self {
+        match preset {
+            UiThemePreset::DefaultDark => Self {
+                background: Color::Reset,
+                foreground: Color::White,
+                muted: Color::DarkGray,
+                accent: Color::Cyan,
+                incoming: Color::Green,
+                outgoing: Color::LightCyan,
+                unread: Color::Yellow,
+                warning: Color::Yellow,
+                error: Color::Red,
+                overlay: Color::LightMagenta,
+            },
+            UiThemePreset::Light => Self {
+                background: Color::White,
+                foreground: Color::Black,
+                muted: Color::Gray,
+                accent: Color::Blue,
+                incoming: Color::Green,
+                outgoing: Color::Blue,
+                unread: Color::Magenta,
+                warning: Color::Yellow,
+                error: Color::Red,
+                overlay: Color::Blue,
+            },
+            UiThemePreset::HighContrast => Self {
+                background: Color::Black,
+                foreground: Color::White,
+                muted: Color::Gray,
+                accent: Color::LightYellow,
+                incoming: Color::LightGreen,
+                outgoing: Color::LightCyan,
+                unread: Color::LightYellow,
+                warning: Color::LightYellow,
+                error: Color::LightRed,
+                overlay: Color::LightYellow,
+            },
+            UiThemePreset::WhatsApp => Self {
+                background: Color::Black,
+                foreground: Color::White,
+                muted: Color::DarkGray,
+                accent: Color::Green,
+                incoming: Color::LightGreen,
+                outgoing: Color::LightCyan,
+                unread: Color::LightGreen,
+                warning: Color::Yellow,
+                error: Color::Red,
+                overlay: Color::Green,
+            },
+            UiThemePreset::Slack => Self {
+                background: Color::Black,
+                foreground: Color::White,
+                muted: Color::Gray,
+                accent: Color::Magenta,
+                incoming: Color::LightMagenta,
+                outgoing: Color::LightBlue,
+                unread: Color::LightMagenta,
+                warning: Color::Yellow,
+                error: Color::LightRed,
+                overlay: Color::Magenta,
+            },
+        }
+    }
     pub fn focus_border(self, focused: bool) -> Style {
         if focused {
             Style::default().fg(self.accent)

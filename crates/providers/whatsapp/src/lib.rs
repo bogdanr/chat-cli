@@ -2,8 +2,9 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chat_core::{
     Account, AuthChallenge, Chat, ChatId, ChatKind, ChatMembership, Content, EventBus, Media,
-    Message, MessageId, OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, PollOption,
-    PollVote, Provider, ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData,
+    Message, MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities,
+    Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent,
+    ProviderId, Reaction, Sender, Timestamp, WhatsAppData,
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -17,7 +18,14 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use tokio::{sync::broadcast, task::JoinHandle};
+use tokio::{
+    sync::broadcast,
+    task::JoinHandle,
+    time::{Duration, sleep},
+};
+
+const WHATSAPP_ON_DEMAND_HISTORY_WAIT: Duration = Duration::from_millis(12_000);
+const WHATSAPP_ON_DEMAND_HISTORY_POLL: Duration = Duration::from_millis(250);
 
 pub mod bridge;
 
@@ -174,6 +182,27 @@ impl WhatsAppProvider {
 }
 
 impl WhatsAppProvider {
+    fn emit_network_activity(
+        &self,
+        direction: NetworkActivityDirection,
+        kind: NetworkActivityKind,
+    ) {
+        self.events
+            .send(ProviderEvent::NetworkActivity { direction, kind });
+    }
+
+    fn bridge_call<T, F>(&self, kind: NetworkActivityKind, call: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        self.emit_network_activity(NetworkActivityDirection::Tx, kind);
+        let result = call();
+        if result.is_ok() {
+            self.emit_network_activity(NetworkActivityDirection::Rx, kind);
+        }
+        result
+    }
+
     fn send_media_to_bridge(
         &self,
         chat_jid: &str,
@@ -195,15 +224,71 @@ impl WhatsAppProvider {
             content_type,
             media.size_bytes,
         );
-        bridge::send_media(
-            self.handle,
-            chat_jid,
-            &path,
-            media.mime_type.as_ref(),
-            file_name,
-            caption,
-            content_type,
-        )
+        self.bridge_call(NetworkActivityKind::Media, || {
+            bridge::send_media(
+                self.handle,
+                chat_jid,
+                &path,
+                media.mime_type.as_ref(),
+                file_name,
+                caption,
+                content_type,
+            )
+        })
+    }
+
+    async fn request_history_before_anchor(
+        &self,
+        chat_id: &ChatId,
+        before: Option<Timestamp>,
+        anchor: &Message,
+        limit: usize,
+        mut page: Vec<Message>,
+    ) -> Result<Vec<Message>> {
+        let chat_jid = whatsapp_jid_from_chat_id(chat_id);
+        if chat_jid.is_empty() || anchor.id.is_empty() {
+            return Ok(page);
+        }
+
+        let raw_response = self.bridge_call(NetworkActivityKind::History, || {
+            bridge::request_history(
+                self.handle,
+                &chat_jid,
+                anchor.id.as_ref(),
+                anchor.is_from_me,
+                anchor.timestamp.timestamp(),
+                limit,
+            )
+        })?;
+        let response = BridgeEvent::decode(&raw_response)?;
+        if response.kind == "error" {
+            if page.is_empty() {
+                bail!(
+                    "{}",
+                    response
+                        .message
+                        .unwrap_or_else(|| "WhatsApp history request failed".to_owned())
+                );
+            }
+            return Ok(page);
+        }
+
+        let deadline = tokio::time::Instant::now() + WHATSAPP_ON_DEMAND_HISTORY_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            sleep(WHATSAPP_ON_DEMAND_HISTORY_POLL).await;
+            let updated = history_page_from_cache(&self.messages, chat_id, before, limit);
+            if updated.len() > page.len()
+                || updated.first().map(|message| message.timestamp)
+                    != page.first().map(|message| message.timestamp)
+            {
+                page = updated;
+                if page.len() >= limit {
+                    break;
+                }
+            }
+        }
+
+        Ok(page)
     }
 }
 
@@ -250,7 +335,9 @@ impl Provider for WhatsAppProvider {
         }
 
         self.start_message_forwarder();
-        if !bridge::connect(self.handle) {
+        if !self.bridge_call(NetworkActivityKind::Connect, || {
+            Ok(bridge::connect(self.handle))
+        })? {
             self.stop_message_forwarder();
             bail!("failed to connect WhatsApp bridge client")
         }
@@ -297,15 +384,27 @@ impl Provider for WhatsAppProvider {
         before: Option<Timestamp>,
         limit: usize,
     ) -> Result<Vec<Message>> {
-        let mut messages = lock_rw_read(&self.messages)
-            .iter()
-            .filter(|message| message.chat_id == *chat_id)
-            .filter(|message| before.is_none_or(|before| message.timestamp < before))
-            .cloned()
-            .collect::<Vec<_>>();
-        messages.sort_by_key(|message| message.timestamp);
-        let start = messages.len().saturating_sub(limit);
-        Ok(messages.split_off(start))
+        Ok(history_page_from_cache(
+            &self.messages,
+            chat_id,
+            before,
+            limit,
+        ))
+    }
+
+    async fn history_before_message(
+        &self,
+        chat_id: &ChatId,
+        before_message: &Message,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let before = Some(before_message.timestamp);
+        let page = history_page_from_cache(&self.messages, chat_id, before, limit);
+        if page.len() >= limit {
+            return Ok(page);
+        }
+        self.request_history_before_anchor(chat_id, before, before_message, limit, page)
+            .await
     }
 
     async fn send(
@@ -320,7 +419,9 @@ impl Provider for WhatsAppProvider {
         }
 
         let raw_response = match &content {
-            Content::Text(text) => bridge::send_text(self.handle, &chat_jid, text)?,
+            Content::Text(text) => self.bridge_call(NetworkActivityKind::Send, || {
+                bridge::send_text(self.handle, &chat_jid, text)
+            })?,
             Content::Image(media) if media.mime_type.as_ref() == "image/gif" => {
                 self.send_media_to_bridge(&chat_jid, media, "gif")?
             }
@@ -433,13 +534,15 @@ impl Provider for WhatsAppProvider {
             (sender_jid, had_reaction)
         };
         let reaction = if had_reaction { "" } else { emoji };
-        let raw_response = bridge::send_reaction(
-            self.handle,
-            &chat_jid,
-            &sender_jid,
-            message_id.as_ref(),
-            reaction,
-        )?;
+        let raw_response = self.bridge_call(NetworkActivityKind::Reaction, || {
+            bridge::send_reaction(
+                self.handle,
+                &chat_jid,
+                &sender_jid,
+                message_id.as_ref(),
+                reaction,
+            )
+        })?;
         let event = BridgeEvent::decode(&raw_response)?;
         if event.kind == "error" {
             bail!(
@@ -510,13 +613,15 @@ impl Provider for WhatsAppProvider {
         if option_labels.is_empty() {
             bail!("select at least one poll option")
         }
-        let raw_response = bridge::send_poll_vote(
-            self.handle,
-            &chat_jid,
-            &sender_jid,
-            message_id.as_ref(),
-            &option_labels,
-        )?;
+        let raw_response = self.bridge_call(NetworkActivityKind::Other, || {
+            bridge::send_poll_vote(
+                self.handle,
+                &chat_jid,
+                &sender_jid,
+                message_id.as_ref(),
+                &option_labels,
+            )
+        })?;
         let event = BridgeEvent::decode(&raw_response)?;
         if event.kind == "error" {
             bail!(
@@ -585,6 +690,8 @@ struct BridgeEvent {
     reason: Option<String>,
     jid: Option<String>,
     id: Option<String>,
+    canonical_jid: Option<String>,
+    alt_jid: Option<String>,
     chat_jid: Option<String>,
     chat_name: Option<String>,
     sender_jid: Option<String>,
@@ -636,6 +743,8 @@ impl BridgeEvent {
                 reason: None,
                 jid: None,
                 id: None,
+                canonical_jid: None,
+                alt_jid: None,
                 chat_jid: Some(BRIDGE_SENDER_ID.to_owned()),
                 chat_name: Some("WhatsApp Bridge".to_owned()),
                 sender_jid: Some(BRIDGE_SENDER_ID.to_owned()),
@@ -893,7 +1002,19 @@ fn forward_message_event(
             increment_unread: !event.from_me && !is_historical,
         },
     );
-    context.events.send(ProviderEvent::ChatUpdated(chat));
+    context
+        .events
+        .send(ProviderEvent::ChatUpdated(chat.clone()));
+    if let Some(alt_chat_id) = alias_chat_id_for_event(&event) {
+        merge_alias_chat(
+            context.account_id,
+            context.chats,
+            context.messages,
+            context.events,
+            alt_chat_id,
+            chat.clone(),
+        );
+    }
     context.events.send(ProviderEvent::Message {
         message,
         is_historical,
@@ -1417,6 +1538,23 @@ fn remove_message_reaction(message: &mut Message, emoji: &Arc<str>, sender: &Arc
         .retain(|reaction| !reaction.senders.is_empty());
 }
 
+fn history_page_from_cache(
+    messages: &Arc<RwLock<Vec<Message>>>,
+    chat_id: &ChatId,
+    before: Option<Timestamp>,
+    limit: usize,
+) -> Vec<Message> {
+    let mut messages = lock_rw_read(messages)
+        .iter()
+        .filter(|message| message.chat_id == *chat_id)
+        .filter(|message| before.is_none_or(|before| message.timestamp < before))
+        .cloned()
+        .collect::<Vec<_>>();
+    messages.sort_by_key(|message| message.timestamp);
+    let start = messages.len().saturating_sub(limit);
+    messages.split_off(start)
+}
+
 fn chat_id_from_jid(jid: &str) -> ChatId {
     arc_str(format!("whatsapp:{jid}"))
 }
@@ -1490,6 +1628,89 @@ fn upsert_profile(
     sender.clone()
 }
 
+fn alias_chat_id_for_event(event: &BridgeEvent) -> Option<ChatId> {
+    if event.is_group {
+        return None;
+    }
+    let alias_jid = event.alt_jid.as_deref()?;
+    let canonical_jid = event
+        .canonical_jid
+        .as_deref()
+        .or(event.chat_jid.as_deref())
+        .or(event.jid.as_deref())?;
+    if alias_jid.is_empty() || alias_jid == canonical_jid {
+        return None;
+    }
+    Some(chat_id_from_jid(alias_jid))
+}
+
+fn merge_alias_chat(
+    account_id: &ProviderId,
+    chats: &Arc<RwLock<HashMap<ChatId, Chat>>>,
+    messages: &Arc<RwLock<Vec<Message>>>,
+    events: &EventBus,
+    from_chat_id: ChatId,
+    to_chat: Chat,
+) {
+    if from_chat_id == to_chat.id {
+        return;
+    }
+
+    let mut merged_chat = to_chat.clone();
+    {
+        let mut chats = lock_rw_write(chats);
+        if let Some(alias_chat) = chats.remove(&from_chat_id) {
+            let canonical = chats
+                .entry(to_chat.id.clone())
+                .or_insert_with(|| to_chat.clone());
+            canonical.unread_count = canonical
+                .unread_count
+                .saturating_add(alias_chat.unread_count);
+            canonical.pinned |= alias_chat.pinned;
+            if canonical.avatar.is_none() {
+                canonical.avatar = alias_chat.avatar;
+            }
+            if canonical.last_message_at.is_none_or(|current| {
+                alias_chat
+                    .last_message_at
+                    .is_some_and(|alias_time| alias_time > current)
+            }) {
+                canonical.last_message_at = alias_chat.last_message_at;
+                canonical.last_message_preview = alias_chat.last_message_preview;
+            }
+            merged_chat = canonical.clone();
+        } else {
+            chats.insert(to_chat.id.clone(), to_chat.clone());
+        }
+    }
+
+    let mut changed_messages = Vec::new();
+    {
+        let mut messages = lock_rw_write(messages);
+        for message in messages.iter_mut() {
+            if message.account == *account_id && message.chat_id == from_chat_id {
+                message.chat_id = merged_chat.id.clone();
+                if let Some(whatsapp) = &mut message.platform_data.whatsapp {
+                    whatsapp.jid = arc_str(whatsapp_jid_from_chat_id(&merged_chat.id));
+                }
+                changed_messages.push(message.clone());
+            }
+        }
+    }
+
+    events.send(ProviderEvent::ChatMerged {
+        from_chat_id,
+        to_chat_id: merged_chat.id.clone(),
+        chat: merged_chat,
+    });
+    for message in changed_messages {
+        events.send(ProviderEvent::Message {
+            message,
+            is_historical: true,
+        });
+    }
+}
+
 fn forward_profile_event(
     account_id: &ProviderId,
     chats: &Arc<RwLock<HashMap<ChatId, Chat>>>,
@@ -1498,15 +1719,21 @@ fn forward_profile_event(
     events: &EventBus,
     event: BridgeEvent,
 ) {
-    let Some(jid) = event.jid.or(event.sender_jid).or(event.chat_jid) else {
+    let Some(jid) = event
+        .jid
+        .clone()
+        .or_else(|| event.sender_jid.clone())
+        .or_else(|| event.chat_jid.clone())
+    else {
         return;
     };
     let name = event
         .sender_name
-        .or(event.chat_name)
+        .clone()
+        .or_else(|| event.chat_name.clone())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| sender_name_from_jid(&jid));
-    let avatar = event.avatar_path;
+    let avatar = event.avatar_path.clone();
     let sender = upsert_profile(profiles, jid.clone(), name.clone(), avatar.clone());
 
     let chat_id = chat_id_from_jid(&jid);
@@ -1521,15 +1748,19 @@ fn forward_profile_event(
                 chat.muted = muted;
             }
             Some(chat.clone())
-        } else if event.is_group {
+        } else {
             let chat = Chat {
                 id: chat_id.clone(),
                 account: account_id.clone(),
                 platform: Platform::WhatsApp,
                 name: arc_str(&name),
                 avatar: avatar.clone(),
-                is_group: true,
-                kind: ChatKind::Group,
+                is_group: event.is_group,
+                kind: if event.is_group {
+                    ChatKind::Group
+                } else {
+                    ChatKind::Direct
+                },
                 membership: ChatMembership::Joined,
                 is_shared: false,
                 unread_count: 0,
@@ -1541,13 +1772,21 @@ fn forward_profile_event(
             };
             chats.insert(chat_id, chat.clone());
             Some(chat)
-        } else {
-            None
         }
     };
 
     if let Some(updated_chat) = updated_chat {
-        events.send(ProviderEvent::ChatUpdated(updated_chat));
+        events.send(ProviderEvent::ChatUpdated(updated_chat.clone()));
+        if let Some(alt_chat_id) = alias_chat_id_for_event(&event) {
+            merge_alias_chat(
+                account_id,
+                chats,
+                messages,
+                events,
+                alt_chat_id,
+                updated_chat,
+            );
+        }
     }
 
     let mut changed_messages = Vec::new();
@@ -1650,6 +1889,17 @@ mod tests {
             .await
     }
 
+    async fn next_non_network_event(
+        events: &mut tokio::sync::broadcast::Receiver<ProviderEvent>,
+    ) -> Result<ProviderEvent> {
+        loop {
+            let event = events.recv().await?;
+            if !matches!(event, ProviderEvent::NetworkActivity { .. }) {
+                return Ok(event);
+            }
+        }
+    }
+
     #[test]
     fn bridge_event_decodes_qr_messages_history_and_profiles() -> Result<()> {
         let qr = BridgeEvent::decode(r#"{"type":"qr","code":"2@test"}"#)?;
@@ -1731,13 +1981,15 @@ mod tests {
         assert_eq!(provider.account_info().display_name.as_ref(), "WhatsApp");
         assert_eq!(provider.chats().await?.len(), 0);
         assert!(matches!(
-            events.recv().await?,
+            next_non_network_event(&mut events).await?,
             ProviderEvent::AuthRequired(_)
         ));
         let mut saw_auth = false;
         let mut saw_sync = false;
         for _ in 0..8 {
-            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+            match tokio::time::timeout(Duration::from_secs(1), next_non_network_event(&mut events))
+                .await??
+            {
                 ProviderEvent::AuthSucceeded => saw_auth = true,
                 ProviderEvent::SyncComplete => saw_sync = true,
                 _ => {}
@@ -1785,7 +2037,7 @@ mod tests {
         );
         assert_eq!(
             provider
-                .history(&arc_str("whatsapp:123@s.whatsapp.net"), None, 10)
+                .history(&arc_str("whatsapp:123@s.whatsapp.net"), None, 1)
                 .await?
                 .len(),
             1
@@ -1951,6 +2203,61 @@ mod tests {
             Some(std::path::Path::new("/tmp/ada-updated.jpg"))
         );
 
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"profile","jid":"456@s.whatsapp.net","sender_name":"Grace Hopper"}"#
+        )?);
+
+        let direct_chat = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::ChatUpdated(chat)
+                    if chat.id.as_ref() == "whatsapp:456@s.whatsapp.net" =>
+                {
+                    break chat;
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(direct_chat.name.as_ref(), "Grace Hopper");
+        assert_eq!(direct_chat.kind, ChatKind::Direct);
+        assert!(
+            provider
+                .chats()
+                .await?
+                .iter()
+                .any(|chat| chat.id.as_ref() == "whatsapp:456@s.whatsapp.net")
+        );
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_fills_history_before_message_with_on_demand_backfill() -> Result<()>
+    {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:recent-history-backfill")?;
+        provider.connect().await?;
+
+        let chat_id = arc_str("whatsapp:123@s.whatsapp.net");
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"history","id":"recent-1","chat_jid":"123@s.whatsapp.net","chat_name":"Ada Lovelace","sender_jid":"123@s.whatsapp.net","sender_name":"Ada","text":"recent whatsapp message","timestamp":"2026-06-06T12:00:00Z"}"#
+        )?);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let recent_history = provider.history(&chat_id, None, 2).await?;
+        assert_eq!(recent_history.len(), 1);
+
+        let history = provider
+            .history_before_message(&chat_id, &recent_history[0], 2)
+            .await?;
+
+        assert!(history.len() > 1);
+        assert!(
+            history
+                .iter()
+                .any(|message| content_text(&message.content).contains("test older history"))
+        );
+
         provider.disconnect().await?;
         Ok(())
     }
@@ -1979,7 +2286,7 @@ mod tests {
             }
         }
 
-        let history = provider.history(&arc_str(INBOX_CHAT_ID), None, 10).await?;
+        let history = provider.history(&arc_str(INBOX_CHAT_ID), None, 1).await?;
         assert!(saw_auth);
         assert!(
             history
@@ -2001,7 +2308,7 @@ mod tests {
             .send(&chat_id, Content::Text(arc_str("hello back")), None)
             .await?;
         assert!(sent_id.starts_with("test-sent-"));
-        let history = provider.history(&chat_id, None, 10).await?;
+        let history = provider.history(&chat_id, None, 1).await?;
         assert_eq!(history.len(), 1);
         assert!(history[0].is_from_me);
         assert_eq!(content_text(&history[0].content), "hello back");
@@ -2037,7 +2344,7 @@ mod tests {
             )
             .await?;
         assert!(sent_id.starts_with("test-sent-media-"));
-        let history = provider.history(&chat_id, None, 10).await?;
+        let history = provider.history(&chat_id, None, 1).await?;
         assert_eq!(history.len(), 1);
         assert!(history[0].is_from_me);
         match &history[0].content {
@@ -2087,7 +2394,7 @@ mod tests {
             )
             .await?;
         assert!(sent_id.starts_with("test-sent-media-"));
-        let history = provider.history(&chat_id, None, 10).await?;
+        let history = provider.history(&chat_id, None, 1).await?;
         assert!(matches!(history[0].content, Content::Sticker(_)));
 
         provider.disconnect().await?;
@@ -2133,14 +2440,14 @@ mod tests {
 
         let chat_id = arc_str("whatsapp:123@s.whatsapp.net");
         let message_id = arc_str("react-target");
-        let history = provider.history(&chat_id, None, 10).await?;
+        let history = provider.history(&chat_id, None, 1).await?;
         let message = history
             .iter()
             .find(|message| message.id == message_id)
             .unwrap()
             .clone();
         provider.react(&chat_id, &message, "👍").await?;
-        let history = provider.history(&chat_id, None, 10).await?;
+        let history = provider.history(&chat_id, None, 1).await?;
         let message = history
             .iter()
             .find(|message| message.id == message_id)
@@ -2151,14 +2458,14 @@ mod tests {
             LOCAL_REACTION_SENDER
         ));
 
-        let history = provider.history(&chat_id, None, 10).await?;
+        let history = provider.history(&chat_id, None, 1).await?;
         let message = history
             .iter()
             .find(|message| message.id == message_id)
             .unwrap()
             .clone();
         provider.react(&chat_id, &message, "👍").await?;
-        let history = provider.history(&chat_id, None, 10).await?;
+        let history = provider.history(&chat_id, None, 1).await?;
         let message = history
             .iter()
             .find(|message| message.id == message_id)
@@ -2229,10 +2536,10 @@ mod tests {
 
         let received = loop {
             let received = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await?;
-            if let Some(received) = received {
-                if received.contains("hello from go") {
-                    break received;
-                }
+            if let Some(received) = received
+                && received.contains("hello from go")
+            {
+                break received;
             }
         };
         assert!(received.contains("hello from go"));

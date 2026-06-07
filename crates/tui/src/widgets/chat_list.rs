@@ -1,6 +1,6 @@
-use crate::theme::Theme;
+use crate::{theme::Theme, widgets::message_list};
 use chat_core::{Chat, ChatKind, ChatMembership, Platform};
-use chrono::Local;
+use chrono::{Local, NaiveDateTime};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -9,12 +9,12 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState},
 };
 use std::collections::HashMap;
+use storage::ChatInboxStyle;
 use unicode_width::UnicodeWidthStr;
 
 const CHAT_ROW_HEIGHT: u16 = 2;
 const CHAT_META_WIDTH: usize = 6;
 const CHAT_RIGHT_PADDING: usize = 1;
-const WHATSAPP_GREEN: Color = Color::Rgb(37, 211, 102);
 const SELECTED_CHAT_BG: Color = Color::Rgb(0, 48, 48);
 pub const CHAT_AVATAR_WIDTH: u16 = 4;
 pub const CHAT_AVATAR_ROWS: u16 = CHAT_ROW_HEIGHT;
@@ -23,7 +23,7 @@ pub type AvatarRows = Vec<Vec<Span<'static>>>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatListRow {
     Chat { chat_index: usize },
-    Section { title: &'static str },
+    Section { title: String },
 }
 
 pub struct ChatListProps<'a> {
@@ -33,13 +33,15 @@ pub struct ChatListProps<'a> {
     pub filter: &'a str,
     pub filter_mode: bool,
     pub account_filter: &'a str,
+    pub inbox_style: ChatInboxStyle,
     pub focused: bool,
     pub avatar_rows: &'a HashMap<usize, AvatarRows>,
+    pub typing_previews: &'a HashMap<usize, String>,
     pub theme: Theme,
 }
 
 pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<'_>) {
-    let rows = build_rows(props.chats, props.visible_chat_indices);
+    let rows = build_rows(props.chats, props.visible_chat_indices, props.inbox_style);
     let inner_width = inner_area(area).width as usize;
     let mut items = rows
         .iter()
@@ -47,6 +49,7 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
             ChatListRow::Chat { chat_index } => chat_item(
                 &props.chats[*chat_index],
                 props.avatar_rows.get(chat_index).map(Vec::as_slice),
+                props.typing_previews.get(chat_index).map(String::as_str),
                 props.theme,
                 inner_width,
                 *chat_index == props.selected_chat_index,
@@ -68,6 +71,7 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
                     props.filter_mode,
                     props.account_filter,
                     props.visible_chat_indices.len(),
+                    props.inbox_style,
                 ))
                 .borders(Borders::ALL)
                 .border_style(props.theme.focus_border(props.focused)),
@@ -93,20 +97,81 @@ pub fn filter_chat_indices(chats: &[Chat], filter: &str) -> Vec<usize> {
         .collect()
 }
 
-pub fn build_rows(chats: &[Chat], visible_chat_indices: &[usize]) -> Vec<ChatListRow> {
-    let mut rows = Vec::with_capacity(visible_chat_indices.len() + 4);
-    let mut current_section: Option<&'static str> = None;
+pub fn build_rows(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+) -> Vec<ChatListRow> {
+    if inbox_style == ChatInboxStyle::RecentFlat {
+        return visible_chat_indices
+            .iter()
+            .copied()
+            .map(|chat_index| ChatListRow::Chat { chat_index })
+            .collect();
+    }
 
-    for &chat_index in visible_chat_indices {
-        let section = chat_section(&chats[chat_index]);
-        if current_section != Some(section) {
-            rows.push(ChatListRow::Section { title: section });
-            current_section = Some(section);
+    let section_titles = section_titles(chats, visible_chat_indices, inbox_style);
+    let mut rows = Vec::with_capacity(visible_chat_indices.len() + section_titles.len());
+
+    for section in section_titles {
+        let section_chat_indices =
+            section_chat_indices(chats, visible_chat_indices, inbox_style, &section);
+
+        if section_chat_indices.is_empty() {
+            continue;
         }
-        rows.push(ChatListRow::Chat { chat_index });
+
+        rows.push(ChatListRow::Section {
+            title: section.clone(),
+        });
+        rows.extend(
+            section_chat_indices
+                .into_iter()
+                .map(|chat_index| ChatListRow::Chat { chat_index }),
+        );
     }
 
     rows
+}
+
+pub fn ordered_chat_indices(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+) -> Vec<usize> {
+    if inbox_style == ChatInboxStyle::RecentFlat {
+        return visible_chat_indices.to_vec();
+    }
+
+    let mut ordered_indices = Vec::with_capacity(visible_chat_indices.len());
+
+    for section in section_titles(chats, visible_chat_indices, inbox_style) {
+        ordered_indices.extend(section_chat_indices(
+            chats,
+            visible_chat_indices,
+            inbox_style,
+            &section,
+        ));
+    }
+
+    ordered_indices
+}
+
+fn section_chat_indices(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+    section: &str,
+) -> Vec<usize> {
+    let use_recent_fallback =
+        use_recent_activity_fallback(chats, visible_chat_indices, inbox_style);
+    visible_chat_indices
+        .iter()
+        .copied()
+        .filter(|chat_index| {
+            chat_section(&chats[*chat_index], inbox_style, use_recent_fallback) == section
+        })
+        .collect()
 }
 
 pub fn row_at(
@@ -116,13 +181,14 @@ pub fn row_at(
     list_area: Rect,
     column: u16,
     row: u16,
+    inbox_style: ChatInboxStyle,
 ) -> Option<ChatListRow> {
     let inner = inner_area(list_area);
     if !contains(inner, column, row) {
         return None;
     }
 
-    let rows = build_rows(chats, visible_chat_indices);
+    let rows = build_rows(chats, visible_chat_indices, inbox_style);
     let selected_row = selected_row_position(&rows, selected_chat_index);
     let offset = scroll_offset(&rows, selected_row, inner.height as usize);
     let relative_row = row.saturating_sub(inner.y);
@@ -149,6 +215,7 @@ pub fn chat_at(
     list_area: Rect,
     column: u16,
     row: u16,
+    inbox_style: ChatInboxStyle,
 ) -> Option<usize> {
     match row_at(
         chats,
@@ -157,6 +224,7 @@ pub fn chat_at(
         list_area,
         column,
         row,
+        inbox_style,
     ) {
         Some(ChatListRow::Chat { chat_index }) => Some(chat_index),
         _ => None,
@@ -174,13 +242,14 @@ pub fn rendered_chat_indices(
     visible_chat_indices: &[usize],
     selected_chat_index: usize,
     list_area: Rect,
+    inbox_style: ChatInboxStyle,
 ) -> Vec<usize> {
     let inner = inner_area(list_area);
     if inner.height == 0 {
         return Vec::new();
     }
 
-    let rows = build_rows(chats, visible_chat_indices);
+    let rows = build_rows(chats, visible_chat_indices, inbox_style);
     let selected_row = selected_row_position(&rows, selected_chat_index);
     let offset = scroll_offset(&rows, selected_row, inner.height as usize);
     let mut used_height = 0;
@@ -202,10 +271,12 @@ pub fn rendered_chat_indices(
 }
 
 pub fn selected_visible_position(
+    chats: &[Chat],
     visible_chat_indices: &[usize],
     selected_chat_index: usize,
+    inbox_style: ChatInboxStyle,
 ) -> Option<usize> {
-    visible_chat_indices
+    ordered_chat_indices(chats, visible_chat_indices, inbox_style)
         .iter()
         .position(|index| *index == selected_chat_index)
 }
@@ -242,14 +313,16 @@ fn unread_marker(unread_count: u32) -> String {
 fn chat_item(
     chat: &Chat,
     avatar_rows: Option<&[Vec<Span<'static>>]>,
+    typing_preview: Option<&str>,
     theme: Theme,
     row_width: usize,
     selected: bool,
 ) -> ListItem<'static> {
+    let has_unread = chat.unread_count > 0;
     let unread_marker = unread_marker(chat.unread_count);
     let pinned_marker = if chat.pinned { " [P]" } else { "" };
     let muted_marker = if chat.muted { " [M]" } else { "" };
-    let name_style = if chat.unread_count > 0 {
+    let name_style = if has_unread {
         theme.unread()
     } else {
         Style::default()
@@ -265,11 +338,13 @@ fn chat_item(
     let selected_bg = selected.then_some(SELECTED_CHAT_BG);
     let selected_message_style = if selected {
         Style::default().fg(theme.accent).bg(SELECTED_CHAT_BG)
+    } else if has_unread {
+        theme.unread()
     } else {
         Style::default().fg(theme.muted)
     };
     let meta_style = style_with_optional_bg(Style::default().fg(theme.muted), selected_bg);
-    let unread_style = style_with_optional_bg(unread_style(), selected_bg);
+    let unread_style = style_with_optional_bg(theme.unread(), selected_bg);
     let effective_width = row_width.saturating_sub(CHAT_RIGHT_PADDING);
     let meta_width = CHAT_META_WIDTH.min(effective_width.saturating_sub(1));
     let content_width = effective_width.saturating_sub(meta_width);
@@ -290,13 +365,17 @@ fn chat_item(
         .saturating_sub(meta_width)
         .saturating_sub(used_first_width);
 
-    let preview = chat
-        .last_message_preview
-        .as_deref()
-        .unwrap_or("No messages yet");
+    let preview = typing_preview
+        .map(str::to_owned)
+        .or_else(|| {
+            chat.last_message_preview
+                .as_deref()
+                .map(message_list::slack_emoji_shortcodes_to_display)
+        })
+        .unwrap_or_else(|| "No messages yet".to_owned());
     let second_prefix_width = CHAT_AVATAR_WIDTH as usize + 1;
     let preview_budget = content_width.saturating_sub(second_prefix_width);
-    let preview = truncate_to_width(preview, preview_budget);
+    let preview = truncate_to_width(&preview, preview_budget);
     let used_second_width = second_prefix_width + UnicodeWidthStr::width(preview.as_str());
     let second_gap = effective_width
         .saturating_sub(meta_width)
@@ -333,30 +412,210 @@ fn chat_item(
     ])
 }
 
-fn section_item(title: &'static str) -> ListItem<'static> {
+fn section_item(title: &str) -> ListItem<'static> {
     ListItem::new(Line::from(Span::styled(
         format!("── {title} ──"),
         Style::default().fg(Color::DarkGray),
     )))
 }
 
-fn chat_section(chat: &Chat) -> &'static str {
-    if chat.pinned {
-        return "Pinned";
+const ACTIVITY_FIRST_SECTION_ORDER: [&str; 9] = [
+    "Today",
+    "Yesterday",
+    "Recent",
+    "Earlier This Week",
+    "Groups & Channels",
+    "People",
+    "Muted",
+    "Browse Channels",
+    "Other Chats",
+];
+const PEOPLE_FIRST_SECTION_ORDER: [&str; 7] = [
+    "Today",
+    "Yesterday",
+    "People",
+    "Groups & Channels",
+    "Muted",
+    "Browse Channels",
+    "Other Chats",
+];
+const GROUPS_FIRST_SECTION_ORDER: [&str; 7] = [
+    "Today",
+    "Yesterday",
+    "Groups & Channels",
+    "People",
+    "Muted",
+    "Browse Channels",
+    "Other Chats",
+];
+
+fn section_titles(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+) -> Vec<String> {
+    let use_recent_fallback =
+        use_recent_activity_fallback(chats, visible_chat_indices, inbox_style);
+    match inbox_style {
+        ChatInboxStyle::ActivityFirst => ACTIVITY_FIRST_SECTION_ORDER
+            .iter()
+            .filter(|section| use_recent_fallback || **section != "Recent")
+            .filter(|section| !use_recent_fallback || **section != "Earlier This Week")
+            .map(|section| (*section).to_owned())
+            .collect(),
+        ChatInboxStyle::PeopleFirst => PEOPLE_FIRST_SECTION_ORDER
+            .iter()
+            .map(|section| (*section).to_owned())
+            .collect(),
+        ChatInboxStyle::GroupsFirst => GROUPS_FIRST_SECTION_ORDER
+            .iter()
+            .map(|section| (*section).to_owned())
+            .collect(),
+        ChatInboxStyle::AccountSeparated => {
+            let mut sections = Vec::new();
+            for chat_index in visible_chat_indices {
+                let section = chat_section(&chats[*chat_index], inbox_style, use_recent_fallback);
+                if !sections.iter().any(|existing| existing == &section) {
+                    sections.push(section);
+                }
+            }
+            sections
+        }
+        ChatInboxStyle::RecentFlat => Vec::new(),
     }
+}
+
+fn use_recent_activity_fallback(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+) -> bool {
+    inbox_style == ChatInboxStyle::ActivityFirst
+        && !visible_chat_indices.iter().any(|chat_index| {
+            let chat = &chats[*chat_index];
+            chat.membership != ChatMembership::NotJoined
+                && !(chat.muted && chat.unread_count == 0)
+                && matches!(
+                    activity_date_section(chat, false, false),
+                    Some("Today" | "Yesterday")
+                )
+        })
+}
+
+fn chat_section(chat: &Chat, inbox_style: ChatInboxStyle, use_recent_fallback: bool) -> String {
+    match inbox_style {
+        ChatInboxStyle::ActivityFirst => {
+            activity_first_chat_section(chat, use_recent_fallback).to_owned()
+        }
+        ChatInboxStyle::PeopleFirst => people_first_chat_section(chat).to_owned(),
+        ChatInboxStyle::GroupsFirst => groups_first_chat_section(chat).to_owned(),
+        ChatInboxStyle::AccountSeparated => format!("Account: {}", chat.account),
+        ChatInboxStyle::RecentFlat => String::new(),
+    }
+}
+
+fn activity_first_chat_section(chat: &Chat, use_recent_fallback: bool) -> &'static str {
     if chat.membership == ChatMembership::NotJoined {
-        return "Browse channels";
+        return "Browse Channels";
     }
-    if chat.muted {
+    if chat.muted && chat.unread_count == 0 {
         return "Muted";
     }
-    match (chat.platform.clone(), chat.kind) {
-        (Platform::Slack, ChatKind::PublicChannel | ChatKind::PrivateChannel) => "Channels",
-        (Platform::Slack, ChatKind::Direct) => "Direct messages",
-        (Platform::Slack, ChatKind::GroupDirectMessage) => "Group DMs",
-        _ if chat.is_group => "Groups",
-        _ => "Chats",
+    if let Some(section) = activity_date_section(chat, true, use_recent_fallback) {
+        return section;
     }
+    type_browse_section(chat)
+}
+
+fn people_first_chat_section(chat: &Chat) -> &'static str {
+    if chat.membership == ChatMembership::NotJoined {
+        return "Browse Channels";
+    }
+    if chat.muted && chat.unread_count == 0 {
+        return "Muted";
+    }
+    if let Some(section) = activity_date_section(chat, false, false) {
+        return section;
+    }
+    if is_direct_chat(chat) {
+        "People"
+    } else {
+        type_browse_section(chat)
+    }
+}
+
+fn groups_first_chat_section(chat: &Chat) -> &'static str {
+    if chat.membership == ChatMembership::NotJoined {
+        return "Browse Channels";
+    }
+    if chat.muted && chat.unread_count == 0 {
+        return "Muted";
+    }
+    if let Some(section) = activity_date_section(chat, false, false) {
+        return section;
+    }
+    if is_shared_space(chat) {
+        "Groups & Channels"
+    } else {
+        type_browse_section(chat)
+    }
+}
+
+fn activity_date_section(
+    chat: &Chat,
+    include_this_week: bool,
+    use_recent_fallback: bool,
+) -> Option<&'static str> {
+    let message_at = chat.last_message_at?.with_timezone(&Local).naive_local();
+    activity_date_section_from_datetimes(
+        message_at,
+        Local::now().naive_local(),
+        include_this_week,
+        use_recent_fallback,
+    )
+}
+
+fn activity_date_section_from_datetimes(
+    message_at: NaiveDateTime,
+    now: NaiveDateTime,
+    include_this_week: bool,
+    use_recent_fallback: bool,
+) -> Option<&'static str> {
+    let days_ago = now
+        .date()
+        .signed_duration_since(message_at.date())
+        .num_days();
+    match days_ago {
+        i64::MIN..=0 => Some("Today"),
+        1 => Some("Yesterday"),
+        2..=6 if include_this_week && use_recent_fallback => Some("Recent"),
+        2..=6 if include_this_week => Some("Earlier This Week"),
+        _ => None,
+    }
+}
+
+fn type_browse_section(chat: &Chat) -> &'static str {
+    if is_shared_space(chat) {
+        "Groups & Channels"
+    } else if is_direct_chat(chat) {
+        "People"
+    } else {
+        "Other Chats"
+    }
+}
+
+fn is_shared_space(chat: &Chat) -> bool {
+    matches!(
+        chat.kind,
+        ChatKind::Group
+            | ChatKind::PublicChannel
+            | ChatKind::PrivateChannel
+            | ChatKind::GroupDirectMessage
+    ) || chat.is_group
+}
+
+fn is_direct_chat(chat: &Chat) -> bool {
+    matches!(chat.kind, ChatKind::Direct) && !chat.is_group
 }
 
 fn empty_state_item(filter: &str, account_filter: &str) -> ListItem<'static> {
@@ -432,10 +691,6 @@ fn avatar_color(chat: &Chat) -> Color {
     }
 }
 
-fn unread_style() -> Style {
-    Style::default().fg(WHATSAPP_GREEN)
-}
-
 fn style_with_optional_bg(style: Style, bg: Option<Color>) -> Style {
     if let Some(bg) = bg {
         style.bg(bg)
@@ -477,18 +732,35 @@ fn truncate_to_width(value: &str, max_width: usize) -> String {
     output
 }
 
-fn title(filter: &str, filter_mode: bool, account_filter: &str, visible_count: usize) -> String {
+fn title(
+    filter: &str,
+    filter_mode: bool,
+    account_filter: &str,
+    visible_count: usize,
+    inbox_style: ChatInboxStyle,
+) -> String {
+    let style = format!(" · {}", inbox_style_title(inbox_style));
     let account = if account_filter == "All accounts" {
         String::new()
     } else {
         format!(" · Account: {account_filter}")
     };
     if filter_mode {
-        format!("Chats{account} · Filter: {filter}")
+        format!("Chats{style}{account} · Filter: {filter}")
     } else if filter.is_empty() {
-        format!("Chats{account}")
+        format!("Chats{style}{account}")
     } else {
-        format!("Chats ({visible_count}){account} · Filter: {filter}")
+        format!("Chats ({visible_count}){style}{account} · Filter: {filter}")
+    }
+}
+
+fn inbox_style_title(inbox_style: ChatInboxStyle) -> &'static str {
+    match inbox_style {
+        ChatInboxStyle::ActivityFirst => "Activity first",
+        ChatInboxStyle::RecentFlat => "Recent flat",
+        ChatInboxStyle::PeopleFirst => "People first",
+        ChatInboxStyle::GroupsFirst => "Groups & channels first",
+        ChatInboxStyle::AccountSeparated => "Account separated",
     }
 }
 
@@ -560,8 +832,12 @@ fn contains(area: Rect, column: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
-pub fn content_height(chats: &[Chat], visible_chat_indices: &[usize]) -> usize {
-    build_rows(chats, visible_chat_indices)
+pub fn content_height(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+) -> usize {
+    build_rows(chats, visible_chat_indices, inbox_style)
         .iter()
         .map(|row| row_height(row) as usize)
         .sum()
@@ -572,13 +848,14 @@ pub fn scroll_position(
     visible_chat_indices: &[usize],
     selected_chat_index: usize,
     list_area: Rect,
+    inbox_style: ChatInboxStyle,
 ) -> usize {
     let inner = inner_area(list_area);
     if inner.height == 0 {
         return 0;
     }
 
-    let rows = build_rows(chats, visible_chat_indices);
+    let rows = build_rows(chats, visible_chat_indices, inbox_style);
     let selected_row = selected_row_position(&rows, selected_chat_index);
     let offset = scroll_offset(&rows, selected_row, inner.height as usize);
     rows.iter()
@@ -599,7 +876,7 @@ fn platform_style(platform: &Platform) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Duration, Utc};
+    use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
     use std::sync::Arc;
 
     #[test]
@@ -621,42 +898,194 @@ mod tests {
     }
 
     #[test]
-    fn rows_insert_slack_style_sections() {
-        let chats = sample_chats();
-        let rows = build_rows(&chats, &[1, 3, 2, 0]);
+    fn activity_date_sections_use_calendar_day_buckets() {
+        let today = NaiveDate::from_ymd_opt(2026, 6, 7).expect("valid date");
+        let now = noon(today);
 
         assert_eq!(
-            rows,
-            vec![
-                ChatListRow::Section { title: "Channels" },
-                ChatListRow::Chat { chat_index: 1 },
-                ChatListRow::Section {
-                    title: "Direct messages"
-                },
-                ChatListRow::Chat { chat_index: 3 },
-                ChatListRow::Section { title: "Muted" },
-                ChatListRow::Chat { chat_index: 2 },
-                ChatListRow::Section { title: "Pinned" },
-                ChatListRow::Chat { chat_index: 0 },
-            ]
+            activity_date_section_from_datetimes(noon(today), now, true, false),
+            Some("Today")
         );
-        assert_eq!(selected_row_position(&rows, 2), Some(5));
+        assert_eq!(
+            activity_date_section_from_datetimes(
+                noon(NaiveDate::from_ymd_opt(2026, 6, 6).expect("valid date")),
+                now,
+                true,
+                false,
+            ),
+            Some("Yesterday")
+        );
+        assert_eq!(
+            activity_date_section_from_datetimes(
+                noon(NaiveDate::from_ymd_opt(2026, 6, 5).expect("valid date")),
+                now,
+                true,
+                false,
+            ),
+            Some("Earlier This Week")
+        );
+        assert_eq!(
+            activity_date_section_from_datetimes(
+                noon(NaiveDate::from_ymd_opt(2026, 6, 5).expect("valid date")),
+                now,
+                false,
+                false,
+            ),
+            None
+        );
     }
 
     #[test]
-    fn rows_keep_a_single_section_when_kinds_are_contiguous() {
-        let chats = sample_chats();
-        let rows = build_rows(&chats, &[1, 4, 3]);
+    fn activity_date_sections_do_not_treat_two_calendar_days_ago_as_yesterday() {
+        let now = NaiveDate::from_ymd_opt(2026, 6, 7)
+            .expect("valid date")
+            .and_hms_opt(5, 45, 0)
+            .expect("valid time");
+        let late_two_local_days_ago = NaiveDate::from_ymd_opt(2026, 6, 5)
+            .expect("valid date")
+            .and_hms_opt(22, 48, 0)
+            .expect("valid time");
+
+        assert_eq!(
+            activity_date_section_from_datetimes(late_two_local_days_ago, now, true, false),
+            Some("Earlier This Week")
+        );
+        assert_eq!(
+            activity_date_section_from_datetimes(late_two_local_days_ago, now, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn activity_first_uses_recent_fallback_when_today_and_yesterday_are_empty() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(3));
+        chats[1].last_message_at = Some(now - Duration::days(4));
+
+        let rows = build_rows(&chats, &[0, 1], ChatInboxStyle::ActivityFirst);
 
         assert_eq!(
             rows,
             vec![
-                ChatListRow::Section { title: "Channels" },
+                ChatListRow::Section {
+                    title: "Recent".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 0 },
                 ChatListRow::Chat { chat_index: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_first_uses_earlier_this_week_when_today_or_yesterday_exist() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(1));
+        chats[1].last_message_at = Some(now - Duration::days(3));
+
+        let rows = build_rows(&chats, &[0, 1], ChatInboxStyle::ActivityFirst);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Section {
+                    title: "Yesterday".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Section {
+                    title: "Earlier This Week".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn rows_group_chats_activity_first_by_default() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now);
+        chats[1].last_message_at = Some(now - Duration::days(1));
+        chats[2].muted = false;
+        chats[2].unread_count = 0;
+        chats[2].last_message_at = Some(now - Duration::days(8));
+        chats[3].last_message_at = Some(now - Duration::days(9));
+        chats[4].last_message_at = Some(now - Duration::days(3));
+
+        let rows = build_rows(&chats, &[0, 1, 4, 2, 3], ChatInboxStyle::ActivityFirst);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Section {
+                    title: "Today".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Section {
+                    title: "Yesterday".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Section {
+                    title: "Earlier This Week".to_owned()
+                },
                 ChatListRow::Chat { chat_index: 4 },
                 ChatListRow::Section {
-                    title: "Direct messages"
+                    title: "Groups & Channels".to_owned()
                 },
+                ChatListRow::Chat { chat_index: 2 },
+                ChatListRow::Section {
+                    title: "People".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 3 },
+            ]
+        );
+        assert_eq!(selected_row_position(&rows, 2), Some(7));
+    }
+
+    #[test]
+    fn rows_can_prioritize_people_after_recent_activity() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now);
+        chats[1].last_message_at = Some(now - Duration::days(8));
+        chats[2].muted = false;
+        chats[2].unread_count = 0;
+        chats[2].last_message_at = Some(now - Duration::days(9));
+        chats[3].last_message_at = Some(now - Duration::days(10));
+
+        let rows = build_rows(&chats, &[0, 1, 2, 3], ChatInboxStyle::PeopleFirst);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Section {
+                    title: "Today".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Section {
+                    title: "People".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::Section {
+                    title: "Groups & Channels".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Chat { chat_index: 2 },
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_flat_omits_section_headers() {
+        let chats = sample_chats();
+        let rows = build_rows(&chats, &[1, 4, 3], ChatInboxStyle::RecentFlat);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Chat { chat_index: 4 },
                 ChatListRow::Chat { chat_index: 3 },
             ]
         );
@@ -669,6 +1098,16 @@ mod tests {
         assert_eq!(unread_marker(140), "99");
         assert!(!unread_marker(2).contains('•'));
         assert!(!unread_marker(2).contains('●'));
+    }
+
+    #[test]
+    fn unread_chat_item_keeps_standard_alignment_and_badge_text() {
+        assert_eq!(unread_marker(2), "2");
+    }
+
+    #[test]
+    fn read_chat_item_has_no_unread_badge_text() {
+        assert_eq!(unread_marker(0), "");
     }
 
     #[test]
@@ -698,8 +1137,14 @@ mod tests {
         let chats = sample_chats();
         let area = Rect::new(0, 0, 40, 4);
 
-        assert_eq!(rendered_chat_indices(&chats, &[0, 1, 2], 0, area), vec![0]);
-        assert_eq!(rendered_chat_indices(&chats, &[0, 1, 2], 2, area), vec![2]);
+        assert_eq!(
+            rendered_chat_indices(&chats, &[0, 1, 2], 0, area, ChatInboxStyle::ActivityFirst),
+            vec![0]
+        );
+        assert_eq!(
+            rendered_chat_indices(&chats, &[0, 1, 2], 2, area, ChatInboxStyle::ActivityFirst),
+            vec![2]
+        );
     }
 
     #[test]
@@ -707,10 +1152,54 @@ mod tests {
         let chats = sample_chats();
         let area = Rect::new(0, 0, 40, 8);
 
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 1), None);
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 2), Some(0));
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 4), None);
-        assert_eq!(chat_at(&chats, &[0, 1, 2], 0, area, 2, 5), Some(1));
+        assert_eq!(
+            chat_at(
+                &chats,
+                &[0, 1, 2],
+                0,
+                area,
+                2,
+                1,
+                ChatInboxStyle::ActivityFirst
+            ),
+            None
+        );
+        assert_eq!(
+            chat_at(
+                &chats,
+                &[0, 1, 2],
+                0,
+                area,
+                2,
+                2,
+                ChatInboxStyle::ActivityFirst
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            chat_at(
+                &chats,
+                &[0, 1, 2],
+                0,
+                area,
+                2,
+                4,
+                ChatInboxStyle::ActivityFirst
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            chat_at(
+                &chats,
+                &[0, 1, 2],
+                0,
+                area,
+                2,
+                6,
+                ChatInboxStyle::ActivityFirst
+            ),
+            Some(2)
+        );
     }
 
     fn sample_chats() -> Vec<Chat> {
@@ -803,6 +1292,10 @@ mod tests {
                 thread_id: None,
             },
         ]
+    }
+
+    fn noon(date: NaiveDate) -> NaiveDateTime {
+        date.and_hms_opt(12, 0, 0).expect("valid noon timestamp")
     }
 
     fn arc_str(value: impl AsRef<str>) -> Arc<str> {

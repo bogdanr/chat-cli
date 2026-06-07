@@ -2,6 +2,26 @@ use crate::types::*;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkActivityDirection {
+    Rx,
+    Tx,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkActivityKind {
+    Auth,
+    Connect,
+    History,
+    Send,
+    Reaction,
+    Receipt,
+    Media,
+    Realtime,
+    Sync,
+    Other,
+}
+
 #[derive(Clone, Debug)]
 pub enum ProviderEvent {
     Message {
@@ -29,6 +49,11 @@ pub enum ProviderEvent {
         sender: PlatformId,
     },
     ChatUpdated(Chat),
+    ChatMerged {
+        from_chat_id: ChatId,
+        to_chat_id: ChatId,
+        chat: Chat,
+    },
     AuthRequired(AuthChallenge),
     AuthSucceeded,
     SyncProgress(u8),
@@ -39,6 +64,10 @@ pub enum ProviderEvent {
         chat_id: ChatId,
         sender: PlatformId,
         is_typing: bool,
+    },
+    NetworkActivity {
+        direction: NetworkActivityDirection,
+        kind: NetworkActivityKind,
     },
 }
 

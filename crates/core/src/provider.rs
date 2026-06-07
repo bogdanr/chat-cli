@@ -177,6 +177,19 @@ pub trait Provider: Send + Sync + 'static {
         limit: usize,
     ) -> anyhow::Result<Vec<Message>>;
 
+    /// Load history before a concrete anchor message.
+    ///
+    /// Providers that need the full message identity for pagination can override this.
+    async fn history_before_message(
+        &self,
+        chat_id: &ChatId,
+        before_message: &Message,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        self.history(chat_id, Some(before_message.timestamp), limit)
+            .await
+    }
+
     /// Send a message. Returns the sent message ID.
     async fn send(
         &self,

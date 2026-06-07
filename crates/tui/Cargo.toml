@@ -14,6 +14,7 @@ arboard.workspace = true
 chat-core = { package = "core", path = "../core" }
 chrono.workspace = true
 crossterm.workspace = true
+emojis.workspace = true
 flate2.workspace = true
 image.workspace = true
 open.workspace = true
