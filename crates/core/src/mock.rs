@@ -955,6 +955,10 @@ fn content_text(content: &Content) -> &str {
         | Content::File(media)
         | Content::Sticker(media) => media.caption.as_deref().unwrap_or(media.file_name.as_ref()),
         Content::LinkPreview(link) => link.title.as_deref().unwrap_or(link.url.as_ref()),
+        Content::Cards(cards) => cards
+            .first()
+            .and_then(|card| card.title.as_deref().or(card.body.as_deref()))
+            .unwrap_or("Card"),
         Content::Poll(poll) => poll.question.as_ref(),
         Content::Deleted => "",
     }

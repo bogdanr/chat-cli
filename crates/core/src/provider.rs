@@ -105,7 +105,7 @@ impl OutboundCapabilities {
             Content::Audio(_) => self.audio,
             Content::File(_) => self.file,
             Content::Sticker(_) => self.sticker,
-            Content::LinkPreview(_) => self.text,
+            Content::LinkPreview(_) | Content::Cards(_) => self.text,
             Content::Poll(_) | Content::Deleted | Content::Unsupported(_) => false,
         }
     }
@@ -133,6 +133,7 @@ fn outbound_content_label(content: &Content) -> &'static str {
         Content::File(_) => "file",
         Content::Sticker(_) => "sticker",
         Content::LinkPreview(_) => "link preview",
+        Content::Cards(_) => "card",
         Content::Poll(_) => "poll",
         Content::Deleted => "deleted message",
         Content::Unsupported(_) => "unsupported content",
@@ -154,6 +155,10 @@ pub trait Provider: Send + Sync + 'static {
 
     fn outbound_capabilities(&self) -> OutboundCapabilities {
         OutboundCapabilities::default()
+    }
+
+    fn discovery_capabilities(&self) -> DiscoveryCapabilities {
+        DiscoveryCapabilities::default()
     }
 
     /// Connect/authenticate. Emits an auth event if credentials are needed.
@@ -225,6 +230,33 @@ pub trait Provider: Send + Sync + 'static {
 
     /// Search messages across this provider.
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Message>>;
+
+    /// Discover reachable chats, contacts, users, and channels without adding them to the sidebar.
+    async fn discover_destinations(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<DiscoveryResult>> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        Ok(self
+            .chats()
+            .await?
+            .into_iter()
+            .filter(|chat| {
+                chat.name.to_lowercase().contains(&query)
+                    || chat
+                        .last_message_preview
+                        .as_deref()
+                        .is_some_and(|preview| preview.to_lowercase().contains(&query))
+            })
+            .take(limit)
+            .map(DiscoveryResult::existing_chat)
+            .collect())
+    }
 
     /// Get contact/user info for a platform ID.
     async fn contact_info(&self, platform_id: &PlatformId) -> anyhow::Result<Option<Sender>>;

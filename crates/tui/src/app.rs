@@ -13,9 +13,9 @@ use arboard::Clipboard;
 use arboard::SetExtLinux;
 use chat_core::{
     Account, AuthChallenge, AuthSubmission, AuthSubmissionMode, Chat, ChatId, ChatKind,
-    ChatMembership, Content, Media, Message, MessageId, NetworkActivityDirection,
-    OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, Provider, ProviderEvent,
-    ProviderId, Reaction, Sender, Timestamp,
+    ChatMembership, Content, DiscoveryAction, DiscoveryResult, Media, Message, MessageId,
+    NetworkActivityDirection, OutboundCapabilities, Platform, PlatformData, PlatformId, Poll,
+    Provider, ProviderEvent, ProviderId, Reaction, Sender, Timestamp,
 };
 use chat_notify::{DesktopNotifier, MessageNotification};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -72,6 +72,9 @@ const WHATSAPP_INITIAL_HISTORY_PAGES: usize = 2;
 const SELECTED_CHAT_MESSAGE_LIMIT: usize = 5000;
 const MAX_PROVIDER_EVENTS_PER_DRAIN: usize = 16;
 const MAX_COMPLETION_EVENTS_PER_DRAIN: usize = 4;
+const COMPLETION_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+const DISCOVERY_RESULT_LIMIT: usize = 16;
+const DISCOVERY_PROVIDER_RESULT_LIMIT: usize = 8;
 const HISTORY_PREFETCH_SCROLL_THRESHOLD: usize = 12;
 const ARCHIVE_SYNC_TICK_INTERVAL: u64 = 8;
 const ARCHIVE_BACKFILL_WINDOW_DAYS: i64 = 36500;
@@ -117,39 +120,37 @@ const COMPOSE_EMOTICON_OPTIONS: &[(&str, &str)] = &[
     ("🍕", "pizza"),
     ("🐱", "cat"),
     ("🐶", "dog"),
-    ("¯\\_(ツ)_/¯", "shrug ascii kaomoji whatever"),
-    ("(╯°□°）╯︵ ┻━┻", "table flip angry rage ascii kaomoji"),
-    ("┬─┬ノ( º _ ºノ)", "table unflip fix calm ascii kaomoji"),
-    ("(ง'̀-'́)ง", "fight angry square up ascii kaomoji"),
-    ("ᕕ( ᐛ )ᕗ", "run happy strut ascii kaomoji"),
-    ("(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧", "magic sparkle excited ascii kaomoji"),
-    ("(づ｡◕‿‿◕｡)づ", "hug cute ascii kaomoji"),
-    ("(｡♥‿♥｡)", "love heart eyes ascii kaomoji"),
-    ("(ಥ﹏ಥ)", "cry sad tears ascii kaomoji"),
-    ("ಠ_ಠ", "disapproval unimpressed judge ascii kaomoji"),
-    ("ಠ‿ಠ", "suspicious smug ascii kaomoji"),
-    ("(¬_¬)", "side eye suspicious ascii kaomoji"),
-    ("( ͡° ͜ʖ ͡°)", "lenny face smirk ascii kaomoji"),
-    ("ʕ•ᴥ•ʔ", "bear cute ascii kaomoji"),
-    ("ᶘ ᵒᴥᵒᶅ", "otter cute ascii kaomoji"),
-    ("(☞ﾟヮﾟ)☞", "point finger right ascii kaomoji"),
-    ("☜(ﾟヮﾟ☜)", "point finger left ascii kaomoji"),
-    ("(☞ﾟヮﾟ)☞ ☜(ﾟヮﾟ☜)", "finger guns ascii kaomoji"),
-    ("ヽ(´▽`)/", "yay happy celebrate ascii kaomoji"),
-    ("ヽ(ಠ_ಠ)ノ", "why annoyed ascii kaomoji"),
-    ("(ノಠ益ಠ)ノ彡┻━┻", "rage table flip ascii kaomoji"),
     (
-        "┻━┻ ︵ヽ(`Д´)ﾉ︵ ┻━┻",
-        "double table flip rage ascii kaomoji",
+        "(ﾉ◕ヮ◕)ﾉ*:・ﾟ✧",
+        "sparkle splash magic excited ascii kaomoji",
     ),
-    ("(╥_╥)", "cry sob ascii kaomoji"),
-    ("(✿◠‿◠)", "flower happy cute ascii kaomoji"),
-    ("(｡◕‿◕｡)", "cute happy smile ascii kaomoji"),
-    ("(ﾉ´ヮ`)ﾉ*: ･ﾟ", "celebrate sparkle ascii kaomoji"),
-    ("٩(◕‿◕｡)۶", "dance happy ascii kaomoji"),
-    ("(￣^￣)ゞ", "salute ascii kaomoji"),
-    ("(－‸ლ)", "facepalm ascii kaomoji"),
-    ("(っ˘ڡ˘ς)", "food yum ascii kaomoji"),
+    ("ᐛ", "dazed happy ascii kaomoji"),
+    ("٩(◕‿◕｡)۶", "overjoyed jump dance happy ascii kaomoji"),
+    ("(☞ﾟ∀ﾟ)☞", "ayyyy finger guns point ascii kaomoji"),
+    (
+        "(╯°□°)╯︵ ┻━┻",
+        "classic table flip angry rage ascii kaomoji",
+    ),
+    ("┬┴┬┴┤(･_├┬┴┬┴", "spy wall peeking ascii kaomoji"),
+    ("(ㆆ _ ㆆ)", "stunned deadpan ascii kaomoji"),
+    ("(ಥ﹏ಥ)", "torrential weep cry sad tears ascii kaomoji"),
+    ("┌∩┐(ಠ_ಠ)┌∩┐", "double bird angry rude ascii kaomoji"),
+    ("(づ｡◕‿‿◕｡)づ", "squishy bear hug cute ascii kaomoji"),
+    ("( ͡° ͜ʖ ͡°)", "legendary lenny face smirk ascii kaomoji"),
+    ("ᕙ(⇀‸↼‶)ᕗ", "exhausted flex strong ascii kaomoji"),
+    ("シ", "smile katakana ascii kaomoji"),
+    ("¯\\_(ツ)_/¯", "shrug whatever ascii kaomoji"),
+    ("(◕‿◕)", "happy content smile ascii kaomoji"),
+    ("(⌒‿⌒)", "pleased relaxed closed eyes smile ascii kaomoji"),
+    ("(´♡‿♡`)", "in love smitten heart eyes ascii kaomoji"),
+    ("٩(ఠ益ఠ)۶", "angry rage fists up ascii kaomoji"),
+    ("┐(シ)┌", "shrug dunno indifferent ascii kaomoji"),
+    ("ʕ •ᴥ• ʔ", "cute bear ascii kaomoji"),
+    (
+        "(ノ ˘_˘)ノ　ζ|||ζ　ζ|||ζ　ζ|||ζ",
+        "casting spell throwing magic ascii kaomoji",
+    ),
+    ("( ˘ ɜ˘) ♬♪♫", "humming singing music ascii kaomoji"),
 ];
 const COMPOSE_EMOTICON_MAX_SUGGESTIONS: usize = 8;
 const LOCAL_REACTION_SENDER: &str = "me";
@@ -178,6 +179,44 @@ struct AvatarPreviewFetchResult {
     key: AvatarPreviewKey,
     result: Result<chat_list::AvatarRows, String>,
     elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct MediaPreviewFetchResult {
+    key: message_list::MediaPreviewKey,
+    result: Result<Vec<Vec<Span<'static>>>, String>,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SelectedMessagesKey {
+    account: ProviderId,
+    chat_id: ChatId,
+}
+
+#[derive(Debug)]
+struct SelectedMessagesFetchResult {
+    key: SelectedMessagesKey,
+    generation: u64,
+    scroll_to_bottom: bool,
+    mark_read_after_load: bool,
+    result: Result<Vec<Message>, String>,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct DiscoveryFetchResult {
+    query: String,
+    generation: u64,
+    results: Vec<DiscoveryResult>,
+    errors: Vec<String>,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSelectedMessagesLoad {
+    key: SelectedMessagesKey,
+    generation: u64,
 }
 
 #[derive(Default)]
@@ -441,6 +480,32 @@ pub enum FocusPane {
     Messages,
     Compose,
     Details,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FilterScope {
+    #[default]
+    Chats,
+    Messages,
+    Thread,
+}
+
+impl FilterScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chats => "Chats",
+            Self::Messages => "Messages",
+            Self::Thread => "Thread",
+        }
+    }
+
+    fn status_label(self) -> &'static str {
+        match self {
+            Self::Chats => "chat",
+            Self::Messages => "message",
+            Self::Thread => "thread",
+        }
+    }
 }
 
 impl FocusPane {
@@ -1530,8 +1595,11 @@ pub struct AppState {
     chats: Vec<Chat>,
     visible_chat_indices: Vec<usize>,
     messages: Vec<Message>,
+    filtered_messages: Vec<Message>,
     selected_chat: usize,
     filter: String,
+    filter_scope: FilterScope,
+    discovery_results: Vec<DiscoveryResult>,
     filter_mode: bool,
     compose: TextArea<'static>,
     compose_text: String,
@@ -1566,6 +1634,7 @@ pub struct AppState {
     thread_root: Option<MessageId>,
     image_viewer: Option<ImageViewer>,
     message_scroll: usize,
+    message_top_padding: usize,
     details_scroll: usize,
     is_loading_older_history: bool,
     older_history_exhausted: bool,
@@ -1590,8 +1659,11 @@ impl Default for AppState {
             chats: Vec::new(),
             visible_chat_indices: Vec::new(),
             messages: Vec::new(),
+            filtered_messages: Vec::new(),
             selected_chat: 0,
             filter: String::new(),
+            filter_scope: FilterScope::Chats,
+            discovery_results: Vec::new(),
             filter_mode: false,
             compose: new_compose_textarea(),
             compose_text: String::new(),
@@ -1626,6 +1698,7 @@ impl Default for AppState {
             thread_root: None,
             image_viewer: None,
             message_scroll: 0,
+            message_top_padding: 0,
             details_scroll: 0,
             is_loading_older_history: false,
             older_history_exhausted: false,
@@ -1821,6 +1894,9 @@ pub struct App {
     settings: AppSettings,
     desktop_notifier: DesktopNotifier,
     media_preview_cache: message_list::MediaPreviewCache,
+    pending_media_previews: HashSet<message_list::MediaPreviewKey>,
+    media_preview_tx: mpsc::UnboundedSender<MediaPreviewFetchResult>,
+    media_preview_rx: mpsc::UnboundedReceiver<MediaPreviewFetchResult>,
     message_layout_cache: message_list::MessageLayoutCache,
     avatar_preview_cache: HashMap<AvatarPreviewKey, Result<chat_list::AvatarRows, String>>,
     pending_avatar_previews: HashSet<AvatarPreviewKey>,
@@ -1835,6 +1911,14 @@ pub struct App {
     history_rx: mpsc::UnboundedReceiver<HistoryFetchResult>,
     chat_members_tx: mpsc::UnboundedSender<ChatMembersFetchResult>,
     chat_members_rx: mpsc::UnboundedReceiver<ChatMembersFetchResult>,
+    selected_messages_tx: mpsc::UnboundedSender<SelectedMessagesFetchResult>,
+    selected_messages_rx: mpsc::UnboundedReceiver<SelectedMessagesFetchResult>,
+    selected_messages_generation: u64,
+    pending_selected_messages: Option<PendingSelectedMessagesLoad>,
+    discovery_tx: mpsc::UnboundedSender<DiscoveryFetchResult>,
+    discovery_rx: mpsc::UnboundedReceiver<DiscoveryFetchResult>,
+    discovery_generation: u64,
+    pending_discovery_query: Option<(String, u64)>,
     image_picker: Option<Picker>,
     image_protocol_cache: HashMap<ImageProtocolKey, Result<Protocol, String>>,
     provider_factory: Option<AccountProviderFactory>,
@@ -1858,9 +1942,12 @@ impl App {
             .map(|provider| (provider.id().clone(), provider.events()))
             .collect();
         let (link_metadata_tx, link_metadata_rx) = mpsc::unbounded_channel();
+        let (media_preview_tx, media_preview_rx) = mpsc::unbounded_channel();
         let (avatar_preview_tx, avatar_preview_rx) = mpsc::unbounded_channel();
         let (history_tx, history_rx) = mpsc::unbounded_channel();
         let (chat_members_tx, chat_members_rx) = mpsc::unbounded_channel();
+        let (selected_messages_tx, selected_messages_rx) = mpsc::unbounded_channel();
+        let (discovery_tx, discovery_rx) = mpsc::unbounded_channel();
         let settings_started = Instant::now();
         let settings = store.app_settings().await?;
         let theme = Theme::from_preset(settings.ui_theme);
@@ -1873,6 +1960,9 @@ impl App {
             settings,
             desktop_notifier: DesktopNotifier::new(),
             media_preview_cache: message_list::MediaPreviewCache::default(),
+            pending_media_previews: HashSet::new(),
+            media_preview_tx,
+            media_preview_rx,
             message_layout_cache: message_list::MessageLayoutCache::default(),
             avatar_preview_cache: HashMap::new(),
             pending_avatar_previews: HashSet::new(),
@@ -1887,6 +1977,14 @@ impl App {
             history_rx,
             chat_members_tx,
             chat_members_rx,
+            selected_messages_tx,
+            selected_messages_rx,
+            selected_messages_generation: 0,
+            pending_selected_messages: None,
+            discovery_tx,
+            discovery_rx,
+            discovery_generation: 0,
+            pending_discovery_query: None,
             image_picker: None,
             image_protocol_cache: HashMap::new(),
             provider_factory,
@@ -1974,19 +2072,25 @@ impl App {
         match event {
             AppEvent::Key(key) => {
                 self.dismiss_notification();
-                if self.handle_key(key).await? {
-                    self.reload_selected_messages_after_navigation().await?;
-                    self.scroll_messages_to_bottom();
+                let selection_changed = self.handle_key(key).await?;
+                if self.should_schedule_navigation_load(selection_changed) {
+                    let mark_read_after_load = self.state.focus == FocusPane::Messages;
+                    self.schedule_selected_messages_after_navigation_with_history(
+                        true,
+                        mark_read_after_load,
+                    )
+                    .await?;
                 }
             }
             AppEvent::Mouse(mouse) => {
                 self.dismiss_notification();
                 if self.handle_mouse(mouse).await? {
-                    self.reload_selected_messages_after_navigation().await?;
-                    self.scroll_messages_to_bottom();
-                    if self.state.focus == FocusPane::Messages {
-                        self.mark_selected_chat_read().await?;
-                    }
+                    let mark_read_after_load = self.state.focus == FocusPane::Messages;
+                    self.schedule_selected_messages_after_navigation_with_history(
+                        true,
+                        mark_read_after_load,
+                    )
+                    .await?;
                 }
             }
             AppEvent::Resize(width, height) => {
@@ -2017,6 +2121,118 @@ impl App {
         Ok(())
     }
 
+    fn should_schedule_navigation_load(&self, selection_changed: bool) -> bool {
+        selection_changed && !self.state.filter_mode
+    }
+
+    fn schedule_discovery_refresh(&mut self) {
+        self.state.discovery_results.clear();
+        let query = self.state.filter.trim().to_owned();
+        if query.len() < 2 {
+            self.pending_discovery_query = None;
+            return;
+        }
+
+        self.discovery_generation = self.discovery_generation.wrapping_add(1);
+        let generation = self.discovery_generation;
+        self.pending_discovery_query = Some((query.clone(), generation));
+        let tx = self.discovery_tx.clone();
+        let providers = self
+            .providers
+            .iter()
+            .filter(|provider| {
+                self.state
+                    .active_account
+                    .as_ref()
+                    .is_none_or(|active| provider.id() == active)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let mut results = Vec::new();
+            let mut errors = Vec::new();
+            for provider in providers {
+                let provider_name = provider.account_info().display_name;
+                match provider
+                    .discover_destinations(&query, DISCOVERY_PROVIDER_RESULT_LIMIT)
+                    .await
+                {
+                    Ok(mut provider_results) => results.append(&mut provider_results),
+                    Err(error) => errors.push(format!("{provider_name}: {error}")),
+                }
+                if results.len() >= DISCOVERY_RESULT_LIMIT {
+                    break;
+                }
+            }
+            results.truncate(DISCOVERY_RESULT_LIMIT);
+            let _ = tx.send(DiscoveryFetchResult {
+                query,
+                generation,
+                results,
+                errors,
+                elapsed: started.elapsed(),
+            });
+        });
+    }
+
+    fn drain_discovery_fetches(&mut self) -> bool {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        let mut stale = 0;
+        let mut errors = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.discovery_rx.try_recv()
+        {
+            drained += 1;
+            self.log_slow_perf_elapsed(
+                "discovery.load",
+                result.elapsed,
+                format!(
+                    "query_len={} generation={} results={} errors={}",
+                    result.query.len(),
+                    result.generation,
+                    result.results.len(),
+                    result.errors.len()
+                ),
+            );
+
+            let is_current = self
+                .pending_discovery_query
+                .as_ref()
+                .is_some_and(|pending| pending.0 == result.query && pending.1 == result.generation)
+                && self.state.filter.trim() == result.query;
+            if !is_current {
+                stale += 1;
+                continue;
+            }
+
+            self.pending_discovery_query = None;
+            self.state.discovery_results = result.results;
+            errors += result.errors.len();
+            if let Some(error) = result.errors.first() {
+                self.state.status = format!("destination discovery failed for {error}");
+            } else {
+                self.state.status = self.filter_status();
+            }
+            changed = true;
+        }
+        if drained > 0 {
+            self.log_slow_perf_duration(
+                "discovery.drain",
+                drain_started,
+                format!(
+                    "count={drained} stale={stale} errors={errors} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
+            );
+        }
+        changed
+    }
+
     fn queue_link_metadata_fetches(&mut self, requests: Vec<message_list::LinkPreviewRequest>) {
         for request in requests {
             if self.link_metadata_cache.contains_key(&request.url)
@@ -2040,11 +2256,35 @@ impl App {
         }
     }
 
+    fn queue_media_preview_fetches(&mut self, requests: Vec<message_list::MediaPreviewRequest>) {
+        for request in requests {
+            if self.media_preview_cache.get(&request.key).is_some()
+                || !self.pending_media_previews.insert(request.key.clone())
+            {
+                continue;
+            }
+
+            let tx = self.media_preview_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = message_list::decode_image_preview_rows_for_key(&request.key);
+                let _ = tx.send(MediaPreviewFetchResult {
+                    key: request.key,
+                    result,
+                    elapsed: started.elapsed(),
+                });
+            });
+        }
+    }
+
     fn drain_link_metadata_fetches(&mut self) -> bool {
         let drain_started = Instant::now();
         let mut changed = false;
         let mut drained = 0;
-        while let Ok(result) = self.link_metadata_rx.try_recv() {
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.link_metadata_rx.try_recv()
+        {
             drained += 1;
             self.pending_link_metadata_fetches.remove(&result.url);
             self.link_metadata_cache.insert(result.url, result.metadata);
@@ -2055,7 +2295,51 @@ impl App {
             self.log_slow_perf_duration(
                 "link_metadata.drain",
                 drain_started,
-                format!("count={drained}"),
+                format!(
+                    "count={drained} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
+            );
+        }
+        changed
+    }
+
+    fn drain_media_preview_fetches(&mut self) -> bool {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        let mut errors = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.media_preview_rx.try_recv()
+        {
+            drained += 1;
+            self.pending_media_previews.remove(&result.key);
+            if result.result.is_err() {
+                errors += 1;
+            }
+            self.log_slow_perf_elapsed(
+                "media_preview.decode",
+                result.elapsed,
+                format!(
+                    "path={} width={} rows={} result={}",
+                    result.key.path.display(),
+                    result.key.width,
+                    result.key.rows,
+                    if result.result.is_ok() { "ok" } else { "err" }
+                ),
+            );
+            self.media_preview_cache.insert(result.key, result.result);
+            changed = true;
+        }
+        if changed {
+            self.log_slow_perf_duration(
+                "media_preview.drain",
+                drain_started,
+                format!(
+                    "count={drained} errors={errors} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
             );
         }
         changed
@@ -2067,6 +2351,7 @@ impl App {
         let mut drained = 0;
         let mut errors = 0;
         while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
             && let Ok(result) = self.avatar_preview_rx.try_recv()
         {
             drained += 1;
@@ -2090,10 +2375,160 @@ impl App {
             self.log_slow_perf_duration(
                 "avatar_preview.drain",
                 drain_started,
-                format!("count={drained} errors={errors}"),
+                format!(
+                    "count={drained} errors={errors} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
             );
         }
         changed
+    }
+
+    fn schedule_selected_messages_after_navigation(
+        &mut self,
+        scroll_to_bottom: bool,
+        mark_read_after_load: bool,
+    ) {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            self.state.messages.clear();
+            self.state.filtered_messages.clear();
+            self.message_layout_cache.clear();
+            self.pending_selected_messages = None;
+            return;
+        };
+
+        let key = SelectedMessagesKey {
+            account: chat.account.clone(),
+            chat_id: chat.id.clone(),
+        };
+        self.selected_messages_generation = self.selected_messages_generation.wrapping_add(1);
+        let generation = self.selected_messages_generation;
+        self.pending_selected_messages = Some(PendingSelectedMessagesLoad {
+            key: key.clone(),
+            generation,
+        });
+        self.state.messages.clear();
+        self.message_layout_cache.clear();
+        let previous_status = self.state.status.clone();
+        self.state.status = if previous_status.is_empty() {
+            format!("loading messages for {}", chat.name)
+        } else {
+            format!("{previous_status}; loading messages for {}", chat.name)
+        };
+
+        let tx = self.selected_messages_tx.clone();
+        let store = Arc::clone(&self.store);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = store
+                .get_messages_for_chat(
+                    &key.account,
+                    &key.chat_id,
+                    None,
+                    SELECTED_CHAT_MESSAGE_LIMIT,
+                )
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(SelectedMessagesFetchResult {
+                key,
+                generation,
+                scroll_to_bottom,
+                mark_read_after_load,
+                result,
+                elapsed: started.elapsed(),
+            });
+        });
+    }
+
+    async fn schedule_selected_messages_after_navigation_with_history(
+        &mut self,
+        scroll_to_bottom: bool,
+        mark_read_after_load: bool,
+    ) -> Result<()> {
+        let should_sync_history = self.consume_pending_history_sync_for_selected_chat();
+        self.request_selected_chat_members();
+        self.schedule_selected_messages_after_navigation(scroll_to_bottom, mark_read_after_load);
+        if should_sync_history {
+            self.sync_selected_chat_history().await?;
+        }
+        Ok(())
+    }
+
+    async fn drain_selected_messages_fetches(&mut self) -> Result<bool> {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        let mut stale = 0;
+        let mut errors = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.selected_messages_rx.try_recv()
+        {
+            drained += 1;
+            self.log_slow_perf_elapsed(
+                "selected_messages.load",
+                result.elapsed,
+                format!(
+                    "account={} chat={} generation={} result={}",
+                    result.key.account,
+                    result.key.chat_id,
+                    result.generation,
+                    if result.result.is_ok() { "ok" } else { "err" }
+                ),
+            );
+
+            let is_current_pending =
+                self.pending_selected_messages
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.key == result.key && pending.generation == result.generation
+                    });
+            let is_selected_chat = self.state.selected_chat().is_some_and(|chat| {
+                chat.account == result.key.account && chat.id == result.key.chat_id
+            });
+            if !is_current_pending || !is_selected_chat {
+                stale += 1;
+                continue;
+            }
+
+            self.pending_selected_messages = None;
+            match result.result {
+                Ok(messages) => {
+                    let message_count = messages.len();
+                    self.state.messages = messages;
+                    self.apply_message_filter();
+                    self.message_layout_cache.clear();
+                    self.apply_cached_member_names_to_selected_messages();
+                    if result.scroll_to_bottom {
+                        self.scroll_messages_to_bottom();
+                    } else {
+                        self.clamp_message_scroll();
+                    }
+                    self.schedule_older_history_prefetch_if_needed();
+                    if result.mark_read_after_load {
+                        self.mark_selected_chat_read().await?;
+                    }
+                    self.state.status = format!("loaded {message_count} messages");
+                    changed = true;
+                }
+                Err(error) => {
+                    errors += 1;
+                    self.state.status = format!("message load failed: {error}");
+                    changed = true;
+                }
+            }
+        }
+        if drained > 0 {
+            self.log_slow_perf_duration(
+                "selected_messages.drain",
+                drain_started,
+                format!(
+                    "count={drained} stale={stale} errors={errors} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
+            );
+        }
+        Ok(changed)
     }
 
     async fn drain_history_fetches(&mut self) -> Result<bool> {
@@ -2101,6 +2536,7 @@ impl App {
         let mut changed = false;
         let mut changed_count = 0;
         while changed_count < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (changed_count == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
             && let Ok(result) = self.history_rx.try_recv()
         {
             changed_count += 1;
@@ -2163,8 +2599,18 @@ impl App {
                             );
                         } else {
                             self.reload_chats().await?;
-                            self.reload_selected_messages().await?;
+                            self.pending_selected_messages = None;
+                            self.selected_messages_generation =
+                                self.selected_messages_generation.wrapping_add(1);
+                            self.state.messages = messages;
+                            self.apply_message_filter();
+                            self.message_layout_cache.clear();
+                            self.apply_cached_member_names_to_selected_messages();
                             self.scroll_messages_to_bottom();
+                            self.schedule_older_history_prefetch_if_needed();
+                            if self.state.focus == FocusPane::Messages {
+                                self.mark_selected_chat_read().await?;
+                            }
                             self.state.status =
                                 format!("synced recent messages for {}", result.chat_name);
                         }
@@ -2189,7 +2635,10 @@ impl App {
             self.log_slow_perf_duration(
                 "history_fetch.drain",
                 drain_started,
-                format!("count={changed_count}"),
+                format!(
+                    "count={changed_count} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
             );
         }
         Ok(changed)
@@ -2199,7 +2648,10 @@ impl App {
         let drain_started = Instant::now();
         let mut changed = false;
         let mut drained = 0;
-        while let Ok(result) = self.chat_members_rx.try_recv() {
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.chat_members_rx.try_recv()
+        {
             drained += 1;
             let key = (result.account.clone(), result.chat_id.clone());
             self.state.loading_chat_members.remove(&key);
@@ -2226,7 +2678,10 @@ impl App {
             self.log_slow_perf_duration(
                 "chat_members.drain",
                 drain_started,
-                format!("count={drained}"),
+                format!(
+                    "count={drained} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
             );
         }
         changed
@@ -2256,6 +2711,7 @@ impl App {
                 message.sender = sender.clone();
             }
         }
+        self.apply_message_filter();
     }
 
     fn apply_cached_member_names_to_selected_messages(&mut self) {
@@ -2266,6 +2722,8 @@ impl App {
         let members = self.state.chat_members.get(&key).cloned();
         if let Some(members) = members {
             self.apply_member_names_to_selected_messages(&key.0, &key.1, &members);
+        } else {
+            self.apply_message_filter();
         }
     }
 
@@ -2289,16 +2747,25 @@ impl App {
         }
 
         let event_type_counts = provider_event_type_counts(&events);
-        let had_events = !events.is_empty();
         let provider_event_count = events.len();
+        let provider_draw_event_count = events
+            .iter()
+            .filter(|event| provider_event_requests_draw(event, self.settings.network_activity))
+            .count();
         for event in events {
             self.handle_event(event).await?;
         }
         let history_changed = self.drain_history_fetches().await?;
+        let selected_messages_changed = self.drain_selected_messages_fetches().await?;
+        let discovery_changed = self.drain_discovery_fetches();
+        let media_preview_changed = self.drain_media_preview_fetches();
         let avatar_preview_changed = self.drain_avatar_preview_fetches();
         let link_metadata_changed = self.drain_link_metadata_fetches();
         let chat_members_changed = self.drain_chat_member_fetches();
-        let changed = had_events
+        let changed = provider_draw_event_count > 0
+            || selected_messages_changed
+            || discovery_changed
+            || media_preview_changed
             || avatar_preview_changed
             || link_metadata_changed
             || chat_members_changed
@@ -2308,7 +2775,7 @@ impl App {
                 "event_drain.batch",
                 drain_started,
                 format!(
-                    "provider_events={provider_event_count} event_types={} history_changed={history_changed} avatar_preview_changed={avatar_preview_changed} link_metadata_changed={link_metadata_changed} chat_members_changed={chat_members_changed}",
+                    "provider_events={provider_event_count} provider_draw_events={provider_draw_event_count} event_types={} history_changed={history_changed} selected_messages_changed={selected_messages_changed} discovery_changed={discovery_changed} media_preview_changed={media_preview_changed} avatar_preview_changed={avatar_preview_changed} link_metadata_changed={link_metadata_changed} chat_members_changed={chat_members_changed}",
                     format_event_type_counts(&event_type_counts)
                 ),
             );
@@ -2511,8 +2978,16 @@ impl App {
             return;
         }
 
+        let chat_layout = chat_list::build_layout(
+            &self.state.chats,
+            &self.state.visible_chat_indices,
+            self.state.selected_chat,
+            area,
+            self.settings.chat_inbox_style,
+        );
+        let rendered_chat_indices = chat_layout.rendered_chat_indices();
         let avatars_started = Instant::now();
-        let avatar_rows = self.chat_avatar_rows();
+        let avatar_rows = self.chat_avatar_rows(&rendered_chat_indices);
         self.log_draw_step(
             "draw.chat_list.avatars",
             avatars_started.elapsed(),
@@ -2540,11 +3015,13 @@ impl App {
                 chats: &self.state.chats,
                 visible_chat_indices: &self.state.visible_chat_indices,
                 selected_chat_index: self.state.selected_chat,
-                filter: &self.state.filter,
-                filter_mode: self.state.filter_mode,
+                filter: self.chat_list_filter(),
+                filter_mode: self.state.filter_mode && self.state.filter_scope == FilterScope::Chats,
+                discovery_results: &self.state.discovery_results,
                 account_filter: &self.account_filter_label(),
                 inbox_style: self.settings.chat_inbox_style,
                 focused: self.state.focus == FocusPane::ChatList,
+                layout: &chat_layout,
                 avatar_rows: &avatar_rows.rows,
                 typing_previews: &typing_previews,
                 theme: self.theme,
@@ -2559,18 +3036,8 @@ impl App {
         self.draw_vertical_scrollbar(
             frame,
             area,
-            chat_list::content_height(
-                &self.state.chats,
-                &self.state.visible_chat_indices,
-                self.settings.chat_inbox_style,
-            ),
-            chat_list::scroll_position(
-                &self.state.chats,
-                &self.state.visible_chat_indices,
-                self.state.selected_chat,
-                area,
-                self.settings.chat_inbox_style,
-            ),
+            chat_layout.content_height,
+            chat_layout.scroll_position,
         );
         self.log_draw_step(
             "draw.chat_list.scrollbar",
@@ -2579,22 +3046,14 @@ impl App {
         );
     }
 
-    fn chat_avatar_rows(&mut self) -> ChatAvatarRowsResult {
+    fn chat_avatar_rows(&mut self, rendered_chat_indices: &[usize]) -> ChatAvatarRowsResult {
         let mut result = ChatAvatarRowsResult::default();
-        let rendered_chat_indices = chat_list::rendered_chat_indices(
-            &self.state.chats,
-            &self.state.visible_chat_indices,
-            self.state.selected_chat,
-            self.state.pane_areas.chat_list,
-            self.settings.chat_inbox_style,
-        );
-        for chat_index in rendered_chat_indices {
+        for chat_index in rendered_chat_indices.iter().copied() {
             let Some(path) = self
                 .state
                 .chats
                 .get(chat_index)
                 .and_then(|chat| chat.avatar.as_deref())
-                .filter(|path| path.exists())
                 .map(Path::to_path_buf)
             else {
                 continue;
@@ -2695,11 +3154,30 @@ impl App {
         let title = self
             .state
             .selected_chat()
-            .map(|chat| format!("Messages - {}", chat.name))
+            .map(|chat| {
+                let messages_filter_scope = self.state.filter_mode
+                    && self.state.filter_scope == FilterScope::Messages;
+                if messages_filter_scope || self.message_filter_active() {
+                    let query = if self.state.filter.is_empty() {
+                        "(type to filter)".to_owned()
+                    } else {
+                        self.state.filter.clone()
+                    };
+                    format!("Messages - {} - filter: {}", chat.name, query)
+                } else {
+                    format!("Messages - {}", chat.name)
+                }
+            })
             .unwrap_or_else(|| "Messages".to_owned());
         let presentation = self.active_message_presentation();
+        let message_filter_active = self.message_filter_active();
+        let messages_empty = if message_filter_active {
+            self.state.filtered_messages.is_empty()
+        } else {
+            self.state.messages.is_empty()
+        };
         let line_count_started = Instant::now();
-        let total_lines = if self.state.messages.is_empty() {
+        let total_lines = if messages_empty {
             0
         } else {
             self.cached_message_line_count()
@@ -2710,16 +3188,24 @@ impl App {
             draw_messages_details(self, area),
         );
         let build_started = Instant::now();
-        let lines = if self.state.messages.is_empty() {
+        let messages = if message_filter_active {
+            &self.state.filtered_messages
+        } else {
+            &self.state.messages
+        };
+        let lines = if messages.is_empty() {
             self.state.media_hits.clear();
-            vec![Line::from(Span::styled(
-                "No messages yet. Open or click this chat to sync today's messages.",
-                self.theme.muted(),
-            ))]
+            self.state.message_hits.clear();
+            let empty_message = if message_filter_active && !self.state.messages.is_empty() {
+                format!("No messages match {}.", self.state.filter)
+            } else {
+                "No messages yet. Open or click this chat to sync today's messages.".to_owned()
+            };
+            vec![Line::from(Span::styled(empty_message, self.theme.muted()))]
         } else {
             let unread_message_ids = self.unread_message_ids();
             let render = message_list::build_message_lines_with_cache(
-                &self.state.messages,
+                messages,
                 area.width.saturating_sub(2),
                 self.state.message_scroll,
                 area.height.saturating_sub(2) as usize,
@@ -2735,6 +3221,7 @@ impl App {
             self.state.media_hits = render.media_hits;
             self.state.message_hits = render.message_hits;
             self.queue_link_metadata_fetches(render.link_preview_requests);
+            self.queue_media_preview_fetches(render.media_preview_requests);
             render.lines
         };
         self.log_draw_step(
@@ -2745,6 +3232,13 @@ impl App {
                 draw_messages_details(self, area),
                 lines.len()
             ),
+        );
+        let viewport_rows = area.height.saturating_sub(2) as usize;
+        self.state.message_top_padding = message_top_padding(
+            lines.len(),
+            total_lines,
+            self.state.message_scroll,
+            viewport_rows,
         );
         let render_started = Instant::now();
         message_list::render_message_list(
@@ -2951,6 +3445,11 @@ impl App {
             return;
         }
 
+        if self.thread_filter_active() && !self.state.filter.is_empty() {
+            self.draw_filtered_thread_details(frame, area);
+            return;
+        }
+
         if let Some(thread_root) = &self.state.thread_root {
             self.draw_thread_details(frame, area, thread_root);
             return;
@@ -2991,9 +3490,9 @@ impl App {
             self.state.filter.clone()
         };
         let mode = if self.state.filter_mode {
-            "filtering chats"
+            format!("filtering {}", self.state.filter_scope.status_label())
         } else {
-            "normal"
+            "normal".to_owned()
         };
         let mut details = vec![
             Line::from(format!("Selected: {selected_chat_name}")),
@@ -3068,9 +3567,10 @@ impl App {
             Line::from("  Esc: back/close/clear"),
             Line::from("  Ctrl+A: account filter"),
             Line::from("  Ctrl+F: text filter"),
+            Line::from("  Ctrl+S: settings"),
             Line::from("  PageUp/PageDown: faster"),
             Line::from("  Home/End: edges"),
-            Line::from("  Ctrl+Q: quit"),
+            Line::from("  Ctrl+Q or Ctrl+C: quit"),
         ]);
         details
     }
@@ -3086,8 +3586,8 @@ impl App {
             .chats
             .iter()
             .find(|chat| chat.id == message.chat_id && chat.account == message.account)
-            .map(|chat| chat.name.as_ref())
-            .unwrap_or("Unknown chat");
+            .map(|chat| chat.name.to_string())
+            .unwrap_or_else(|| "Unknown chat".to_owned());
         let reply = message
             .reply_to
             .as_ref()
@@ -3104,13 +3604,21 @@ impl App {
             .as_deref()
             .filter(|path| path.exists())
             .and_then(|path| {
-                message_list::cached_image_preview_rows(
-                    path,
-                    &mut self.media_preview_cache,
-                    area.width.saturating_sub(4).clamp(1, 16),
-                    6,
-                )
-                .ok()
+                let key = message_list::MediaPreviewKey {
+                    path: path.to_path_buf(),
+                    width: area.width.saturating_sub(4).clamp(1, 16),
+                    rows: 6,
+                };
+                match self.media_preview_cache.get(&key) {
+                    Some(Ok(rows)) => Some(rows.clone()),
+                    Some(Err(_)) => None,
+                    None => {
+                        self.queue_media_preview_fetches(vec![message_list::MediaPreviewRequest {
+                            key,
+                        }]);
+                        None
+                    }
+                }
             });
         let avatar_status = if message.sender.avatar.is_some() {
             "avatar preview"
@@ -3322,6 +3830,105 @@ impl App {
         self.draw_thread_compose(frame, compose_area, is_thread_focused);
     }
 
+    fn filtered_thread_matches(&self) -> Vec<&Message> {
+        let Some(thread_root) = self.state.thread_root.as_ref() else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        if let Some(root) = self.message_by_id(thread_root)
+            && message_matches_filter(root, &self.state.filter)
+        {
+            matches.push(root);
+        }
+        for reply in self.thread_replies(thread_root) {
+            if message_matches_filter(reply, &self.state.filter) {
+                matches.push(reply);
+            }
+        }
+        matches
+    }
+
+    fn draw_filtered_thread_details(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let matches = self.filtered_thread_matches();
+        let chat_name = self
+            .state
+            .thread_root
+            .as_ref()
+            .and_then(|root| self.message_by_id(root))
+            .and_then(|message| {
+                self.state
+                    .chats
+                    .iter()
+                    .find(|chat| chat.id == message.chat_id && chat.account == message.account)
+            })
+            .map(|chat| chat.name.as_ref())
+            .unwrap_or("Current chat");
+
+        let outer = Block::default()
+            .title(" Thread ")
+            .borders(Borders::ALL)
+            .border_style(
+                self.theme
+                    .focus_border(self.state.focus == FocusPane::Details),
+            );
+        let inner = outer.inner(area);
+        frame.render_widget(outer, area);
+        if inner.is_empty() {
+            return;
+        }
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1)])
+            .split(inner);
+
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Thread", self.theme.pane_title()),
+                Span::styled(" · ", self.theme.muted()),
+                Span::styled(chat_name.to_string(), self.theme.status_key()),
+            ]),
+            Line::from(Span::styled(
+                format!(
+                    "filter: {} · {} matches · Esc finishes",
+                    self.state.filter,
+                    matches.len()
+                ),
+                self.theme.muted(),
+            )),
+        ]);
+        frame.render_widget(header, chunks[0]);
+
+        let mut body_lines = Vec::new();
+        if matches.is_empty() {
+            body_lines.push(Line::from(Span::styled(
+                "  No thread items match this filter.",
+                self.theme.muted(),
+            )));
+        } else {
+            for message in matches {
+                let is_root = self
+                    .state
+                    .thread_root
+                    .as_ref()
+                    .is_some_and(|root| root.as_ref() == message.id.as_ref());
+                body_lines.extend(thread_message_card_lines(
+                    message,
+                    self.theme,
+                    is_root,
+                    chunks[1].width,
+                ));
+            }
+        }
+
+        let content_len = body_lines.len();
+        let body = Paragraph::new(body_lines)
+            .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(body, chunks[1]);
+        self.draw_vertical_scrollbar(frame, chunks[1], content_len, self.state.details_scroll);
+    }
+
     fn draw_thread_compose(&self, frame: &mut Frame<'_>, area: Rect, is_focused: bool) {
         if area.is_empty() {
             return;
@@ -3465,9 +4072,14 @@ impl App {
 
         if self.state.filter_mode {
             return vec![
+                Span::styled(
+                    format!("Filter {}", self.state.filter_scope.label()),
+                    self.theme.status_bar(),
+                ),
                 hint("Type to filter"),
-                hint("Backspace deletes"),
-                hint("Enter or Esc finishes"),
+                hint("↑↓/Enter select"),
+                hint("←→ switch scope"),
+                hint("Esc finishes"),
             ];
         }
 
@@ -4145,8 +4757,8 @@ impl App {
             Line::from(Span::styled("Everywhere", self.theme.status_key())),
             Line::from("  F1: open or close this help"),
             Line::from("  ?: open or close this help outside compose"),
-            Line::from("  Ctrl+,: open settings"),
-            Line::from("  Ctrl+Q: quit"),
+            Line::from("  Ctrl+S: open settings"),
+            Line::from("  Ctrl+Q or Ctrl+C: quit"),
             Line::from("  Esc: close popup, cancel reply, or move back"),
             Line::from("  Left/Right: move between panes"),
             Line::from("  Mouse/touchpad: click to focus, scroll to browse"),
@@ -4501,17 +5113,24 @@ impl App {
         let preview_width = area.width.clamp(1, IMAGE_VIEWER_MAX_WIDTH);
         let preview_rows = area.height.max(1);
         let preview_area = centered_fixed_rect(area, preview_width, preview_rows);
-        let preview = message_list::cached_image_preview_rows(
-            path,
-            &mut self.media_preview_cache,
-            preview_width,
-            preview_rows,
-        );
+        let key = message_list::MediaPreviewKey {
+            path: path.to_path_buf(),
+            width: preview_width,
+            rows: preview_rows,
+        };
+        let preview = match self.media_preview_cache.get(&key) {
+            Some(Ok(rows)) => Some(Ok(rows.clone())),
+            Some(Err(error)) => Some(Err(error.clone())),
+            None => {
+                self.queue_media_preview_fetches(vec![message_list::MediaPreviewRequest { key }]);
+                None
+            }
+        };
         let mut lines = Vec::new();
 
         match preview {
-            Ok(preview_rows) => lines.extend(preview_rows.into_iter().map(Line::from)),
-            Err(error) => {
+            Some(Ok(preview_rows)) => lines.extend(preview_rows.into_iter().map(Line::from)),
+            Some(Err(error)) => {
                 lines.extend(
                     message_list::fallback_preview_rows(
                         preview_width,
@@ -4527,8 +5146,19 @@ impl App {
                     Style::default().fg(Color::Red),
                 )));
             }
+            None => {
+                lines.extend(
+                    message_list::fallback_preview_rows(
+                        preview_width,
+                        preview_rows,
+                        Color::DarkGray,
+                        "loading image",
+                    )
+                    .into_iter()
+                    .map(Line::from),
+                );
+            }
         }
-
         if let Some(protocol_error) = protocol_error {
             lines.push(Line::from(Span::styled(
                 protocol_error,
@@ -4667,7 +5297,10 @@ impl App {
         }
         self.request_selected_chat_history_sync();
         self.request_selected_chat_members();
-        self.reload_selected_messages_after_navigation().await?;
+        self.reload_selected_messages().await?;
+        if self.consume_pending_history_sync_for_selected_chat() {
+            self.sync_selected_chat_history().await?;
+        }
         self.state.pending_scroll_to_latest = true;
         Ok(())
     }
@@ -4699,7 +5332,10 @@ impl App {
         );
         self.request_selected_chat_history_sync();
         self.request_selected_chat_members();
-        self.reload_selected_messages_after_navigation().await?;
+        self.reload_selected_messages().await?;
+        if self.consume_pending_history_sync_for_selected_chat() {
+            self.sync_selected_chat_history().await?;
+        }
         self.state.pending_scroll_to_latest = true;
         self.state.status = if self.state.chats.is_empty() {
             "ready - no chats loaded".to_owned()
@@ -5210,7 +5846,7 @@ impl App {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
-        if is_ctrl_char(key, 'q') {
+        if is_ctrl_char(key, 'q') || is_ctrl_char(key, 'c') {
             self.state.should_quit = true;
             return Ok(false);
         }
@@ -5260,7 +5896,7 @@ impl App {
         }
 
         if self.state.filter_mode {
-            return Ok(self.handle_filter_key(key));
+            return self.handle_filter_key(key).await;
         }
 
         if matches!(key.code, KeyCode::F(1))
@@ -5279,18 +5915,13 @@ impl App {
             return Ok(false);
         }
 
-        if self.state.focus != FocusPane::Compose && is_ctrl_char(key, 'n') {
-            self.open_account_setup();
-            return Ok(false);
-        }
-
-        if is_ctrl_char(key, ',') {
+        if is_ctrl_char(key, 's') {
             self.open_settings_overlay();
             return Ok(false);
         }
 
         if is_ctrl_char(key, 'f') {
-            return Ok(self.enter_filter_mode());
+            return self.enter_filter_mode().await;
         }
 
         if self.state.focus == FocusPane::Compose {
@@ -5322,11 +5953,7 @@ impl App {
                     self.focus_next_pane();
                     false
                 }
-                KeyCode::Enter => {
-                    let changed = self.activate_selected_chat();
-                    self.mark_selected_chat_read().await?;
-                    changed
-                }
+                KeyCode::Enter => self.activate_selected_chat(),
                 KeyCode::Down => self.select_next_chat(),
                 KeyCode::Up => self.select_previous_chat(),
                 KeyCode::Home => self.select_first_chat(),
@@ -6018,6 +6645,7 @@ impl App {
         if self.state.focus != pane {
             self.state.focus = pane;
         }
+        let scope_selection_changed = self.sync_filter_scope_to_focus();
 
         let changed = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_left_click(pane, mouse),
@@ -6036,7 +6664,7 @@ impl App {
             | MouseEventKind::Drag(_)
             | MouseEventKind::Moved => false,
         };
-        Ok(changed)
+        Ok(changed || scope_selection_changed)
     }
 
     async fn handle_action_menu_click(&mut self, mouse: MouseEvent) -> Result<bool> {
@@ -6251,21 +6879,219 @@ impl App {
         }
     }
 
-    fn handle_filter_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Enter | KeyCode::Esc => {
+    fn active_filter_scope(&self) -> FilterScope {
+        match self.state.focus {
+            FocusPane::ChatList => FilterScope::Chats,
+            FocusPane::Details if self.state.thread_root.is_some() => FilterScope::Thread,
+            FocusPane::Messages | FocusPane::Compose | FocusPane::Details => FilterScope::Messages,
+        }
+    }
+
+    fn sync_filter_scope_to_focus(&mut self) -> bool {
+        if !self.state.filter_mode {
+            return false;
+        }
+        let scope = self.active_filter_scope();
+        if scope == self.state.filter_scope {
+            return false;
+        }
+        self.state.filter_scope = scope;
+        let selection_changed = self.apply_active_filter();
+        self.state.status = self.filter_status();
+        selection_changed
+    }
+
+    fn chat_filter_active(&self) -> bool {
+        self.state.filter_scope == FilterScope::Chats
+    }
+
+    fn message_filter_active(&self) -> bool {
+        self.state.filter_scope == FilterScope::Messages && !self.state.filter.is_empty()
+    }
+
+    fn thread_filter_active(&self) -> bool {
+        self.state.filter_scope == FilterScope::Thread
+            && self.state.thread_root.is_some()
+            && !self.state.filter.is_empty()
+    }
+
+    fn chat_list_filter(&self) -> &str {
+        if self.chat_filter_active() {
+            &self.state.filter
+        } else {
+            ""
+        }
+    }
+
+    fn apply_active_filter(&mut self) -> bool {
+        let selection_changed = self.apply_filter();
+        self.apply_message_filter();
+        if self.chat_filter_active() {
+            self.schedule_discovery_refresh();
+            if selection_changed {
+                self.request_selected_chat_history_sync();
+            }
+        } else {
+            self.state.discovery_results.clear();
+            self.pending_discovery_query = None;
+        }
+        if self.thread_filter_active() {
+            self.state.details_scroll = self.state.details_scroll.min(self.max_details_scroll());
+        }
+        selection_changed
+    }
+
+    async fn confirm_filter_selection(&mut self) -> Result<bool> {
+        match self.state.filter_scope {
+            FilterScope::Chats => {
+                if self.state.visible_chat_indices.is_empty()
+                    && let Some(result) = self.state.discovery_results.first().cloned()
+                {
+                    self.state.filter_mode = false;
+                    return self.open_discovery_result(result).await;
+                }
+                let load_selected_after_filter = self.state.pending_history_sync_chat.is_some();
                 self.state.filter_mode = false;
                 self.state.status = self.filter_status();
+                Ok(load_selected_after_filter)
+            }
+            FilterScope::Messages => {
+                if self.state.selected_message_id.is_some() {
+                    self.open_action_menu();
+                } else {
+                    self.state.status = self.filter_status();
+                }
+                Ok(false)
+            }
+            FilterScope::Thread => {
+                self.state.status = self.filter_status();
+                Ok(false)
+            }
+        }
+    }
+
+    async fn filter_select_next(&mut self) -> Result<bool> {
+        match self.state.filter_scope {
+            FilterScope::Chats => Ok(self.select_next_chat()),
+            FilterScope::Messages => {
+                self.select_next_message();
+                Ok(false)
+            }
+            FilterScope::Thread => {
+                self.scroll_details_down(1);
+                Ok(false)
+            }
+        }
+    }
+
+    async fn filter_select_previous(&mut self) -> Result<bool> {
+        match self.state.filter_scope {
+            FilterScope::Chats => Ok(self.select_previous_chat()),
+            FilterScope::Messages => {
+                self.select_previous_message();
+                Ok(false)
+            }
+            FilterScope::Thread => {
+                self.scroll_details_up(1);
+                Ok(false)
+            }
+        }
+    }
+
+    fn filter_select_first(&mut self) -> bool {
+        match self.state.filter_scope {
+            FilterScope::Chats => self.select_first_chat(),
+            FilterScope::Messages => {
+                self.select_first_message();
                 false
+            }
+            FilterScope::Thread => {
+                self.state.details_scroll = 0;
+                self.state.status = "details at top".to_owned();
+                false
+            }
+        }
+    }
+
+    fn filter_select_last(&mut self) -> bool {
+        match self.state.filter_scope {
+            FilterScope::Chats => self.select_last_chat(),
+            FilterScope::Messages => {
+                self.select_last_message();
+                false
+            }
+            FilterScope::Thread => {
+                self.state.details_scroll = self.max_details_scroll();
+                self.state.status = "details at bottom".to_owned();
+                false
+            }
+        }
+    }
+
+    async fn filter_page_down(&mut self) -> Result<bool> {
+        match self.state.filter_scope {
+            FilterScope::Chats => Ok(self.page_down_chats()),
+            FilterScope::Messages => {
+                self.scroll_messages_down(self.message_page_step());
+                Ok(false)
+            }
+            FilterScope::Thread => {
+                self.scroll_details_down(self.details_page_step());
+                Ok(false)
+            }
+        }
+    }
+
+    async fn filter_page_up(&mut self) -> Result<bool> {
+        match self.state.filter_scope {
+            FilterScope::Chats => Ok(self.page_up_chats()),
+            FilterScope::Messages => {
+                self.scroll_messages_up(self.message_page_step());
+                self.load_older_messages_if_at_top().await?;
+                Ok(false)
+            }
+            FilterScope::Thread => {
+                self.scroll_details_up(self.details_page_step());
+                Ok(false)
+            }
+        }
+    }
+
+    async fn handle_filter_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Enter => self.confirm_filter_selection().await,
+            KeyCode::Esc => {
+                self.state.filter_mode = false;
+                self.state.status = self.filter_status();
+                Ok(false)
             }
             KeyCode::Backspace => {
                 self.state.filter.pop();
-                let selection_changed = self.apply_filter();
-                if selection_changed {
-                    self.request_selected_chat_history_sync();
-                }
+                let selection_changed = self.apply_active_filter();
                 self.state.status = self.filter_status();
-                selection_changed
+                Ok(selection_changed)
+            }
+            KeyCode::Down => self.filter_select_next().await,
+            KeyCode::Up => self.filter_select_previous().await,
+            KeyCode::Home => {
+                let selection_changed = self.filter_select_first();
+                Ok(selection_changed)
+            }
+            KeyCode::End => {
+                let selection_changed = self.filter_select_last();
+                Ok(selection_changed)
+            }
+            KeyCode::PageDown => self.filter_page_down().await,
+            KeyCode::PageUp => self.filter_page_up().await,
+            KeyCode::Left => {
+                self.focus_previous_pane();
+                let selection_changed = self.sync_filter_scope_to_focus();
+                Ok(selection_changed)
+            }
+            KeyCode::Right => {
+                self.focus_next_pane();
+                let selection_changed = self.sync_filter_scope_to_focus();
+                Ok(selection_changed)
             }
             KeyCode::Char(value)
                 if !key
@@ -6273,14 +7099,11 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.state.filter.push(value);
-                let selection_changed = self.apply_filter();
-                if selection_changed {
-                    self.request_selected_chat_history_sync();
-                }
+                let selection_changed = self.apply_active_filter();
                 self.state.status = self.filter_status();
-                selection_changed
+                Ok(selection_changed)
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
@@ -6767,11 +7590,16 @@ impl App {
         self.state.pending_scroll_to_latest = false;
     }
 
-    fn enter_filter_mode(&mut self) -> bool {
-        self.state.focus = FocusPane::ChatList;
+    async fn enter_filter_mode(&mut self) -> Result<bool> {
+        self.state.filter_scope = self.active_filter_scope();
         self.state.filter_mode = true;
-        self.state.status = "type to filter chats; Enter or Esc closes filtering".to_owned();
-        false
+        let selection_changed = self.apply_active_filter();
+        self.state.status = match self.state.filter_scope {
+            FilterScope::Chats => "type to find chats, contacts, or channels; arrows/click still select; Enter opens; Esc finishes".to_owned(),
+            FilterScope::Messages => "type to filter messages in this chat; arrows/click still select; Enter opens actions; Esc finishes".to_owned(),
+            FilterScope::Thread => "type to filter this thread; arrows or mouse still scroll/select; Esc finishes".to_owned(),
+        };
+        Ok(selection_changed)
     }
 
     fn open_help_overlay(&mut self) {
@@ -6886,7 +7714,8 @@ impl App {
             self.request_selected_chat_history_sync();
             self.state.status = format!("opened {chat_name}");
         }
-        had_unread || should_sync_if_empty
+        let mark_read_after_load = self.state.focus == FocusPane::Messages || had_unread;
+        had_unread || should_sync_if_empty || mark_read_after_load
     }
 
     fn activate_chat_index(&mut self, chat_index: usize) -> bool {
@@ -6928,8 +7757,12 @@ impl App {
 
         self.state.filter_mode = false;
         self.state.filter.clear();
+        self.state.discovery_results.clear();
+        self.state.filtered_messages.clear();
+        self.pending_discovery_query = None;
+        self.message_layout_cache.clear();
         let selection_changed = self.apply_filter();
-        self.state.status = "chat filter cleared".to_owned();
+        self.state.status = "filter cleared".to_owned();
         selection_changed
     }
 
@@ -7120,6 +7953,7 @@ impl App {
             self.state.messages.push(message);
         }
         self.state.messages.sort_by_key(|message| message.timestamp);
+        self.apply_message_filter();
         self.message_layout_cache.clear();
         self.clamp_message_scroll();
     }
@@ -7220,10 +8054,9 @@ impl App {
             return false;
         }
 
-        let clicked_line = self
-            .state
-            .message_scroll
-            .saturating_add(row.saturating_sub(content_area.y) as usize);
+        let Some(clicked_line) = self.clicked_message_line(content_area, row) else {
+            return false;
+        };
         let Some(hit) = self
             .state
             .media_hits
@@ -7256,10 +8089,9 @@ impl App {
             return false;
         }
 
-        let clicked_line = self
-            .state
-            .message_scroll
-            .saturating_add(row.saturating_sub(content_area.y) as usize);
+        let Some(clicked_line) = self.clicked_message_line(content_area, row) else {
+            return false;
+        };
         let Some(hit) = self
             .state
             .message_hits
@@ -7315,10 +8147,9 @@ impl App {
             return false;
         }
 
-        let clicked_line = self
-            .state
-            .message_scroll
-            .saturating_add(row.saturating_sub(content_area.y) as usize);
+        let Some(clicked_line) = self.clicked_message_line(content_area, row) else {
+            return false;
+        };
         let Some(hit) = self
             .state
             .message_hits
@@ -7356,20 +8187,40 @@ impl App {
         true
     }
 
+    fn clicked_message_line(&self, content_area: Rect, row: u16) -> Option<usize> {
+        let offset = row.saturating_sub(content_area.y) as usize;
+        let adjusted_offset = offset.checked_sub(self.state.message_top_padding)?;
+        Some(self.state.message_scroll.saturating_add(adjusted_offset))
+    }
+
     fn visible_timeline_message_indices(&self) -> Vec<usize> {
-        self.state
-            .messages
+        self.message_source()
             .iter()
             .enumerate()
             .filter_map(|(index, message)| (!is_slack_thread_reply(message)).then_some(index))
             .collect()
     }
 
+    fn selected_message_source_position(&self) -> Option<usize> {
+        let selected = self.state.selected_message_id.as_ref()?;
+        self.message_source()
+            .iter()
+            .position(|message| message.id == *selected)
+    }
+
     fn selected_visible_message_position(&self) -> Option<usize> {
         let selected = self.state.selected_message_id.as_ref()?;
         self.visible_timeline_message_indices()
             .iter()
-            .position(|index| self.state.messages[*index].id == *selected)
+            .position(|index| self.message_source()[*index].id == *selected)
+    }
+
+    fn message_source(&self) -> &[Message] {
+        if self.message_filter_active() {
+            &self.state.filtered_messages
+        } else {
+            &self.state.messages
+        }
     }
 
     fn message_by_id(&self, message_id: &MessageId) -> Option<&Message> {
@@ -7408,7 +8259,7 @@ impl App {
             self.state.status = "no messages to select".to_owned();
             return;
         };
-        self.state.selected_message_id = Some(self.state.messages[index].id.clone());
+        self.state.selected_message_id = Some(self.message_source()[index].id.clone());
         self.state.message_scroll = 0;
         self.state.status = "selected first message".to_owned();
         self.ensure_selected_message_visible();
@@ -7420,7 +8271,7 @@ impl App {
             self.state.status = "no messages to select".to_owned();
             return;
         };
-        self.state.selected_message_id = Some(self.state.messages[index].id.clone());
+        self.state.selected_message_id = Some(self.message_source()[index].id.clone());
         self.scroll_messages_to_bottom();
         self.state.status = "selected latest message".to_owned();
         self.ensure_selected_message_visible();
@@ -7438,7 +8289,7 @@ impl App {
             .map(|position| position.saturating_add(1).min(visible_indices.len() - 1))
             .unwrap_or(0);
         let next = visible_indices[next_position];
-        self.state.selected_message_id = Some(self.state.messages[next].id.clone());
+        self.state.selected_message_id = Some(self.message_source()[next].id.clone());
         self.state.status = "selected next message".to_owned();
         self.ensure_selected_message_visible();
     }
@@ -7455,9 +8306,34 @@ impl App {
             .map(|position| position.saturating_sub(1))
             .unwrap_or_else(|| visible_indices.len().saturating_sub(1));
         let previous = visible_indices[previous_position];
-        self.state.selected_message_id = Some(self.state.messages[previous].id.clone());
+        self.state.selected_message_id = Some(self.message_source()[previous].id.clone());
         self.state.status = "selected previous message".to_owned();
         self.ensure_selected_message_visible();
+    }
+
+    fn ensure_filtered_message_selection(&mut self) {
+        if !self.message_filter_active() {
+            return;
+        }
+        if self.state.filtered_messages.is_empty() {
+            self.state.selected_message_id = None;
+            return;
+        }
+        if let Some(selected) = self.state.selected_message_id.as_ref()
+            && self
+                .state
+                .filtered_messages
+                .iter()
+                .any(|message| message.id == *selected)
+        {
+            return;
+        }
+        self.state.selected_message_id = self
+            .state
+            .filtered_messages
+            .first()
+            .map(|message| message.id.clone());
+        self.state.message_scroll = 0;
     }
 
     fn ensure_selected_message_visible(&mut self) {
@@ -8579,8 +9455,13 @@ impl App {
     fn cached_message_line_count(&mut self) -> usize {
         let content_width = self.message_content_width();
         let presentation = self.active_message_presentation();
+        let messages = if self.message_filter_active() {
+            &self.state.filtered_messages
+        } else {
+            &self.state.messages
+        };
         message_list::cached_message_line_count(
-            &self.state.messages,
+            messages,
             content_width,
             &self.link_metadata_cache,
             self.link_metadata_revision,
@@ -8600,6 +9481,30 @@ impl App {
     }
 
     fn details_line_count(&self) -> usize {
+        if self.thread_filter_active() {
+            let matches = self.filtered_thread_matches();
+            if matches.is_empty() {
+                return 4;
+            }
+            return 3 + matches
+                .iter()
+                .map(|message| {
+                    let is_root = self
+                        .state
+                        .thread_root
+                        .as_ref()
+                        .is_some_and(|root| root.as_ref() == message.id.as_ref());
+                    thread_message_card_lines(
+                        message,
+                        self.theme,
+                        is_root,
+                        self.state.pane_areas.details.width,
+                    )
+                    .len()
+                })
+                .sum::<usize>();
+        }
+
         if let Some(thread_root) = &self.state.thread_root {
             return self.thread_details_line_count(thread_root);
         }
@@ -8694,13 +9599,32 @@ impl App {
         bounded_message_scroll(self.details_line_count(), viewport_rows.max(1))
     }
 
+    fn apply_message_filter(&mut self) {
+        self.state.filtered_messages = if self.message_filter_active() {
+            self.state
+                .messages
+                .iter()
+                .filter(|message| message_matches_filter(message, &self.state.filter))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.ensure_filtered_message_selection();
+        self.message_layout_cache.clear();
+    }
+
     fn apply_filter(&mut self) -> bool {
         let previous_selected_chat = self
             .state
             .selected_chat()
             .map(|chat| (chat.id.clone(), chat.account.clone()));
-        self.state.visible_chat_indices =
-            chat_list::filter_chat_indices(&self.state.chats, &self.state.filter)
+        let chat_filter = if self.chat_filter_active() {
+            self.state.filter.as_str()
+        } else {
+            ""
+        };
+        self.state.visible_chat_indices = chat_list::filter_chat_indices(&self.state.chats, chat_filter)
                 .into_iter()
                 .filter(|index| self.chat_is_visible_in_sidebar(*index))
                 .filter(|index| {
@@ -8815,6 +9739,7 @@ impl App {
         }
         self.sort_chats_preserving_selection();
         self.apply_filter();
+        self.apply_message_filter();
     }
 
     fn merge_chat_in_state(&mut self, account: &ProviderId, from_chat_id: &ChatId, chat: Chat) {
@@ -8857,6 +9782,7 @@ impl App {
                 self.state.selected_chat = index;
             }
         }
+        self.apply_message_filter();
         self.apply_filter();
     }
 
@@ -8864,14 +9790,100 @@ impl App {
         if self.state.filter.is_empty() {
             "filter cleared".to_owned()
         } else {
-            format!(
-                "filter {}: {} chats",
-                self.state.filter,
-                self.state.visible_chat_indices.len()
-            )
+            match self.state.filter_scope {
+                FilterScope::Chats => {
+                    let discovery_count = self.state.discovery_results.len();
+                    if discovery_count == 0 {
+                        format!(
+                            "filter {}: {} chats",
+                            self.state.filter,
+                            self.state.visible_chat_indices.len()
+                        )
+                    } else {
+                        format!(
+                            "filter {}: {} chats · {} discoverable destinations",
+                            self.state.filter,
+                            self.state.visible_chat_indices.len(),
+                            discovery_count
+                        )
+                    }
+                }
+                FilterScope::Messages => format!(
+                    "filter {}: {} messages",
+                    self.state.filter,
+                    self.state.filtered_messages.len()
+                ),
+                FilterScope::Thread => format!(
+                    "filter {}: {} thread items",
+                    self.state.filter,
+                    self.filtered_thread_matches().len()
+                ),
+            }
         }
     }
 
+    async fn open_discovery_result(&mut self, result: DiscoveryResult) -> Result<bool> {
+        match result.action {
+            DiscoveryAction::Open | DiscoveryAction::CreateChat | DiscoveryAction::OpenDm => {}
+            DiscoveryAction::JoinRequired => {
+                self.state.status = format!(
+                    "{} is discoverable but not joined yet; joining requires an explicit join action",
+                    result.label
+                );
+                return Ok(false);
+            }
+            DiscoveryAction::Unsupported => {
+                self.state.status = format!("{} cannot be opened by this provider", result.label);
+                return Ok(false);
+            }
+        }
+
+        let chat_id = result
+            .chat_id
+            .clone()
+            .unwrap_or_else(|| result.platform_id.clone());
+        let chat = Chat {
+            id: chat_id.clone(),
+            account: result.account.clone(),
+            platform: result.platform.clone(),
+            name: result.label.clone(),
+            avatar: result.avatar.clone(),
+            is_group: matches!(
+                result.chat_kind,
+                Some(
+                    ChatKind::Group
+                        | ChatKind::PublicChannel
+                        | ChatKind::PrivateChannel
+                        | ChatKind::GroupDirectMessage
+                )
+            ),
+            kind: result.chat_kind.unwrap_or(ChatKind::Direct),
+            membership: result.membership,
+            is_shared: false,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            last_message_at: None,
+            last_message_preview: Some(Arc::from("No messages yet")),
+            thread_id: None,
+        };
+
+        self.store.upsert_chat(&chat).await?;
+        self.upsert_chat_in_state(chat);
+        if let Some(index) = self
+            .state
+            .chats
+            .iter()
+            .position(|chat| chat.id == chat_id && chat.account == result.account)
+        {
+            self.state.selected_chat = index;
+        }
+        self.state.filter_mode = false;
+        self.state.discovery_results.clear();
+        self.state.status = format!("opened {}", result.label);
+        self.request_selected_chat_history_sync();
+        Ok(true)
+    }
     async fn reload_chats(&mut self) -> Result<()> {
         let reload_started = Instant::now();
         let selected_chat = self
@@ -9019,13 +10031,23 @@ impl App {
     }
 
     async fn reload_selected_messages_after_navigation(&mut self) -> Result<()> {
-        let should_sync_history = self.consume_pending_history_sync_for_selected_chat();
-        self.request_selected_chat_members();
-        self.reload_selected_messages().await?;
-        if should_sync_history {
-            self.sync_selected_chat_history().await?;
-        }
-        Ok(())
+        self.reload_selected_messages_after_navigation_with_options(
+            true,
+            self.state.focus == FocusPane::Messages,
+        )
+        .await
+    }
+
+    async fn reload_selected_messages_after_navigation_with_options(
+        &mut self,
+        scroll_to_bottom: bool,
+        mark_read_after_load: bool,
+    ) -> Result<()> {
+        self.schedule_selected_messages_after_navigation_with_history(
+            scroll_to_bottom,
+            mark_read_after_load,
+        )
+        .await
     }
 
     async fn sync_selected_chat_history(&mut self) -> Result<()> {
@@ -9133,10 +10155,12 @@ impl App {
                 .store
                 .get_messages_for_chat(&chat.account, &chat.id, None, SELECTED_CHAT_MESSAGE_LIMIT)
                 .await?;
+            self.apply_message_filter();
             self.message_layout_cache.clear();
             self.apply_cached_member_names_to_selected_messages();
         } else {
             self.state.messages.clear();
+            self.state.filtered_messages.clear();
             self.message_layout_cache.clear();
         }
         self.clamp_message_scroll();
@@ -9230,7 +10254,10 @@ impl App {
     }
 
     async fn schedule_on_demand_archive_sync(&mut self) -> Result<()> {
-        if self.state.monthly_backfill_tick % ARCHIVE_SYNC_TICK_INTERVAL != 0
+        if !self
+            .state
+            .monthly_backfill_tick
+            .is_multiple_of(ARCHIVE_SYNC_TICK_INTERVAL)
             || self.state.monthly_backfill_ready_accounts.is_empty()
         {
             return Ok(());
@@ -9434,6 +10461,7 @@ impl App {
         older.extend(self.state.messages.iter().cloned());
         older.sort_by_key(|message| message.timestamp);
         self.state.messages = older;
+        self.apply_message_filter();
         self.message_layout_cache.clear();
 
         let new_line_count = self.cached_message_line_count();
@@ -9616,6 +10644,11 @@ fn content_send_preview(content: &Content) -> String {
             .title
             .as_deref()
             .unwrap_or(link.url.as_ref())
+            .to_owned(),
+        Content::Cards(cards) => cards
+            .first()
+            .and_then(|card| card.title.as_deref().or(card.body.as_deref()))
+            .unwrap_or("Card")
             .to_owned(),
         Content::Poll(poll) => format!("Poll: {}", poll.question),
         Content::Deleted => "Deleted message".to_owned(),
@@ -9843,6 +10876,20 @@ fn format_event_type_counts(counts: &BTreeMap<&'static str, usize>) -> String {
         .join(",")
 }
 
+fn provider_event_requests_draw(
+    event: &AppEvent,
+    network_activity: NetworkActivityDisplay,
+) -> bool {
+    let AppEvent::Provider(_, provider_event) = event else {
+        return false;
+    };
+
+    match provider_event.as_ref() {
+        ProviderEvent::NetworkActivity { .. } => network_activity != NetworkActivityDisplay::Hidden,
+        _ => true,
+    }
+}
+
 fn app_event_label(event: &AppEvent) -> &'static str {
     match event {
         AppEvent::Key(_) => "key",
@@ -10053,7 +11100,7 @@ fn combined_network_activity_spans(
                 .rx_active(now)
                 .then_some(network_activity_account_style(provider.platform(), index))
         })
-        .last()
+        .next_back()
         .unwrap_or_else(|| network_activity_idle_style(theme));
     let tx_style = providers
         .iter()
@@ -10064,7 +11111,7 @@ fn combined_network_activity_spans(
                 .tx_active(now)
                 .then_some(network_activity_account_style(provider.platform(), index))
         })
-        .last()
+        .next_back()
         .unwrap_or_else(|| network_activity_idle_style(theme));
 
     vec![
@@ -10194,6 +11241,22 @@ fn fallback_network_activity_account_color(index: usize) -> Color {
         Color::Cyan,
     ];
     COLORS[index % COLORS.len()]
+}
+
+fn message_top_padding(
+    rendered_lines: usize,
+    total_lines: usize,
+    scroll: usize,
+    viewport_rows: usize,
+) -> usize {
+    if total_lines == 0
+        || rendered_lines >= viewport_rows
+        || scroll.saturating_add(viewport_rows) < total_lines
+    {
+        return 0;
+    }
+
+    viewport_rows.saturating_sub(rendered_lines)
 }
 
 fn bounded_message_scroll(total_lines: usize, viewport_rows: usize) -> usize {
@@ -10474,6 +11537,23 @@ fn notification_preview(message: &Message) -> String {
     truncate_chars(&preview, 80)
 }
 
+fn message_matches_filter(message: &Message, filter: &str) -> bool {
+    let terms = filter
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return true;
+    }
+    let haystack = format!(
+        "{} {}",
+        content_copy_text(&message.content),
+        message.sender.display_name,
+    )
+    .to_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
 fn is_slack_thread_reply(message: &Message) -> bool {
     message.platform_data.slack.as_ref().is_some_and(|slack| {
         slack
@@ -10588,6 +11668,12 @@ fn content_copy_text(content: &Content) -> String {
                 .unwrap_or_default();
             format!("{title}: {}{description}", link.url)
         }
+        Content::Cards(cards) => cards
+            .iter()
+            .filter_map(|card| card.title.as_deref().or(card.body.as_deref()))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
         Content::Poll(poll) => {
             let mut text = format!("Poll: {}", poll.question);
             for (index, option) in poll.options.iter().enumerate() {
@@ -10608,6 +11694,10 @@ fn message_image_preview(content: &Content) -> Option<(PathBuf, String, Option<S
     match content {
         Content::Image(media) | Content::Sticker(media) => media_image_preview(media),
         Content::LinkPreview(link) => link.image.as_ref().and_then(media_image_preview),
+        Content::Cards(cards) => cards
+            .iter()
+            .find_map(|card| card.image.as_ref().or(card.thumbnail.as_ref()))
+            .and_then(media_image_preview),
         Content::Video(_)
         | Content::Audio(_)
         | Content::File(_)
@@ -11019,7 +12109,7 @@ mod tests {
         slack_unread_new.unread_count = 2;
         slack_unread_new.last_message_at = Some(now - chrono::Duration::minutes(1));
 
-        let mut chats = vec![slack_read, whatsapp_unread_old, slack_unread_new];
+        let mut chats = [slack_read, whatsapp_unread_old, slack_unread_new];
         chats.sort_by(compare_chats_for_sidebar);
 
         assert_eq!(chats[0].name.as_ref(), "slack unread new");
@@ -11187,11 +12277,13 @@ mod tests {
 
         app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
             .await?;
+        drain_async_app_work(&mut app).await?;
         assert_eq!(app.state().selected_chat_index(), 1);
         assert_eq!(app.state().messages().len(), 3);
 
         app.handle_event(AppEvent::Key(key(KeyCode::Up, KeyModifiers::NONE)))
             .await?;
+        drain_async_app_work(&mut app).await?;
         assert_eq!(app.state().selected_chat_index(), 0);
         assert_eq!(app.state().messages().len(), 2);
 
@@ -11206,12 +12298,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filter_typing_schedules_discovery_without_blocking_message_load() -> Result<()> {
+        let mut app = test_app().await?;
+        let initial_message_count = app.state().messages().len();
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert!(app.state().filter_mode());
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('m'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('e'), KeyModifiers::NONE)))
+            .await?;
+
+        assert!(app.state().filter_mode());
+        assert_eq!(app.state().filter(), "me");
+        assert_eq!(app.state().messages().len(), initial_message_count);
+        assert!(app.pending_selected_messages.is_none());
+        assert!(app.pending_discovery_query.is_some());
+
+        drain_async_app_work(&mut app).await?;
+        assert!(app.pending_discovery_query.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_marks_unread_chat_read_when_opened() -> Result<()> {
         let mut app = test_app().await?;
         assert_eq!(app.state().selected_chat().unwrap().unread_count, 4);
 
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
+        drain_async_app_work(&mut app).await?;
 
         let chat = app.state().selected_chat().unwrap();
         assert_eq!(chat.unread_count, 0);
@@ -11356,10 +12478,14 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 32))?;
 
         app.handle_event(AppEvent::Key(key(
-            KeyCode::Char('n'),
+            KeyCode::Char('a'),
             KeyModifiers::CONTROL,
         )))
         .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::End, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
         assert!(app.state().account_setup_open());
 
         terminal.draw(|frame| app.draw(frame))?;
@@ -11580,8 +12706,7 @@ mod tests {
         assert_eq!(app.state().messages().len(), 0);
         assert!(app.state().status().contains("loading recent messages"));
 
-        tokio::task::yield_now().await;
-        app.drain_provider_events().await?;
+        drain_async_app_work(&mut app).await?;
 
         assert_eq!(app.state().messages().len(), 1);
         assert_eq!(
@@ -11611,10 +12736,14 @@ mod tests {
         let mut app = test_app_with_factory(Vec::new(), factory).await?;
 
         app.handle_event(AppEvent::Key(key(
-            KeyCode::Char('n'),
+            KeyCode::Char('a'),
             KeyModifiers::CONTROL,
         )))
         .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::End, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
         app.drain_provider_events().await?;
@@ -11628,10 +12757,14 @@ mod tests {
         app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
             .await?;
         app.handle_event(AppEvent::Key(key(
-            KeyCode::Char('n'),
+            KeyCode::Char('a'),
             KeyModifiers::CONTROL,
         )))
         .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::End, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
         app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
             .await?;
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
@@ -11765,6 +12898,7 @@ mod tests {
             app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
                 .await?;
         }
+        drain_async_app_work(&mut app).await?;
 
         assert_eq!(app.state().filter(), "media");
         let expected_media_index = app
@@ -11778,11 +12912,14 @@ mod tests {
             app.state().selected_chat().map(|chat| chat.name.as_ref()),
             Some("Media Samples")
         );
-        assert_eq!(app.state().messages().len(), 3);
+        assert_eq!(app.state().messages().len(), 2);
+        assert!(app.pending_selected_messages.is_none());
 
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
         assert!(!app.state().filter_mode());
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(app.state().messages().len(), 3);
 
         app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
             .await?;
@@ -11791,6 +12928,86 @@ mod tests {
             app.state().visible_chat_indices(),
             &[0, 1, 2, 3, 8, 4, 7, 5, 6, 9]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_filter_scope_follows_focused_pane() -> Result<()> {
+        let mut app = test_app().await?;
+
+        // Filtering from the chat list searches chats/contacts.
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert!(app.state().filter_mode());
+        assert_eq!(app.state().focus(), FocusPane::ChatList);
+
+        for value in "media".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        drain_async_app_work(&mut app).await?;
+        let media_index = app
+            .state()
+            .chats()
+            .iter()
+            .position(|chat| chat.name.as_ref() == "Media Samples")
+            .expect("media chat should exist");
+        assert_eq!(app.state().visible_chat_indices(), &[media_index]);
+
+        // Moving focus into the Messages pane switches the filter to message
+        // scope, so the chat list is no longer narrowed by the query.
+        app.handle_event(AppEvent::Key(key(KeyCode::Right, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().focus(), FocusPane::Messages);
+        assert!(app.state().filter_mode());
+        assert!(app.state().visible_chat_indices().len() > 1);
+
+        // Moving focus back to the chat list restores chat-scoped filtering.
+        app.handle_event(AppEvent::Key(key(KeyCode::Left, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().focus(), FocusPane::ChatList);
+        assert!(app.state().filter_mode());
+        assert_eq!(app.state().visible_chat_indices(), &[media_index]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filter_mode_allows_arrow_selection_in_messages() -> Result<()> {
+        let mut app = test_app().await?;
+
+        // Open a chat so the Messages pane is focused with messages loaded.
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(app.state().focus(), FocusPane::Messages);
+        assert!(app.state().messages().len() > 1);
+
+        // Enter the filter while focused on Messages.
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert!(app.state().filter_mode());
+
+        // Arrow keys still move the message selection while filtering.
+        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+            .await?;
+        let first = app.state().selected_message_id().cloned();
+        assert!(first.is_some());
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+            .await?;
+        let second = app.state().selected_message_id().cloned();
+        assert!(second.is_some());
+
+        // The chat list stays unfiltered because the filter is message-scoped.
+        assert!(app.state().visible_chat_indices().len() > 1);
 
         Ok(())
     }
@@ -11832,12 +13049,14 @@ mod tests {
             .await?;
         app.handle_event(AppEvent::Key(key(KeyCode::End, KeyModifiers::NONE)))
             .await?;
+        drain_async_app_work(&mut app).await?;
         assert_eq!(app.selected_visible_position(), Some(9));
         assert_eq!(app.state().selected_chat_index(), 9);
         assert_eq!(app.state().messages().len(), 1);
 
         app.handle_event(AppEvent::Key(key(KeyCode::Home, KeyModifiers::NONE)))
             .await?;
+        drain_async_app_work(&mut app).await?;
         assert_eq!(app.selected_visible_position(), Some(0));
         assert!(!app.state().messages().is_empty());
 
@@ -11953,7 +13172,7 @@ mod tests {
             .await?;
         assert_eq!(
             app.state().compose_text(),
-            "Hello compo!se ✅ 😂 (╯°□°）╯︵ ┻━┻"
+            "Hello compo!se ✅ 😂 (╯°□°)╯︵ ┻━┻"
         );
 
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
@@ -11973,14 +13192,14 @@ mod tests {
             .await?;
         assert!(persisted.iter().any(|message| {
             message.is_from_me
-                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅ 😂 (╯°□°）╯︵ ┻━┻")
+                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅ 😂 (╯°□°)╯︵ ┻━┻")
         }));
         let provider_history = app.providers[0]
             .history(&chat_id, None, HISTORY_LIMIT)
             .await?;
         assert!(provider_history.iter().any(|message| {
             message.is_from_me
-                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅ 😂 (╯°□°）╯︵ ┻━┻")
+                && matches!(&message.content, Content::Text(text) if text.as_ref() == "Hello compo!se ✅ 😂 (╯°□°)╯︵ ┻━┻")
         }));
 
         Ok(())
@@ -12237,6 +13456,7 @@ mod tests {
             4,
         )))
         .await?;
+        drain_async_app_work(&mut app).await?;
         assert_eq!(app.state().selected_chat_index(), 1);
         assert_eq!(
             app.state().selected_chat().map(|chat| chat.name.as_ref()),
@@ -12285,6 +13505,14 @@ mod tests {
         let backend = TestBackend::new(140, 40);
         let mut terminal = Terminal::new(backend)?;
         terminal.draw(|frame| app.draw(frame))?;
+        for _ in 0..100 {
+            app.drain_media_preview_fetches();
+            if app.pending_media_previews.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        terminal.draw(|frame| app.draw(frame))?;
         let content = terminal
             .backend()
             .buffer()
@@ -12319,6 +13547,7 @@ mod tests {
             4,
         )))
         .await?;
+        drain_async_app_work(&mut app).await?;
         assert_eq!(
             app.state().selected_chat().map(|chat| chat.name.as_ref()),
             Some("Alice Chen")
@@ -12334,6 +13563,14 @@ mod tests {
             .id
             .clone();
         app.state.selected_message_id = Some(message_id);
+        terminal.draw(|frame| app.draw(frame))?;
+        for _ in 0..100 {
+            app.drain_media_preview_fetches();
+            if app.pending_media_previews.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         terminal.draw(|frame| app.draw(frame))?;
 
         let content = buffer_text(terminal.backend().buffer());
@@ -12360,6 +13597,7 @@ mod tests {
 
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
+        drain_async_app_work(&mut app).await?;
         app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
             .await?;
         let selected_message_id = app.state().selected_message_id().cloned().unwrap();
@@ -13302,10 +14540,14 @@ mod tests {
         assert!(!app.state().action_menu_open());
 
         let avatar_hit = hit.avatar_hit.as_ref().unwrap();
+        let line_row = content_area
+            .y
+            .saturating_add(app.state.message_top_padding as u16)
+            .saturating_add(line_hit.line.saturating_sub(app.state.message_scroll) as u16);
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             content_area.x + avatar_hit.end_col + 1,
-            content_area.y + line_hit.line as u16,
+            line_row,
         )))
         .await?;
 
@@ -13342,6 +14584,14 @@ mod tests {
 
         let backend = TestBackend::new(140, 40);
         let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| app.draw(frame))?;
+        for _ in 0..100 {
+            app.drain_media_preview_fetches();
+            if app.pending_media_previews.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         terminal.draw(|frame| app.draw(frame))?;
 
         assert!(app.state().media_hit_count() > 0);
@@ -13398,7 +14648,11 @@ mod tests {
         terminal.draw(|frame| app.draw(frame))?;
         for _ in 0..100 {
             app.drain_avatar_preview_fetches();
-            if app.pending_avatar_previews.is_empty() && !app.avatar_preview_cache.is_empty() {
+            app.drain_media_preview_fetches();
+            if app.pending_avatar_previews.is_empty()
+                && app.pending_media_previews.is_empty()
+                && !app.avatar_preview_cache.is_empty()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -13413,8 +14667,19 @@ mod tests {
                 && (avatar_start..avatar_end).any(|x| rgb_cell_at(buffer, x, 3)),
             "chat list should render a square-ish real PNG avatar in the first visible chat row"
         );
+        let message_area = app.state().pane_areas.messages;
+        let message_inner_x = message_area.x.saturating_add(1)
+            ..message_area
+                .x
+                .saturating_add(message_area.width.saturating_sub(1));
+        let message_inner_y = message_area.y.saturating_add(1)
+            ..message_area
+                .y
+                .saturating_add(message_area.height.saturating_sub(1));
         assert!(
-            (43..45).any(|x| rgb_cell_at(buffer, x, 1)),
+            message_inner_x
+                .clone()
+                .any(|x| message_inner_y.clone().any(|y| rgb_cell_at(buffer, x, y))),
             "message header should render a compact square real PNG sender avatar"
         );
 
@@ -13721,7 +14986,28 @@ mod tests {
             .position(|index| app.state.chats[*index].name.as_ref() == name)
             .with_context(|| format!("chat {name} should be visible"))?;
         if app.select_visible_position(position) {
-            app.reload_selected_messages_after_navigation().await?;
+            app.reload_selected_messages_after_navigation_with_options(true, false)
+                .await?;
+            drain_async_app_work(app).await?;
+        }
+        Ok(())
+    }
+
+    async fn drain_async_app_work(app: &mut App) -> Result<()> {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            let changed = app.drain_provider_events().await?;
+            if !changed
+                && app.pending_selected_messages.is_none()
+                && app.pending_discovery_query.is_none()
+                && app.state.loading_history_chats.is_empty()
+                && app.state.loading_chat_members.is_empty()
+                && app.pending_media_previews.is_empty()
+                && app.pending_avatar_previews.is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         Ok(())
     }
@@ -14001,6 +15287,31 @@ mod tests {
                 })
                 .take(limit)
                 .cloned()
+                .collect())
+        }
+
+        async fn discover_destinations(
+            &self,
+            query: &str,
+            limit: usize,
+        ) -> Result<Vec<DiscoveryResult>> {
+            let query = query.trim().to_lowercase();
+            if query.is_empty() || limit == 0 {
+                return Ok(Vec::new());
+            }
+            Ok(self
+                .chats
+                .iter()
+                .filter(|chat| {
+                    chat.name.to_lowercase().contains(&query)
+                        || chat
+                            .last_message_preview
+                            .as_deref()
+                            .is_some_and(|preview| preview.to_lowercase().contains(&query))
+                })
+                .take(limit)
+                .cloned()
+                .map(DiscoveryResult::existing_chat)
                 .collect())
         }
 

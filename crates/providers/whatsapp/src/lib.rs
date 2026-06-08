@@ -1,10 +1,11 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chat_core::{
-    Account, AuthChallenge, Chat, ChatId, ChatKind, ChatMembership, Content, EventBus, Media,
-    Message, MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities,
-    Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent,
-    ProviderId, Reaction, Sender, Timestamp, WhatsAppData,
+    Account, AuthChallenge, Chat, ChatId, ChatKind, ChatMembership, Content, DiscoveryAction,
+    DiscoveryCapabilities, DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message,
+    MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform,
+    PlatformData, PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent, ProviderId,
+    Reaction, Sender, Timestamp, WhatsAppData,
 };
 use chrono::Utc;
 use serde::Deserialize;
@@ -329,6 +330,18 @@ impl Provider for WhatsAppProvider {
         }
     }
 
+    fn discovery_capabilities(&self) -> DiscoveryCapabilities {
+        DiscoveryCapabilities {
+            existing_chats: true,
+            contacts: true,
+            users: false,
+            public_channels: false,
+            private_channels: false,
+            open_dm: false,
+            join_public_channel: false,
+        }
+    }
+
     async fn connect(&self) -> Result<()> {
         if self.connected.load(Ordering::Acquire) {
             return Ok(());
@@ -430,8 +443,8 @@ impl Provider for WhatsAppProvider {
             Content::Audio(media) => self.send_media_to_bridge(&chat_jid, media, "audio")?,
             Content::File(media) => self.send_media_to_bridge(&chat_jid, media, "file")?,
             Content::Sticker(media) => self.send_media_to_bridge(&chat_jid, media, "sticker")?,
-            Content::LinkPreview(_) => {
-                bail!("WhatsApp link preview sending should be sent as plain text first")
+            Content::LinkPreview(_) | Content::Cards(_) => {
+                bail!("WhatsApp link preview/card sending should be sent as plain text first")
             }
             Content::Poll(_) => bail!("WhatsApp poll creation is not wired yet"),
             Content::Deleted => bail!("cannot send a deleted WhatsApp message"),
@@ -481,6 +494,7 @@ impl Provider for WhatsAppProvider {
                     jid: arc_str(chat_jid),
                 }),
                 slack: None,
+                cards: Vec::new(),
             },
         };
         lock_rw_write(&self.messages).push(message.clone());
@@ -662,6 +676,87 @@ impl Provider for WhatsAppProvider {
             .collect())
     }
 
+    async fn discover_destinations(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveryResult>> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        let mut seen = std::collections::HashSet::<String>::new();
+        for chat in lock_rw_read(&self.chats).values().cloned() {
+            if !whatsapp_chat_matches_query(&chat, &query) {
+                continue;
+            }
+            seen.insert(chat.id.to_string());
+            results.push(DiscoveryResult::existing_chat(chat));
+            if results.len() >= limit {
+                return Ok(results);
+            }
+        }
+
+        for profile in lock_rw_read(&self.profiles).values().cloned() {
+            if results.len() >= limit {
+                break;
+            }
+            if !whatsapp_sender_matches_query(&profile, &query) {
+                continue;
+            }
+            append_whatsapp_contact_result(&mut results, &mut seen, &self.id, profile);
+        }
+
+        if results.len() < limit {
+            let bridge_limit = limit.saturating_sub(results.len()).max(limit);
+            let handle = self.handle;
+            let bridge_query = query.clone();
+            self.emit_network_activity(NetworkActivityDirection::Tx, NetworkActivityKind::Other);
+            let raw_response = tokio::task::spawn_blocking(move || {
+                bridge::search_contacts(handle, &bridge_query, bridge_limit)
+            })
+            .await??;
+            if !raw_response.trim_start().starts_with('{') {
+                bail!("WhatsApp contact search returned an invalid bridge response");
+            }
+            self.emit_network_activity(NetworkActivityDirection::Rx, NetworkActivityKind::Other);
+            let event = BridgeEvent::decode(&raw_response)?;
+            if event.kind == "error" {
+                bail!(
+                    "{}",
+                    event
+                        .message
+                        .unwrap_or_else(|| "WhatsApp contact search failed".to_owned())
+                );
+            }
+
+            for contact in event.contacts {
+                if results.len() >= limit {
+                    break;
+                }
+                if contact.jid.is_empty() {
+                    continue;
+                }
+                let display_name = if contact.name.is_empty() {
+                    sender_name_from_jid(&contact.jid)
+                } else {
+                    contact.name
+                };
+                let profile = upsert_profile(
+                    &self.profiles,
+                    contact.jid,
+                    display_name,
+                    contact.avatar_path,
+                );
+                append_whatsapp_contact_result(&mut results, &mut seen, &self.id, profile);
+            }
+        }
+
+        Ok(results)
+    }
+
     async fn contact_info(&self, platform_id: &PlatformId) -> Result<Option<Sender>> {
         if let Some(profile) = lock_rw_read(&self.profiles).get(platform_id).cloned() {
             return Ok(Some(profile));
@@ -678,6 +773,13 @@ impl Provider for WhatsAppProvider {
 struct BridgeReaction {
     emoji: String,
     senders: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct BridgeContact {
+    jid: String,
+    name: String,
+    avatar_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -728,6 +830,8 @@ struct BridgeEvent {
     poll_vote_message_id: Option<String>,
     #[serde(default)]
     poll_vote_options: Vec<String>,
+    #[serde(default)]
+    contacts: Vec<BridgeContact>,
 }
 
 impl BridgeEvent {
@@ -774,6 +878,7 @@ impl BridgeEvent {
                 poll_selectable_options_count: None,
                 poll_vote_message_id: None,
                 poll_vote_options: Vec::new(),
+                contacts: Vec::new(),
             })
         }
     }
@@ -984,6 +1089,7 @@ fn forward_message_event(
                 jid: arc_str(chat_jid),
             }),
             slack: None,
+            cards: Vec::new(),
         },
     };
     apply_pending_reactions(context.pending_reactions, &mut message);
@@ -1056,6 +1162,7 @@ fn emit_bridge_status_message(
                 jid: arc_str(BRIDGE_SENDER_ID),
             }),
             slack: None,
+            cards: Vec::new(),
         },
     };
 
@@ -1159,6 +1266,10 @@ fn content_text(content: &Content) -> &str {
             .as_deref()
             .or(preview.description.as_deref())
             .unwrap_or(preview.url.as_ref()),
+        Content::Cards(cards) => cards
+            .first()
+            .and_then(|card| card.title.as_deref().or(card.body.as_deref()))
+            .unwrap_or("Card"),
         Content::Poll(poll) => poll.question.as_ref(),
         Content::Deleted => "",
         Content::Unsupported(description) => description,
@@ -1176,6 +1287,12 @@ fn content_preview(content: &Content) -> Arc<str> {
         Content::LinkPreview(preview) => {
             arc_str(preview.title.as_deref().unwrap_or(preview.url.as_ref()))
         }
+        Content::Cards(cards) => arc_str(
+            cards
+                .first()
+                .and_then(|card| card.title.as_deref().or(card.body.as_deref()))
+                .unwrap_or("Card"),
+        ),
         Content::Poll(poll) => arc_str(format!("Poll: {}", poll.question)),
         Content::Deleted => arc_str("Deleted message"),
         Content::Unsupported(description) => description.clone(),
@@ -1564,6 +1681,48 @@ fn whatsapp_jid_from_chat_id(chat_id: &ChatId) -> String {
         .strip_prefix("whatsapp:")
         .unwrap_or_default()
         .to_owned()
+}
+
+fn whatsapp_chat_matches_query(chat: &Chat, query: &str) -> bool {
+    chat.name.to_lowercase().contains(query)
+        || chat
+            .last_message_preview
+            .as_deref()
+            .is_some_and(|preview| preview.to_lowercase().contains(query))
+        || chat.id.to_lowercase().contains(query)
+}
+
+fn whatsapp_sender_matches_query(sender: &Sender, query: &str) -> bool {
+    sender.display_name.to_lowercase().contains(query)
+        || sender.platform_id.to_lowercase().contains(query)
+}
+
+fn append_whatsapp_contact_result(
+    results: &mut Vec<DiscoveryResult>,
+    seen: &mut std::collections::HashSet<String>,
+    account_id: &ProviderId,
+    profile: Sender,
+) {
+    let chat_id = chat_id_from_jid(profile.platform_id.as_ref());
+    if seen.contains(chat_id.as_ref()) {
+        return;
+    }
+    seen.insert(chat_id.to_string());
+    results.push(DiscoveryResult {
+        account: account_id.clone(),
+        platform: Platform::WhatsApp,
+        kind: DiscoveryResultKind::Contact,
+        action: DiscoveryAction::CreateChat,
+        id: arc_str(format!("whatsapp:contact:{}", profile.platform_id)),
+        platform_id: profile.platform_id.clone(),
+        chat_id: Some(chat_id),
+        label: profile.display_name.clone(),
+        subtitle: Some(arc_str(profile.platform_id.as_ref())),
+        avatar: profile.avatar.clone(),
+        chat_kind: Some(ChatKind::Direct),
+        membership: ChatMembership::Joined,
+        metadata: Default::default(),
+    });
 }
 
 fn sender_name_from_jid(jid: &str) -> String {
@@ -2226,6 +2385,25 @@ mod tests {
                 .iter()
                 .any(|chat| chat.id.as_ref() == "whatsapp:456@s.whatsapp.net")
         );
+
+        let discoveries = provider.discover_destinations("Katherine", 5).await?;
+        let contact = discoveries
+            .iter()
+            .find(|result| result.platform_id.as_ref() == "447700900456@s.whatsapp.net")
+            .expect("expected bridge contact search result");
+        assert_eq!(contact.label.as_ref(), "Katherine Johnson");
+        assert_eq!(
+            contact.chat_id.as_deref(),
+            Some("whatsapp:447700900456@s.whatsapp.net")
+        );
+        assert_eq!(contact.kind, DiscoveryResultKind::Contact);
+        assert_eq!(contact.action, DiscoveryAction::CreateChat);
+
+        let cached = provider
+            .contact_info(&arc_str("447700900456@s.whatsapp.net"))
+            .await?
+            .unwrap();
+        assert_eq!(cached.display_name.as_ref(), "Katherine Johnson");
 
         provider.disconnect().await?;
         Ok(())

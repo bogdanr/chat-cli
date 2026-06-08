@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 pub type ProviderId = Arc<str>;
@@ -67,6 +67,88 @@ pub struct Chat {
 }
 
 #[derive(Clone, Debug)]
+pub struct DiscoveryResult {
+    pub account: ProviderId,
+    pub platform: Platform,
+    pub kind: DiscoveryResultKind,
+    pub action: DiscoveryAction,
+    pub id: Arc<str>,
+    pub platform_id: PlatformId,
+    pub chat_id: Option<ChatId>,
+    pub label: Arc<str>,
+    pub subtitle: Option<Arc<str>>,
+    pub avatar: Option<PathBuf>,
+    pub chat_kind: Option<ChatKind>,
+    pub membership: ChatMembership,
+    pub metadata: BTreeMap<Arc<str>, Arc<str>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum DiscoveryResultKind {
+    ExistingChat,
+    Contact,
+    User,
+    DirectMessage,
+    PublicChannel,
+    PrivateChannel,
+    Group,
+    ManualDestination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum DiscoveryAction {
+    Open,
+    CreateChat,
+    OpenDm,
+    JoinRequired,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiscoveryCapabilities {
+    pub existing_chats: bool,
+    pub contacts: bool,
+    pub users: bool,
+    pub public_channels: bool,
+    pub private_channels: bool,
+    pub open_dm: bool,
+    pub join_public_channel: bool,
+}
+
+impl DiscoveryResult {
+    pub fn existing_chat(chat: Chat) -> Self {
+        let mut metadata = BTreeMap::new();
+        if let Some(preview) = chat.last_message_preview.clone() {
+            metadata.insert(Arc::from("preview"), preview);
+        }
+        Self {
+            account: chat.account.clone(),
+            platform: chat.platform.clone(),
+            kind: discovery_kind_for_chat(chat.kind),
+            action: DiscoveryAction::Open,
+            id: Arc::from(format!("chat:{}:{}", chat.account, chat.id)),
+            platform_id: chat.id.clone(),
+            chat_id: Some(chat.id.clone()),
+            label: chat.name.clone(),
+            subtitle: chat.last_message_preview.clone(),
+            avatar: chat.avatar.clone(),
+            chat_kind: Some(chat.kind),
+            membership: chat.membership,
+            metadata,
+        }
+    }
+}
+
+fn discovery_kind_for_chat(kind: ChatKind) -> DiscoveryResultKind {
+    match kind {
+        ChatKind::Direct => DiscoveryResultKind::ExistingChat,
+        ChatKind::Group => DiscoveryResultKind::Group,
+        ChatKind::PublicChannel => DiscoveryResultKind::PublicChannel,
+        ChatKind::PrivateChannel => DiscoveryResultKind::PrivateChannel,
+        ChatKind::GroupDirectMessage => DiscoveryResultKind::DirectMessage,
+    }
+}
+#[derive(Clone, Debug)]
 pub struct Message {
     pub id: MessageId,
     pub chat_id: ChatId,
@@ -99,9 +181,67 @@ pub enum Content {
     File(Media),
     Sticker(Media),
     LinkPreview(LinkPreview),
+    Cards(Vec<Card>),
     Poll(Poll),
     Deleted,
     Unsupported(Arc<str>),
+}
+
+#[derive(Clone, Debug)]
+pub struct Card {
+    pub kind: CardKind,
+    pub source: CardSource,
+    pub title: Option<Arc<str>>,
+    pub subtitle: Option<Arc<str>>,
+    pub body: Option<Arc<str>>,
+    pub footer: Option<Arc<str>>,
+    pub url: Option<Arc<str>>,
+    pub accent_color: Option<CardColor>,
+    pub thumbnail: Option<Media>,
+    pub image: Option<Media>,
+    pub fields: Vec<CardField>,
+    pub actions: Vec<CardAction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CardKind {
+    LinkPreview,
+    ProviderAttachment,
+    BotMessage,
+    MediaPreview,
+    SocialPreview,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CardSource {
+    Slack,
+    WhatsApp,
+    OpenGraph,
+    YouTube,
+    Instagram,
+    Facebook,
+    GenericUrl,
+    Unknown(Arc<str>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CardColor {
+    Named(Arc<str>),
+    Hex(Arc<str>),
+}
+
+#[derive(Clone, Debug)]
+pub struct CardField {
+    pub title: Option<Arc<str>>,
+    pub value: Arc<str>,
+    pub short: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CardAction {
+    pub label: Arc<str>,
+    pub url: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +307,7 @@ pub enum ReceiptKind {
 pub struct PlatformData {
     pub whatsapp: Option<WhatsAppData>,
     pub slack: Option<SlackData>,
+    pub cards: Vec<Card>,
 }
 
 #[derive(Clone, Debug)]

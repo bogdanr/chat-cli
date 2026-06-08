@@ -14,9 +14,10 @@ use std::{
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatInboxStyle {
+    #[default]
     ActivityFirst,
     RecentFlat,
     PeopleFirst,
@@ -24,9 +25,10 @@ pub enum ChatInboxStyle {
     AccountSeparated,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiThemePreset {
+    #[default]
     DefaultDark,
     Light,
     HighContrast,
@@ -34,19 +36,21 @@ pub enum UiThemePreset {
     Slack,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConversationPresentationSetting {
     ProviderNative,
     #[serde(alias = "unified")]
+    #[default]
     WhatsApp,
     Slack,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkActivityDisplay {
     Hidden,
+    #[default]
     CombinedLights,
     RecentCounts,
 }
@@ -89,30 +93,6 @@ pub struct ChatLatestMessage {
     pub account_id: ProviderId,
     pub chat_id: ChatId,
     pub message: Message,
-}
-
-impl Default for ChatInboxStyle {
-    fn default() -> Self {
-        Self::ActivityFirst
-    }
-}
-
-impl Default for UiThemePreset {
-    fn default() -> Self {
-        Self::DefaultDark
-    }
-}
-
-impl Default for ConversationPresentationSetting {
-    fn default() -> Self {
-        Self::WhatsApp
-    }
-}
-
-impl Default for NetworkActivityDisplay {
-    fn default() -> Self {
-        Self::CombinedLights
-    }
 }
 
 impl Default for AppSettings {
@@ -765,6 +745,185 @@ impl StoredPoll {
     }
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredCards {
+    cards: Vec<StoredCard>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredCard {
+    kind: String,
+    source: String,
+    title: Option<String>,
+    subtitle: Option<String>,
+    body: Option<String>,
+    footer: Option<String>,
+    url: Option<String>,
+    accent_color: Option<String>,
+    fields: Vec<StoredCardField>,
+    actions: Vec<StoredCardAction>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredCardField {
+    title: Option<String>,
+    value: String,
+    short: bool,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredCardAction {
+    label: String,
+    url: Option<String>,
+}
+
+impl StoredCards {
+    fn from_cards(cards: &[Card]) -> Self {
+        Self {
+            cards: cards.iter().map(StoredCard::from_card).collect(),
+        }
+    }
+
+    fn into_cards(self) -> Vec<Card> {
+        self.cards.into_iter().map(StoredCard::into_card).collect()
+    }
+}
+
+impl StoredCard {
+    fn from_card(card: &Card) -> Self {
+        Self {
+            kind: card_kind_to_str(card.kind).to_owned(),
+            source: card_source_to_str(&card.source),
+            title: card.title.as_ref().map(ToString::to_string),
+            subtitle: card.subtitle.as_ref().map(ToString::to_string),
+            body: card.body.as_ref().map(ToString::to_string),
+            footer: card.footer.as_ref().map(ToString::to_string),
+            url: card.url.as_ref().map(ToString::to_string),
+            accent_color: card.accent_color.as_ref().map(card_color_to_str),
+            fields: card
+                .fields
+                .iter()
+                .map(|field| StoredCardField {
+                    title: field.title.as_ref().map(ToString::to_string),
+                    value: field.value.to_string(),
+                    short: field.short,
+                })
+                .collect(),
+            actions: card
+                .actions
+                .iter()
+                .map(|action| StoredCardAction {
+                    label: action.label.to_string(),
+                    url: action.url.as_ref().map(ToString::to_string),
+                })
+                .collect(),
+        }
+    }
+
+    fn into_card(self) -> Card {
+        Card {
+            kind: card_kind_from_str(&self.kind),
+            source: card_source_from_str(&self.source),
+            title: self.title.map(arc_str),
+            subtitle: self.subtitle.map(arc_str),
+            body: self.body.map(arc_str),
+            footer: self.footer.map(arc_str),
+            url: self.url.map(arc_str),
+            accent_color: self.accent_color.map(card_color_from_str),
+            thumbnail: None,
+            image: None,
+            fields: self
+                .fields
+                .into_iter()
+                .map(|field| CardField {
+                    title: field.title.map(arc_str),
+                    value: arc_str(field.value),
+                    short: field.short,
+                })
+                .collect(),
+            actions: self
+                .actions
+                .into_iter()
+                .map(|action| CardAction {
+                    label: arc_str(action.label),
+                    url: action.url.map(arc_str),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn card_kind_to_str(kind: CardKind) -> &'static str {
+    match kind {
+        CardKind::LinkPreview => "link_preview",
+        CardKind::ProviderAttachment => "provider_attachment",
+        CardKind::BotMessage => "bot_message",
+        CardKind::MediaPreview => "media_preview",
+        CardKind::SocialPreview => "social_preview",
+        CardKind::Unknown => "unknown",
+    }
+}
+
+fn card_kind_from_str(value: &str) -> CardKind {
+    match value {
+        "link_preview" => CardKind::LinkPreview,
+        "provider_attachment" => CardKind::ProviderAttachment,
+        "bot_message" => CardKind::BotMessage,
+        "media_preview" => CardKind::MediaPreview,
+        "social_preview" => CardKind::SocialPreview,
+        _ => CardKind::Unknown,
+    }
+}
+
+fn card_source_to_str(source: &CardSource) -> String {
+    match source {
+        CardSource::Slack => "slack".to_owned(),
+        CardSource::WhatsApp => "whatsapp".to_owned(),
+        CardSource::OpenGraph => "open_graph".to_owned(),
+        CardSource::YouTube => "youtube".to_owned(),
+        CardSource::Instagram => "instagram".to_owned(),
+        CardSource::Facebook => "facebook".to_owned(),
+        CardSource::GenericUrl => "generic_url".to_owned(),
+        CardSource::Unknown(value) => value.to_string(),
+    }
+}
+
+fn card_source_from_str(value: &str) -> CardSource {
+    match value {
+        "slack" => CardSource::Slack,
+        "whatsapp" => CardSource::WhatsApp,
+        "open_graph" => CardSource::OpenGraph,
+        "youtube" => CardSource::YouTube,
+        "instagram" => CardSource::Instagram,
+        "facebook" => CardSource::Facebook,
+        "generic_url" => CardSource::GenericUrl,
+        other => CardSource::Unknown(arc_str(other.to_owned())),
+    }
+}
+
+fn card_color_to_str(color: &CardColor) -> String {
+    match color {
+        CardColor::Named(value) => value.to_string(),
+        CardColor::Hex(value) => format!("#{value}"),
+    }
+}
+
+fn card_color_from_str(value: String) -> CardColor {
+    let trimmed = value.trim().trim_start_matches('#');
+    if trimmed.len() == 6 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        CardColor::Hex(arc_str(trimmed.to_owned()))
+    } else {
+        CardColor::Named(arc_str(value))
+    }
+}
+
+fn cards_from_text(text: Option<String>) -> Content {
+    let text = text.unwrap_or_default();
+    serde_json::from_str::<StoredCards>(&text)
+        .map(|stored| Content::Cards(stored.into_cards()))
+        .unwrap_or_else(|_| Content::Unsupported(arc_str("cards".to_owned())))
+}
+
 struct StoredContent {
     kind: &'static str,
     text: Option<String>,
@@ -806,6 +965,10 @@ impl StoredContent {
             Content::Audio(media) => Self::media("audio", media),
             Content::File(media) => Self::media("file", media),
             Content::Sticker(media) => Self::media("sticker", media),
+            Content::Cards(cards) => Self::text(
+                "cards",
+                Some(serde_json::to_string(&StoredCards::from_cards(cards)).unwrap_or_default()),
+            ),
         }
     }
 
@@ -999,6 +1162,7 @@ fn content_from_parts(parts: ContentParts<'_>) -> Content {
             description: None,
             image: None,
         }),
+        "cards" => cards_from_text(text),
         "image" => Content::Image(media_from_parts(
             media_id,
             media_filename,
@@ -1233,6 +1397,7 @@ fn platform_data_to_json(data: &PlatformData) -> Result<String> {
             "thread_ts": slack.thread_ts.as_deref(),
             "channel": slack.channel.as_ref(),
         })),
+        "cards": StoredCards::from_cards(&data.cards),
     });
     Ok(serde_json::to_string(&value)?)
 }
@@ -1261,7 +1426,18 @@ fn platform_data_from_json(json: Option<&str>) -> PlatformData {
         })
     });
 
-    PlatformData { whatsapp, slack }
+    let cards = value
+        .get("cards")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<StoredCards>(value).ok())
+        .map(StoredCards::into_cards)
+        .unwrap_or_default();
+
+    PlatformData {
+        whatsapp,
+        slack,
+        cards,
+    }
 }
 
 fn path_to_string(path: Option<&PathBuf>) -> Option<String> {
@@ -1473,6 +1649,7 @@ mod tests {
                     jid: arc_str("alice@s.whatsapp.net".to_owned()),
                 }),
                 slack: None,
+                cards: Vec::new(),
             },
         };
         store.upsert_message(&message).await?;

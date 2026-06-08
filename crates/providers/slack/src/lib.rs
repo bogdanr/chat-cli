@@ -10,10 +10,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chat_core::{
-    Account, AuthChallenge, AuthSubmission, AuthSubmissionMode, Chat, ChatId, ChatKind,
-    ChatMembership, Content, EventBus, Media, Message, MessageId, NetworkActivityDirection,
-    NetworkActivityKind, OutboundCapabilities, Platform, PlatformData, PlatformId, Provider,
-    ProviderEvent, ProviderId, Reaction, Sender, SlackData, Timestamp,
+    Account, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card, CardColor, CardField,
+    CardKind, CardSource, Chat, ChatId, ChatKind, ChatMembership, Content, DiscoveryAction,
+    DiscoveryCapabilities, DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message,
+    MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform,
+    PlatformData, PlatformId, Provider, ProviderEvent, ProviderId, Reaction, Sender, SlackData,
+    Timestamp,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -395,8 +397,16 @@ struct SlackMessageSenderMetadata {
 struct SlackAttachmentResponse {
     pretext: Option<String>,
     title: Option<String>,
+    title_link: Option<String>,
     text: Option<String>,
     fallback: Option<String>,
+    color: Option<String>,
+    image_url: Option<String>,
+    thumb_url: Option<String>,
+    author_name: Option<String>,
+    author_link: Option<String>,
+    footer: Option<String>,
+    ts: Option<String>,
     fields: Option<Vec<SlackAttachmentFieldResponse>>,
 }
 
@@ -404,6 +414,7 @@ struct SlackAttachmentResponse {
 struct SlackAttachmentFieldResponse {
     title: Option<String>,
     value: Option<String>,
+    short: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2079,6 +2090,30 @@ impl SlackProvider {
         })
     }
 
+    fn discovery_result_from_conversation(
+        &self,
+        conversation: SlackConversation,
+    ) -> Option<DiscoveryResult> {
+        let chat = self.chat_from_conversation(conversation.clone())?;
+        let action = match chat.membership {
+            ChatMembership::NotJoined if chat.kind == ChatKind::PublicChannel => {
+                DiscoveryAction::JoinRequired
+            }
+            _ => DiscoveryAction::Open,
+        };
+        let kind = discovery_kind_from_slack_chat_kind(chat.kind);
+        let subtitle = slack_conversation_subtitle(&conversation, chat.membership);
+        let mut result = DiscoveryResult::existing_chat(chat);
+        result.kind = kind;
+        result.action = action;
+        result.id = arc_str(format!(
+            "slack:destination:{}:{}",
+            result.account, result.platform_id
+        ));
+        result.subtitle = subtitle;
+        Some(result)
+    }
+
     async fn send_text_message(
         &self,
         chat_id: &ChatId,
@@ -2573,24 +2608,39 @@ impl Provider for SlackProvider {
     }
 
     fn outbound_capabilities(&self) -> OutboundCapabilities {
-        if matches!(self.send_identity(), SlackSendIdentity::None) {
-            OutboundCapabilities {
-                text: false,
-                media_note: Some(Arc::from("Slack is not configured for sending")),
-                ..OutboundCapabilities::default()
-            }
-        } else {
-            OutboundCapabilities {
+        match self.send_identity() {
+            SlackSendIdentity::User | SlackSendIdentity::Bot => OutboundCapabilities {
                 text: true,
                 image: true,
                 gif: true,
                 video: true,
                 audio: true,
                 file: true,
-                sticker: true,
+                sticker: false,
                 max_upload_size: None,
-                media_note: Some(Arc::from("Slack stickers are sent as file uploads")),
-            }
+                media_note: Some(Arc::from(
+                    "Slack uploads files for image, GIF, video, audio, and document content",
+                )),
+            },
+            SlackSendIdentity::Webhook => OutboundCapabilities::text_only(
+                "incoming webhooks can only post text through this app",
+            ),
+            SlackSendIdentity::None => OutboundCapabilities::text_only(
+                "configure a Slack user token, bot token, or webhook before sending",
+            ),
+        }
+    }
+
+    fn discovery_capabilities(&self) -> DiscoveryCapabilities {
+        let can_read = self.capabilities().can_read_history;
+        DiscoveryCapabilities {
+            existing_chats: can_read,
+            contacts: false,
+            users: can_read,
+            public_channels: can_read,
+            private_channels: can_read,
+            open_dm: false,
+            join_public_channel: false,
         }
     }
 
@@ -2714,8 +2764,8 @@ impl Provider for SlackProvider {
             | Content::Audio(media)
             | Content::File(media)
             | Content::Sticker(media) => self.send_file_message(chat_id, media, reply_to).await,
-            Content::LinkPreview(_) => Err(anyhow!(
-                "Slack link preview sending should be sent as plain text first"
+            Content::LinkPreview(_) | Content::Cards(_) => Err(anyhow!(
+                "Slack link preview/card sending should be sent as plain text first"
             )),
             Content::Poll(_) => Err(anyhow!("Slack poll sending is not implemented yet")),
             Content::Deleted => Err(anyhow!("cannot send deleted Slack message content")),
@@ -2808,10 +2858,65 @@ impl Provider for SlackProvider {
 
     async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<Message>> {
         if self.capabilities().can_search {
-            Ok(Vec::new())
+            bail!("Slack message search is not wired yet")
         } else {
-            Err(self.unsupported("search"))
+            bail!("Slack message search requires search:read scope")
         }
+    }
+
+    async fn discover_destinations(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveryResult>> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut results = Vec::new();
+        for chat in read_lock(&self.chats).iter().cloned() {
+            if slack_chat_matches_query(&chat, &query) {
+                results.push(DiscoveryResult::existing_chat(chat));
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+            }
+        }
+
+        let credential = match read_lock(&self.connection).read_credential() {
+            Some(credential) => credential,
+            None => return Ok(results),
+        };
+
+        let conversations = self
+            .call_api(
+                NetworkActivityKind::Other,
+                self.api_client.list_conversations(credential),
+            )
+            .await
+            .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
+        let existing_chat_ids = results
+            .iter()
+            .filter_map(|result| result.chat_id.as_deref().map(str::to_owned))
+            .collect::<HashSet<_>>();
+
+        for conversation in conversations {
+            if results.len() >= limit {
+                break;
+            }
+            if conversation.is_archived || existing_chat_ids.contains(&conversation.id) {
+                continue;
+            }
+            if !slack_conversation_matches_query(&conversation, &query) {
+                continue;
+            }
+            if let Some(result) = self.discovery_result_from_conversation(conversation) {
+                results.push(result);
+            }
+        }
+
+        Ok(results)
     }
 
     async fn contact_info(&self, platform_id: &PlatformId) -> Result<Option<Sender>> {
@@ -2893,6 +2998,74 @@ fn include_conversation_in_sidebar(conversation: &SlackConversation) -> bool {
         return true;
     }
     conversation.is_member.unwrap_or(false)
+}
+
+fn slack_chat_matches_query(chat: &Chat, query: &str) -> bool {
+    chat.name.to_lowercase().contains(query)
+        || chat
+            .last_message_preview
+            .as_deref()
+            .is_some_and(|preview| preview.to_lowercase().contains(query))
+}
+
+fn slack_conversation_matches_query(conversation: &SlackConversation, query: &str) -> bool {
+    conversation_display_name(conversation)
+        .to_lowercase()
+        .contains(query)
+        || conversation
+            .name
+            .as_deref()
+            .is_some_and(|name| name.to_lowercase().contains(query))
+        || conversation
+            .user
+            .as_deref()
+            .is_some_and(|user| user.to_lowercase().contains(query))
+        || conversation
+            .topic
+            .as_deref()
+            .is_some_and(|topic| topic.to_lowercase().contains(query))
+        || conversation
+            .purpose
+            .as_deref()
+            .is_some_and(|purpose| purpose.to_lowercase().contains(query))
+}
+
+fn discovery_kind_from_slack_chat_kind(kind: ChatKind) -> DiscoveryResultKind {
+    match kind {
+        ChatKind::Direct => DiscoveryResultKind::DirectMessage,
+        ChatKind::Group => DiscoveryResultKind::Group,
+        ChatKind::PublicChannel => DiscoveryResultKind::PublicChannel,
+        ChatKind::PrivateChannel => DiscoveryResultKind::PrivateChannel,
+        ChatKind::GroupDirectMessage => DiscoveryResultKind::DirectMessage,
+    }
+}
+
+fn slack_conversation_subtitle(
+    conversation: &SlackConversation,
+    membership: ChatMembership,
+) -> Option<Arc<str>> {
+    let mut parts = Vec::new();
+    match membership {
+        ChatMembership::Joined => parts.push("joined".to_owned()),
+        ChatMembership::NotJoined => parts.push("not joined".to_owned()),
+        ChatMembership::Unknown => {}
+    }
+    if let Some(num_members) = conversation.num_members {
+        parts.push(format!("{num_members} members"));
+    }
+    if let Some(topic) = conversation
+        .topic
+        .as_deref()
+        .or(conversation.purpose.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    {
+        parts.push(topic.to_owned());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(arc_str(parts.join(" · ")))
+    }
 }
 
 fn direct_chat_user_id(chat: &Chat) -> Option<&str> {
@@ -3247,7 +3420,9 @@ fn slack_message_from_parts(
     let sender_id = non_empty_option(&user)
         .or_else(|| non_empty_option(&bot_id))
         .unwrap_or_else(|| "slack".to_owned());
-    let text = slack_message_text(text, attachments);
+    let attachments = attachments.unwrap_or_default();
+    let text = slack_message_text(text, &attachments);
+    let cards = slack_attachment_cards(&attachments);
     let timestamp = slack_ts_to_timestamp(&ts).unwrap_or_else(Utc::now);
     let thread_id = non_empty_option(&thread_ts)
         .filter(|thread_ts| thread_ts != &ts)
@@ -3270,7 +3445,11 @@ fn slack_message_from_parts(
         sender,
         timestamp,
         edited_at: None,
-        content: Content::Text(arc_str(text)),
+        content: if cards.is_empty() {
+            Content::Text(arc_str(text))
+        } else {
+            Content::Cards(cards.clone())
+        },
         reply_to,
         thread_id: thread_id.map(arc_str),
         reactions,
@@ -3282,40 +3461,39 @@ fn slack_message_from_parts(
                 thread_ts: thread_ts.map(arc_str),
                 channel: arc_str(channel),
             }),
+            cards,
             ..PlatformData::default()
         },
     })
 }
 
-fn slack_message_text(
-    text: Option<String>,
-    attachments: Option<Vec<SlackAttachmentResponse>>,
-) -> String {
+fn slack_message_text(text: Option<String>, attachments: &[SlackAttachmentResponse]) -> String {
     let mut parts = Vec::new();
     if let Some(text) = text.and_then(non_empty_string) {
         parts.push(text);
     }
 
-    for attachment in attachments.unwrap_or_default() {
+    for attachment in attachments {
         parts.extend(slack_attachment_text_parts(attachment));
     }
 
     replace_slack_emoji_codes(&parts.join("\n"))
 }
 
-fn slack_attachment_text_parts(attachment: SlackAttachmentResponse) -> Vec<String> {
+fn slack_attachment_text_parts(attachment: &SlackAttachmentResponse) -> Vec<String> {
     let mut parts = Vec::new();
-    push_unique_text_part(&mut parts, attachment.pretext);
+    push_unique_text_part(&mut parts, attachment.pretext.clone());
     push_unique_text_part(
         &mut parts,
         attachment
             .title
+            .clone()
             .and_then(non_empty_string)
             .map(|title| format!("**{title}**")),
     );
-    push_unique_text_part(&mut parts, attachment.text);
+    push_unique_text_part(&mut parts, attachment.text.clone());
 
-    for field in attachment.fields.unwrap_or_default() {
+    for field in attachment.fields.clone().unwrap_or_default() {
         match (
             field.title.and_then(non_empty_string),
             field.value.and_then(non_empty_string),
@@ -3330,10 +3508,157 @@ fn slack_attachment_text_parts(attachment: SlackAttachmentResponse) -> Vec<Strin
     }
 
     if parts.is_empty() {
-        push_unique_text_part(&mut parts, attachment.fallback);
+        push_unique_text_part(&mut parts, attachment.fallback.clone());
     }
 
     parts
+}
+
+fn slack_attachment_cards(attachments: &[SlackAttachmentResponse]) -> Vec<Card> {
+    attachments
+        .iter()
+        .filter_map(slack_attachment_card)
+        .collect()
+}
+
+fn slack_attachment_card(attachment: &SlackAttachmentResponse) -> Option<Card> {
+    let title = attachment
+        .title
+        .clone()
+        .and_then(non_empty_string)
+        .map(|text| arc_str(replace_slack_emoji_codes(&text)));
+    let subtitle = attachment
+        .pretext
+        .clone()
+        .and_then(non_empty_string)
+        .map(|text| arc_str(replace_slack_emoji_codes(&text)))
+        .or_else(|| {
+            attachment
+                .author_name
+                .clone()
+                .and_then(non_empty_string)
+                .map(|text| arc_str(replace_slack_emoji_codes(&text)))
+        });
+    let body = attachment
+        .text
+        .clone()
+        .and_then(non_empty_string)
+        .map(|text| arc_str(replace_slack_emoji_codes(&text)));
+    let footer = attachment
+        .footer
+        .clone()
+        .and_then(non_empty_string)
+        .or_else(|| attachment.ts.clone().and_then(non_empty_string))
+        .map(|text| arc_str(replace_slack_emoji_codes(&text)));
+    let url = attachment
+        .title_link
+        .clone()
+        .and_then(non_empty_string)
+        .or_else(|| attachment.author_link.clone().and_then(non_empty_string))
+        .map(arc_str);
+    let accent_color = attachment
+        .color
+        .clone()
+        .and_then(non_empty_string)
+        .map(slack_attachment_color);
+    let image = attachment
+        .image_url
+        .clone()
+        .and_then(non_empty_string)
+        .map(|url| slack_card_media("image", &url));
+    let thumbnail = attachment
+        .thumb_url
+        .clone()
+        .and_then(non_empty_string)
+        .map(|url| slack_card_media("thumbnail", &url));
+    let fields = attachment
+        .fields
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(slack_attachment_card_field)
+        .collect::<Vec<_>>();
+
+    if title.is_none()
+        && subtitle.is_none()
+        && body.is_none()
+        && footer.is_none()
+        && fields.is_empty()
+        && image.is_none()
+        && thumbnail.is_none()
+    {
+        return attachment
+            .fallback
+            .clone()
+            .and_then(non_empty_string)
+            .map(|fallback| Card {
+                kind: CardKind::ProviderAttachment,
+                source: CardSource::Slack,
+                title: None,
+                subtitle: None,
+                body: Some(arc_str(replace_slack_emoji_codes(&fallback))),
+                footer: None,
+                url: None,
+                accent_color,
+                thumbnail: None,
+                image: None,
+                fields: Vec::new(),
+                actions: Vec::new(),
+            });
+    }
+
+    Some(Card {
+        kind: CardKind::ProviderAttachment,
+        source: CardSource::Slack,
+        title,
+        subtitle,
+        body,
+        footer,
+        url,
+        accent_color,
+        thumbnail,
+        image,
+        fields,
+        actions: Vec::new(),
+    })
+}
+
+fn slack_attachment_card_field(field: SlackAttachmentFieldResponse) -> Option<CardField> {
+    let value = field.value.and_then(non_empty_string)?;
+    Some(CardField {
+        title: field
+            .title
+            .and_then(non_empty_string)
+            .map(|title| arc_str(replace_slack_emoji_codes(&title))),
+        value: arc_str(replace_slack_emoji_codes(&value)),
+        short: field.short.unwrap_or(false),
+    })
+}
+
+fn slack_attachment_color(color: String) -> CardColor {
+    let color = color.trim().trim_start_matches('#');
+    if color.len() == 6 && color.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        CardColor::Hex(arc_str(color))
+    } else {
+        CardColor::Named(arc_str(color.to_ascii_lowercase()))
+    }
+}
+
+fn slack_card_media(kind: &str, url: &str) -> Media {
+    let file_name = url
+        .split(['/', '?', '#'])
+        .next_back()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(kind);
+    Media {
+        id: arc_str(url),
+        file_name: arc_str(file_name),
+        mime_type: arc_str("image/*"),
+        size_bytes: None,
+        caption: None,
+        local_path: None,
+        thumbnail: None,
+    }
 }
 
 fn push_unique_text_part(parts: &mut Vec<String>, value: Option<String>) {
@@ -3441,12 +3766,50 @@ fn apply_cached_user_to_message(
         message.sender = user.sender();
     }
 
-    if let Content::Text(text) = &message.content {
-        let replaced = replace_slack_user_mentions(text, users);
-        if replaced != text.as_ref() {
-            message.content = Content::Text(arc_str(replaced));
+    if matches!(&message.content, Content::Text(_)) {
+        if let Content::Text(text) = &message.content {
+            let replaced = replace_slack_user_mentions(text, users);
+            if replaced != text.as_ref() {
+                message.content = Content::Text(arc_str(replaced));
+            }
         }
+    } else if let Content::Cards(cards) = &message.content {
+        let replaced_cards = replace_slack_mentions_in_cards(cards, users);
+        message.platform_data.cards = replaced_cards.clone();
+        message.content = Content::Cards(replaced_cards);
     }
+}
+
+fn replace_slack_mentions_in_cards(
+    cards: &[Card],
+    users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+) -> Vec<Card> {
+    cards
+        .iter()
+        .cloned()
+        .map(|mut card| {
+            card.title = card
+                .title
+                .map(|text| arc_str(replace_slack_user_mentions(&text, users)));
+            card.subtitle = card
+                .subtitle
+                .map(|text| arc_str(replace_slack_user_mentions(&text, users)));
+            card.body = card
+                .body
+                .map(|text| arc_str(replace_slack_user_mentions(&text, users)));
+            card.footer = card
+                .footer
+                .map(|text| arc_str(replace_slack_user_mentions(&text, users)));
+            for field in &mut card.fields {
+                field.title = field
+                    .title
+                    .clone()
+                    .map(|text| arc_str(replace_slack_user_mentions(&text, users)));
+                field.value = arc_str(replace_slack_user_mentions(&field.value, users));
+            }
+            card
+        })
+        .collect()
 }
 
 fn content_text(content: &Content) -> String {
@@ -3465,10 +3828,45 @@ fn content_text(content: &Content) -> String {
             let title = link.title.as_deref().unwrap_or("Link");
             format!("{title}: {}", link.url)
         }
+        Content::Cards(cards) => cards
+            .iter()
+            .map(slack_card_fallback_text)
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
         Content::Poll(poll) => format!("Poll: {}", poll.question),
         Content::Deleted => "deleted message".to_owned(),
         Content::Unsupported(text) => text.to_string(),
     }
+}
+
+fn slack_card_fallback_text(card: &Card) -> String {
+    let mut parts = Vec::new();
+    if let Some(subtitle) = &card.subtitle {
+        parts.push(subtitle.to_string());
+    }
+    if let Some(title) = &card.title {
+        parts.push(title.to_string());
+    }
+    if let Some(body) = &card.body {
+        parts.push(body.to_string());
+    }
+    for field in &card.fields {
+        parts.push(
+            field
+                .title
+                .as_deref()
+                .map(|title| format!("{title}: {}", field.value))
+                .unwrap_or_else(|| field.value.to_string()),
+        );
+    }
+    if let Some(footer) = &card.footer {
+        parts.push(footer.to_string());
+    }
+    if let Some(url) = &card.url {
+        parts.push(url.to_string());
+    }
+    parts.join("\n")
 }
 
 fn slack_user_ids_in_text(text: &str) -> Vec<String> {
@@ -5011,6 +5409,14 @@ mod tests {
                 attachments: Some(vec![SlackAttachmentResponse {
                     pretext: None,
                     title: Some("Partition maintenance successful on deploy".to_owned()),
+                    title_link: None,
+                    color: Some("good".to_owned()),
+                    image_url: None,
+                    thumb_url: None,
+                    author_name: None,
+                    author_link: None,
+                    footer: None,
+                    ts: None,
                     text: Some(
                         "Script: /var/www/wap/partition_maintenance.sh, Elapsed time: 415 seconds"
                             .to_owned(),
@@ -5026,9 +5432,25 @@ mod tests {
         .expect("message should parse");
 
         assert_eq!(message.sender.display_name.as_ref(), "deploy");
+        let Content::Cards(cards) = &message.content else {
+            panic!("Slack attachment should be preserved as cards");
+        };
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        assert_eq!(card.source, CardSource::Slack);
+        assert_eq!(card.kind, CardKind::ProviderAttachment);
+        assert_eq!(
+            card.title.as_deref(),
+            Some("Partition maintenance successful on deploy")
+        );
+        assert_eq!(
+            card.body.as_deref(),
+            Some("Script: /var/www/wap/partition_maintenance.sh, Elapsed time: 415 seconds")
+        );
+        assert_eq!(card.accent_color, Some(CardColor::Named(arc_str("good"))));
         assert_eq!(
             content_text(&message.content),
-            "**Partition maintenance successful on deploy**\nScript: /var/www/wap/partition_maintenance.sh, Elapsed time: 415 seconds"
+            "Partition maintenance successful on deploy\nScript: /var/www/wap/partition_maintenance.sh, Elapsed time: 415 seconds"
         );
     }
 

@@ -21,10 +21,16 @@ const MEDIA_PREVIEW_MAX_WIDTH: u16 = 48;
 const MEDIA_PREVIEW_ROWS: u16 = 8;
 const LINK_PREVIEW_CARD_WIDTH: u16 = 42;
 const LINK_PREVIEW_THUMBNAIL_ROWS: u16 = 4;
-const MESSAGE_AVATAR_WIDTH: u16 = 2;
-const MESSAGE_AVATAR_ROWS: u16 = 1;
+pub const MESSAGE_AVATAR_WIDTH: u16 = 2;
+pub const MESSAGE_AVATAR_ROWS: u16 = 1;
 const BUBBLE_MAX_PERCENT: u16 = 72;
 const BUBBLE_MIN_WIDTH: usize = 10;
+const SLACK_TIMESTAMP_WIDTH: usize = 5;
+const SLACK_GUTTER_GAP: usize = 2;
+const SLACK_AVATAR_GAP: usize = 1;
+const SLACK_BODY_INDENT_WIDTH: usize =
+    SLACK_TIMESTAMP_WIDTH + SLACK_GUTTER_GAP + MESSAGE_AVATAR_WIDTH as usize + SLACK_AVATAR_GAP;
+const SLACK_MESSAGE_SPACER_LINES: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConversationPresentation {
@@ -162,7 +168,10 @@ pub struct MessageListRender {
 
 pub fn render_message_list(frame: &mut Frame<'_>, area: Rect, props: MessageListProps<'_>) {
     frame.render_widget(Clear, area);
-    let paragraph = Paragraph::new(props.lines).block(
+    let viewport_rows = inner_area(area).height as usize;
+    let lines =
+        bottom_aligned_message_lines(props.lines, props.total_lines, props.scroll, viewport_rows);
+    let paragraph = Paragraph::new(lines).block(
         Block::default()
             .title(props.title)
             .borders(Borders::ALL)
@@ -170,6 +179,27 @@ pub fn render_message_list(frame: &mut Frame<'_>, area: Rect, props: MessageList
     );
     frame.render_widget(paragraph, area);
     render_scrollbar(frame, area, props.total_lines, props.scroll, props.theme);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bottom_aligned_message_lines(
+    lines: Vec<Line<'static>>,
+    total_lines: usize,
+    scroll: usize,
+    viewport_rows: usize,
+) -> Vec<Line<'static>> {
+    if total_lines == 0
+        || lines.len() >= viewport_rows
+        || scroll.saturating_add(viewport_rows) < total_lines
+    {
+        return lines;
+    }
+
+    let top_padding = viewport_rows.saturating_sub(lines.len());
+    let mut padded = Vec::with_capacity(viewport_rows);
+    padded.extend(std::iter::repeat_with(Line::default).take(top_padding));
+    padded.extend(lines);
+    padded
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -276,6 +306,7 @@ pub fn build_message_lines_with_presentation(
     let mut media_hits = Vec::new();
     let mut message_hits = Vec::new();
     let mut link_preview_requests = Vec::new();
+    let mut media_preview_requests = Vec::new();
     let reply_previews = messages
         .iter()
         .map(|message| (message.id.clone(), compact_message_preview(message)))
@@ -290,11 +321,13 @@ pub fn build_message_lines_with_presentation(
         thread_summaries: &thread_summaries,
         link_metadata,
         link_preview_requests: &mut link_preview_requests,
+        media_preview_requests: &mut media_preview_requests,
         presentation,
     };
 
     let mut line_cursor: usize = 0;
     for message in visible_messages {
+        let has_previous_message = context.previous_sender.is_some();
         let grouped = context
             .previous_sender
             .as_ref()
@@ -302,6 +335,7 @@ pub fn build_message_lines_with_presentation(
         let line_count = message_lines_len(
             message,
             grouped,
+            has_previous_message,
             content_width,
             link_metadata,
             context.thread_summaries.get(&message.id),
@@ -324,6 +358,7 @@ pub fn build_message_lines_with_presentation(
             message_start,
             selected,
             grouped,
+            has_previous_message,
             unread,
         );
         let line_hits = message_line_hits(
@@ -333,7 +368,13 @@ pub fn build_message_lines_with_presentation(
             grouped,
             presentation,
         );
-        let avatar_hit = message_avatar_hit(&message_lines, message_start, content_width, grouped);
+        let avatar_hit = message_avatar_hit(
+            &message_lines,
+            message_start,
+            content_width,
+            grouped,
+            presentation,
+        );
         let thread_summary_hit = message_thread_summary_hit(
             &message_lines,
             message_start,
@@ -365,6 +406,7 @@ pub fn build_message_lines_with_presentation(
         message_hits,
         total_lines,
         link_preview_requests,
+        media_preview_requests,
     }
 }
 
@@ -390,11 +432,13 @@ fn rebuild_message_layout_cache(
         if is_slack_thread_reply(message) {
             continue;
         }
+        let has_previous_message = previous_sender.is_some();
         let grouped =
             previous_sender.is_some_and(|previous| previous == &message.sender.platform_id);
         let line_count = message_lines_len(
             message,
             grouped,
+            has_previous_message,
             content_width,
             link_metadata,
             cache.thread_summaries.get(&message.id),
@@ -435,6 +479,7 @@ fn build_message_lines_from_layout_cache(
     let mut media_hits = Vec::new();
     let mut message_hits = Vec::new();
     let mut link_preview_requests = Vec::new();
+    let mut media_preview_requests = Vec::new();
     let mut context = MessageRenderContext {
         media_cache,
         content_width,
@@ -445,6 +490,7 @@ fn build_message_lines_from_layout_cache(
         thread_summaries: &cache.thread_summaries,
         link_metadata,
         link_preview_requests: &mut link_preview_requests,
+        media_preview_requests: &mut media_preview_requests,
         presentation,
     };
 
@@ -475,6 +521,7 @@ fn build_message_lines_from_layout_cache(
             message_start,
             selected,
             entry.grouped,
+            message_start > 0,
             unread,
         );
         let line_hits = message_line_hits(
@@ -484,8 +531,13 @@ fn build_message_lines_from_layout_cache(
             entry.grouped,
             presentation,
         );
-        let avatar_hit =
-            message_avatar_hit(&message_lines, message_start, content_width, entry.grouped);
+        let avatar_hit = message_avatar_hit(
+            &message_lines,
+            message_start,
+            content_width,
+            entry.grouped,
+            presentation,
+        );
         let thread_summary_hit = message_thread_summary_hit(
             &message_lines,
             message_start,
@@ -517,6 +569,7 @@ fn build_message_lines_from_layout_cache(
         message_hits,
         total_lines,
         link_preview_requests,
+        media_preview_requests,
     }
 }
 
@@ -570,6 +623,20 @@ fn message_content_layout_hash(content: &Content, hasher: &mut DefaultHasher) {
             link.description.hash(hasher);
             if let Some(media) = &link.image {
                 media_layout_hash(media, hasher);
+            }
+        }
+        Content::Cards(cards) => {
+            for card in cards {
+                card.title.hash(hasher);
+                card.subtitle.hash(hasher);
+                card.body.hash(hasher);
+                card.footer.hash(hasher);
+                card.url.hash(hasher);
+                for field in &card.fields {
+                    field.title.hash(hasher);
+                    field.value.hash(hasher);
+                    field.short.hash(hasher);
+                }
             }
         }
         Content::Poll(poll) => {
@@ -666,25 +733,36 @@ fn message_avatar_hit(
     start_line: usize,
     content_width: u16,
     grouped: bool,
+    presentation: ConversationPresentation,
 ) -> Option<MessageLineHit> {
     if grouped {
         return None;
     }
-    let header = lines.first()?;
+    let header = lines.iter().find(|line| !line.spans.is_empty())?;
+    let header_offset = lines
+        .iter()
+        .position(|line| std::ptr::eq(line, header))
+        .unwrap_or_default();
     let width = line_width(header).min(content_width as usize) as u16;
     if width == 0 {
         return None;
     }
     let start_col = aligned_line_start_col(header, width, content_width);
-    let selected_prefix = header
-        .spans
-        .first()
-        .filter(|span| span.content.as_ref() == "▏ ")
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
-        .unwrap_or_default();
-    let avatar_start = start_col.saturating_add(selected_prefix);
+    let avatar_start = if presentation == ConversationPresentation::Flat {
+        start_col
+            .saturating_add(SLACK_TIMESTAMP_WIDTH as u16)
+            .saturating_add(SLACK_GUTTER_GAP as u16)
+    } else {
+        let selected_prefix = header
+            .spans
+            .first()
+            .filter(|span| span.content.as_ref() == "▏ ")
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+            .unwrap_or_default();
+        start_col.saturating_add(selected_prefix)
+    };
     Some(MessageLineHit {
-        line: start_line,
+        line: start_line.saturating_add(header_offset),
         start_col: avatar_start,
         end_col: avatar_start.saturating_add(MESSAGE_AVATAR_WIDTH),
     })
@@ -757,6 +835,21 @@ fn line_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
+fn push_right_aligned_spans(
+    line_spans: &mut Vec<Span<'static>>,
+    content_width: u16,
+    trailing_spans: &[Span<'static>],
+) {
+    let leading_width = spans_width(line_spans);
+    let trailing_width = spans_width(trailing_spans);
+    let spacer = (content_width as usize)
+        .saturating_sub(leading_width)
+        .saturating_sub(trailing_width)
+        .max(1);
+    line_spans.push(Span::raw(" ".repeat(spacer)));
+    line_spans.extend(trailing_spans.iter().cloned());
+}
+
 fn line_text(line: &Line<'_>) -> String {
     line.spans
         .iter()
@@ -805,12 +898,14 @@ fn message_line_count_for_visible_messages(
     messages
         .iter()
         .map(|message| {
+            let has_previous_message = previous_sender.is_some();
             let grouped =
                 previous_sender.is_some_and(|previous| previous == &message.sender.platform_id);
             previous_sender = Some(&message.sender.platform_id);
             message_lines_len(
                 message,
                 grouped,
+                has_previous_message,
                 content_width,
                 link_metadata,
                 thread_summaries.get(&message.id),
@@ -936,17 +1031,26 @@ fn message_lines(
     start_line: usize,
     selected: bool,
     grouped: bool,
+    has_previous_message: bool,
     unread: bool,
 ) -> Vec<Line<'static>> {
+    if context.presentation == ConversationPresentation::Flat {
+        return slack_message_lines(
+            message,
+            context,
+            start_line,
+            selected,
+            grouped,
+            has_previous_message,
+            unread,
+        );
+    }
+
     let accent_style = bubble_accent(context.theme, message.is_from_me, unread);
     let mut lines = Vec::new();
-    let flat = context.presentation == ConversationPresentation::Flat;
 
     if !grouped {
         let mut header_spans = Vec::new();
-        if flat {
-            header_spans.push(Span::styled("▌ ", accent_style));
-        }
         header_spans.extend(message_avatar_spans(&message.sender, context));
         header_spans.extend([
             Span::raw(" "),
@@ -957,27 +1061,12 @@ fn message_lines(
             Span::raw(if message.is_from_me { " (me)" } else { "" }),
         ]);
         let timestamp = format_message_time(message.timestamp);
-        let header_width = header_spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum::<usize>();
-        let timestamp_width = UnicodeWidthStr::width(timestamp.as_str());
-        let reserved_trailing_space = 1u16;
-        let spacer = context
-            .content_width
-            .saturating_sub(header_width as u16)
-            .saturating_sub(timestamp_width as u16)
-            .saturating_sub(reserved_trailing_space)
-            .max(2) as usize;
-        header_spans.push(Span::raw(" ".repeat(spacer)));
-        header_spans.push(Span::styled(timestamp, context.theme.muted()));
-        header_spans.push(Span::raw(" "));
+        push_right_aligned_spans(
+            &mut header_spans,
+            context.content_width,
+            &[Span::styled(timestamp, context.theme.muted())],
+        );
         lines.push(Line::from(header_spans));
-    } else if flat {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", format_message_time(message.timestamp)),
-            context.theme.muted(),
-        )));
     }
 
     if let Some(reply_to) = &message.reply_to {
@@ -996,20 +1085,20 @@ fn message_lines(
         &message.content,
         context,
         start_line + lines.len(),
-        if flat { false } else { message.is_from_me },
+        message.is_from_me,
         accent_style,
         Some(&message.id),
     ));
 
     let receipts = receipt_summary(message);
-    if message.is_from_me && !flat {
+    if message.is_from_me {
         let status = if receipts.is_empty() {
             format_message_time(message.timestamp)
         } else {
             format!("{} · {receipts}", format_message_time(message.timestamp))
         };
         lines.push(status_line(&status, context.theme.muted()));
-    } else if !flat && !receipts.is_empty() {
+    } else if !receipts.is_empty() {
         lines.push(status_line(&receipts, context.theme.muted()));
     }
 
@@ -1018,24 +1107,18 @@ fn message_lines(
     }
 
     if let Some(summary) = context.thread_summaries.get(&message.id) {
-        lines.push(thread_summary_line(
-            summary,
-            message.is_from_me,
-            context.theme,
-        ));
+        lines.push(thread_summary_line(summary, message.is_from_me, context));
     }
 
     for line in &mut lines {
-        line.alignment = Some(if flat {
-            Alignment::Left
-        } else if message.is_from_me {
+        line.alignment = Some(if message.is_from_me {
             Alignment::Right
         } else {
             Alignment::Left
         });
         if selected && !line.spans.is_empty() {
             let marker = Span::styled(" ▕", Style::default().fg(context.theme.accent));
-            if !flat && message.is_from_me {
+            if message.is_from_me {
                 line.spans.push(marker);
             } else {
                 line.spans.insert(
@@ -1056,6 +1139,209 @@ fn message_lines(
     }
 
     lines
+}
+
+fn slack_message_lines(
+    message: &Message,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    selected: bool,
+    grouped: bool,
+    has_previous_message: bool,
+    unread: bool,
+) -> Vec<Line<'static>> {
+    let accent_style = bubble_accent(context.theme, message.is_from_me, unread);
+    let mut lines = Vec::new();
+    let spacer_lines = slack_message_spacer_lines(grouped, has_previous_message);
+    lines.extend((0..spacer_lines).map(|_| Line::default()));
+    let body_start_line =
+        start_line + spacer_lines + usize::from(!grouped) + usize::from(message.reply_to.is_some());
+    let mut body_lines = slack_content_lines(message, context, body_start_line, accent_style);
+    if body_lines.is_empty() {
+        body_lines.push(Line::from(""));
+    }
+    let merge_first_body_line =
+        !grouped && message.reply_to.is_none() && slack_content_can_merge(&message.content);
+
+    if !grouped {
+        let mut header_spans = slack_header_spans(message, context);
+        if merge_first_body_line {
+            let first_body_line = body_lines.remove(0);
+            if !line_text(&first_body_line).trim().is_empty() {
+                header_spans.push(Span::raw(" "));
+                header_spans.extend(first_body_line.spans);
+            }
+        }
+        lines.push(Line::from(header_spans));
+    }
+
+    if let Some(reply_to) = &message.reply_to {
+        let preview = context
+            .reply_previews
+            .get(reply_to)
+            .cloned()
+            .unwrap_or_else(|| format!("message {}", short_id(reply_to)));
+        lines.push(slack_indented_line(vec![Span::styled(
+            format!("↪ {preview}"),
+            context.theme.muted(),
+        )]));
+    }
+
+    for (index, mut line) in body_lines.into_iter().enumerate() {
+        if grouped && index == 0 {
+            prefix_line_spans(
+                &mut line,
+                slack_grouped_prefix_spans(message, context.theme),
+            );
+        } else {
+            prefix_line_spans(&mut line, slack_body_indent_spans());
+        }
+        lines.push(line);
+    }
+
+    if !message.reactions.is_empty() {
+        lines.push(slack_indented_line(reaction_pill_spans(message)));
+    }
+
+    if let Some(summary) = context.thread_summaries.get(&message.id) {
+        let summary_spans = thread_summary_spans(summary, context);
+        lines.push(slack_indented_line(summary_spans));
+    }
+
+    for line in &mut lines {
+        line.alignment = Some(Alignment::Left);
+        if selected && !line.spans.is_empty() {
+            apply_slack_timestamp_selection(line, context.theme);
+        }
+    }
+
+    lines
+}
+
+fn slack_message_spacer_lines(grouped: bool, has_previous_message: bool) -> usize {
+    usize::from(has_previous_message && !grouped) * SLACK_MESSAGE_SPACER_LINES
+}
+
+fn apply_slack_timestamp_selection(line: &mut Line<'static>, theme: Theme) {
+    let selection_style = Style::default().fg(theme.foreground).bg(Color::DarkGray);
+    let mut remaining = SLACK_TIMESTAMP_WIDTH;
+    let mut spans = Vec::new();
+
+    for span in line.spans.drain(..) {
+        if remaining == 0 {
+            spans.push(span);
+            continue;
+        }
+
+        let content = span.content.to_string();
+        let width = UnicodeWidthStr::width(content.as_str());
+        if width <= remaining {
+            let mut selected_span = span;
+            selected_span.style = selected_span.style.patch(selection_style);
+            spans.push(selected_span);
+            remaining = remaining.saturating_sub(width);
+            continue;
+        }
+
+        let (selected_text, rest_text) = split_by_display_width(&content, remaining);
+        if !selected_text.is_empty() {
+            spans.push(Span::styled(
+                selected_text,
+                span.style.patch(selection_style),
+            ));
+        }
+        if !rest_text.is_empty() {
+            spans.push(Span::styled(rest_text, span.style));
+        }
+        remaining = 0;
+    }
+
+    if remaining > 0 {
+        spans.insert(0, Span::styled(" ".repeat(remaining), selection_style));
+    }
+
+    line.spans = spans;
+}
+
+fn slack_content_lines(
+    message: &Message,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    accent: Style,
+) -> Vec<Line<'static>> {
+    let original_width = context.content_width;
+    let body_width = slack_body_width(original_width) as u16;
+    let media_hit_start = context.media_hits.len();
+    context.content_width = body_width;
+    let lines = content_lines(
+        &message.content,
+        context,
+        start_line,
+        false,
+        accent,
+        Some(&message.id),
+    );
+    context.content_width = original_width;
+    for hit in &mut context.media_hits[media_hit_start..] {
+        hit.start_col = hit.start_col.saturating_add(SLACK_BODY_INDENT_WIDTH as u16);
+        hit.end_col = hit.end_col.saturating_add(SLACK_BODY_INDENT_WIDTH as u16);
+    }
+    lines
+}
+
+fn slack_header_spans(
+    message: &Message,
+    context: &mut MessageRenderContext<'_>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    spans.extend(slack_timestamp_spans(message, context.theme));
+    spans.extend(message_avatar_spans(&message.sender, context));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        message.sender.display_name.to_string(),
+        sender_style(context.theme, message.is_from_me).add_modifier(Modifier::BOLD),
+    ));
+    if message.is_from_me {
+        spans.push(Span::raw(" (me)"));
+    }
+    spans
+}
+
+fn slack_grouped_prefix_spans(message: &Message, theme: Theme) -> Vec<Span<'static>> {
+    let mut spans = slack_timestamp_spans(message, theme);
+    spans.push(Span::raw(
+        " ".repeat(MESSAGE_AVATAR_WIDTH as usize + SLACK_AVATAR_GAP),
+    ));
+    spans
+}
+
+fn slack_timestamp_spans(message: &Message, theme: Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format_message_time(message.timestamp), theme.muted()),
+        Span::raw(" ".repeat(SLACK_GUTTER_GAP)),
+    ]
+}
+
+fn slack_body_indent_spans() -> Vec<Span<'static>> {
+    vec![Span::raw(" ".repeat(SLACK_BODY_INDENT_WIDTH))]
+}
+
+fn slack_indented_line(spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut line = Line::from(spans);
+    prefix_line_spans(&mut line, slack_body_indent_spans());
+    line
+}
+
+fn prefix_line_spans(line: &mut Line<'static>, mut prefix: Vec<Span<'static>>) {
+    prefix.append(&mut line.spans);
+    line.spans = prefix;
+}
+
+fn slack_content_can_merge(content: &Content) -> bool {
+    matches!(
+        content,
+        Content::Text(_) | Content::Poll(_) | Content::Deleted | Content::Unsupported(_)
+    )
 }
 
 fn content_lines(
@@ -1087,6 +1373,9 @@ fn content_lines(
         }
         Content::LinkPreview(link) => {
             link_preview_card_lines(link, accent, context, start_line, is_from_me)
+        }
+        Content::Cards(cards) => {
+            card_collection_lines(cards, accent, context, start_line, is_from_me)
         }
         Content::Poll(poll) => text_content_lines(
             &poll_text(poll),
@@ -1261,14 +1550,10 @@ fn text_content_lines(
     }
 }
 
-fn text_flat_lines(text: &str, content_width: u16, accent: Style) -> Vec<Line<'static>> {
+fn text_flat_lines(text: &str, content_width: u16, _accent: Style) -> Vec<Line<'static>> {
     wrap_markdown_text(text, flat_text_width(content_width))
         .into_iter()
-        .map(|spans| {
-            let mut line_spans = vec![Span::styled("  │ ", accent)];
-            line_spans.extend(spans);
-            Line::from(line_spans)
-        })
+        .map(Line::from)
         .collect()
 }
 
@@ -1292,6 +1577,310 @@ fn text_bubble_lines(text: &str, content_width: u16, accent: Style) -> Vec<Line<
     lines
 }
 
+fn card_collection_lines(
+    cards: &[chat_core::Card],
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for card in cards {
+        lines.extend(generic_card_lines(
+            card,
+            accent,
+            context,
+            start_line + lines.len(),
+            is_from_me,
+        ));
+    }
+    lines
+}
+
+fn flat_card_lines(
+    card: &chat_core::Card,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    let card_width = flat_text_width(context.content_width).max(1) as u16;
+    let accent = card_accent_style(card.accent_color.as_ref(), accent);
+    let mut lines = Vec::new();
+
+    if let Some(image) = card.image.as_ref().or(card.thumbnail.as_ref()) {
+        let (preview_rows, source, error, ready) = media_preview_rows(
+            image,
+            context,
+            card_width,
+            LINK_PREVIEW_THUMBNAIL_ROWS,
+            accent.fg.unwrap_or(Color::DarkGray),
+        );
+        if let (Some(path), None) = (&source, &error)
+            && ready
+        {
+            context.media_hits.push(MediaHit {
+                start_line: start_line + lines.len(),
+                end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
+                start_col: if is_from_me {
+                    context
+                        .content_width
+                        .saturating_sub(card_width.saturating_add(4))
+                } else {
+                    0
+                },
+                end_col: context.content_width,
+                path: path.clone(),
+                title: card
+                    .title
+                    .as_deref()
+                    .unwrap_or(image.file_name.as_ref())
+                    .to_owned(),
+                caption: card.body.as_deref().map(str::to_owned),
+            });
+        }
+        lines.extend(
+            preview_rows
+                .into_iter()
+                .map(|row| flat_card_preview_line(accent, row)),
+        );
+    }
+
+    if let Some(subtitle) = card.subtitle.as_deref() {
+        lines.push(flat_card_text_line(
+            accent,
+            subtitle,
+            card_width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(title) = card.title.as_deref() {
+        lines.push(flat_card_text_line(
+            accent,
+            title,
+            card_width,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(body) = card.body.as_deref() {
+        let body = sanitize_flat_provider_text(body);
+        for row in wrap_markdown_text(&body, card_width as usize) {
+            lines.push(flat_card_spans_line(accent, row));
+        }
+    }
+    for field in &card.fields {
+        let text = field
+            .title
+            .as_deref()
+            .map(|title| format!("{title}: {}", field.value))
+            .unwrap_or_else(|| field.value.to_string());
+        lines.push(flat_card_text_line(
+            accent,
+            &text,
+            card_width,
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if let Some(footer) = card.footer.as_deref() {
+        lines.push(flat_card_text_line(
+            accent,
+            footer,
+            card_width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(url) = card.url.as_deref() {
+        lines.push(flat_card_text_line(
+            accent,
+            url,
+            card_width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    if lines.is_empty() {
+        lines.push(flat_card_text_line(
+            accent,
+            "Card",
+            card_width,
+            Style::default(),
+        ));
+    }
+    lines
+}
+
+fn generic_card_lines(
+    card: &chat_core::Card,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    if context.presentation == ConversationPresentation::Flat {
+        return flat_card_lines(card, accent, context, start_line, is_from_me);
+    }
+
+    let card_width = link_preview_card_width(context.content_width);
+    let accent = card_accent_style(card.accent_color.as_ref(), media_card_accent(accent));
+    let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
+
+    if let Some(image) = card.image.as_ref().or(card.thumbnail.as_ref()) {
+        let (preview_rows, source, error, ready) = media_preview_rows(
+            image,
+            context,
+            card_width,
+            LINK_PREVIEW_THUMBNAIL_ROWS,
+            accent.fg.unwrap_or(Color::DarkGray),
+        );
+        if let (Some(path), None) = (&source, &error)
+            && ready
+        {
+            let hit_width = card_width.saturating_add(4).min(context.content_width);
+            let start_col = if is_from_me {
+                context.content_width.saturating_sub(hit_width)
+            } else {
+                0
+            };
+            context.media_hits.push(MediaHit {
+                start_line: start_line + lines.len(),
+                end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
+                start_col,
+                end_col: start_col.saturating_add(hit_width),
+                path: path.clone(),
+                title: card
+                    .title
+                    .as_deref()
+                    .unwrap_or(image.file_name.as_ref())
+                    .to_owned(),
+                caption: card.body.as_deref().map(str::to_owned),
+            });
+        }
+        lines.extend(
+            preview_rows
+                .into_iter()
+                .map(|row| card_preview_line(accent, row, card_width)),
+        );
+    }
+
+    if let Some(subtitle) = card.subtitle.as_deref() {
+        lines.push(card_text_line(
+            accent,
+            subtitle,
+            card_width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(title) = card.title.as_deref() {
+        lines.push(card_text_line(
+            accent,
+            title,
+            card_width,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(body) = card.body.as_deref() {
+        for row in wrap_markdown_text(body, card_width as usize) {
+            lines.push(card_spans_line(accent, row, card_width));
+        }
+    }
+    for field in &card.fields {
+        let text = field
+            .title
+            .as_deref()
+            .map(|title| format!("{title}: {}", field.value))
+            .unwrap_or_else(|| field.value.to_string());
+        lines.push(card_text_line(
+            accent,
+            &text,
+            card_width,
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if let Some(footer) = card.footer.as_deref() {
+        lines.push(card_text_line(
+            accent,
+            footer,
+            card_width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(url) = card.url.as_deref() {
+        lines.push(card_text_line(
+            accent,
+            url,
+            card_width,
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    if lines.len() == 1 {
+        lines.push(card_text_line(accent, "Card", card_width, Style::default()));
+    }
+    lines.push(card_border_line('╰', '─', '╯', card_width, accent));
+    lines
+}
+
+fn card_accent_style(color: Option<&chat_core::CardColor>, fallback: Style) -> Style {
+    let Some(color) = color else {
+        return fallback;
+    };
+    fallback.fg(match color {
+        chat_core::CardColor::Named(value) => match value.as_ref() {
+            "good" => Color::Green,
+            "warning" => Color::Yellow,
+            "danger" => Color::Red,
+            "primary" => Color::Blue,
+            _ => fallback.fg.unwrap_or(Color::DarkGray),
+        },
+        chat_core::CardColor::Hex(value) => {
+            terminal_color_from_hex(value).unwrap_or_else(|| fallback.fg.unwrap_or(Color::DarkGray))
+        }
+    })
+}
+
+fn terminal_color_from_hex(value: &str) -> Option<Color> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(red, green, blue))
+}
+
+fn card_collection_text(cards: &[chat_core::Card]) -> String {
+    cards
+        .iter()
+        .map(card_text)
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn card_text(card: &chat_core::Card) -> String {
+    let mut parts = Vec::new();
+    if let Some(title) = &card.title {
+        parts.push(title.to_string());
+    }
+    if let Some(body) = &card.body {
+        parts.push(body.to_string());
+    }
+    for field in &card.fields {
+        parts.push(
+            field
+                .title
+                .as_deref()
+                .map(|title| format!("{title}: {}", field.value))
+                .unwrap_or_else(|| field.value.to_string()),
+        );
+    }
+    if let Some(footer) = &card.footer {
+        parts.push(footer.to_string());
+    }
+    parts.join("\n")
+}
+
 fn link_preview_card_lines(
     link: &chat_core::LinkPreview,
     accent: Style,
@@ -1299,20 +1888,26 @@ fn link_preview_card_lines(
     start_line: usize,
     is_from_me: bool,
 ) -> Vec<Line<'static>> {
+    if context.presentation == ConversationPresentation::Flat {
+        return flat_link_preview_card_lines(link, accent, context, start_line);
+    }
+
     let card_width = link_preview_card_width(context.content_width);
     let accent = media_card_accent(accent);
     let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
 
     if let Some(image) = &link.image {
-        let (preview_rows, source, error) = media_preview_rows(
+        let (preview_rows, source, error, ready) = media_preview_rows(
             image,
-            context.media_cache,
+            context,
             card_width,
             LINK_PREVIEW_THUMBNAIL_ROWS,
             accent.fg.unwrap_or(Color::DarkGray),
         );
 
-        if let (Some(path), None) = (&source, &error) {
+        if let (Some(path), None) = (&source, &error)
+            && ready
+        {
             let hit_width = card_width.saturating_add(4).min(context.content_width);
             let start_col = if is_from_me {
                 context.content_width.saturating_sub(hit_width)
@@ -1368,6 +1963,74 @@ fn link_preview_card_lines(
     lines
 }
 
+fn flat_link_preview_card_lines(
+    link: &chat_core::LinkPreview,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+) -> Vec<Line<'static>> {
+    let card_width = link_preview_card_width(context.content_width);
+    let accent = media_card_accent(accent);
+    let mut lines = Vec::new();
+
+    if let Some(image) = &link.image {
+        let (preview_rows, source, error, ready) = media_preview_rows(
+            image,
+            context,
+            card_width,
+            LINK_PREVIEW_THUMBNAIL_ROWS,
+            accent.fg.unwrap_or(Color::DarkGray),
+        );
+
+        if let (Some(path), None) = (&source, &error)
+            && ready
+        {
+            context.media_hits.push(MediaHit {
+                start_line: start_line + lines.len(),
+                end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
+                start_col: 0,
+                end_col: card_width,
+                path: path.clone(),
+                title: link
+                    .title
+                    .as_deref()
+                    .unwrap_or("Link preview image")
+                    .to_owned(),
+                caption: link.description.as_deref().map(str::to_owned),
+            });
+        }
+
+        lines.extend(
+            preview_rows
+                .into_iter()
+                .map(|row| flat_card_preview_line(accent, row)),
+        );
+    }
+
+    let title = link.title.as_deref().unwrap_or("Link");
+    let source = link_preview_source_label(link.url.as_ref());
+
+    lines.push(flat_card_text_line(
+        accent,
+        title,
+        card_width,
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if let Some(description) = link.description.as_deref() {
+        let description = sanitize_flat_provider_text(description);
+        for row in wrap_markdown_text(&description, card_width as usize) {
+            lines.push(flat_card_spans_line(accent, row));
+        }
+    }
+    lines.push(flat_card_text_line(
+        accent,
+        &source,
+        card_width,
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines
+}
+
 fn link_preview_source_label(url: &str) -> String {
     let without_scheme = url
         .strip_prefix("https://")
@@ -1397,14 +2060,14 @@ fn link_image_card_lines(
     let card_width =
         media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
     let accent = media_card_accent(accent);
-    let (preview_rows, source, error) = media_preview_rows(
+    let (preview_rows, source, error, ready) = media_preview_rows(
         media,
-        context.media_cache,
+        context,
         card_width,
         MEDIA_PREVIEW_ROWS,
         accent.fg.unwrap_or(Color::DarkGray),
     );
-    let path = source.filter(|_| error.is_none())?;
+    let path = source.filter(|_| error.is_none() && ready)?;
     let mut lines = vec![
         card_border_line('╭', '─', '╮', card_width, accent),
         card_text_line(
@@ -1462,12 +2125,16 @@ fn media_card_lines(
     start_line: usize,
     is_from_me: bool,
 ) -> Vec<Line<'static>> {
+    if context.presentation == ConversationPresentation::Flat {
+        return flat_media_card_lines(label, media, accent, context, start_line);
+    }
+
     let card_width =
         media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
     let accent = media_card_accent(accent);
-    let (preview_rows, source, error) = media_preview_rows(
+    let (preview_rows, source, error, ready) = media_preview_rows(
         media,
-        context.media_cache,
+        context,
         card_width,
         MEDIA_PREVIEW_ROWS,
         accent.fg.unwrap_or(Color::DarkGray),
@@ -1482,7 +2149,9 @@ fn media_card_lines(
         ),
     ];
 
-    if let (Some(path), None) = (&source, &error) {
+    if let (Some(path), None) = (&source, &error)
+        && ready
+    {
         let hit_width = card_width.saturating_add(4).min(context.content_width);
         let start_col = if is_from_me {
             context.content_width.saturating_sub(hit_width)
@@ -1539,18 +2208,93 @@ fn media_card_lines(
     lines
 }
 
+fn flat_media_card_lines(
+    label: &str,
+    media: &chat_core::Media,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+) -> Vec<Line<'static>> {
+    let card_width =
+        media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
+    let accent = media_card_accent(accent);
+    let (preview_rows, source, error, ready) = media_preview_rows(
+        media,
+        context,
+        card_width,
+        MEDIA_PREVIEW_ROWS,
+        accent.fg.unwrap_or(Color::DarkGray),
+    );
+    let mut lines = vec![flat_card_text_line(
+        accent,
+        &format!("{label}: {}{}", media.file_name, format_media_size(media)),
+        card_width,
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+
+    if let (Some(path), None) = (&source, &error)
+        && ready
+    {
+        context.media_hits.push(MediaHit {
+            start_line: start_line + lines.len(),
+            end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
+            start_col: 0,
+            end_col: card_width,
+            path: path.clone(),
+            title: media.file_name.to_string(),
+            caption: media.caption.as_deref().map(str::to_owned),
+        });
+    }
+
+    lines.extend(
+        preview_rows
+            .into_iter()
+            .map(|row| flat_card_preview_line(accent, row)),
+    );
+
+    if error.is_some() || source.is_none() {
+        lines.push(flat_card_text_line(
+            accent,
+            "Preview unavailable",
+            card_width,
+            Style::default().fg(if error.is_some() {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
+        ));
+    }
+
+    if let Some(caption) = &media.caption {
+        lines.push(flat_card_text_line(
+            accent,
+            caption,
+            card_width,
+            Style::default(),
+        ));
+    }
+
+    lines
+}
+
 fn media_preview_rows(
     media: &chat_core::Media,
-    media_cache: &mut MediaPreviewCache,
+    context: &mut MessageRenderContext<'_>,
     width: u16,
     rows: u16,
     accent: Color,
-) -> (Vec<Vec<Span<'static>>>, Option<PathBuf>, Option<String>) {
+) -> (
+    Vec<Vec<Span<'static>>>,
+    Option<PathBuf>,
+    Option<String>,
+    bool,
+) {
     let Some(source) = media_preview_source(media) else {
         return (
             fallback_preview_rows(width, rows, accent, "no local image"),
             None,
             None,
+            false,
         );
     };
 
@@ -1559,19 +2303,26 @@ fn media_preview_rows(
         width,
         rows,
     };
-    let decode_path = source.clone();
-    let cached = media_cache
-        .previews
-        .entry(key)
-        .or_insert_with(|| decode_image_preview_rows(&decode_path, width, rows));
 
-    match cached {
-        Ok(rows) => (rows.clone(), Some(source), None),
-        Err(error) => (
+    match context.media_cache.get(&key) {
+        Some(Ok(rows)) => (rows.clone(), Some(source), None, true),
+        Some(Err(error)) => (
             fallback_preview_rows(width, rows, accent, "image decode failed"),
             Some(source),
             Some(error.clone()),
+            true,
         ),
+        None => {
+            context
+                .media_preview_requests
+                .push(MediaPreviewRequest { key });
+            (
+                fallback_preview_rows(width, rows, accent, "loading image"),
+                Some(source),
+                None,
+                false,
+            )
+        }
     }
 }
 
@@ -1705,6 +2456,57 @@ fn pad_preview_row(
     padded
 }
 
+fn flat_card_preview_line(_accent: Style, preview: Vec<Span<'static>>) -> Line<'static> {
+    Line::from(preview)
+}
+
+fn flat_card_text_line(_accent: Style, text: &str, width: u16, style: Style) -> Line<'static> {
+    Line::from(Span::styled(
+        fit_cell_text(&sanitize_flat_provider_text(text), width),
+        style,
+    ))
+}
+
+fn flat_card_spans_line(_accent: Style, spans: Vec<Span<'static>>) -> Line<'static> {
+    Line::from(sanitize_flat_provider_spans(spans))
+}
+
+fn sanitize_flat_provider_spans(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let text = spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    if should_collapse_flat_provider_line(&text) {
+        vec![Span::raw(sanitize_flat_provider_text(&text))]
+    } else {
+        spans
+    }
+}
+
+fn sanitize_flat_provider_text(text: &str) -> String {
+    text.replace('\u{00a0}', " ")
+        .replace('\u{200b}', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn should_collapse_flat_provider_line(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let whitespace = trimmed
+        .chars()
+        .filter(|character| character.is_whitespace())
+        .count();
+    let non_whitespace = trimmed
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .count();
+    whitespace > non_whitespace.saturating_mul(2)
+}
+
 fn card_preview_line(accent: Style, preview: Vec<Span<'static>>, width: u16) -> Line<'static> {
     let content_width = preview
         .iter()
@@ -1726,6 +2528,18 @@ fn card_text_line(accent: Style, text: &str, width: u16, style: Style) -> Line<'
         Span::styled(fit_cell_text(text, width), style),
         Span::styled(" │", accent),
     ])
+}
+
+fn card_spans_line(accent: Style, spans: Vec<Span<'static>>, width: u16) -> Line<'static> {
+    let content_width = spans_width(&spans);
+    let mut line_spans = Vec::with_capacity(spans.len() + 3);
+    line_spans.push(Span::styled("│ ", accent));
+    line_spans.extend(spans);
+    line_spans.push(Span::raw(
+        " ".repeat((width as usize).saturating_sub(content_width)),
+    ));
+    line_spans.push(Span::styled(" │", accent));
+    Line::from(line_spans)
 }
 
 fn card_border_line(
@@ -1755,7 +2569,7 @@ fn media_card_width(content_width: u16) -> u16 {
 fn media_card_width_for_media(
     media: &chat_core::Media,
     content_width: u16,
-    rows: u16,
+    _rows: u16,
     label: &str,
 ) -> u16 {
     let max_width = media_card_width(content_width);
@@ -1771,10 +2585,11 @@ fn media_card_width_for_media(
         .max(file_line_width)
         .max(caption_line_width)
         .max(1) as u16;
-    media_preview_source(media)
-        .and_then(|path| image_cell_size(&path, max_width, rows).ok())
-        .map(|(width, _)| width.max(min_width).min(max_width))
-        .unwrap_or(max_width)
+
+    // Keep message drawing non-blocking: do not inspect image files here.
+    // Preview decoding/resizing runs through queued MediaPreviewRequest jobs;
+    // synchronous dimension reads in this width helper can still stall the draw path.
+    min_width.min(max_width).max(1)
 }
 
 fn link_preview_card_width(content_width: u16) -> u16 {
@@ -2040,6 +2855,29 @@ fn fit_spans(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
     fitted
 }
 
+fn split_by_display_width(text: &str, width: usize) -> (String, String) {
+    if width == 0 {
+        return (String::new(), text.to_owned());
+    }
+
+    let mut selected = String::new();
+    let mut used = 0usize;
+    for (offset, character) in text.char_indices() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used.saturating_add(character_width) > width {
+            return (selected, text[offset..].to_owned());
+        }
+        selected.push(character);
+        used += character_width;
+        if used >= width {
+            let rest_offset = offset + character.len_utf8();
+            return (selected, text[rest_offset..].to_owned());
+        }
+    }
+
+    (selected, String::new())
+}
+
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut wrapped = Vec::new();
@@ -2151,6 +2989,15 @@ fn reaction_pill_line(message: &Message, _theme: Theme) -> Line<'static> {
     if !message.is_from_me {
         spans.push(Span::raw("  "));
     }
+    spans.extend(reaction_pill_spans(message));
+    if message.is_from_me {
+        spans.push(Span::raw("  "));
+    }
+    Line::from(spans)
+}
+
+fn reaction_pill_spans(message: &Message) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
     for (index, reaction) in message.reactions.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
@@ -2161,10 +3008,7 @@ fn reaction_pill_line(message: &Message, _theme: Theme) -> Line<'static> {
             reaction.senders.len()
         )));
     }
-    if message.is_from_me {
-        spans.push(Span::raw("  "));
-    }
-    Line::from(spans)
+    spans
 }
 
 pub fn reaction_display_emoji(value: &str) -> String {
@@ -2323,38 +3167,45 @@ fn is_slack_thread_reply(message: &Message) -> bool {
     })
 }
 
-fn thread_summary_line(summary: &ThreadSummary, is_from_me: bool, theme: Theme) -> Line<'static> {
+fn thread_summary_line(
+    summary: &ThreadSummary,
+    is_from_me: bool,
+    context: &mut MessageRenderContext<'_>,
+) -> Line<'static> {
     let mut spans = Vec::new();
     if !is_from_me {
         spans.push(Span::raw("  "));
     }
 
-    for participant in summary.participants.iter().take(5) {
-        spans.push(Span::styled(
-            format!("[{}]", avatar_label(participant).trim()),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" "));
-    }
-
-    spans.push(Span::styled(
-        reply_count_text(summary.reply_count),
-        theme.status_key().add_modifier(Modifier::BOLD),
-    ));
-    spans.push(Span::styled(
-        format!(
-            "  Last reply {}",
-            relative_reply_time(summary.last_reply_at)
-        ),
-        theme.muted(),
-    ));
+    spans.extend(thread_summary_spans(summary, context));
 
     if is_from_me {
         spans.push(Span::raw("  "));
     }
     Line::from(spans)
+}
+
+fn thread_summary_spans(
+    summary: &ThreadSummary,
+    context: &mut MessageRenderContext<'_>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for participant in summary.participants.iter().take(5) {
+        spans.extend(compact_reply_avatar_spans(participant, context));
+    }
+
+    spans.push(Span::styled(
+        reply_count_text(summary.reply_count),
+        context.theme.status_key().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!(
+            " · Last reply {}",
+            relative_reply_time(summary.last_reply_at)
+        ),
+        context.theme.muted(),
+    ));
+    spans
 }
 
 fn reply_count_text(count: usize) -> String {
@@ -2388,7 +3239,7 @@ fn thread_summaries(messages: &[Message]) -> HashMap<MessageId, ThreadSummary> {
     let mut summaries: HashMap<MessageId, ThreadSummary> = HashMap::new();
 
     for reply in messages {
-        let Some(root_id) = reply.reply_to.as_ref().or_else(|| reply.thread_id.as_ref()) else {
+        let Some(root_id) = reply.reply_to.as_ref().or(reply.thread_id.as_ref()) else {
             continue;
         };
         if root_id.as_ref() == reply.id.as_ref() || !message_ids.contains(root_id) {
@@ -2439,23 +3290,34 @@ fn receipt_summary(message: &Message) -> String {
 
 fn message_avatar_spans(
     sender: &Sender,
-    media_cache: &mut MediaPreviewCache,
+    context: &mut MessageRenderContext<'_>,
 ) -> Vec<Span<'static>> {
     sender
         .avatar
         .as_deref()
         .filter(|path| path.exists())
         .and_then(|path| {
-            cached_image_preview_rows(path, media_cache, MESSAGE_AVATAR_WIDTH, MESSAGE_AVATAR_ROWS)
-                .ok()
-                .and_then(|rows| rows.into_iter().next())
+            let key = MediaPreviewKey {
+                path: path.to_path_buf(),
+                width: MESSAGE_AVATAR_WIDTH,
+                rows: MESSAGE_AVATAR_ROWS,
+            };
+            match context.media_cache.get(&key) {
+                Some(Ok(rows)) => rows.iter().next().cloned(),
+                Some(Err(_)) => None,
+                None => {
+                    context
+                        .media_preview_requests
+                        .push(MediaPreviewRequest { key });
+                    None
+                }
+            }
         })
-        .unwrap_or_else(|| {
-            vec![Span::styled(
-                avatar_label(sender),
-                Style::default().fg(Color::Cyan),
-            )]
-        })
+        .unwrap_or_else(|| vec![Span::styled(avatar_label(sender), compact_avatar_style())])
+}
+
+fn compact_avatar_style() -> Style {
+    Style::default().fg(Color::Cyan)
 }
 
 fn avatar_label(sender: &Sender) -> String {
@@ -2472,6 +3334,15 @@ fn avatar_label(sender: &Sender) -> String {
     } else {
         format!("{initials:<2}")
     }
+}
+
+fn compact_reply_avatar_spans(
+    sender: &Sender,
+    context: &mut MessageRenderContext<'_>,
+) -> Vec<Span<'static>> {
+    let mut spans = message_avatar_spans(sender, context);
+    spans.push(Span::raw(" "));
+    spans
 }
 
 fn compact_message_preview(message: &Message) -> String {
@@ -2500,6 +3371,7 @@ fn content_preview_text(content: &Content) -> String {
             let title = link.title.as_deref().unwrap_or("Link");
             format!("{title}: {}", link.url)
         }
+        Content::Cards(cards) => card_collection_text(cards),
         Content::Poll(poll) => format!("Poll: {}", poll.question),
         Content::Deleted => String::new(),
         Content::Unsupported(kind) => format!("Unsupported message: {kind}"),
@@ -2528,22 +3400,61 @@ fn short_id(id: &str) -> String {
 fn message_lines_len(
     message: &Message,
     grouped: bool,
+    has_previous_message: bool,
     content_width: u16,
     link_metadata: &LinkMetadataCache,
     thread_summary: Option<&ThreadSummary>,
     presentation: ConversationPresentation,
 ) -> usize {
+    if presentation == ConversationPresentation::Flat {
+        return slack_message_lines_len(
+            message,
+            grouped,
+            has_previous_message,
+            content_width,
+            link_metadata,
+            thread_summary,
+        );
+    }
+
     usize::from(!grouped)
-        + usize::from(grouped && presentation == ConversationPresentation::Flat)
         + usize::from(message.reply_to.is_some())
         + content_lines_len(&message.content, content_width, link_metadata, presentation)
-        + usize::from(
-            presentation == ConversationPresentation::Bubbles
-                && (message.is_from_me || !receipt_summary(message).is_empty()),
-        )
+        + usize::from(message.is_from_me || !receipt_summary(message).is_empty())
         + usize::from(!message.reactions.is_empty())
         + usize::from(thread_summary.is_some())
         + 1
+}
+
+fn slack_message_lines_len(
+    message: &Message,
+    grouped: bool,
+    has_previous_message: bool,
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+    thread_summary: Option<&ThreadSummary>,
+) -> usize {
+    let body_width = slack_body_width(content_width);
+    let content_count = content_lines_len(
+        &message.content,
+        body_width as u16,
+        link_metadata,
+        ConversationPresentation::Flat,
+    )
+    .max(1);
+    let merged_content_line = usize::from(
+        !grouped
+            && message.reply_to.is_none()
+            && slack_content_can_merge(&message.content)
+            && content_count > 0,
+    );
+
+    slack_message_spacer_lines(grouped, has_previous_message)
+        + usize::from(!grouped)
+        + usize::from(message.reply_to.is_some())
+        + content_count.saturating_sub(merged_content_line)
+        + usize::from(!message.reactions.is_empty())
+        + usize::from(thread_summary.is_some())
 }
 
 fn content_lines_len(
@@ -2564,8 +3475,9 @@ fn content_lines_len(
         | Content::Video(media)
         | Content::Audio(media)
         | Content::File(media)
-        | Content::Sticker(media) => media_card_line_count(media),
-        Content::LinkPreview(link) => link_preview_card_line_count(link),
+        | Content::Sticker(media) => media_card_line_count(media, presentation),
+        Content::LinkPreview(link) => link_preview_card_line_count(link, presentation),
+        Content::Cards(cards) => card_collection_line_count(cards, content_width, presentation),
         Content::Unsupported(kind) => text_content_line_count(
             &format!("[unsupported: {kind}]"),
             content_width,
@@ -2613,26 +3525,115 @@ fn text_with_link_preview_line_count(
     };
 
     if let Some(image) = &metadata.image {
-        text_lines + media_card_line_count(image)
+        text_lines + media_card_line_count(image, presentation)
     } else {
-        text_lines + link_preview_card_line_count_for_image(false, metadata.description.is_some())
+        text_lines
+            + link_preview_card_line_count_for_image(
+                false,
+                metadata.description.is_some(),
+                presentation,
+            )
     }
 }
 
-fn media_card_line_count(media: &chat_core::Media) -> usize {
-    4 + MEDIA_PREVIEW_ROWS as usize + usize::from(media.caption.is_some())
+fn media_card_line_count(
+    media: &chat_core::Media,
+    presentation: ConversationPresentation,
+) -> usize {
+    match presentation {
+        ConversationPresentation::Bubbles => {
+            4 + MEDIA_PREVIEW_ROWS as usize + usize::from(media.caption.is_some())
+        }
+        ConversationPresentation::Flat => {
+            1 + MEDIA_PREVIEW_ROWS as usize + 1 + usize::from(media.caption.is_some())
+        }
+    }
 }
 
-fn link_preview_card_line_count(link: &chat_core::LinkPreview) -> usize {
-    link_preview_card_line_count_for_image(link.image.is_some(), link.description.is_some())
+fn card_collection_line_count(
+    cards: &[chat_core::Card],
+    content_width: u16,
+    presentation: ConversationPresentation,
+) -> usize {
+    cards
+        .iter()
+        .map(|card| generic_card_line_count(card, content_width, presentation))
+        .sum()
 }
 
-fn link_preview_card_line_count_for_image(has_image: bool, has_description: bool) -> usize {
-    4 + usize::from(has_description) + usize::from(has_image) * LINK_PREVIEW_THUMBNAIL_ROWS as usize
+fn generic_card_line_count(
+    card: &chat_core::Card,
+    content_width: u16,
+    presentation: ConversationPresentation,
+) -> usize {
+    let card_width = match presentation {
+        ConversationPresentation::Bubbles => link_preview_card_width(content_width) as usize,
+        ConversationPresentation::Flat => flat_text_width(content_width),
+    };
+    let body_lines = card
+        .body
+        .as_deref()
+        .map(|body| wrap_text(&sanitize_flat_provider_text(body), card_width).len())
+        .unwrap_or(0);
+    let content_lines = usize::from(card.image.is_some() || card.thumbnail.is_some())
+        * LINK_PREVIEW_THUMBNAIL_ROWS as usize
+        + usize::from(card.subtitle.is_some())
+        + usize::from(card.title.is_some())
+        + body_lines
+        + card.fields.len()
+        + usize::from(card.footer.is_some())
+        + usize::from(card.url.is_some())
+        + usize::from(
+            card.title.is_none()
+                && card.subtitle.is_none()
+                && card.body.is_none()
+                && card.footer.is_none()
+                && card.url.is_none()
+                && card.fields.is_empty(),
+        );
+
+    match presentation {
+        ConversationPresentation::Bubbles => content_lines + 2,
+        ConversationPresentation::Flat => content_lines,
+    }
+}
+
+fn link_preview_card_line_count(
+    link: &chat_core::LinkPreview,
+    presentation: ConversationPresentation,
+) -> usize {
+    link_preview_card_line_count_for_image(
+        link.image.is_some(),
+        link.description.is_some(),
+        presentation,
+    )
+}
+
+fn link_preview_card_line_count_for_image(
+    has_image: bool,
+    has_description: bool,
+    presentation: ConversationPresentation,
+) -> usize {
+    match presentation {
+        ConversationPresentation::Bubbles => {
+            4 + usize::from(has_description)
+                + usize::from(has_image) * LINK_PREVIEW_THUMBNAIL_ROWS as usize
+        }
+        ConversationPresentation::Flat => {
+            2 + usize::from(has_description)
+                + usize::from(has_image) * LINK_PREVIEW_THUMBNAIL_ROWS as usize
+        }
+    }
 }
 
 fn flat_text_width(content_width: u16) -> usize {
-    (content_width as usize).saturating_sub(4).max(1)
+    (content_width as usize).max(1)
+}
+
+fn slack_body_width(content_width: u16) -> usize {
+    (content_width as usize)
+        .saturating_sub(SLACK_BODY_INDENT_WIDTH)
+        .max(1)
 }
 
 fn render_scrollbar(
@@ -2669,7 +3670,7 @@ fn inner_area(area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chat_core::PlatformData;
+    use chat_core::{Card, CardColor, CardField, CardKind, CardSource, PlatformData};
     use chrono::{TimeZone, Utc};
     use ratatui::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
@@ -2807,6 +3808,62 @@ mod tests {
             rendered_line_containing(&outgoing_render.lines, "Outgoing selected");
         assert!(outgoing_selected.ends_with(" ▕"));
         assert!(!outgoing_selected.starts_with("▏ "));
+    }
+
+    #[test]
+    fn flat_selection_uses_timestamp_column_block_without_shifting_content() {
+        let account = Arc::<str>::from("slack:workspace");
+        let chat_id = Arc::<str>::from("slack:channel:general");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let message = text_message(
+            "selected-flat",
+            &chat_id,
+            &account,
+            sender,
+            "Selected flat message",
+            9,
+            30,
+            false,
+        );
+
+        let mut cache = MediaPreviewCache::default();
+        let unselected_render = build_message_lines_with_presentation(
+            std::slice::from_ref(&message),
+            80,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+            ConversationPresentation::Flat,
+        );
+        let mut cache = MediaPreviewCache::default();
+        let selected_render = build_message_lines_with_presentation(
+            &[message],
+            80,
+            0,
+            40,
+            Some("selected-flat"),
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+            ConversationPresentation::Flat,
+        );
+        let unselected =
+            rendered_line_containing(&unselected_render.lines, "Selected flat message");
+        let selected = rendered_line_containing(&selected_render.lines, "Selected flat message");
+
+        assert_eq!(selected, unselected);
+        assert!(!selected.starts_with("▏ "));
+        assert!(!selected.ends_with(" ▕"));
+        assert_eq!(selected.find("Alice"), unselected.find("Alice"));
     }
 
     #[test]
@@ -3167,6 +4224,24 @@ mod tests {
         );
 
         let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            std::slice::from_ref(&message),
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &metadata,
+            Theme::default(),
+        );
+        let request = render
+            .media_preview_requests
+            .first()
+            .expect("image preview should be queued")
+            .clone();
+        let decoded = decode_image_preview_rows_for_key(&request.key);
+        cache.insert(request.key, decoded);
         let render = build_message_lines(
             &[message],
             120,
@@ -3607,8 +4682,11 @@ mod tests {
         let rendered = rendered_lines(&render.lines).join("\n");
 
         assert!(rendered.contains("😆2"));
-        assert!(rendered.contains("[AG]"));
-        assert!(rendered.contains("[V]"));
+        assert!(rendered.contains("AG"));
+        assert!(rendered.contains("V "));
+        assert!(!rendered.contains("A "));
+        assert!(!rendered.contains("[AG]"));
+        assert!(!rendered.contains("[V]"));
         assert!(rendered.contains("2 replies"));
         assert!(rendered.contains("Last reply"));
         let root_hit = render
@@ -3725,16 +4803,27 @@ mod tests {
             ConversationPresentation::Flat,
         );
         let rendered_lines = rendered_lines(&render.lines);
+        let incoming_line = rendered_lines
+            .iter()
+            .find(|line| line.contains("Incoming flat message"))
+            .expect("incoming Slack-style row");
 
-        assert!(
-            rendered_lines
-                .iter()
-                .any(|line| line.contains("Incoming flat message"))
+        let expected_time = format_message_time(
+            Utc.with_ymd_and_hms(2026, 6, 5, 9, 30, 0)
+                .single()
+                .expect("valid timestamp"),
         );
+        assert!(incoming_line.starts_with(&expected_time));
+        assert!(incoming_line.contains("Alice Incoming flat message"));
         assert!(
             rendered_lines
                 .iter()
                 .any(|line| line.contains("Outgoing flat message"))
+        );
+        assert_eq!(render.total_lines, 3);
+        assert!(
+            rendered_lines.iter().any(|line| line.trim().is_empty()),
+            "separate sender groups should have a spacer row: {rendered_lines:?}"
         );
         assert!(
             rendered_lines
@@ -3750,6 +4839,297 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_cards_render_flat_attachment_without_extra_indent_bar() {
+        let card = Card {
+            kind: CardKind::ProviderAttachment,
+            source: CardSource::Slack,
+            title: Some(arc_str("Partition maintenance successful")),
+            subtitle: None,
+            body: Some(arc_str("Script: partition-maintenance")),
+            footer: Some(arc_str("deploy")),
+            url: None,
+            accent_color: Some(CardColor::Named(arc_str("good"))),
+            thumbnail: None,
+            image: None,
+            fields: vec![CardField {
+                title: Some(arc_str("Status")),
+                value: arc_str("successful"),
+                short: true,
+            }],
+            actions: Vec::new(),
+        };
+        let mut cache = MediaPreviewCache::default();
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = MessageRenderContext {
+            content_width: 90,
+            media_cache: &mut cache,
+            media_hits: &mut media_hits,
+            link_metadata: &link_metadata,
+            link_preview_requests: &mut link_preview_requests,
+            media_preview_requests: &mut media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation: ConversationPresentation::Flat,
+            reply_previews: &reply_previews,
+            thread_summaries: &thread_summaries,
+        };
+
+        let lines = card_collection_lines(&[card], Style::default(), &mut context, 0, false);
+        let rendered = rendered_lines(&lines).join("\n");
+
+        assert!(rendered.contains("Partition maintenance successful"));
+        assert!(rendered.contains("Script:"));
+        assert!(rendered.contains("partition-maintenance"));
+        assert!(rendered.contains("Status: successful"));
+        assert!(rendered.contains("deploy"));
+        assert!(!rendered.contains('│'));
+        assert!(!rendered.contains('╭'));
+        assert!(!rendered.contains('╰'));
+    }
+
+    #[test]
+    fn flat_provider_card_artifact_text_is_sanitized() {
+        let card = Card {
+            kind: CardKind::ProviderAttachment,
+            source: CardSource::Slack,
+            title: Some(arc_str("Critical priority issue is active")),
+            subtitle: None,
+            body: Some(arc_str("t        ,        h        e        .")),
+            footer: None,
+            url: None,
+            accent_color: Some(CardColor::Named(arc_str("danger"))),
+            thumbnail: None,
+            image: None,
+            fields: Vec::new(),
+            actions: Vec::new(),
+        };
+        let mut cache = MediaPreviewCache::default();
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = MessageRenderContext {
+            content_width: 90,
+            media_cache: &mut cache,
+            media_hits: &mut media_hits,
+            link_metadata: &link_metadata,
+            link_preview_requests: &mut link_preview_requests,
+            media_preview_requests: &mut media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation: ConversationPresentation::Flat,
+            reply_previews: &reply_previews,
+            thread_summaries: &thread_summaries,
+        };
+
+        let lines = card_collection_lines(&[card], Style::default(), &mut context, 0, false);
+        let rendered = rendered_lines(&lines).join("\n");
+
+        assert!(!rendered.contains("t        ,        h        e"));
+        assert!(rendered.contains("t , h e ."));
+    }
+
+    #[test]
+    fn provider_cards_render_bubble_card_in_bubble_presentation() {
+        let card = Card {
+            kind: CardKind::ProviderAttachment,
+            source: CardSource::Slack,
+            title: Some(arc_str("Partition maintenance successful")),
+            subtitle: None,
+            body: Some(arc_str("Script: partition-maintenance")),
+            footer: None,
+            url: None,
+            accent_color: Some(CardColor::Named(arc_str("good"))),
+            thumbnail: None,
+            image: None,
+            fields: Vec::new(),
+            actions: Vec::new(),
+        };
+        let mut cache = MediaPreviewCache::default();
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = MessageRenderContext {
+            content_width: 90,
+            media_cache: &mut cache,
+            media_hits: &mut media_hits,
+            link_metadata: &link_metadata,
+            link_preview_requests: &mut link_preview_requests,
+            media_preview_requests: &mut media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation: ConversationPresentation::Bubbles,
+            reply_previews: &reply_previews,
+            thread_summaries: &thread_summaries,
+        };
+
+        let lines = card_collection_lines(&[card], Style::default(), &mut context, 0, false);
+        let rendered = rendered_lines(&lines).join("\n");
+
+        assert!(rendered.contains("Partition maintenance successful"));
+        assert!(rendered.contains("Script: partition-maintenance"));
+        assert!(rendered.contains('╭'));
+        assert!(rendered.contains('╰'));
+    }
+
+    #[test]
+    fn flat_presentation_puts_grouped_timestamps_on_content_row_left_aligned() {
+        let account = Arc::<str>::from("slack:workspace");
+        let chat_id = Arc::<str>::from("slack:channel:general");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let messages = vec![
+            text_message(
+                "first-flat",
+                &chat_id,
+                &account,
+                sender.clone(),
+                "First flat message",
+                9,
+                30,
+                false,
+            ),
+            text_message(
+                "second-flat",
+                &chat_id,
+                &account,
+                sender,
+                "Second flat message",
+                9,
+                31,
+                false,
+            ),
+        ];
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines_with_presentation(
+            &messages,
+            80,
+            0,
+            80,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+            ConversationPresentation::Flat,
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+        let second_line = rendered_lines
+            .iter()
+            .find(|line| line.contains("Second flat message"))
+            .expect("grouped message content line");
+
+        assert!(second_line.contains("Second flat message"));
+        assert!(second_line.starts_with(&format_message_time(messages[1].timestamp)));
+        assert!(
+            second_line.find(&format_message_time(messages[1].timestamp))
+                < second_line.find("Second flat message"),
+            "timestamp should be at the left of grouped Slack content: {second_line}"
+        );
+        assert_eq!(render.total_lines, 2);
+    }
+
+    #[test]
+    fn flat_presentation_latest_scroll_ends_on_latest_message_without_trailing_gap() {
+        let account = Arc::<str>::from("slack:workspace");
+        let chat_id = Arc::<str>::from("slack:channel:general");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let messages = (0..12)
+            .map(|index| {
+                text_message(
+                    &format!("flat-{index}"),
+                    &chat_id,
+                    &account,
+                    sender.clone(),
+                    &format!("flat message {index}"),
+                    9,
+                    index,
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut cache = MediaPreviewCache::default();
+        let total_lines = message_line_count_with_presentation(
+            &messages,
+            80,
+            &LinkMetadataCache::default(),
+            ConversationPresentation::Flat,
+        );
+        let viewport_rows = 5;
+        let latest_scroll = total_lines.saturating_sub(viewport_rows);
+        let render = build_message_lines_with_presentation(
+            &messages,
+            80,
+            latest_scroll,
+            viewport_rows,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+            ConversationPresentation::Flat,
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+
+        assert_eq!(rendered_lines.len(), viewport_rows);
+        assert!(
+            rendered_lines
+                .last()
+                .is_some_and(|line| line.contains("flat message 11")),
+            "latest flat message should occupy the bottom rendered row: {rendered_lines:?}"
+        );
+        assert!(rendered_lines.iter().any(|line| !line.trim().is_empty()));
+    }
+
+    #[test]
+    fn message_list_bottom_aligns_short_history_at_latest_scroll() {
+        let backend = TestBackend::new(48, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let area = Rect::new(0, 0, 48, 8);
+        let theme = Theme::default();
+
+        terminal
+            .draw(|frame| {
+                render_message_list(
+                    frame,
+                    area,
+                    MessageListProps {
+                        title: "Messages",
+                        lines: vec![Line::from("last slack message")],
+                        total_lines: 20,
+                        scroll: 15,
+                        focused: true,
+                        theme,
+                    },
+                );
+            })
+            .expect("draw");
+
+        let rows = terminal_rows(terminal.backend(), 48);
+        assert!(rows[6].contains("last slack message"));
+        assert!(!rows[1].contains("last slack message"));
+    }
+
     fn reaction_pill_test_line(emoji: &str, count: usize, _theme: Theme) -> Line<'static> {
         Line::from(vec![Span::raw("  "), Span::raw(format!("{emoji}{count}"))])
     }
@@ -3761,6 +5141,15 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>()
+    }
+
+    fn terminal_rows(backend: &TestBackend, width: usize) -> Vec<String> {
+        backend
+            .buffer()
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
     }
 
     fn rendered_lines(lines: &[Line<'static>]) -> Vec<String> {

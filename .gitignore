@@ -2,3 +2,8 @@
 **/target/
 /tmp/
 *~
+
+# Local runtime databases
+*.db
+*.db-shm
+*.db-wal

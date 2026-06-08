@@ -1,5 +1,7 @@
 use crate::{theme::Theme, widgets::message_list};
-use chat_core::{Chat, ChatKind, ChatMembership, Platform};
+use chat_core::{
+    Chat, ChatKind, ChatMembership, DiscoveryAction, DiscoveryResult, DiscoveryResultKind, Platform,
+};
 use chrono::{Local, NaiveDateTime};
 use ratatui::{
     Frame,
@@ -8,7 +10,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use storage::ChatInboxStyle;
 use unicode_width::UnicodeWidthStr;
 
@@ -32,16 +34,38 @@ pub struct ChatListProps<'a> {
     pub selected_chat_index: usize,
     pub filter: &'a str,
     pub filter_mode: bool,
+    pub discovery_results: &'a [DiscoveryResult],
     pub account_filter: &'a str,
     pub inbox_style: ChatInboxStyle,
     pub focused: bool,
+    pub layout: &'a ChatListLayout,
     pub avatar_rows: &'a HashMap<usize, AvatarRows>,
     pub typing_previews: &'a HashMap<usize, String>,
     pub theme: Theme,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChatListLayout {
+    pub rows: Vec<ChatListRow>,
+    pub visible_rows: Vec<ChatListRow>,
+    pub content_height: usize,
+    pub scroll_position: usize,
+}
+
+impl ChatListLayout {
+    pub fn rendered_chat_indices(&self) -> Vec<usize> {
+        self.visible_rows
+            .iter()
+            .filter_map(|row| match row {
+                ChatListRow::Chat { chat_index } => Some(*chat_index),
+                ChatListRow::Section { .. } => None,
+            })
+            .collect()
+    }
+}
+
 pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<'_>) {
-    let rows = build_rows(props.chats, props.visible_chat_indices, props.inbox_style);
+    let rows = &props.layout.visible_rows;
     let inner_width = inner_area(area).width as usize;
     let mut items = rows
         .iter()
@@ -58,10 +82,22 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
         })
         .collect::<Vec<_>>();
     if items.is_empty() {
-        items.push(empty_state_item(props.filter, props.account_filter));
+        if props.filter.is_empty() || props.discovery_results.is_empty() {
+            items.push(empty_state_item(props.filter, props.account_filter));
+        } else {
+            items.extend(
+                props
+                    .discovery_results
+                    .iter()
+                    .map(|result| discovery_item(result, props.theme, inner_width)),
+            );
+        }
     }
     let mut state = ListState::default();
-    state.select(selected_row_position(&rows, props.selected_chat_index));
+    state.select(
+        selected_row_position(rows, props.selected_chat_index)
+            .or_else(|| (!items.is_empty()).then_some(0)),
+    );
 
     let list = List::new(items)
         .block(
@@ -97,6 +133,60 @@ pub fn filter_chat_indices(chats: &[Chat], filter: &str) -> Vec<usize> {
         .collect()
 }
 
+pub fn build_layout(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    list_area: Rect,
+    inbox_style: ChatInboxStyle,
+) -> ChatListLayout {
+    let rows = build_rows(chats, visible_chat_indices, inbox_style);
+    let content_height = rows.iter().map(|row| row_height(row) as usize).sum();
+    let inner = inner_area(list_area);
+    if inner.height == 0 {
+        return ChatListLayout {
+            rows,
+            visible_rows: Vec::new(),
+            content_height,
+            scroll_position: 0,
+        };
+    }
+
+    let selected_row = selected_row_position(&rows, selected_chat_index);
+    let offset = scroll_offset(&rows, selected_row, inner.height as usize);
+    let scroll_position = rows
+        .iter()
+        .take(offset)
+        .map(|row| row_height(row) as usize)
+        .sum();
+    let visible_rows = visible_rows_from_offset(&rows, offset, inner.height as usize);
+
+    ChatListLayout {
+        rows,
+        visible_rows,
+        content_height,
+        scroll_position,
+    }
+}
+
+#[cfg(test)]
+fn visible_rows(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    list_area: Rect,
+    inbox_style: ChatInboxStyle,
+) -> Vec<ChatListRow> {
+    build_layout(
+        chats,
+        visible_chat_indices,
+        selected_chat_index,
+        list_area,
+        inbox_style,
+    )
+    .visible_rows
+}
+
 pub fn build_rows(
     chats: &[Chat],
     visible_chat_indices: &[usize],
@@ -110,25 +200,20 @@ pub fn build_rows(
             .collect();
     }
 
-    let section_titles = section_titles(chats, visible_chat_indices, inbox_style);
-    let mut rows = Vec::with_capacity(visible_chat_indices.len() + section_titles.len());
+    let use_recent_fallback =
+        use_recent_activity_fallback(chats, visible_chat_indices, inbox_style);
+    let ordered_indices = ordered_chat_indices(chats, visible_chat_indices, inbox_style);
+    let mut seen_sections = HashSet::new();
+    let mut rows = Vec::with_capacity(ordered_indices.len() + 8);
 
-    for section in section_titles {
-        let section_chat_indices =
-            section_chat_indices(chats, visible_chat_indices, inbox_style, &section);
-
-        if section_chat_indices.is_empty() {
-            continue;
+    for chat_index in ordered_indices {
+        let section = chat_section(&chats[chat_index], inbox_style, use_recent_fallback);
+        if seen_sections.insert(section.to_owned()) {
+            rows.push(ChatListRow::Section {
+                title: section.to_owned(),
+            });
         }
-
-        rows.push(ChatListRow::Section {
-            title: section.clone(),
-        });
-        rows.extend(
-            section_chat_indices
-                .into_iter()
-                .map(|chat_index| ChatListRow::Chat { chat_index }),
-        );
+        rows.push(ChatListRow::Chat { chat_index });
     }
 
     rows
@@ -174,6 +259,47 @@ fn section_chat_indices(
         .collect()
 }
 
+fn visible_rows_from_offset(
+    rows: &[ChatListRow],
+    offset: usize,
+    list_height: usize,
+) -> Vec<ChatListRow> {
+    if list_height == 0 {
+        return Vec::new();
+    }
+    let mut used_height = 0;
+
+    rows.iter()
+        .skip(offset)
+        .take_while(|row| {
+            if used_height >= list_height {
+                return false;
+            }
+            used_height += row_height(row) as usize;
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+fn first_visible_row_offset(
+    rows: &[ChatListRow],
+    selected_chat_index: usize,
+    list_height: usize,
+) -> usize {
+    let selected_row = selected_row_position(rows, selected_chat_index);
+    scroll_offset(rows, selected_row, list_height)
+}
+
+fn visible_rows_for_rows(
+    rows: &[ChatListRow],
+    selected_chat_index: usize,
+    list_height: usize,
+) -> Vec<ChatListRow> {
+    let offset = first_visible_row_offset(rows, selected_chat_index, list_height);
+    visible_rows_from_offset(rows, offset, list_height)
+}
+
 pub fn row_at(
     chats: &[Chat],
     visible_chat_indices: &[usize],
@@ -189,15 +315,14 @@ pub fn row_at(
     }
 
     let rows = build_rows(chats, visible_chat_indices, inbox_style);
-    let selected_row = selected_row_position(&rows, selected_chat_index);
-    let offset = scroll_offset(&rows, selected_row, inner.height as usize);
+    let offset = first_visible_row_offset(&rows, selected_chat_index, inner.height as usize);
     let relative_row = row.saturating_sub(inner.y);
     let mut y = 0;
 
-    for chat_row in rows.into_iter().skip(offset) {
-        let height = row_height(&chat_row);
+    for chat_row in rows.iter().skip(offset) {
+        let height = row_height(chat_row);
         if relative_row < y + height {
-            return Some(chat_row);
+            return Some(chat_row.clone());
         }
         y += height;
         if y >= inner.height {
@@ -250,19 +375,8 @@ pub fn rendered_chat_indices(
     }
 
     let rows = build_rows(chats, visible_chat_indices, inbox_style);
-    let selected_row = selected_row_position(&rows, selected_chat_index);
-    let offset = scroll_offset(&rows, selected_row, inner.height as usize);
-    let mut used_height = 0;
-
-    rows.into_iter()
-        .skip(offset)
-        .take_while(|row| {
-            if used_height >= inner.height {
-                return false;
-            }
-            used_height += row_height(row);
-            true
-        })
+    visible_rows_for_rows(&rows, selected_chat_index, inner.height as usize)
+        .into_iter()
         .filter_map(|row| match row {
             ChatListRow::Chat { chat_index } => Some(chat_index),
             ChatListRow::Section { .. } => None,
@@ -616,6 +730,87 @@ fn is_shared_space(chat: &Chat) -> bool {
 
 fn is_direct_chat(chat: &Chat) -> bool {
     matches!(chat.kind, ChatKind::Direct) && !chat.is_group
+}
+
+fn discovery_item(result: &DiscoveryResult, theme: Theme, row_width: usize) -> ListItem<'static> {
+    let effective_width = row_width.saturating_sub(CHAT_RIGHT_PADDING);
+    let kind = discovery_kind_label(result);
+    let action = discovery_action_label(result.action);
+    let label_prefix_width = platform_badge(&result.platform).len() + kind.len() + 3;
+    let action_width = UnicodeWidthStr::width(action);
+    let label_budget = effective_width
+        .saturating_sub(label_prefix_width)
+        .saturating_sub(action_width)
+        .saturating_sub(1);
+    let label = truncate_to_width(result.label.as_ref(), label_budget);
+    let used_first_width =
+        label_prefix_width + UnicodeWidthStr::width(label.as_str()) + action_width;
+    let first_gap = effective_width.saturating_sub(used_first_width);
+
+    let subtitle = result
+        .subtitle
+        .as_deref()
+        .map(str::to_owned)
+        .unwrap_or_else(|| discovery_default_subtitle(result).to_owned());
+    let subtitle = truncate_to_width(&subtitle, effective_width.saturating_sub(2));
+
+    ListItem::new(vec![
+        Line::from(vec![
+            Span::styled(
+                platform_badge(&result.platform),
+                platform_style(&result.platform),
+            ),
+            Span::raw(" "),
+            Span::styled(kind, Style::default().fg(theme.accent)),
+            Span::raw(" "),
+            Span::styled(label, Style::default()),
+            Span::raw(" ".repeat(first_gap)),
+            Span::styled(action.to_owned(), Style::default().fg(theme.muted)),
+            Span::raw(" ".repeat(CHAT_RIGHT_PADDING)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(subtitle, Style::default().fg(theme.muted)),
+            Span::raw(" ".repeat(CHAT_RIGHT_PADDING)),
+        ]),
+    ])
+}
+
+fn discovery_kind_label(result: &DiscoveryResult) -> &'static str {
+    match result.kind {
+        DiscoveryResultKind::ExistingChat => "chat",
+        DiscoveryResultKind::Contact => "contact",
+        DiscoveryResultKind::User => "user",
+        DiscoveryResultKind::DirectMessage => "dm",
+        DiscoveryResultKind::PublicChannel => "channel",
+        DiscoveryResultKind::PrivateChannel => "private",
+        DiscoveryResultKind::Group => "group",
+        DiscoveryResultKind::ManualDestination => "manual",
+    }
+}
+
+fn discovery_action_label(action: DiscoveryAction) -> &'static str {
+    match action {
+        DiscoveryAction::Open => "open",
+        DiscoveryAction::CreateChat => "start",
+        DiscoveryAction::OpenDm => "dm",
+        DiscoveryAction::JoinRequired => "join required",
+        DiscoveryAction::Unsupported => "unavailable",
+    }
+}
+
+fn discovery_default_subtitle(result: &DiscoveryResult) -> &'static str {
+    match result.action {
+        DiscoveryAction::JoinRequired => "Discoverable public channel; join before opening",
+        DiscoveryAction::CreateChat => "Not in the chat list yet; open to start a chat",
+        DiscoveryAction::OpenDm => "Open or create a direct message",
+        DiscoveryAction::Unsupported => "This destination cannot be opened yet",
+        DiscoveryAction::Open => match result.membership {
+            ChatMembership::NotJoined => "Not joined",
+            ChatMembership::Joined => "Existing destination",
+            ChatMembership::Unknown => "Destination",
+        },
+    }
 }
 
 fn empty_state_item(filter: &str, account_filter: &str) -> ListItem<'static> {
@@ -1133,6 +1328,42 @@ mod tests {
     }
 
     #[test]
+    fn visible_rows_are_limited_to_viewport_height() {
+        let chats = sample_chats();
+        let visible = [0, 1, 2, 3, 4];
+        let area = Rect::new(0, 0, 40, 6);
+
+        let rows = visible_rows(&chats, &visible, 0, area, ChatInboxStyle::RecentFlat);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Chat { chat_index: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn visible_rows_scroll_to_keep_selected_chat_visible() {
+        let chats = sample_chats();
+        let visible = [0, 1, 2, 3, 4];
+        let area = Rect::new(0, 0, 40, 6);
+
+        let rows = visible_rows(&chats, &visible, 4, area, ChatInboxStyle::RecentFlat);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::Chat { chat_index: 4 },
+            ]
+        );
+    }
+
+    #[test]
     fn rendered_chat_indices_only_returns_rows_that_fit() {
         let chats = sample_chats();
         let area = Rect::new(0, 0, 40, 4);
@@ -1149,7 +1380,12 @@ mod tests {
 
     #[test]
     fn row_at_maps_pointer_position_to_visible_chat() {
-        let chats = sample_chats();
+        let mut chats = sample_chats();
+        let base = Utc::now();
+        for (index, chat) in chats.iter_mut().enumerate() {
+            chat.last_message_at = Some(base - Duration::minutes(index as i64));
+            chat.muted = false;
+        }
         let area = Rect::new(0, 0, 40, 8);
 
         assert_eq!(
@@ -1199,6 +1435,32 @@ mod tests {
                 ChatInboxStyle::ActivityFirst
             ),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn discovery_result_labels_make_destination_actions_clear() {
+        let result = DiscoveryResult {
+            account: arc_str("slack:test"),
+            platform: Platform::Slack,
+            kind: DiscoveryResultKind::PublicChannel,
+            action: DiscoveryAction::JoinRequired,
+            id: arc_str("slack:destination:slack:test:Cnew"),
+            platform_id: arc_str("Cnew"),
+            chat_id: Some(arc_str("Cnew")),
+            label: arc_str("#new-public-channel"),
+            subtitle: None,
+            avatar: None,
+            chat_kind: Some(ChatKind::PublicChannel),
+            membership: ChatMembership::NotJoined,
+            metadata: Default::default(),
+        };
+
+        assert_eq!(discovery_kind_label(&result), "channel");
+        assert_eq!(discovery_action_label(result.action), "join required");
+        assert_eq!(
+            discovery_default_subtitle(&result),
+            "Discoverable public channel; join before opening"
         );
     }
 

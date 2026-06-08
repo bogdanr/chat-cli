@@ -47,6 +47,7 @@ unsafe extern "C" {
         message_id: *const c_char,
         selected_options_json: *const c_char,
     ) -> *mut c_char;
+    fn C_SearchContacts(client_id: u64, query: *const c_char, limit: i32) -> *mut c_char;
     fn C_FireSyntheticMessage(message: *const c_char) -> u8;
     fn C_FreeString(value: *mut c_char);
     fn C_Disconnect(client_id: u64);
@@ -192,6 +193,13 @@ pub fn send_poll_vote(
             selected_options_json.as_ptr(),
         )
     };
+    take_c_string(response)
+}
+
+pub fn search_contacts(handle: ClientHandle, query: &str, limit: usize) -> anyhow::Result<String> {
+    let query = CString::new(query)?;
+    let limit = limit.min(i32::MAX as usize) as i32;
+    let response = unsafe { C_SearchContacts(handle, query.as_ptr(), limit) };
     take_c_string(response)
 }
 

@@ -55,6 +55,12 @@ type bridgeReaction struct {
 	Sender []string `json:"senders"`
 }
 
+type bridgeContact struct {
+	JID        string `json:"jid"`
+	Name       string `json:"name"`
+	AvatarPath string `json:"avatar_path,omitempty"`
+}
+
 type bridgeEvent struct {
 	Type         string `json:"type"`
 	Event        string `json:"event,omitempty"`
@@ -95,6 +101,7 @@ type bridgeEvent struct {
 	PollSelectable        uint32           `json:"poll_selectable_options_count,omitempty"`
 	PollVoteMessageID     string           `json:"poll_vote_message_id,omitempty"`
 	PollVoteOptions       []string         `json:"poll_vote_options,omitempty"`
+	Contacts              []bridgeContact  `json:"contacts,omitempty"`
 }
 
 var (
@@ -597,6 +604,46 @@ func C_SendPollVote(clientID C.uint64_t, chatJID *C.char, senderJID *C.char, mes
 		PollVoteMessageID: targetID,
 		PollVoteOptions:   selectedOptions,
 	})
+}
+
+//export C_SearchContacts
+func C_SearchContacts(clientID C.uint64_t, query *C.char, limit C.int) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "unknown WhatsApp bridge client"})
+	}
+
+	queryText := strings.ToLower(strings.TrimSpace(C.GoString(query)))
+	requested := int(limit)
+	if queryText == "" || requested == 0 {
+		return cJSON(bridgeEvent{Type: "contact_search"})
+	}
+	if requested < 0 || requested > 100 {
+		requested = 100
+	}
+
+	if strings.HasPrefix(c.dbPath, "test:") {
+		contacts := []bridgeContact{
+			{JID: "447700900123@s.whatsapp.net", Name: "Alan Turing"},
+			{JID: "447700900456@s.whatsapp.net", Name: "Katherine Johnson"},
+			{JID: "447700900789@s.whatsapp.net", Name: "Grace Hopper"},
+		}
+		return cJSON(bridgeEvent{Type: "contact_search", Contacts: filterBridgeContacts(contacts, queryText, requested)})
+	}
+	if c.wa == nil || !c.wa.IsConnected() || c.wa.Store == nil || c.wa.Store.Contacts == nil {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	started := time.Now()
+	contacts, err := c.searchContacts(context.Background(), queryText, requested)
+	if err != nil {
+		c.log("search WhatsApp contacts failed query_len=%d limit=%d: %v", len(queryText), requested, err)
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("search WhatsApp contacts: %v", err)})
+	}
+	c.log("searched WhatsApp contacts query_len=%d limit=%d results=%d elapsed_ms=%d", len(queryText), requested, len(contacts), time.Since(started).Milliseconds())
+	return cJSON(bridgeEvent{Type: "contact_search", Contacts: contacts})
 }
 
 //export C_FireSyntheticMessage
@@ -1112,13 +1159,103 @@ func contactDisplayName(c *client, ctx context.Context, jid types.JID) (string, 
 
 func contactDisplayNameForJID(c *client, ctx context.Context, jid types.JID) (string, bool) {
 	if contact, err := c.wa.Store.Contacts.GetContact(ctx, jid); err == nil {
-		for _, name := range []string{contact.FullName, contact.FirstName, contact.BusinessName, contact.PushName} {
-			if name != "" {
-				return name, true
-			}
+		if name := displayNameForContact(contact, jid); name != "" {
+			return name, true
 		}
 	}
 	return "", false
+}
+
+func displayNameForContact(contact types.ContactInfo, jid types.JID) string {
+	for _, name := range []string{contact.FullName, contact.FirstName, contact.BusinessName, contact.PushName} {
+		if strings.TrimSpace(name) != "" {
+			return name
+		}
+	}
+	return jid.User
+}
+
+func (c *client) searchContacts(ctx context.Context, query string, limit int) ([]bridgeContact, error) {
+	if c == nil || c.wa == nil || c.wa.Store == nil || c.wa.Store.Contacts == nil {
+		return nil, fmt.Errorf("contact store unavailable")
+	}
+	storedContacts, err := c.wa.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	jids := make([]types.JID, 0, len(storedContacts))
+	for jid := range storedContacts {
+		if jid.IsEmpty() || jid.Server == types.GroupServer {
+			continue
+		}
+		jids = append(jids, jid)
+	}
+	sort.Slice(jids, func(i, j int) bool {
+		left := strings.ToLower(displayNameForContact(storedContacts[jids[i]], jids[i]))
+		right := strings.ToLower(displayNameForContact(storedContacts[jids[j]], jids[j]))
+		if left == right {
+			return jids[i].String() < jids[j].String()
+		}
+		return left < right
+	})
+
+	results := make([]bridgeContact, 0, limit)
+	seen := make(map[string]struct{})
+	for _, jid := range jids {
+		contact := storedContacts[jid]
+		name := displayNameForContact(contact, jid)
+		canonical := canonicalJID(c, ctx, jid)
+		if !contactMatchesQuery(contact, jid, canonical, name, query) {
+			continue
+		}
+		canonicalText := canonical.String()
+		if _, ok := seen[canonicalText]; ok {
+			continue
+		}
+		seen[canonicalText] = struct{}{}
+		results = append(results, bridgeContact{JID: canonicalText, Name: name})
+		if len(results) >= limit {
+			break
+		}
+	}
+	return results, nil
+}
+
+func contactMatchesQuery(contact types.ContactInfo, jid, canonical types.JID, displayName, query string) bool {
+	if query == "" {
+		return false
+	}
+	candidates := []string{
+		displayName,
+		contact.FullName,
+		contact.FirstName,
+		contact.BusinessName,
+		contact.PushName,
+		contact.RedactedPhone,
+		jid.String(),
+		jid.User,
+		canonical.String(),
+		canonical.User,
+	}
+	for _, candidate := range candidates {
+		if strings.Contains(strings.ToLower(candidate), query) {
+			return true
+		}
+	}
+	return false
+}
+
+func filterBridgeContacts(contacts []bridgeContact, query string, limit int) []bridgeContact {
+	results := make([]bridgeContact, 0, limit)
+	for _, contact := range contacts {
+		if strings.Contains(strings.ToLower(contact.Name), query) || strings.Contains(strings.ToLower(contact.JID), query) {
+			results = append(results, contact)
+			if len(results) >= limit {
+				break
+			}
+		}
+	}
+	return results
 }
 
 func (c *client) fetchAndEmitGroupInfo(ctx context.Context, jid types.JID) {
