@@ -34,11 +34,12 @@ const PROVIDER_ID: &str = "whatsapp:bridge";
 const INBOX_CHAT_ID: &str = "whatsapp:bridge:inbox";
 const BRIDGE_SENDER_ID: &str = "whatsapp:bridge:sender";
 const LOCAL_REACTION_SENDER: &str = "me";
+const EMPTY_MESSAGE_PLACEHOLDER: &str = "[empty WhatsApp message]";
 
 pub struct WhatsAppProvider {
     handle: bridge::ClientHandle,
     id: ProviderId,
-    account: Account,
+    account: Arc<RwLock<Account>>,
     inbox_chat: Arc<RwLock<Chat>>,
     chats: Arc<RwLock<HashMap<ChatId, Chat>>>,
     messages: Arc<RwLock<Vec<Message>>>,
@@ -89,12 +90,12 @@ impl WhatsAppProvider {
             .map(|path| path.to_string_lossy().to_string());
         let handle = bridge::new_client(&options.db_path, &sync_scope, log_path_text.as_deref())?;
         let id = arc_str(PROVIDER_ID);
-        let account = Account {
+        let account = Arc::new(RwLock::new(Account {
             id: id.clone(),
             platform: Platform::WhatsApp,
             display_name: arc_str("WhatsApp"),
             avatar: None,
-        };
+        }));
         let inbox_chat = Chat {
             id: arc_str(INBOX_CHAT_ID),
             account: id.clone(),
@@ -142,7 +143,7 @@ impl WhatsAppProvider {
         }
         *lock_mutex(&self.callback_sender) = Some(sender_box);
 
-        let account_id = self.id.clone();
+        let account = Arc::clone(&self.account);
         let inbox_chat = Arc::clone(&self.inbox_chat);
         let chats = Arc::clone(&self.chats);
         let messages = Arc::clone(&self.messages);
@@ -155,7 +156,7 @@ impl WhatsAppProvider {
         let task = tokio::spawn(async move {
             while let Some(raw_event) = rx.recv().await {
                 let context = BridgeForwardContext {
-                    account_id: &account_id,
+                    account: &account,
                     inbox_chat: &inbox_chat,
                     chats: &chats,
                     messages: &messages,
@@ -311,7 +312,10 @@ impl Provider for WhatsAppProvider {
     }
 
     fn account_info(&self) -> Account {
-        self.account.clone()
+        self.account
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn outbound_capabilities(&self) -> OutboundCapabilities {
@@ -489,6 +493,7 @@ impl Provider for WhatsAppProvider {
             reactions: Vec::new(),
             receipts: Vec::new(),
             is_from_me: true,
+            mentions_me: false,
             platform_data: PlatformData {
                 whatsapp: Some(WhatsAppData {
                     jid: arc_str(chat_jid),
@@ -507,8 +512,7 @@ impl Provider for WhatsAppProvider {
                 avatar: None,
                 is_group: event.is_group,
                 muted: event.muted,
-                timestamp,
-                preview: content_preview(&content),
+                activity: Some((timestamp, content_preview(&content))),
                 increment_unread: false,
             },
         );
@@ -523,7 +527,14 @@ impl Provider for WhatsAppProvider {
         bail!("WhatsApp media download is not wired yet")
     }
 
-    async fn mark_read(&self, _chat_id: &ChatId, _up_to: &MessageId) -> Result<()> {
+    async fn mark_read(&self, chat_id: &ChatId, _up_to: &MessageId) -> Result<()> {
+        // WhatsApp unread is tracked locally by incrementing on inbound
+        // messages; there is no bridge read-receipt call yet. Clear the cached
+        // unread for this chat so later chat snapshots report it as read
+        // instead of re-inflating the count through the sidebar's max() merge.
+        if let Some(chat) = lock_rw_write(&self.chats).get_mut(chat_id) {
+            chat.unread_count = 0;
+        }
         Ok(())
     }
 
@@ -647,7 +658,7 @@ impl Provider for WhatsAppProvider {
         }
         forward_poll_vote_event(
             &BridgeForwardContext {
-                account_id: &self.id,
+                account: &self.account,
                 inbox_chat: &self.inbox_chat,
                 chats: &self.chats,
                 messages: &self.messages,
@@ -804,6 +815,8 @@ struct BridgeEvent {
     #[serde(default)]
     from_me: bool,
     #[serde(default)]
+    mentions_me: bool,
+    #[serde(default)]
     is_group: bool,
     muted: Option<bool>,
     progress: Option<u8>,
@@ -857,6 +870,7 @@ impl BridgeEvent {
                 text: Some(raw_event.to_owned()),
                 timestamp: None,
                 from_me: false,
+                mentions_me: false,
                 is_group: false,
                 muted: None,
                 progress: None,
@@ -892,7 +906,7 @@ impl BridgeEvent {
 }
 
 struct BridgeForwardContext<'a> {
-    account_id: &'a ProviderId,
+    account: &'a Arc<RwLock<Account>>,
     inbox_chat: &'a Arc<RwLock<Chat>>,
     chats: &'a Arc<RwLock<HashMap<ChatId, Chat>>>,
     messages: &'a Arc<RwLock<Vec<Message>>>,
@@ -903,13 +917,29 @@ struct BridgeForwardContext<'a> {
     next_message: &'a AtomicU64,
 }
 
+fn context_account_id(context: &BridgeForwardContext<'_>) -> ProviderId {
+    lock_rw_read(context.account).id.clone()
+}
+
+fn update_whatsapp_account_identity(
+    account: &Arc<RwLock<Account>>,
+    jid: &str,
+    avatar: Option<PathBuf>,
+) {
+    let mut account = lock_rw_write(account);
+    account.display_name = arc_str(format!("WhatsApp ({})", sender_name_from_jid(jid)));
+    if avatar.is_some() {
+        account.avatar = avatar;
+    }
+}
+
 fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
     log_provider_event(context.log_path, raw_event);
     let event = match BridgeEvent::decode(raw_event) {
         Ok(event) => event,
         Err(error) => {
             emit_bridge_status_message(
-                context.account_id,
+                &context_account_id(context),
                 context.inbox_chat,
                 context.messages,
                 context.events,
@@ -929,7 +959,7 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
                         &code,
                     ))));
                 emit_bridge_status_message(
-                    context.account_id,
+                    &context_account_id(context),
                     context.inbox_chat,
                     context.messages,
                     context.events,
@@ -941,7 +971,7 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         "login" => {
             let detail = event.event.unwrap_or_else(|| "waiting".to_owned());
             emit_bridge_status_message(
-                context.account_id,
+                &context_account_id(context),
                 context.inbox_chat,
                 context.messages,
                 context.events,
@@ -952,8 +982,9 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         "connected" => {
             context.events.send(ProviderEvent::AuthSucceeded);
             if let Some(jid) = event.jid {
+                update_whatsapp_account_identity(context.account, &jid, event.avatar_path.clone());
                 emit_bridge_status_message(
-                    context.account_id,
+                    &lock_rw_read(context.account).id,
                     context.inbox_chat,
                     context.messages,
                     context.events,
@@ -981,7 +1012,7 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         }
         "profile" => {
             forward_profile_event(
-                context.account_id,
+                &context_account_id(context),
                 context.chats,
                 context.messages,
                 context.profiles,
@@ -1002,7 +1033,7 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         }
         "error" => {
             emit_bridge_status_message(
-                context.account_id,
+                &context_account_id(context),
                 context.inbox_chat,
                 context.messages,
                 context.events,
@@ -1013,7 +1044,7 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
             );
         }
         _ => emit_bridge_status_message(
-            context.account_id,
+            &context_account_id(context),
             context.inbox_chat,
             context.messages,
             context.events,
@@ -1036,7 +1067,7 @@ fn forward_message_event(
     let text = event
         .text
         .clone()
-        .unwrap_or_else(|| "[empty WhatsApp message]".to_owned());
+        .unwrap_or_else(|| EMPTY_MESSAGE_PLACEHOLDER.to_owned());
     let timestamp = event.timestamp().unwrap_or_else(Utc::now);
     let message_id = arc_str(event.id.clone().unwrap_or_else(|| {
         format!(
@@ -1071,31 +1102,39 @@ fn forward_message_event(
     );
     let preview = content_preview_for_event(&event, &text);
     let content = content_from_event(&event, text);
-    let mut message = Message {
-        id: message_id.clone(),
-        chat_id: chat_id.clone(),
-        account: context.account_id.clone(),
-        sender,
-        timestamp,
-        edited_at: None,
-        content,
-        reply_to: None,
-        thread_id: None,
-        reactions: reactions_from_event(&event),
-        receipts: Vec::new(),
-        is_from_me: event.from_me,
-        platform_data: PlatformData {
-            whatsapp: Some(WhatsAppData {
-                jid: arc_str(chat_jid),
-            }),
-            slack: None,
-            cards: Vec::new(),
-        },
-    };
-    apply_pending_reactions(context.pending_reactions, &mut message);
-    lock_rw_write(context.messages).push(message.clone());
+    let is_placeholder_message = is_empty_message_placeholder(&content);
+    if !is_placeholder_message {
+        let mut message = Message {
+            id: message_id.clone(),
+            chat_id: chat_id.clone(),
+            account: context_account_id(context),
+            sender,
+            timestamp,
+            edited_at: None,
+            content,
+            reply_to: None,
+            thread_id: None,
+            reactions: reactions_from_event(&event),
+            receipts: Vec::new(),
+            is_from_me: event.from_me,
+            mentions_me: event.mentions_me,
+            platform_data: PlatformData {
+                whatsapp: Some(WhatsAppData {
+                    jid: arc_str(chat_jid),
+                }),
+                slack: None,
+                cards: Vec::new(),
+            },
+        };
+        apply_pending_reactions(context.pending_reactions, &mut message);
+        lock_rw_write(context.messages).push(message.clone());
+        context.events.send(ProviderEvent::Message {
+            message,
+            is_historical,
+        });
+    }
     let chat = upsert_chat_preview(
-        context.account_id,
+        &context_account_id(context),
         context.chats,
         ChatPreviewUpdate {
             chat_id,
@@ -1103,9 +1142,8 @@ fn forward_message_event(
             avatar: event.avatar_path.clone(),
             is_group: event.is_group,
             muted: event.muted,
-            timestamp,
-            preview,
-            increment_unread: !event.from_me && !is_historical,
+            activity: (!is_placeholder_message).then_some((timestamp, preview)),
+            increment_unread: !event.from_me && !is_historical && !is_placeholder_message,
         },
     );
     context
@@ -1113,7 +1151,7 @@ fn forward_message_event(
         .send(ProviderEvent::ChatUpdated(chat.clone()));
     if let Some(alt_chat_id) = alias_chat_id_for_event(&event) {
         merge_alias_chat(
-            context.account_id,
+            &context_account_id(context),
             context.chats,
             context.messages,
             context.events,
@@ -1121,10 +1159,6 @@ fn forward_message_event(
             chat.clone(),
         );
     }
-    context.events.send(ProviderEvent::Message {
-        message,
-        is_historical,
-    });
 }
 
 fn emit_bridge_status_message(
@@ -1157,6 +1191,7 @@ fn emit_bridge_status_message(
         reactions: Vec::new(),
         receipts: Vec::new(),
         is_from_me: false,
+        mentions_me: false,
         platform_data: PlatformData {
             whatsapp: Some(WhatsAppData {
                 jid: arc_str(BRIDGE_SENDER_ID),
@@ -1179,8 +1214,7 @@ struct ChatPreviewUpdate {
     avatar: Option<PathBuf>,
     is_group: bool,
     muted: Option<bool>,
-    timestamp: Timestamp,
-    preview: Arc<str>,
+    activity: Option<(Timestamp, Arc<str>)>,
     increment_unread: bool,
 }
 
@@ -1211,12 +1245,14 @@ fn upsert_chat_preview(
         last_message_preview: None,
         thread_id: None,
     });
-    let should_update_preview = chat
-        .last_message_at
-        .is_none_or(|current| update.timestamp >= current);
-    if should_update_preview {
-        chat.last_message_at = Some(update.timestamp);
-        chat.last_message_preview = Some(update.preview);
+    if let Some((timestamp, preview)) = update.activity {
+        let should_update_preview = chat
+            .last_message_at
+            .is_none_or(|current| timestamp >= current);
+        if should_update_preview {
+            chat.last_message_at = Some(timestamp);
+            chat.last_message_preview = Some(preview);
+        }
     }
     if update.avatar.is_some() {
         chat.avatar = update.avatar;
@@ -1332,13 +1368,22 @@ fn media_preview(label: &str, event: &BridgeEvent, text: &str) -> Arc<str> {
     let caption = event
         .caption
         .as_deref()
-        .or((!text.is_empty()).then_some(text))
+        .filter(|caption| !caption.is_empty())
+        .or((!text.is_empty() && text != EMPTY_MESSAGE_PLACEHOLDER).then_some(text))
         .unwrap_or_default();
     if caption.is_empty() {
         arc_str(label)
     } else {
         arc_str(format!("{label}: {caption}"))
     }
+}
+
+fn is_empty_message_placeholder(content: &Content) -> bool {
+    matches!(
+        content,
+        Content::Text(text) | Content::Unsupported(text)
+            if text.trim() == EMPTY_MESSAGE_PLACEHOLDER
+    )
 }
 
 fn content_from_event(event: &BridgeEvent, text: String) -> Content {
@@ -1401,7 +1446,8 @@ fn content_from_event(event: &BridgeEvent, text: String) -> Content {
         caption: event
             .caption
             .as_deref()
-            .or((!text.is_empty()).then_some(text.as_str()))
+            .filter(|caption| !caption.is_empty())
+            .or((!text.is_empty() && text != EMPTY_MESSAGE_PLACEHOLDER).then_some(text.as_str()))
             .map(arc_str),
         local_path: event.media_local_path.clone(),
         thumbnail: event.media_thumbnail_path.clone(),
@@ -2127,6 +2173,22 @@ mod tests {
         assert_eq!(legacy.text.as_deref(), Some("hello from legacy callback"));
         Ok(())
     }
+
+    #[test]
+    fn bridge_event_decodes_mentions_me_flag() -> Result<()> {
+        let mentioned = BridgeEvent::decode(
+            r#"{"type":"message","id":"m1","chat_jid":"group@g.us","text":"<@me> ping","mentions_me":true,"is_group":true}"#,
+        )?;
+        assert!(mentioned.mentions_me);
+        assert!(mentioned.is_group);
+
+        // Absent flag defaults to false (legacy/non-mention messages).
+        let plain = BridgeEvent::decode(
+            r#"{"type":"message","id":"m2","chat_jid":"group@g.us","text":"hi","is_group":true}"#,
+        )?;
+        assert!(!plain.mentions_me);
+        Ok(())
+    }
     #[tokio::test]
     async fn whatsapp_provider_connects_and_exposes_bridge_inbox() -> Result<()> {
         let _guard = ffi_test_guard().await;
@@ -2404,6 +2466,56 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(cached.display_name.as_ref(), "Katherine Johnson");
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_mark_read_clears_cached_unread_count() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:mark-read")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+
+        // Inbound (not from me) message increments the chat's unread count.
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"message","id":"unread-1","chat_jid":"999@s.whatsapp.net","chat_name":"Unread Chat","sender_jid":"999@s.whatsapp.net","sender_name":"Pat","text":"ping","timestamp":"2026-06-05T12:00:00Z"}"#
+        )?);
+
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::Message { message, .. }
+                    if content_text(&message.content) == "ping" =>
+                {
+                    assert!(!message.is_from_me);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        let chat_id = arc_str("whatsapp:999@s.whatsapp.net");
+        let unread_chat = provider
+            .chats()
+            .await?
+            .into_iter()
+            .find(|chat| chat.id == chat_id)
+            .expect("unread chat present");
+        assert_eq!(unread_chat.unread_count, 1);
+
+        // Marking the chat read must clear the cached unread so later chat
+        // snapshots report it as read instead of re-inflating via the sidebar
+        // max() merge.
+        provider.mark_read(&chat_id, &arc_str("unread-1")).await?;
+
+        let read_chat = provider
+            .chats()
+            .await?
+            .into_iter()
+            .find(|chat| chat.id == chat_id)
+            .expect("read chat present");
+        assert_eq!(read_chat.unread_count, 0);
 
         provider.disconnect().await?;
         Ok(())

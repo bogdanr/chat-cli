@@ -228,6 +228,16 @@ pub trait Provider: Send + Sync + 'static {
         bail!("interactive authentication setup is not supported by this provider")
     }
 
+    /// Whether this provider has an official/bundled OAuth application
+    /// configured, so the normal "connect workspace" path can run browser
+    /// OAuth without the user creating their own app or entering a client
+    /// ID/secret. Providers that ship or are configured with official app
+    /// credentials should override this to report `true` when those are
+    /// available; the setup UI uses it to skip manual app-creation steps.
+    fn has_bundled_oauth_app(&self) -> bool {
+        false
+    }
+
     /// Search messages across this provider.
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Message>>;
 

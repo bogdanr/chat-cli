@@ -55,14 +55,39 @@ pub enum NetworkActivityDisplay {
     RecentCounts,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationMode {
+    Off,
+    #[default]
+    Desktop,
+    InApp,
+}
+
+/// Which incoming messages are eligible for notifications. Applies on top of
+/// [`NotificationMode`]: it never enables notifications that the mode disables,
+/// it only further restricts which messages qualify.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationScope {
+    /// Notify for every eligible message, including group and channel traffic.
+    #[default]
+    All,
+    /// Notify only for direct (1:1) messages and messages that mention the
+    /// authenticated user. Group and channel messages without a mention are
+    /// suppressed.
+    DirectAndMentions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AppSettings {
-    pub desktop_notifications: bool,
-    pub in_app_notifications: bool,
-    pub notification_previews: bool,
-    pub notify_selected_chat: bool,
-    pub notify_muted_chats: bool,
+    pub notifications: NotificationMode,
+    pub notification_scope: NotificationScope,
+    /// When enabled, messages the authenticated user sent themselves (e.g. a
+    /// Slack/WhatsApp "note to self" or a message echoed from another device)
+    /// are eligible for notifications. Defaults to `true` so users can verify
+    /// notifications end-to-end by sending themselves a message from web clients.
+    pub notify_self_messages: bool,
     pub chat_inbox_style: ChatInboxStyle,
     pub ui_theme: UiThemePreset,
     pub conversation_presentation: ConversationPresentationSetting,
@@ -70,6 +95,19 @@ pub struct AppSettings {
     pub show_muted_chats: bool,
     pub show_browse_channels: bool,
     pub show_empty_chats: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct NotificationPauseState {
+    pub paused_until: Option<chrono::DateTime<Utc>>,
+}
+
+impl NotificationPauseState {
+    pub fn is_paused_at(&self, now: chrono::DateTime<Utc>) -> bool {
+        self.paused_until
+            .is_some_and(|paused_until| paused_until > now)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,11 +136,9 @@ pub struct ChatLatestMessage {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            desktop_notifications: true,
-            in_app_notifications: true,
-            notification_previews: true,
-            notify_selected_chat: false,
-            notify_muted_chats: false,
+            notifications: NotificationMode::Desktop,
+            notification_scope: NotificationScope::All,
+            notify_self_messages: true,
             chat_inbox_style: ChatInboxStyle::ActivityFirst,
             ui_theme: UiThemePreset::DefaultDark,
             conversation_presentation: ConversationPresentationSetting::WhatsApp,
@@ -111,6 +147,74 @@ impl Default for AppSettings {
             show_browse_channels: false,
             show_empty_chats: true,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for AppSettings {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct AppSettingsCompat {
+            notifications: Option<NotificationMode>,
+            desktop_notifications: Option<bool>,
+            in_app_notifications: Option<bool>,
+            notification_scope: NotificationScope,
+            notify_self_messages: bool,
+            chat_inbox_style: ChatInboxStyle,
+            ui_theme: UiThemePreset,
+            conversation_presentation: ConversationPresentationSetting,
+            network_activity: NetworkActivityDisplay,
+            show_muted_chats: bool,
+            show_browse_channels: bool,
+            show_empty_chats: bool,
+        }
+
+        impl Default for AppSettingsCompat {
+            fn default() -> Self {
+                let defaults = AppSettings::default();
+                Self {
+                    notifications: None,
+                    desktop_notifications: None,
+                    in_app_notifications: None,
+                    notification_scope: defaults.notification_scope,
+                    notify_self_messages: defaults.notify_self_messages,
+                    chat_inbox_style: defaults.chat_inbox_style,
+                    ui_theme: defaults.ui_theme,
+                    conversation_presentation: defaults.conversation_presentation,
+                    network_activity: defaults.network_activity,
+                    show_muted_chats: defaults.show_muted_chats,
+                    show_browse_channels: defaults.show_browse_channels,
+                    show_empty_chats: defaults.show_empty_chats,
+                }
+            }
+        }
+
+        let compat = AppSettingsCompat::deserialize(deserializer)?;
+        let notifications = compat.notifications.unwrap_or_else(|| {
+            if compat.desktop_notifications.unwrap_or(false) {
+                NotificationMode::Desktop
+            } else if compat.in_app_notifications.unwrap_or(false) {
+                NotificationMode::InApp
+            } else {
+                NotificationMode::Off
+            }
+        });
+
+        Ok(Self {
+            notifications,
+            notification_scope: compat.notification_scope,
+            notify_self_messages: compat.notify_self_messages,
+            chat_inbox_style: compat.chat_inbox_style,
+            ui_theme: compat.ui_theme,
+            conversation_presentation: compat.conversation_presentation,
+            network_activity: compat.network_activity,
+            show_muted_chats: compat.show_muted_chats,
+            show_browse_channels: compat.show_browse_channels,
+            show_empty_chats: compat.show_empty_chats,
+        })
     }
 }
 
@@ -242,6 +346,34 @@ impl Store {
 
     pub async fn save_app_settings(&self, settings: &AppSettings) -> Result<()> {
         self.set_setting("app.settings", settings).await
+    }
+
+    pub async fn notification_pause_state(&self) -> Result<NotificationPauseState> {
+        self.get_setting("notifications.pause")
+            .await
+            .map(|state| state.unwrap_or_default())
+    }
+
+    pub async fn save_notification_pause_state(
+        &self,
+        state: &NotificationPauseState,
+    ) -> Result<()> {
+        self.set_setting("notifications.pause", state).await
+    }
+
+    pub async fn pause_notifications_until(
+        &self,
+        paused_until: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        self.save_notification_pause_state(&NotificationPauseState {
+            paused_until: Some(paused_until),
+        })
+        .await
+    }
+
+    pub async fn resume_notifications(&self) -> Result<()> {
+        self.save_notification_pause_state(&NotificationPauseState { paused_until: None })
+            .await
     }
 
     async fn get_setting<T>(&self, key: &str) -> Result<Option<T>>
@@ -1122,6 +1254,7 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         reactions: Vec::new(),
         receipts: Vec::new(),
         is_from_me: row.get(19)?,
+        mentions_me: false,
         platform_data: platform_data_from_json(platform_json.as_deref()),
     })
 }
@@ -1581,6 +1714,96 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn legacy_notification_booleans_migrate_to_notification_mode() -> Result<()> {
+        let desktop = serde_json::from_str::<AppSettings>(
+            r#"{
+                "desktop_notifications": true,
+                "in_app_notifications": true
+            }"#,
+        )?;
+        assert_eq!(desktop.notifications, NotificationMode::Desktop);
+
+        let in_app = serde_json::from_str::<AppSettings>(
+            r#"{
+                "desktop_notifications": false,
+                "in_app_notifications": true
+            }"#,
+        )?;
+        assert_eq!(in_app.notifications, NotificationMode::InApp);
+
+        let off = serde_json::from_str::<AppSettings>(
+            r#"{
+                "desktop_notifications": false,
+                "in_app_notifications": false
+            }"#,
+        )?;
+        assert_eq!(off.notifications, NotificationMode::Off);
+        Ok(())
+    }
+
+    #[test]
+    fn notification_scope_defaults_to_all_and_roundtrips() -> Result<()> {
+        // Legacy settings without the field migrate to the permissive default.
+        let legacy = serde_json::from_str::<AppSettings>(
+            r#"{
+                "notifications": "desktop"
+            }"#,
+        )?;
+        assert_eq!(legacy.notification_scope, NotificationScope::All);
+
+        // An explicitly stored restricted scope survives a serialize/deserialize
+        // round-trip.
+        let mut settings = AppSettings::default();
+        settings.notification_scope = NotificationScope::DirectAndMentions;
+        let json = serde_json::to_string(&settings)?;
+        let restored = serde_json::from_str::<AppSettings>(&json)?;
+        assert_eq!(
+            restored.notification_scope,
+            NotificationScope::DirectAndMentions
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn notify_self_messages_defaults_on_and_roundtrips() -> Result<()> {
+        // Legacy settings without the field migrate to the enabled default, so
+        // sending yourself a message from a web client can exercise the
+        // notification pipeline without another settings toggle.
+        let legacy = serde_json::from_str::<AppSettings>(
+            r#"{
+                "notifications": "desktop"
+            }"#,
+        )?;
+        assert!(legacy.notify_self_messages);
+
+        // An explicit stored value still survives a serialize/deserialize
+        // round-trip for compatibility with existing config files.
+        let mut settings = AppSettings::default();
+        settings.notify_self_messages = false;
+        let json = serde_json::to_string(&settings)?;
+        let restored = serde_json::from_str::<AppSettings>(&json)?;
+        assert!(!restored.notify_self_messages);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notification_pause_state_roundtrips_and_resumes() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let paused_until = Utc::now() + chrono::Duration::minutes(25);
+
+        store.pause_notifications_until(paused_until).await?;
+        let paused = store.notification_pause_state().await?;
+        assert_eq!(paused.paused_until, Some(paused_until));
+        assert!(paused.is_paused_at(Utc::now()));
+
+        store.resume_notifications().await?;
+        let resumed = store.notification_pause_state().await?;
+        assert_eq!(resumed.paused_until, None);
+        assert!(!resumed.is_paused_at(Utc::now()));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn account_chat_message_and_person_roundtrip() -> Result<()> {
         let dir = tempdir()?;
@@ -1644,6 +1867,7 @@ mod tests {
                 at: Some(Utc::now()),
             }],
             is_from_me: false,
+            mentions_me: false,
             platform_data: PlatformData {
                 whatsapp: Some(WhatsAppData {
                     jid: arc_str("alice@s.whatsapp.net".to_owned()),
@@ -1845,6 +2069,7 @@ mod tests {
                     reactions: Vec::new(),
                     receipts: Vec::new(),
                     is_from_me: false,
+                    mentions_me: false,
                     platform_data: PlatformData::default(),
                 })
                 .await?;
@@ -1922,6 +2147,7 @@ mod tests {
                 reactions: Vec::new(),
                 receipts: Vec::new(),
                 is_from_me: false,
+                mentions_me: false,
                 platform_data: PlatformData::default(),
             },
             Message {
@@ -1937,6 +2163,7 @@ mod tests {
                 reactions: Vec::new(),
                 receipts: Vec::new(),
                 is_from_me: false,
+                mentions_me: false,
                 platform_data: PlatformData::default(),
             },
         ];

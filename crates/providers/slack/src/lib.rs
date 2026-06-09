@@ -10,12 +10,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chat_core::{
-    Account, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card, CardColor, CardField,
-    CardKind, CardSource, Chat, ChatId, ChatKind, ChatMembership, Content, DiscoveryAction,
-    DiscoveryCapabilities, DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message,
-    MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform,
-    PlatformData, PlatformId, Provider, ProviderEvent, ProviderId, Reaction, Sender, SlackData,
-    Timestamp,
+    Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
+    CardColor, CardField, CardKind, CardSource, Chat, ChatId, ChatKind, ChatMembership, Content,
+    DiscoveryAction, DiscoveryCapabilities, DiscoveryResult, DiscoveryResultKind, EventBus, Media,
+    Message, MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities,
+    Platform, PlatformData, PlatformId, Provider, ProviderEvent, ProviderId, Reaction, Sender,
+    SlackData, Timestamp,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -24,13 +24,15 @@ use std::{
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     fmt, fs,
     hash::{Hash, Hasher},
+    io::{Read, Write},
+    net::TcpListener,
     path::PathBuf,
     str::FromStr,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WebSocketMessage};
@@ -39,6 +41,100 @@ const PROVIDER_ID: &str = "slack:setup";
 const PROVIDER_ID_PREFIX: &str = "slack";
 const SLACK_CONVERSATION_TYPES: &str = "public_channel,private_channel,mpim,im";
 const SLACK_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+// Loopback OAuth callback. Slack matches redirect URIs exactly against the
+// app's registered `redirect_urls`, so the port is fixed (not ephemeral) and
+// the same value is baked into the generated app manifest.
+const SLACK_OAUTH_REDIRECT_PORT: u16 = 41419;
+const SLACK_OAUTH_REDIRECT_URI: &str = "http://localhost:41419/slack/oauth/callback";
+// How long the loopback listener waits for the browser to complete the OAuth
+// redirect before giving up.
+const SLACK_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const SLACK_HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(20);
+// Fetch a small window (not just the single newest message) per conversation
+// each poll so a burst of messages arriving between polls is not collapsed to
+// only the last one. The dedup set plus the `started_at` timestamp gate in
+// `run_history_poll_loop` keep this safe: already-seen or pre-startup messages
+// are never re-surfaced as live, so a larger window only improves catch-up.
+const SLACK_HISTORY_POLL_LIMIT: usize = 15;
+const PERF_LOG_FILE_ENV: &str = "CHAT_CLI_PERF_LOG_FILE";
+
+// Official distributed chat-cli Slack app credentials. Distributors bake these
+// in at build time via environment variables (read by `option_env!`), and
+// operators can override them at runtime via the same variable names. When a
+// client ID and secret are available, the default "Connect Slack workspace"
+// path uses them directly so users never create their own Slack app. Open
+// builds typically leave them unset and fall back to manual app setup.
+const SLACK_OFFICIAL_CLIENT_ID_ENV: &str = "CHAT_CLI_SLACK_CLIENT_ID";
+const SLACK_OFFICIAL_CLIENT_SECRET_ENV: &str = "CHAT_CLI_SLACK_CLIENT_SECRET";
+const SLACK_OFFICIAL_REDIRECT_URI_ENV: &str = "CHAT_CLI_SLACK_REDIRECT_URI";
+const BUNDLED_SLACK_CLIENT_ID: Option<&str> = option_env!("CHAT_CLI_SLACK_CLIENT_ID");
+const BUNDLED_SLACK_CLIENT_SECRET: Option<&str> = option_env!("CHAT_CLI_SLACK_CLIENT_SECRET");
+const BUNDLED_SLACK_REDIRECT_URI: Option<&str> = option_env!("CHAT_CLI_SLACK_REDIRECT_URI");
+
+/// Credentials for the official distributed chat-cli Slack app. When present,
+/// the normal workspace-connect path can run browser OAuth without asking the
+/// user to create a Slack app or paste a client ID/secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfficialSlackApp {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+}
+
+/// Resolve the official chat-cli Slack app credentials, if configured. Runtime
+/// environment variables take precedence over compile-time bundled values so a
+/// build can be overridden without recompiling. Both a client ID and secret are
+/// required (the `oauth.v2.access` exchange needs the secret); otherwise this
+/// returns `None` and callers fall back to the manual app-creation flow.
+pub fn official_slack_app() -> Option<OfficialSlackApp> {
+    resolve_official_slack_app(
+        resolved_official_value(SLACK_OFFICIAL_CLIENT_ID_ENV, BUNDLED_SLACK_CLIENT_ID),
+        resolved_official_value(
+            SLACK_OFFICIAL_CLIENT_SECRET_ENV,
+            BUNDLED_SLACK_CLIENT_SECRET,
+        ),
+        resolved_official_value(SLACK_OFFICIAL_REDIRECT_URI_ENV, BUNDLED_SLACK_REDIRECT_URI),
+    )
+}
+
+/// Pure resolution of official app credentials from already-resolved values.
+/// Requires both a client ID and secret; the redirect URI defaults to the
+/// loopback callback when not explicitly configured. Kept separate from env
+/// reads so the precedence and required-field rules are unit-testable.
+fn resolve_official_slack_app(
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    redirect_uri: Option<String>,
+) -> Option<OfficialSlackApp> {
+    Some(OfficialSlackApp {
+        client_id: client_id?,
+        client_secret: client_secret?,
+        redirect_uri: redirect_uri.unwrap_or_else(|| SLACK_OAUTH_REDIRECT_URI.to_owned()),
+    })
+}
+
+/// True when an official Slack app is bundled/configured, meaning the normal
+/// connect path can skip manual app creation and client ID/secret entry.
+pub fn official_slack_app_is_configured() -> bool {
+    official_slack_app().is_some()
+}
+
+fn resolved_official_value(env_key: &str, bundled: Option<&str>) -> Option<String> {
+    std::env::var(env_key)
+        .ok()
+        .and_then(non_empty_string)
+        .or_else(|| bundled.and_then(|value| non_empty_string(value.to_owned())))
+}
+
+fn slack_diagnostic_log(label: &str, details: impl AsRef<str>) {
+    let Some(path) = std::env::var_os(PERF_LOG_FILE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{} label={} {}", timestamp, label, details.as_ref());
+    }
+}
 
 pub struct SlackProvider {
     id: ProviderId,
@@ -53,6 +149,7 @@ pub struct SlackProvider {
     events: EventBus,
     connected: AtomicBool,
     realtime_task: RwLock<Option<JoinHandle<()>>>,
+    history_poll_task: RwLock<Option<JoinHandle<()>>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -172,6 +269,7 @@ struct SlackConnectionState {
     webhook_url: Option<String>,
     team_id: Option<String>,
     team_name: Option<String>,
+    team_icon_url: Option<String>,
     user_id: Option<String>,
     bot_id: Option<String>,
 }
@@ -308,6 +406,10 @@ struct SlackWebhookPostRequest<'a> {
 struct SlackConversationsListResponse {
     ok: bool,
     error: Option<String>,
+    // Slack omits `channels` on error responses, so default it to let the
+    // `ok`/`error` check surface the real cause instead of an opaque decode
+    // failure.
+    #[serde(default)]
     channels: Vec<SlackConversationResponse>,
     #[serde(default)]
     response_metadata: SlackResponseMetadata,
@@ -345,6 +447,18 @@ struct SlackConversationResponse {
 struct SlackConversationsHistoryResponse {
     ok: bool,
     error: Option<String>,
+    // Slack omits `messages` entirely on error responses (for example
+    // `{"ok":false,"error":"missing_scope"}`). Without a default, serde fails
+    // with "missing field `messages`", masking the real Slack error behind an
+    // opaque decode failure. Defaulting lets the `ok`/`error` check below
+    // surface the actual cause.
+    //
+    // Individual messages are decoded leniently: a single entry whose shape
+    // does not match (an unexpected field type, a new subtype payload, etc.)
+    // must not discard every other message in the conversation. Without this,
+    // one odd message silently drops the whole history response, so genuine
+    // messages never get stored or surfaced in the sidebar.
+    #[serde(default, deserialize_with = "deserialize_lenient_slack_messages")]
     messages: Vec<SlackHistoryMessageResponse>,
     #[serde(default)]
     response_metadata: SlackResponseMetadata,
@@ -365,8 +479,52 @@ struct SlackHistoryMessageResponse {
     reply_count: Option<u32>,
     text: Option<String>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
+    files: Option<Vec<SlackFileResponse>>,
     hidden: Option<bool>,
     reactions: Option<Vec<SlackReactionResponse>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct SlackFileResponse {
+    id: Option<String>,
+    name: Option<String>,
+    title: Option<String>,
+    mimetype: Option<String>,
+    filetype: Option<String>,
+    size: Option<u64>,
+    url_private: Option<String>,
+    url_private_download: Option<String>,
+    thumb_360: Option<String>,
+    thumb_720: Option<String>,
+    thumb_1024: Option<String>,
+    permalink: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+/// Decodes the `messages` array of a `conversations.history`/`conversations.replies`
+/// response one entry at a time, skipping (and logging) any message that fails to
+/// deserialize. Slack occasionally returns messages with field shapes we do not
+/// model yet; decoding the array strictly would fail the entire response and drop
+/// every valid message in the conversation, so the history poll would never
+/// surface them in the sidebar or notify on them.
+fn deserialize_lenient_slack_messages<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SlackHistoryMessageResponse>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    let mut messages = Vec::with_capacity(raw.len());
+    for value in raw {
+        match serde_json::from_value::<SlackHistoryMessageResponse>(value) {
+            Ok(message) => messages.push(message),
+            Err(error) => {
+                slack_diagnostic_log("slack.history.message_decode_skipped", error.to_string())
+            }
+        }
+    }
+    Ok(messages)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -467,6 +625,79 @@ struct SlackUserProfileResponse {
     image_72: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SlackTeamInfo {
+    pub id: Option<String>,
+    pub name: Option<String>,
+    pub domain: Option<String>,
+    pub email_domain: Option<String>,
+    pub icon_url: Option<String>,
+}
+
+impl SlackTeamInfo {
+    fn from_response(team: SlackTeamInfoTeam) -> Self {
+        let icon_url = team.icon.and_then(SlackTeamIconResponse::best_image_url);
+        Self {
+            id: team.id.and_then(non_empty_string),
+            name: team.name.and_then(non_empty_string),
+            domain: team.domain.and_then(non_empty_string),
+            email_domain: team.email_domain.and_then(non_empty_string),
+            icon_url,
+        }
+    }
+
+    /// Best human-readable workspace name, preferring the display name and
+    /// falling back to the workspace domain.
+    fn display_name(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or(self.domain.as_deref())
+            .or(self.email_domain.as_deref())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackTeamInfoResponse {
+    ok: bool,
+    error: Option<String>,
+    team: Option<SlackTeamInfoTeam>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackTeamInfoTeam {
+    id: Option<String>,
+    name: Option<String>,
+    domain: Option<String>,
+    email_domain: Option<String>,
+    icon: Option<SlackTeamIconResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackTeamIconResponse {
+    image_34: Option<String>,
+    image_44: Option<String>,
+    image_68: Option<String>,
+    image_88: Option<String>,
+    image_102: Option<String>,
+    image_132: Option<String>,
+    image_230: Option<String>,
+    image_original: Option<String>,
+}
+
+impl SlackTeamIconResponse {
+    fn best_image_url(self) -> Option<String> {
+        self.image_original
+            .or(self.image_230)
+            .or(self.image_132)
+            .or(self.image_102)
+            .or(self.image_88)
+            .or(self.image_68)
+            .or(self.image_44)
+            .or(self.image_34)
+            .and_then(non_empty_string)
+    }
+}
+
 impl SlackUser {
     fn from_response(response: SlackUserResponse) -> Option<Self> {
         let id = non_empty_string(response.id)?;
@@ -548,6 +779,12 @@ pub trait SlackApiClient: Send + Sync {
         user_id: &str,
     ) -> Result<Option<SlackUser>>;
 
+    async fn team_info(
+        &self,
+        credential: SlackCredential,
+        team_id: Option<&str>,
+    ) -> Result<Option<SlackTeamInfo>>;
+
     async fn conversation_members(
         &self,
         credential: SlackCredential,
@@ -585,6 +822,17 @@ pub trait SlackApiClient: Send + Sync {
         &self,
         app_token: SlackCredential,
     ) -> Result<SlackSocketModeConnection>;
+
+    /// Exchange an OAuth authorization `code` for Slack tokens via
+    /// `oauth.v2.access`. Returns both bot and user tokens (whichever the app
+    /// requested) plus the workspace identity and granted scopes.
+    async fn exchange_oauth_code(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        redirect_uri: &str,
+        code: &str,
+    ) -> Result<SlackOAuthTokens>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -597,6 +845,78 @@ struct SlackSocketModeOpenResponse {
     ok: bool,
     error: Option<String>,
     url: Option<String>,
+}
+
+/// Tokens and workspace identity returned by a successful `oauth.v2.access`
+/// exchange. A single OAuth install can yield both a bot token (top-level
+/// `access_token`) and a user token (`authed_user.access_token`), along with
+/// the granted scopes for each, which let the provider report accurate
+/// capabilities without asking the user to paste anything.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlackOAuthTokens {
+    pub user_token: Option<String>,
+    pub bot_token: Option<String>,
+    pub user_scopes: Option<String>,
+    pub bot_scopes: Option<String>,
+    pub team_id: Option<String>,
+    pub team_name: Option<String>,
+    pub user_id: Option<String>,
+    pub bot_user_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackOAuthAccessResponse {
+    ok: bool,
+    error: Option<String>,
+    access_token: Option<String>,
+    scope: Option<String>,
+    bot_user_id: Option<String>,
+    team: Option<SlackOAuthTeam>,
+    authed_user: Option<SlackOAuthAuthedUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackOAuthTeam {
+    id: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SlackOAuthAuthedUser {
+    id: Option<String>,
+    scope: Option<String>,
+    access_token: Option<String>,
+}
+
+impl SlackOAuthAccessResponse {
+    fn into_tokens(self) -> SlackOAuthTokens {
+        let (team_id, team_name) = self
+            .team
+            .map(|team| (team.id, team.name))
+            .unwrap_or((None, None));
+        let (user_id, user_scopes, user_token) = self
+            .authed_user
+            .map(|user| (user.id, user.scope, user.access_token))
+            .unwrap_or((None, None, None));
+        SlackOAuthTokens {
+            user_token: user_token.and_then(non_empty_string),
+            bot_token: self.access_token.and_then(non_empty_string),
+            user_scopes: user_scopes.and_then(non_empty_string),
+            bot_scopes: self.scope.and_then(non_empty_string),
+            team_id: team_id.and_then(non_empty_string),
+            team_name: team_name.and_then(non_empty_string),
+            user_id: user_id.and_then(non_empty_string),
+            bot_user_id: self.bot_user_id.and_then(non_empty_string),
+        }
+    }
+}
+
+/// Parameters captured from the loopback OAuth redirect request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlackOAuthCallback {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -629,6 +949,7 @@ struct SlackRealtimeEvent {
     thread_ts: Option<String>,
     text: Option<String>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
+    files: Option<Vec<SlackFileResponse>>,
     subtype: Option<String>,
     hidden: Option<bool>,
     deleted_ts: Option<String>,
@@ -650,6 +971,7 @@ struct SlackRealtimeInnerMessage {
     thread_ts: Option<String>,
     text: Option<String>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
+    files: Option<Vec<SlackFileResponse>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -792,6 +1114,14 @@ impl SlackApiClient for SlackWebApiClient {
         get_web_api_user_info(credential, user_id).await
     }
 
+    async fn team_info(
+        &self,
+        credential: SlackCredential,
+        team_id: Option<&str>,
+    ) -> Result<Option<SlackTeamInfo>> {
+        get_web_api_team_info(credential, team_id).await
+    }
+
     async fn conversation_members(
         &self,
         credential: SlackCredential,
@@ -847,6 +1177,16 @@ impl SlackApiClient for SlackWebApiClient {
         app_token: SlackCredential,
     ) -> Result<SlackSocketModeConnection> {
         open_socket_mode(app_token).await
+    }
+
+    async fn exchange_oauth_code(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        redirect_uri: &str,
+        code: &str,
+    ) -> Result<SlackOAuthTokens> {
+        exchange_web_api_oauth_code(client_id, client_secret, redirect_uri, code).await
     }
 }
 
@@ -1180,6 +1520,45 @@ async fn get_web_api_user_info(
     .context("joining Slack user info task")?
 }
 
+async fn get_web_api_team_info(
+    credential: SlackCredential,
+    team_id: Option<&str>,
+) -> Result<Option<SlackTeamInfo>> {
+    if !matches!(
+        credential.kind,
+        SlackCredentialKind::UserToken
+            | SlackCredentialKind::BotToken
+            | SlackCredentialKind::Unknown
+    ) {
+        bail!("Slack team.info requires a user or bot Web API token");
+    }
+
+    let token = credential.value;
+    let team_id = team_id.map(str::to_owned).and_then(non_empty_string);
+    tokio::task::spawn_blocking(move || {
+        let mut request = slack_http_agent()
+            .get("https://slack.com/api/team.info")
+            .header("Authorization", format!("Bearer {token}"));
+        if let Some(team_id) = team_id.as_deref() {
+            request = request.query("team", team_id);
+        }
+        let mut response = request.call().context("calling Slack team.info")?;
+        let info: SlackTeamInfoResponse = response
+            .body_mut()
+            .read_json()
+            .context("decoding Slack team.info response")?;
+        if !info.ok {
+            bail!(
+                "Slack team.info failed: {}",
+                info.error.unwrap_or_else(|| "unknown_error".to_owned())
+            );
+        }
+        Ok(info.team.map(SlackTeamInfo::from_response))
+    })
+    .await
+    .context("joining Slack team info task")?
+}
+
 async fn list_web_api_conversation_members(
     credential: SlackCredential,
     channel: &str,
@@ -1350,6 +1729,7 @@ async fn list_web_api_history(
                 chat_id.clone(),
                 message,
                 users.as_ref(),
+                Some(token.as_str()),
             ) {
                 if reply_count > 0
                     && thread_ts
@@ -1434,6 +1814,7 @@ fn fetch_web_api_thread_replies(
                 chat_id.to_owned(),
                 message,
                 users,
+                Some(token),
             )
         }));
 
@@ -1447,6 +1828,286 @@ fn fetch_web_api_thread_replies(
     }
 
     Ok(replies)
+}
+
+async fn exchange_web_api_oauth_code(
+    client_id: &str,
+    client_secret: &str,
+    redirect_uri: &str,
+    code: &str,
+) -> Result<SlackOAuthTokens> {
+    let client_id = client_id.trim().to_owned();
+    let client_secret = client_secret.trim().to_owned();
+    let redirect_uri = redirect_uri.trim().to_owned();
+    let code = code.trim().to_owned();
+    if client_id.is_empty() || client_secret.is_empty() {
+        bail!("Slack OAuth requires a client ID and client secret");
+    }
+    if code.is_empty() {
+        bail!("Slack OAuth code is empty");
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let mut response = slack_http_agent()
+            .post("https://slack.com/api/oauth.v2.access")
+            .send_form([
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+                ("code", code.as_str()),
+                ("redirect_uri", redirect_uri.as_str()),
+            ])
+            .context("calling Slack oauth.v2.access")?;
+        let parsed: SlackOAuthAccessResponse = response
+            .body_mut()
+            .read_json()
+            .context("decoding Slack oauth.v2.access response")?;
+        if !parsed.ok {
+            bail!(
+                "Slack oauth.v2.access failed: {}",
+                parsed.error.unwrap_or_else(|| "unknown_error".to_owned())
+            );
+        }
+        let tokens = parsed.into_tokens();
+        if tokens.user_token.is_none() && tokens.bot_token.is_none() {
+            bail!("Slack oauth.v2.access succeeded but returned no usable token");
+        }
+        Ok(tokens)
+    })
+    .await
+    .context("joining Slack oauth.v2.access task")?
+}
+
+/// Generate an unguessable OAuth `state` value for CSRF protection on the
+/// loopback redirect. No `rand` dependency is available, so entropy is mixed
+/// from a high-resolution timestamp, a monotonic counter, and a stack address.
+fn slack_oauth_state() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let stack_marker = &counter as *const _ as usize;
+
+    let mut hasher = DefaultHasher::new();
+    nanos.hash(&mut hasher);
+    counter.hash(&mut hasher);
+    stack_marker.hash(&mut hasher);
+    let high = hasher.finish();
+    // Hash again with the first digest folded in for a second 64-bit chunk so
+    // the resulting token is 128 bits of derived state.
+    high.hash(&mut hasher);
+    nanos.hash(&mut hasher);
+    let low = hasher.finish();
+    format!("{high:016x}{low:016x}")
+}
+
+/// Constant-length-ish comparison of OAuth state values. Both sides come from
+/// our own generator (hex), so this rejects empty/mismatched callback state.
+fn slack_oauth_state_matches(expected: &str, received: Option<&str>) -> bool {
+    match received {
+        Some(received) => !expected.is_empty() && expected == received.trim(),
+        None => false,
+    }
+}
+
+/// Bind the fixed loopback OAuth callback port. Returned to the caller so the
+/// browser can be opened only after the listener is ready to accept the
+/// redirect (avoiding a race where Slack redirects before we are listening).
+fn bind_oauth_callback_listener() -> Result<TcpListener> {
+    let listener =
+        TcpListener::bind(("127.0.0.1", SLACK_OAUTH_REDIRECT_PORT)).with_context(|| {
+            format!(
+                "binding Slack OAuth callback listener on 127.0.0.1:{SLACK_OAUTH_REDIRECT_PORT}; \
+             another instance may be mid-login"
+            )
+        })?;
+    Ok(listener)
+}
+
+/// Accept a single loopback HTTP request, parse the OAuth `code`/`state`/`error`
+/// from its query string, and reply with a small confirmation page so the
+/// browser tab shows a friendly message. Runs to completion on a blocking
+/// thread; callers should invoke it via `spawn_blocking`.
+fn accept_oauth_callback(listener: &TcpListener, timeout: Duration) -> Result<SlackOAuthCallback> {
+    listener
+        .set_nonblocking(false)
+        .context("configuring Slack OAuth callback listener")?;
+    let deadline = SystemTime::now() + timeout;
+    loop {
+        let (mut stream, _addr) = listener
+            .accept()
+            .context("waiting for Slack OAuth callback request")?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut buffer = [0u8; 4096];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buffer[..read]);
+        let Some(target) = request.lines().next().and_then(parse_http_request_target) else {
+            // Ignore non-HTTP or preflight noise (e.g. favicon) and keep waiting
+            // until the real redirect arrives or the deadline passes.
+            write_oauth_callback_response(&mut stream, "Waiting for Slack…");
+            if SystemTime::now() >= deadline {
+                bail!("Timed out waiting for the Slack OAuth callback");
+            }
+            continue;
+        };
+        let callback = parse_oauth_callback_query(&target);
+        let body = if callback.error.is_some() {
+            "Slack sign-in failed. You can close this tab and return to chat-cli."
+        } else if callback.code.is_some() {
+            "Slack connected. You can close this tab and return to chat-cli."
+        } else {
+            "Slack sign-in is missing an authorization code. Return to chat-cli to retry."
+        };
+        write_oauth_callback_response(&mut stream, body);
+        return Ok(callback);
+    }
+}
+
+fn parse_http_request_target(request_line: &str) -> Option<String> {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?;
+    if !method.eq_ignore_ascii_case("GET") {
+        return None;
+    }
+    Some(parts.next()?.to_owned())
+}
+
+fn parse_oauth_callback_query(target: &str) -> SlackOAuthCallback {
+    let query = target.split_once('?').map(|(_, query)| query).unwrap_or("");
+    let mut callback = SlackOAuthCallback::default();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = percent_decode_form(value);
+        match key {
+            "code" => callback.code = non_empty_string(value),
+            "state" => callback.state = non_empty_string(value),
+            "error" => callback.error = non_empty_string(value),
+            _ => {}
+        }
+    }
+    callback
+}
+
+fn percent_decode_form(value: &str) -> String {
+    let bytes = value.replace('+', " ");
+    let bytes = bytes.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hi = (bytes[index + 1] as char).to_digit(16);
+                let lo = (bytes[index + 2] as char).to_digit(16);
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    out.push((hi * 16 + lo) as u8);
+                    index += 3;
+                    continue;
+                }
+                out.push(bytes[index]);
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn write_oauth_callback_response(stream: &mut impl Write, message: &str) {
+    let body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>chat-cli</title></head>\
+         <body style=\"font-family:sans-serif;padding:2rem\">{message}</body></html>"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// A browser-based Slack OAuth login in progress.
+///
+/// Created by [`begin_slack_oauth_login`], which binds the fixed loopback
+/// listener and builds the authorize URL (including a CSRF `state`) up front.
+/// The caller opens [`SlackOAuthLoginFlow::authorize_url`] in a browser, then
+/// awaits [`SlackOAuthLoginFlow::wait_for_authorization_code`] to receive the
+/// authorization code without the user copy/pasting anything.
+pub struct SlackOAuthLoginFlow {
+    authorize_url: String,
+    listener: TcpListener,
+    state: String,
+}
+
+impl SlackOAuthLoginFlow {
+    /// The Slack authorize URL to open in the user's browser.
+    pub fn authorize_url(&self) -> &str {
+        &self.authorize_url
+    }
+
+    /// The loopback redirect URI Slack will call back. Matches the value baked
+    /// into the generated app manifest's `redirect_urls`.
+    pub fn redirect_uri(&self) -> &str {
+        SLACK_OAUTH_REDIRECT_URI
+    }
+
+    /// Wait for Slack to redirect to the loopback listener, validate the CSRF
+    /// `state`, and return the authorization `code`. Runs the blocking accept on
+    /// a worker thread so the async runtime is never blocked.
+    pub async fn wait_for_authorization_code(self) -> Result<String> {
+        let SlackOAuthLoginFlow {
+            listener, state, ..
+        } = self;
+        let callback = tokio::task::spawn_blocking(move || {
+            accept_oauth_callback(&listener, SLACK_OAUTH_CALLBACK_TIMEOUT)
+        })
+        .await
+        .context("joining Slack OAuth callback listener task")??;
+        if let Some(error) = callback.error {
+            bail!("Slack sign-in failed: {error}");
+        }
+        if !slack_oauth_state_matches(&state, callback.state.as_deref()) {
+            bail!(
+                "Slack OAuth state mismatch; aborting login to avoid a cross-request token mixup"
+            );
+        }
+        callback
+            .code
+            .ok_or_else(|| anyhow!("Slack OAuth callback did not include an authorization code"))
+    }
+}
+
+/// Begin a browser-based Slack OAuth login: bind the loopback callback listener
+/// and build the authorize URL with a fresh CSRF `state`. The listener is bound
+/// before returning so the browser can be opened without racing the redirect.
+pub fn begin_slack_oauth_login(
+    client_id: &str,
+    bot_scopes: &str,
+    user_scopes: &str,
+) -> Result<SlackOAuthLoginFlow> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        bail!("Slack OAuth requires a client ID to start the browser login");
+    }
+    let listener = bind_oauth_callback_listener()?;
+    let state = slack_oauth_state();
+    let authorize_url = format!(
+        "https://slack.com/oauth/v2/authorize?client_id={}&scope={}&user_scope={}&redirect_uri={}&state={}",
+        url_component(client_id),
+        url_component(bot_scopes),
+        url_component(user_scopes),
+        url_component(SLACK_OAUTH_REDIRECT_URI),
+        url_component(&state),
+    );
+    Ok(SlackOAuthLoginFlow {
+        authorize_url,
+        listener,
+        state,
+    })
 }
 
 async fn open_socket_mode(app_token: SlackCredential) -> Result<SlackSocketModeConnection> {
@@ -1487,6 +2148,38 @@ fn synthetic_webhook_message_id(text: &str) -> String {
         chrono::Utc::now().timestamp_millis(),
         text.len()
     )
+}
+
+/// Build the account display label, preferring the real Slack workspace name
+/// over a manually-entered label. Always derives from a raw name and unwraps
+/// any previously double-wrapped `Slack (...)` value so it cannot compound.
+fn slack_account_display_name(
+    team_name: Option<&str>,
+    workspace: Option<&str>,
+    auth_mode: &SlackAuthMode,
+) -> String {
+    let resolved = team_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| workspace.map(str::trim).filter(|value| !value.is_empty()));
+    match resolved {
+        Some(name) => format!("Slack ({})", strip_slack_label_wrapper(name)),
+        None => format!("Slack ({})", auth_mode.label()),
+    }
+}
+
+/// Strip one or more enclosing `Slack (...)` wrappers from a stored label so a
+/// previously double-wrapped value renders cleanly.
+fn strip_slack_label_wrapper(name: &str) -> &str {
+    let trimmed = name.trim();
+    match trimmed
+        .strip_prefix("Slack (")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .map(str::trim)
+    {
+        Some(inner) if !inner.is_empty() => strip_slack_label_wrapper(inner),
+        _ => trimmed,
+    }
 }
 
 fn provider_id_for_options(options: &SlackProviderOptions) -> ProviderId {
@@ -1612,6 +2305,23 @@ impl SlackConnectionState {
                 .map(|token| SlackCredential::new(SlackCredentialKind::BotToken, token.clone()))
         }
     }
+
+    fn web_api_credentials(&self) -> Vec<SlackCredential> {
+        let mut credentials = Vec::new();
+        if let Some(token) = &self.user_token {
+            credentials.push(SlackCredential::new(
+                SlackCredentialKind::UserToken,
+                token.clone(),
+            ));
+        }
+        if let Some(token) = &self.bot_token {
+            credentials.push(SlackCredential::new(
+                SlackCredentialKind::BotToken,
+                token.clone(),
+            ));
+        }
+        credentials
+    }
 }
 
 impl SlackProvider {
@@ -1645,12 +2355,8 @@ impl SlackProvider {
         api_client: Arc<dyn SlackApiClient>,
     ) -> Result<Self> {
         let id = provider_id_for_options(&options);
-        let display_name = options
-            .workspace
-            .as_deref()
-            .filter(|workspace| !workspace.trim().is_empty())
-            .map(|workspace| format!("Slack ({workspace})"))
-            .unwrap_or_else(|| format!("Slack ({})", options.auth_mode.label()));
+        let display_name =
+            slack_account_display_name(None, options.workspace.as_deref(), &options.auth_mode);
         let capabilities = SlackCapabilities::default();
         let account = Account {
             id: id.clone(),
@@ -1672,6 +2378,7 @@ impl SlackProvider {
             events: EventBus::new(),
             connected: AtomicBool::new(false),
             realtime_task: RwLock::new(None),
+            history_poll_task: RwLock::new(None),
         })
     }
 
@@ -1687,10 +2394,37 @@ impl SlackProvider {
         self.capabilities().send_identity()
     }
 
+    /// Rebuild the cached account display name and avatar from the latest
+    /// connection metadata (real Slack workspace name + icon) without ever
+    /// changing the provider id, so stored chats/messages stay associated.
+    fn refresh_account_identity(&self) {
+        let (display_name, avatar) = {
+            let options = read_lock(&self.options);
+            let connection = read_lock(&self.connection);
+            let display_name = slack_account_display_name(
+                connection.team_name.as_deref(),
+                options.workspace.as_deref(),
+                &options.auth_mode,
+            );
+            let avatar = connection
+                .team_icon_url
+                .as_deref()
+                .and_then(slack_avatar_path);
+            (display_name, avatar)
+        };
+        *write_lock(&self.account) = Account {
+            id: self.id.clone(),
+            platform: Platform::Slack,
+            display_name: arc_str(display_name),
+            avatar,
+        };
+    }
+
     pub async fn validate_submission(
         &self,
         submission: AuthSubmission,
     ) -> Result<SlackCapabilities> {
+        let submission = self.resolve_oauth_submission(submission).await?;
         let options = self.options_for_submission(submission)?;
         let validated = self
             .call_api(
@@ -1700,27 +2434,32 @@ impl SlackProvider {
             .await;
         match validated {
             Ok(validated) => {
+                let supports_realtime = options.auth_mode.supports_realtime();
                 *write_lock(&self.options) = options;
-                let workspace = read_lock(&self.options).workspace.clone();
-                if let Some(workspace) = workspace
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|workspace| !workspace.is_empty())
-                {
-                    *write_lock(&self.account) = Account {
-                        id: self.id.clone(),
-                        platform: Platform::Slack,
-                        display_name: arc_str(format!("Slack ({workspace})")),
-                        avatar: None,
-                    };
-                }
                 *write_lock(&self.capabilities) = validated.capabilities.clone();
                 *write_lock(&self.connection) = validated.connection;
+                self.refresh_account_identity();
+                let account = self.account_info();
+                slack_diagnostic_log(
+                    "slack.provider.account_identity",
+                    format!(
+                        "id={} display_name={} avatar={}",
+                        account.id,
+                        account.display_name,
+                        account
+                            .avatar
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "<none>".to_owned())
+                    ),
+                );
                 self.connected.store(true, Ordering::Release);
                 self.events.send(ProviderEvent::AuthSucceeded);
                 self.events.send(ProviderEvent::SyncComplete);
                 if validated.capabilities.can_realtime {
                     self.start_realtime();
+                } else if validated.capabilities.can_read_history && supports_realtime {
+                    self.start_history_polling_with_realtime_notice();
                 }
                 Ok(validated.capabilities)
             }
@@ -1732,6 +2471,159 @@ impl SlackProvider {
                 Err(anyhow!(reason))
             }
         }
+    }
+
+    /// If the submission carries an OAuth authorization `code`, exchange it for
+    /// real Slack tokens via `oauth.v2.access` and fold the results into the
+    /// submission (user/bot tokens + workspace name) so the rest of the
+    /// connection flow proceeds exactly like a token submission. Submissions
+    /// without a code are returned unchanged.
+    async fn resolve_oauth_submission(
+        &self,
+        mut submission: AuthSubmission,
+    ) -> Result<AuthSubmission> {
+        submission = self.maybe_run_browser_oauth_login(submission).await?;
+        let Some(code) = submission
+            .oauth_code
+            .as_deref()
+            .map(str::trim)
+            .filter(|code| !code.is_empty())
+            .map(str::to_owned)
+        else {
+            return Ok(submission);
+        };
+
+        let options = self.options();
+        let official = official_slack_app();
+        let client_id = submission
+            .client_id
+            .clone()
+            .or_else(|| options.client_id.clone())
+            .or_else(|| official.as_ref().map(|app| app.client_id.clone()))
+            .and_then(non_empty_string)
+            .ok_or_else(|| {
+                anyhow!("Slack OAuth requires a client ID before exchanging the authorization code")
+            })?;
+        let client_secret = submission
+            .client_secret
+            .clone()
+            .or_else(|| options.client_secret.clone())
+            .or_else(|| official.as_ref().map(|app| app.client_secret.clone()))
+            .and_then(non_empty_string)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Slack OAuth requires a client secret before exchanging the authorization code"
+                )
+            })?;
+        let redirect_uri = submission
+            .redirect_uri
+            .clone()
+            .or_else(|| options.redirect_uri.clone())
+            .or_else(|| official.as_ref().map(|app| app.redirect_uri.clone()))
+            .and_then(non_empty_string)
+            .unwrap_or_else(|| SLACK_OAUTH_REDIRECT_URI.to_owned());
+
+        let tokens = self
+            .call_api(
+                NetworkActivityKind::Auth,
+                self.api_client.exchange_oauth_code(
+                    &client_id,
+                    &client_secret,
+                    &redirect_uri,
+                    &code,
+                ),
+            )
+            .await?;
+
+        // Never overwrite a token the user explicitly pasted alongside a code.
+        if submission.user_token.is_none() {
+            submission.user_token = tokens.user_token;
+        }
+        if submission.bot_token.is_none() {
+            submission.bot_token = tokens.bot_token;
+        }
+        if non_empty_option(&submission.workspace_label).is_none() {
+            submission.workspace_label = tokens.team_name;
+        }
+        // The code is single-use; clear it so downstream option building treats
+        // this as a normal token submission.
+        submission.oauth_code = None;
+        Ok(submission)
+    }
+
+    /// If this is a browser-login-capable OAuth submission (a user-OAuth mode
+    /// with client credentials but no pasted token or code yet), run the
+    /// loopback browser login: bind the callback listener, emit an `OAuthUrl`
+    /// challenge so the UI opens the browser, then wait for Slack to redirect
+    /// back with an authorization `code`. The code is folded into the
+    /// submission so the existing `oauth.v2.access` exchange path completes the
+    /// login without the user copy/pasting anything. Submissions that already
+    /// carry a code/token, or that lack a client ID/secret, are returned
+    /// unchanged so the manual paths still work.
+    async fn maybe_run_browser_oauth_login(
+        &self,
+        mut submission: AuthSubmission,
+    ) -> Result<AuthSubmission> {
+        if non_empty_option(&submission.oauth_code).is_some() {
+            return Ok(submission);
+        }
+        // A pasted token means the user opted into the manual path.
+        if non_empty_option(&submission.user_token).is_some()
+            || non_empty_option(&submission.bot_token).is_some()
+        {
+            return Ok(submission);
+        }
+
+        let options = self.options();
+        let official = official_slack_app();
+        let mode = match submission.mode.clone() {
+            Some(mode) => SlackAuthMode::try_from(mode)?,
+            None => options.auth_mode.clone(),
+        };
+        if !mode.supports_oauth_code_exchange() {
+            return Ok(submission);
+        }
+
+        let Some(client_id) = submission
+            .client_id
+            .clone()
+            .or_else(|| options.client_id.clone())
+            .or_else(|| official.as_ref().map(|app| app.client_id.clone()))
+            .and_then(non_empty_string)
+        else {
+            return Ok(submission);
+        };
+        // Without a client secret we cannot exchange the code, so leave the
+        // submission untouched and let validation surface the missing secret.
+        if submission
+            .client_secret
+            .clone()
+            .or_else(|| options.client_secret.clone())
+            .or_else(|| official.as_ref().map(|app| app.client_secret.clone()))
+            .and_then(non_empty_string)
+            .is_none()
+        {
+            return Ok(submission);
+        }
+
+        let flow = begin_slack_oauth_login(&client_id, mode.bot_scopes(), mode.user_scopes())?;
+        let redirect_uri = flow.redirect_uri().to_owned();
+        slack_diagnostic_log(
+            "slack.oauth.browser_login.start",
+            format!("mode={} redirect_uri={redirect_uri}", mode.label()),
+        );
+        // Ask the UI to open the browser at the authorize URL while we wait for
+        // the loopback redirect. This is a non-blocking channel send.
+        self.events
+            .send(ProviderEvent::AuthRequired(AuthChallenge::OAuthUrl(
+                arc_str(flow.authorize_url()),
+            )));
+
+        let code = flow.wait_for_authorization_code().await?;
+        slack_diagnostic_log("slack.oauth.browser_login.code_received", "ok");
+        submission.oauth_code = Some(code);
+        submission.redirect_uri = Some(redirect_uri);
+        Ok(submission)
     }
 
     fn options_for_submission(&self, submission: AuthSubmission) -> Result<SlackProviderOptions> {
@@ -1763,15 +2655,8 @@ impl SlackProvider {
         if submission.webhook_url.is_some() {
             options.webhook_url = submission.webhook_url;
         }
-        if submission
-            .oauth_code
-            .as_deref()
-            .is_some_and(|code| !code.trim().is_empty())
-        {
-            bail!(
-                "Slack OAuth code exchange is not implemented yet; paste the resulting user token or use an approved token import"
-            )
-        }
+        // Any `oauth_code` is consumed earlier by `resolve_oauth_submission`,
+        // which turns it into real tokens before this runs.
         Ok(options)
     }
 
@@ -1895,9 +2780,12 @@ impl SlackProvider {
 
         if options.auth_mode.accepts_webhook() {
             if let Some(webhook_url) = non_empty_option(&options.webhook_url) {
-                api_client.validate_webhook(&webhook_url).await?;
+                let validation = api_client.validate_webhook(&webhook_url).await?;
                 capabilities.can_send_webhook = true;
                 connection.webhook_url = Some(webhook_url);
+                if connection.team_name.is_none() {
+                    connection.team_name = non_empty_string(validation.url_host);
+                }
             }
         }
 
@@ -1916,6 +2804,64 @@ impl SlackProvider {
         }
 
         capabilities.requires_admin_approval = false;
+
+        // Best-effort: enrich the connection with the real Slack workspace name
+        // and icon. Failures (e.g. missing team:read scope on one token) are
+        // non-fatal, but try every configured Web API credential before giving
+        // up so mixed user/bot setups still get the workspace icon. Pass the
+        // validated team id explicitly because some token/app combinations need
+        // it to return complete team metadata.
+        let mut team_info_errors = Vec::new();
+        let team_id = connection.team_id.clone();
+        for credential in connection.web_api_credentials() {
+            let credential_kind = credential.kind.clone();
+            match api_client.team_info(credential, team_id.as_deref()).await {
+                Ok(Some(team)) => {
+                    let team_id_label = team.id.as_deref().unwrap_or("<none>").to_owned();
+                    let has_icon = team.icon_url.is_some();
+                    if let Some(name) = team
+                        .display_name()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                    {
+                        connection.team_name = Some(name.to_owned());
+                    }
+                    if connection.team_icon_url.is_none() {
+                        connection.team_icon_url = team.icon_url;
+                    }
+                    slack_diagnostic_log(
+                        "slack.provider.team_info",
+                        format!(
+                            "credential={:?} requested_team_id={} returned_team_id={} has_icon={}",
+                            credential_kind,
+                            team_id.as_deref().unwrap_or("<none>"),
+                            team_id_label,
+                            has_icon
+                        ),
+                    );
+                    if connection.team_icon_url.is_some() {
+                        break;
+                    }
+                }
+                Ok(None) => slack_diagnostic_log(
+                    "slack.provider.team_info",
+                    format!(
+                        "credential={:?} requested_team_id={} result=no_team",
+                        credential_kind,
+                        team_id.as_deref().unwrap_or("<none>")
+                    ),
+                ),
+                Err(error) => team_info_errors.push(sanitize_slack_error(&error)),
+            }
+        }
+
+        if connection.team_icon_url.is_none() && !team_info_errors.is_empty() {
+            slack_diagnostic_log(
+                "slack.provider.team_info_failed",
+                team_info_errors.join("; "),
+            );
+        }
+
         Ok(SlackValidatedConnection {
             capabilities,
             connection,
@@ -2062,32 +3008,7 @@ impl SlackProvider {
     }
 
     fn chat_from_conversation(&self, conversation: SlackConversation) -> Option<Chat> {
-        let id = conversation.id.trim();
-        if id.is_empty() || conversation.is_archived {
-            return None;
-        }
-
-        let name = conversation_display_name(&conversation);
-        let kind = conversation_chat_kind(&conversation);
-        let membership = conversation_membership(&conversation);
-
-        Some(Chat {
-            id: arc_str(id),
-            account: self.id.clone(),
-            platform: Platform::Slack,
-            name: arc_str(name),
-            avatar: None,
-            is_group: conversation.is_channel || conversation.is_group || conversation.is_mpim,
-            kind,
-            membership,
-            is_shared: conversation.is_ext_shared,
-            unread_count: conversation.unread_count,
-            muted: conversation.is_muted,
-            pinned: conversation.is_pinned,
-            last_message_at: None,
-            last_message_preview: None,
-            thread_id: None,
-        })
+        chat_from_slack_conversation(&self.id, &conversation)
     }
 
     fn discovery_result_from_conversation(
@@ -2240,8 +3161,20 @@ impl SlackProvider {
     }
 
     fn start_realtime(&self) {
+        self.stop_history_polling();
         let app_token = read_lock(&self.connection).app_token.clone();
         let Some(app_token) = app_token else {
+            slack_diagnostic_log(
+                "slack.realtime.no_app_token",
+                format!("account={}", self.id),
+            );
+            self.events.send(ProviderEvent::AccountNotice {
+                title: arc_str("Slack realtime unavailable"),
+                body: arc_str(
+                    "Configure an app-level xapp token and enable Socket Mode/Event Subscriptions to receive Slack messages in realtime.",
+                ),
+                severity: AccountNoticeSeverity::SystemAlert,
+            });
             return;
         };
 
@@ -2249,16 +3182,79 @@ impl SlackProvider {
         let api_client = self.api_client.clone();
         let events = self.events.clone();
         let account = self.id.clone();
-        let user_id = read_lock(&self.connection).user_id.clone();
+        let connection = read_lock(&self.connection).clone();
+        let user_id = connection.user_id.clone();
+        let fallback_credential = connection.read_credential();
+        let history_user_id = connection.user_id.clone().or(connection.bot_id.clone());
         let users = Arc::clone(&self.users);
+        slack_diagnostic_log(
+            "slack.realtime.start",
+            format!(
+                "account={account} user_id={} has_history_fallback={}",
+                user_id.as_deref().unwrap_or("<none>"),
+                fallback_credential.is_some(),
+            ),
+        );
         let handle = tokio::spawn(async move {
-            run_socket_mode_loop(api_client, events, account, user_id, app_token, users).await;
+            run_socket_mode_loop(
+                api_client,
+                events,
+                account,
+                user_id,
+                app_token,
+                users,
+                fallback_credential,
+                history_user_id,
+            )
+            .await;
         });
         *write_lock(&self.realtime_task) = Some(handle);
     }
 
     fn stop_realtime(&self) {
         if let Some(handle) = write_lock(&self.realtime_task).take() {
+            handle.abort();
+        }
+    }
+
+    fn start_history_polling(&self) {
+        let connection = read_lock(&self.connection).clone();
+        let Some(credential) = connection.read_credential() else {
+            return;
+        };
+        self.stop_history_polling();
+        let api_client = self.api_client.clone();
+        let events = self.events.clone();
+        let account = self.id.clone();
+        let current_user_id = connection.user_id.or(connection.bot_id);
+        let users = Arc::clone(&self.users);
+        let handle = tokio::spawn(async move {
+            run_history_poll_loop(
+                api_client,
+                events,
+                account,
+                credential,
+                current_user_id,
+                users,
+            )
+            .await;
+        });
+        *write_lock(&self.history_poll_task) = Some(handle);
+    }
+
+    fn start_history_polling_with_realtime_notice(&self) {
+        self.events.send(ProviderEvent::AccountNotice {
+            title: arc_str("Slack realtime unavailable"),
+            body: arc_str(
+                "Using periodic Slack history checks because realtime is unavailable. Configure an app-level xapp token and enable Socket Mode/Event Subscriptions for instant Slack messages.",
+            ),
+            severity: AccountNoticeSeverity::SystemAlert,
+        });
+        self.start_history_polling();
+    }
+
+    fn stop_history_polling(&self) {
+        if let Some(handle) = write_lock(&self.history_poll_task).take() {
             handle.abort();
         }
     }
@@ -2502,10 +3498,10 @@ impl SlackAuthMode {
     fn user_scopes(&self) -> &'static str {
         match self {
             Self::ReadOnlyOAuth => {
-                "users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,files:read,search:read"
+                "team:read,users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,files:read,search:read"
             }
             Self::UserOAuth | Self::ManualApp | Self::ImportedToken => {
-                "users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,reactions:read,reactions:write,files:read,files:write,search:read"
+                "team:read,users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,reactions:read,reactions:write,files:read,files:write,search:read"
             }
             Self::BotToken | Self::Webhook => "",
         }
@@ -2514,7 +3510,7 @@ impl SlackAuthMode {
     fn bot_scopes(&self) -> &'static str {
         match self {
             Self::BotToken | Self::ManualApp => {
-                "users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,reactions:read,reactions:write,files:read,files:write"
+                "team:read,users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,reactions:read,reactions:write,files:read,files:write"
             }
             Self::UserOAuth | Self::ReadOnlyOAuth | Self::ImportedToken | Self::Webhook => "",
         }
@@ -2540,6 +3536,14 @@ impl SlackAuthMode {
                 | Self::ImportedToken
                 | Self::ManualApp
         )
+    }
+
+    fn supports_realtime(&self) -> bool {
+        self.accepts_app_token()
+    }
+
+    fn supports_oauth_code_exchange(&self) -> bool {
+        matches!(self, Self::UserOAuth | Self::ReadOnlyOAuth)
     }
 
     fn accepts_webhook(&self) -> bool {
@@ -2661,11 +3665,43 @@ impl Provider for SlackProvider {
                 let capabilities = validated.capabilities.clone();
                 *write_lock(&self.capabilities) = capabilities.clone();
                 *write_lock(&self.connection) = validated.connection;
+                self.refresh_account_identity();
+                let account = self.account_info();
+                slack_diagnostic_log(
+                    "slack.provider.account_identity",
+                    format!(
+                        "id={} display_name={} avatar={}",
+                        account.id,
+                        account.display_name,
+                        account
+                            .avatar
+                            .as_ref()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "<none>".to_owned())
+                    ),
+                );
                 self.connected.store(true, Ordering::Release);
                 self.events.send(ProviderEvent::AuthSucceeded);
                 self.events.send(ProviderEvent::SyncComplete);
+                slack_diagnostic_log(
+                    "slack.connect.realtime_decision",
+                    format!(
+                        "account={} can_realtime={} can_read_history={} has_app_token={} supports_realtime={}",
+                        self.id,
+                        capabilities.can_realtime,
+                        capabilities.can_read_history,
+                        read_lock(&self.connection).app_token.is_some(),
+                        options.auth_mode.supports_realtime(),
+                    ),
+                );
                 if capabilities.can_realtime {
                     self.start_realtime();
+                } else if capabilities.can_read_history {
+                    if options.auth_mode.supports_realtime() && capabilities.has_non_realtime() {
+                        self.start_history_polling_with_realtime_notice();
+                    } else {
+                        self.start_history_polling();
+                    }
                 }
                 Ok(())
             }
@@ -2683,6 +3719,7 @@ impl Provider for SlackProvider {
 
     async fn disconnect(&self) -> Result<()> {
         self.stop_realtime();
+        self.stop_history_polling();
         self.connected.store(false, Ordering::Release);
         *write_lock(&self.connection) = SlackConnectionState::default();
         *write_lock(&self.chats) = Vec::new();
@@ -2854,6 +3891,10 @@ impl Provider for SlackProvider {
 
     async fn submit_auth(&self, submission: AuthSubmission) -> Result<()> {
         self.validate_submission(submission).await.map(|_| ())
+    }
+
+    fn has_bundled_oauth_app(&self) -> bool {
+        official_slack_app_is_configured()
     }
 
     async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<Message>> {
@@ -3135,6 +4176,202 @@ fn conversation_display_name(conversation: &SlackConversation) -> String {
     conversation.id.clone()
 }
 
+fn chat_from_slack_conversation(
+    account: &ProviderId,
+    conversation: &SlackConversation,
+) -> Option<Chat> {
+    let id = conversation.id.trim();
+    if id.is_empty() || conversation.is_archived {
+        return None;
+    }
+
+    let name = conversation_display_name(conversation);
+    let kind = conversation_chat_kind(conversation);
+    let membership = conversation_membership(conversation);
+
+    Some(Chat {
+        id: arc_str(id),
+        account: account.clone(),
+        platform: Platform::Slack,
+        name: arc_str(name),
+        avatar: None,
+        is_group: conversation.is_channel || conversation.is_group || conversation.is_mpim,
+        kind,
+        membership,
+        is_shared: conversation.is_ext_shared,
+        unread_count: conversation.unread_count,
+        muted: conversation.is_muted,
+        pinned: conversation.is_pinned,
+        last_message_at: None,
+        last_message_preview: None,
+        thread_id: None,
+    })
+}
+
+async fn run_history_poll_loop(
+    api_client: Arc<dyn SlackApiClient>,
+    events: EventBus,
+    account: ProviderId,
+    credential: SlackCredential,
+    current_user_id: Option<String>,
+    users: Arc<RwLock<HashMap<String, SlackUser>>>,
+) {
+    // History polling is a fallback for missing realtime, so it must only
+    // surface messages that genuinely arrive *after* polling begins. Gating on
+    // a "first poll" flag alone is unsafe: if the baseline history fetch fails
+    // (for example a transient decode error), those old messages are not
+    // recorded and would later look brand new, notifying the user about
+    // long-past conversations. Anchoring to a startup timestamp makes the
+    // baseline robust against such failures.
+    let started_at = Utc::now();
+    let mut seen_message_ids = HashSet::new();
+    loop {
+        match api_client.list_conversations(credential.clone()).await {
+            Ok(conversations) => {
+                events.send(ProviderEvent::NetworkActivity {
+                    direction: NetworkActivityDirection::Rx,
+                    kind: NetworkActivityKind::History,
+                });
+                for conversation in conversations
+                    .into_iter()
+                    .filter(|conversation| include_conversation_in_sidebar(conversation))
+                {
+                    let Some(mut chat) = chat_from_slack_conversation(&account, &conversation)
+                    else {
+                        continue;
+                    };
+                    // Realtime is unavailable here, so the `load_chats`
+                    // name-resolution path never runs for these chats. Resolve
+                    // direct-message names inline (cached after the first
+                    // lookup) so DMs do not stay labelled with the raw Slack
+                    // user id, for example "DM U01ABC".
+                    resolve_slack_dm_chat_name(
+                        &api_client,
+                        &credential,
+                        &users,
+                        &events,
+                        &mut chat,
+                    )
+                    .await;
+                    events.send(ProviderEvent::ChatUpdated(chat));
+                    match api_client
+                        .history(
+                            credential.clone(),
+                            &account,
+                            current_user_id.as_deref(),
+                            &arc_str(&conversation.id),
+                            None,
+                            SLACK_HISTORY_POLL_LIMIT,
+                            Some(Arc::clone(&users)),
+                        )
+                        .await
+                    {
+                        Ok(messages) => {
+                            for message in messages {
+                                let first_seen = seen_message_ids
+                                    .insert(format!("{}:{}", message.chat_id, message.id));
+                                // Only notify for messages first observed by
+                                // this loop AND newer than when polling began,
+                                // so historical backlog never triggers alerts.
+                                if history_poll_message_is_live(
+                                    started_at,
+                                    message.timestamp,
+                                    first_seen,
+                                ) {
+                                    events.send(ProviderEvent::Message {
+                                        message,
+                                        is_historical: false,
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) => slack_diagnostic_log(
+                            "slack.history_poll.history_failed",
+                            sanitize_slack_error(&error),
+                        ),
+                    }
+                }
+            }
+            Err(error) => slack_diagnostic_log(
+                "slack.history_poll.conversations_failed",
+                sanitize_slack_error(&error),
+            ),
+        }
+        tokio::time::sleep(SLACK_HISTORY_POLL_INTERVAL).await;
+    }
+}
+
+/// Resolves a direct-message chat's display name from the user cache, fetching
+/// `users.info` once when the user is not yet cached and falling back to a
+/// synthetic user when the lookup yields nothing. Without this, the
+/// history-poll fallback leaves DM chats labelled with the raw Slack user id
+/// (for example "DM U01ABC") because the realtime/`load_chats` resolution path
+/// does not run while polling. The resolved user is cached so later polls reuse
+/// it without another API call and never downgrade the name back to the id.
+async fn resolve_slack_dm_chat_name(
+    api_client: &Arc<dyn SlackApiClient>,
+    credential: &SlackCredential,
+    users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+    events: &EventBus,
+    chat: &mut Chat,
+) {
+    let Some(user_id) = direct_chat_user_id(chat).map(str::to_owned) else {
+        return;
+    };
+
+    let user = if let Some(cached) = read_lock(users).get(&user_id).cloned() {
+        Some(cached)
+    } else {
+        events.send(ProviderEvent::NetworkActivity {
+            direction: NetworkActivityDirection::Tx,
+            kind: NetworkActivityKind::Other,
+        });
+        let fetched = match api_client.user_info(credential.clone(), &user_id).await {
+            Ok(user) => {
+                events.send(ProviderEvent::NetworkActivity {
+                    direction: NetworkActivityDirection::Rx,
+                    kind: NetworkActivityKind::Other,
+                });
+                user
+            }
+            Err(error) => {
+                slack_diagnostic_log(
+                    "slack.history_poll.user_info_failed",
+                    sanitize_slack_error(&error),
+                );
+                None
+            }
+        }
+        .or_else(|| fallback_slack_user(&user_id));
+        if let Some(user) = fetched.as_ref() {
+            write_lock(users).insert(user.id.clone(), user.clone());
+        }
+        fetched
+    };
+
+    if let Some(user) = user {
+        chat.name = arc_str(user.best_name());
+        chat.avatar = user.sender().avatar;
+    }
+}
+
+/// Decides whether a message returned by the history-poll fallback should be
+/// surfaced as a live (notify-worthy) message.
+///
+/// A message qualifies only when it is observed for the first time by this loop
+/// *and* was sent after polling began. Anchoring to the loop's start time keeps
+/// the baseline robust even if the very first history fetch fails: messages
+/// that were already in the backlog (and only become visible on a later
+/// successful poll) are still older than `started_at`, so they never trigger a
+/// notification about a long-past conversation.
+fn history_poll_message_is_live(
+    started_at: Timestamp,
+    message_timestamp: Timestamp,
+    first_seen: bool,
+) -> bool {
+    first_seen && message_timestamp > started_at
+}
+
 async fn run_socket_mode_loop(
     api_client: Arc<dyn SlackApiClient>,
     events: EventBus,
@@ -3142,7 +4379,10 @@ async fn run_socket_mode_loop(
     user_id: Option<String>,
     app_token: String,
     users: Arc<RwLock<HashMap<String, SlackUser>>>,
+    fallback_credential: Option<SlackCredential>,
+    history_user_id: Option<String>,
 ) {
+    let mut transient_alerted = false;
     loop {
         let result = run_socket_mode_once(
             api_client.clone(),
@@ -3153,10 +4393,92 @@ async fn run_socket_mode_loop(
             Arc::clone(&users),
         )
         .await;
-        if result.is_err() {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        match &result {
+            Ok(()) => {
+                slack_diagnostic_log(
+                    "slack.realtime.disconnected",
+                    format!("account={account} reason=stream_closed reconnect_in_s=5"),
+                );
+            }
+            Err(error) => {
+                let reason = sanitize_slack_error(error);
+                slack_diagnostic_log(
+                    "slack.realtime.error",
+                    format!("account={account} reconnect_in_s=5 error={reason}"),
+                );
+
+                // A bad app-level token (for example `invalid_auth` from
+                // apps.connections.open) never recovers by retrying, so retrying
+                // forever leaves the user with no realtime *and* no notice. Alert
+                // them with a system notification and degrade to history polling
+                // so messages still arrive, then stop the dead realtime loop.
+                if is_fatal_realtime_auth_error(&reason) {
+                    slack_diagnostic_log(
+                        "slack.realtime.fatal_auth",
+                        format!(
+                            "account={account} reason={reason} history_fallback={}",
+                            fallback_credential.is_some()
+                        ),
+                    );
+                    events.send(ProviderEvent::AccountNotice {
+                        title: arc_str("Slack realtime unavailable"),
+                        body: arc_str(format!(
+                            "Slack rejected the realtime connection ({reason}). Configure a valid app-level (xapp-) token with connections:write and enable Socket Mode. Falling back to periodic history checks."
+                        )),
+                        severity: AccountNoticeSeverity::SystemAlert,
+                    });
+                    if let Some(credential) = fallback_credential {
+                        run_history_poll_loop(
+                            api_client,
+                            events,
+                            account,
+                            credential,
+                            history_user_id,
+                            users,
+                        )
+                        .await;
+                    }
+                    return;
+                }
+
+                // Transient errors (network blips, Slack restarts) can recover, so
+                // keep retrying, but still alert the user once so a prolonged
+                // outage is visible instead of silent.
+                if !transient_alerted {
+                    transient_alerted = true;
+                    events.send(ProviderEvent::AccountNotice {
+                        title: arc_str("Slack realtime interrupted"),
+                        body: arc_str(format!(
+                            "Lost the Slack realtime connection ({reason}). Reconnecting automatically."
+                        )),
+                        severity: AccountNoticeSeverity::SystemAlert,
+                    });
+                }
+            }
         }
+        if result.is_ok() {
+            transient_alerted = false;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
+}
+
+/// Classifies a sanitized Slack error string as a non-recoverable realtime
+/// authentication/authorization failure. These never succeed on retry, so the
+/// realtime loop should alert the user and fall back instead of spinning.
+fn is_fatal_realtime_auth_error(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    [
+        "invalid_auth",
+        "not_authed",
+        "account_inactive",
+        "token_revoked",
+        "token_expired",
+        "no_permission",
+        "missing_scope",
+    ]
+    .iter()
+    .any(|needle| reason.contains(needle))
 }
 
 async fn run_socket_mode_once(
@@ -3171,6 +4493,10 @@ async fn run_socket_mode_once(
         direction: NetworkActivityDirection::Tx,
         kind: NetworkActivityKind::Connect,
     });
+    slack_diagnostic_log(
+        "slack.realtime.open_socket_mode.request",
+        format!("account={account}"),
+    );
     let connection = api_client
         .open_socket_mode(SlackCredential::new(
             SlackCredentialKind::AppToken,
@@ -3181,9 +4507,17 @@ async fn run_socket_mode_once(
         direction: NetworkActivityDirection::Rx,
         kind: NetworkActivityKind::Connect,
     });
+    slack_diagnostic_log(
+        "slack.realtime.websocket.connecting",
+        format!("account={account}"),
+    );
     let (mut socket, _) = connect_async(&connection.url)
         .await
         .context("connecting Slack Socket Mode WebSocket")?;
+    slack_diagnostic_log(
+        "slack.realtime.websocket.connected",
+        format!("account={account}"),
+    );
 
     while let Some(message) = socket.next().await {
         let message = message.context("reading Slack Socket Mode frame")?;
@@ -3242,6 +4576,19 @@ fn handle_socket_mode_text(
         .as_deref()
         .map(|id| format!(r#"{{"envelope_id":"{}"}}"#, json_escape(id)));
 
+    slack_diagnostic_log(
+        "slack.realtime.envelope",
+        format!(
+            "account={account} type={} payload_event={}",
+            envelope.envelope_type.as_deref().unwrap_or("<none>"),
+            envelope
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.event_type.as_deref())
+                .unwrap_or("<none>"),
+        ),
+    );
+
     if envelope.envelope_type.as_deref() == Some("events_api")
         && envelope
             .payload
@@ -3266,8 +4613,18 @@ fn emit_realtime_event(
     match event.event_type.as_str() {
         "message" => emit_realtime_message(events, account, current_user_id, event, users),
         "reaction_added" | "reaction_removed" => emit_realtime_reaction(events, event),
-        _ => {}
+        other => slack_diagnostic_log(
+            "slack.realtime.event.unhandled",
+            format!("account={account} event_type={other}"),
+        ),
     }
+}
+
+fn is_ignored_slack_message_subtype(subtype: Option<&str>) -> bool {
+    matches!(
+        subtype,
+        Some("channel_join" | "channel_leave" | "message_deleted" | "message_changed")
+    )
 }
 
 fn emit_realtime_message(
@@ -3304,9 +4661,11 @@ fn emit_realtime_message(
                 message.thread_ts,
                 message.text,
                 message.attachments,
+                message.files,
                 Vec::new(),
                 Some(users),
                 false,
+                None,
             )
         }) {
             events.send(ProviderEvent::MessageEdited { message });
@@ -3314,10 +4673,18 @@ fn emit_realtime_message(
         return;
     }
 
-    if subtype.is_some() {
+    if is_ignored_slack_message_subtype(subtype) {
+        slack_diagnostic_log(
+            "slack.realtime.message.dropped",
+            format!(
+                "account={account} reason=ignored_subtype subtype={}",
+                subtype.unwrap_or("<none>")
+            ),
+        );
         return;
     }
 
+    let channel = event.channel.clone();
     if let Some(message) = slack_message_from_parts(
         account,
         current_user_id,
@@ -3329,14 +4696,35 @@ fn emit_realtime_message(
         event.thread_ts,
         event.text,
         event.attachments,
+        event.files,
         Vec::new(),
         Some(users),
         false,
+        None,
     ) {
+        slack_diagnostic_log(
+            "slack.realtime.message.emit",
+            format!(
+                "account={account} chat={} message={} from_me={} subtype={}",
+                message.chat_id,
+                message.id,
+                message.is_from_me,
+                subtype.unwrap_or("<none>")
+            ),
+        );
         events.send(ProviderEvent::Message {
             message,
             is_historical: false,
         });
+    } else {
+        slack_diagnostic_log(
+            "slack.realtime.message.dropped",
+            format!(
+                "account={account} reason=unbuildable channel={} subtype={}",
+                channel.as_deref().unwrap_or("<none>"),
+                subtype.unwrap_or("<none>")
+            ),
+        );
     }
 }
 
@@ -3368,16 +4756,14 @@ fn slack_history_message(
     channel: String,
     message: SlackHistoryMessageResponse,
     users: Option<&Arc<RwLock<HashMap<String, SlackUser>>>>,
+    web_api_token: Option<&str>,
 ) -> Option<Message> {
     if message.hidden.unwrap_or(false)
         || message
             .message_type
             .as_deref()
             .is_some_and(|kind| kind != "message")
-        || matches!(
-            message.subtype.as_deref(),
-            Some("message_deleted" | "message_changed" | "channel_join" | "channel_leave")
-        )
+        || is_ignored_slack_message_subtype(message.subtype.as_deref())
     {
         return None;
     }
@@ -3394,9 +4780,11 @@ fn slack_history_message(
         message.thread_ts,
         message.text,
         message.attachments,
+        message.files,
         slack_reactions(message.reactions),
         users,
         is_thread_root,
+        web_api_token,
     )
 }
 
@@ -3411,9 +4799,11 @@ fn slack_message_from_parts(
     thread_ts: Option<String>,
     text: Option<String>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
+    files: Option<Vec<SlackFileResponse>>,
     reactions: Vec<Reaction>,
     users: Option<&Arc<RwLock<HashMap<String, SlackUser>>>>,
     is_thread_root: bool,
+    web_api_token: Option<&str>,
 ) -> Option<Message> {
     let channel = non_empty_option(&channel)?;
     let ts = non_empty_option(&ts)?;
@@ -3421,8 +4811,26 @@ fn slack_message_from_parts(
         .or_else(|| non_empty_option(&bot_id))
         .unwrap_or_else(|| "slack".to_owned());
     let attachments = attachments.unwrap_or_default();
+    let files = files.unwrap_or_default();
     let text = slack_message_text(text, &attachments);
-    let cards = slack_attachment_cards(&attachments);
+    let mut cards = slack_attachment_cards(&attachments);
+    let mut file_cards = slack_file_cards(&files, web_api_token);
+    // Preserve the message's own text as a caption on the first file card when
+    // there are no attachment cards (attachment cards already fold in their
+    // text). Otherwise a message like "<text> + 2 images" would render the
+    // images but silently drop the text once content becomes `Cards`.
+    if cards.is_empty()
+        && let Some(first) = file_cards.first_mut()
+        && first.body.is_none()
+        && !text.trim().is_empty()
+    {
+        first.body = Some(arc_str(text.clone()));
+    }
+    cards.append(&mut file_cards);
+    // Detect self-mentions from the raw text while `<@U123>`/`<!here>` tokens
+    // are still present (mention substitution happens later, in
+    // `apply_cached_user_to_message`). Used by the notification scope filter.
+    let mentions_me = slack_text_mentions_user(&text, current_user_id);
     let timestamp = slack_ts_to_timestamp(&ts).unwrap_or_else(Utc::now);
     let thread_id = non_empty_option(&thread_ts)
         .filter(|thread_ts| thread_ts != &ts)
@@ -3455,6 +4863,7 @@ fn slack_message_from_parts(
         reactions,
         receipts: Vec::new(),
         is_from_me: current_user_id.is_some_and(|current_user_id| current_user_id == sender_id),
+        mentions_me,
         platform_data: PlatformData {
             slack: Some(SlackData {
                 ts: arc_str(&ts),
@@ -3659,6 +5068,135 @@ fn slack_card_media(kind: &str, url: &str) -> Media {
         local_path: None,
         thumbnail: None,
     }
+}
+
+/// Builds attachment cards for the `files` array of a Slack message. Image
+/// uploads become `MediaPreview` cards whose image points at a locally cached
+/// (and lazily, authenticated-downloaded) copy of the file; other file types
+/// become a lightweight `ProviderAttachment` card with a download link.
+fn slack_file_cards(files: &[SlackFileResponse], token: Option<&str>) -> Vec<Card> {
+    files
+        .iter()
+        .filter_map(|file| slack_file_card(file, token))
+        .collect()
+}
+
+fn slack_file_card(file: &SlackFileResponse, token: Option<&str>) -> Option<Card> {
+    // Slack uses `mode: "tombstone"` (and similar) for deleted/expired files.
+    if file
+        .mode
+        .as_deref()
+        .is_some_and(|mode| matches!(mode, "tombstone" | "hidden_by_limit"))
+    {
+        return None;
+    }
+
+    let title = file
+        .title
+        .clone()
+        .and_then(non_empty_string)
+        .or_else(|| file.name.clone().and_then(non_empty_string))
+        .map(|text| arc_str(replace_slack_emoji_codes(&text)));
+    let permalink = file
+        .permalink
+        .clone()
+        .and_then(non_empty_string)
+        .map(arc_str);
+
+    if slack_file_is_image(file) {
+        let image = slack_file_image_media(file, token)?;
+        return Some(Card {
+            kind: CardKind::MediaPreview,
+            source: CardSource::Slack,
+            title,
+            subtitle: None,
+            body: None,
+            footer: None,
+            url: permalink,
+            accent_color: None,
+            thumbnail: None,
+            image: Some(image),
+            fields: Vec::new(),
+            actions: Vec::new(),
+        });
+    }
+
+    let url = file
+        .url_private_download
+        .clone()
+        .and_then(non_empty_string)
+        .map(arc_str)
+        .or_else(|| permalink.clone());
+    // Without at least a title or a link there is nothing useful to render.
+    if title.is_none() && url.is_none() {
+        return None;
+    }
+    Some(Card {
+        kind: CardKind::ProviderAttachment,
+        source: CardSource::Slack,
+        title,
+        subtitle: file
+            .filetype
+            .clone()
+            .and_then(non_empty_string)
+            .map(|filetype| arc_str(filetype.to_ascii_uppercase())),
+        body: None,
+        footer: None,
+        url,
+        accent_color: None,
+        thumbnail: None,
+        image: None,
+        fields: Vec::new(),
+        actions: Vec::new(),
+    })
+}
+
+fn slack_file_is_image(file: &SlackFileResponse) -> bool {
+    if file
+        .mimetype
+        .as_deref()
+        .is_some_and(|mimetype| mimetype.starts_with("image/"))
+    {
+        return true;
+    }
+    file.filetype.as_deref().is_some_and(|filetype| {
+        matches!(
+            filetype.to_ascii_lowercase().as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "heic" | "heif" | "tiff"
+        )
+    })
+}
+
+fn slack_file_image_media(file: &SlackFileResponse, token: Option<&str>) -> Option<Media> {
+    // Prefer the full-resolution private URL; fall back to the largest available
+    // thumbnail. All of these require Bearer auth to download.
+    let url = file
+        .url_private
+        .clone()
+        .or_else(|| file.thumb_1024.clone())
+        .or_else(|| file.thumb_720.clone())
+        .or_else(|| file.thumb_360.clone())
+        .and_then(non_empty_string)?;
+    let file_name = file
+        .name
+        .clone()
+        .and_then(non_empty_string)
+        .or_else(|| file.title.clone().and_then(non_empty_string))
+        .unwrap_or_else(|| "image".to_owned());
+    let mime_type = file
+        .mimetype
+        .clone()
+        .and_then(non_empty_string)
+        .unwrap_or_else(|| "image/*".to_owned());
+    Some(Media {
+        id: arc_str(&url),
+        file_name: arc_str(file_name),
+        mime_type: arc_str(mime_type),
+        size_bytes: file.size,
+        caption: None,
+        local_path: slack_cached_media_path(&url, "files", token),
+        thumbnail: None,
+    })
 }
 
 fn push_unique_text_part(parts: &mut Vec<String>, value: Option<String>) {
@@ -3887,6 +5425,41 @@ fn slack_user_ids_in_text(text: &str) -> Vec<String> {
     ids
 }
 
+/// Returns true when `text` mentions the authenticated user. This covers both
+/// explicit `<@U123>` mentions of the current user id and Slack broadcast pings
+/// (`<!here>`, `<!channel>`, `<!everyone>`), which directly target the user's
+/// attention and are therefore treated as mentions for notification scoping.
+fn slack_text_mentions_user(text: &str, current_user_id: Option<&str>) -> bool {
+    if slack_text_has_broadcast_mention(text) {
+        return true;
+    }
+    let Some(current_user_id) = current_user_id.filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    slack_user_ids_in_text(text)
+        .iter()
+        .any(|id| id == current_user_id)
+}
+
+/// Detects Slack broadcast mention tokens of the form `<!here>`, `<!channel>`,
+/// and `<!everyone>` (optionally carrying a `|label`, e.g. `<!here|here>`).
+fn slack_text_has_broadcast_mention(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(start) = rest.find("<!") {
+        rest = &rest[start + 2..];
+        let Some(end) = rest.find('>') else {
+            break;
+        };
+        let token = &rest[..end];
+        let keyword = token.split('|').next().unwrap_or_default().trim();
+        if matches!(keyword, "here" | "channel" | "everyone") {
+            return true;
+        }
+        rest = &rest[end + 1..];
+    }
+    false
+}
+
 fn replace_slack_user_mentions(
     text: &str,
     users: &Arc<RwLock<HashMap<String, SlackUser>>>,
@@ -4071,6 +5644,16 @@ fn slack_builtin_emoji_alias(name: &str) -> Option<&'static str> {
 }
 
 fn slack_avatar_path(url: &str) -> Option<PathBuf> {
+    slack_cached_media_path(url, "avatars", None)
+}
+
+/// Resolve (and lazily download) a Slack media URL into a local cache path.
+///
+/// Returns the eventual cache path immediately; the bytes are fetched on a
+/// background thread if not already cached. When `auth_token` is provided the
+/// download includes a `Bearer` header, which is required for authenticated
+/// file uploads (`url_private`). Public CDN assets (avatars) pass `None`.
+fn slack_cached_media_path(url: &str, subdir: &str, auth_token: Option<&str>) -> Option<PathBuf> {
     let url = url.trim();
     if url.is_empty() {
         return None;
@@ -4082,7 +5665,7 @@ fn slack_avatar_path(url: &str) -> Option<PathBuf> {
         .unwrap_or_else(std::env::temp_dir)
         .join("chat-cli")
         .join("slack")
-        .join("avatars");
+        .join(subdir);
     let extension = url
         .split('?')
         .next()
@@ -4100,6 +5683,15 @@ fn slack_avatar_path(url: &str) -> Option<PathBuf> {
     let path = cache_dir.join(format!("{:016x}.{extension}", hasher.finish()));
 
     if path.exists() {
+        slack_diagnostic_log(
+            "slack.provider.media_path",
+            format!(
+                "subdir={} url={} path={} status=cached",
+                subdir,
+                url,
+                path.display()
+            ),
+        );
         return Some(path);
     }
     if fs::create_dir_all(&cache_dir).is_err() {
@@ -4107,21 +5699,53 @@ fn slack_avatar_path(url: &str) -> Option<PathBuf> {
     }
 
     let url = url.to_owned();
+    let subdir = subdir.to_owned();
+    let auth_token = auth_token.map(str::to_owned);
+    slack_diagnostic_log(
+        "slack.provider.media_path",
+        format!(
+            "subdir={} url={} path={} status=queued",
+            subdir,
+            url,
+            path.display()
+        ),
+    );
     let path_for_download = path.clone();
     std::thread::spawn(move || {
         let result = (|| -> Result<()> {
-            let mut response = slack_http_agent()
-                .get(&url)
-                .call()
-                .context("downloading Slack avatar")?;
+            let mut request = slack_http_agent().get(&url);
+            if let Some(token) = auth_token.as_deref() {
+                request = request.header("Authorization", &format!("Bearer {token}"));
+            }
+            let mut response = request.call().context("downloading Slack media")?;
             let bytes = response
                 .body_mut()
                 .read_to_vec()
-                .context("reading Slack avatar body")?;
-            fs::write(&path_for_download, bytes).context("writing Slack avatar cache")?;
+                .context("reading Slack media body")?;
+            fs::write(&path_for_download, bytes).context("writing Slack media cache")?;
             Ok(())
         })();
-        let _ = result;
+        match result {
+            Ok(()) => slack_diagnostic_log(
+                "slack.provider.media_cached",
+                format!(
+                    "subdir={} url={} path={}",
+                    subdir,
+                    url,
+                    path_for_download.display()
+                ),
+            ),
+            Err(error) => slack_diagnostic_log(
+                "slack.provider.media_download_failed",
+                format!(
+                    "subdir={} url={} path={} error={:#}",
+                    subdir,
+                    url,
+                    path_for_download.display(),
+                    error
+                ),
+            ),
+        };
     });
 
     Some(path)
@@ -4281,17 +5905,65 @@ fn slack_app_manifest_url(auth_mode: &SlackAuthMode) -> String {
     } else {
         "features:\n  bot_user:\n    display_name: chat-cli\n    always_online: false\n".to_owned()
     };
+    let event_subscriptions_section = manifest_event_subscriptions_section(auth_mode);
+    let redirect_urls_section = manifest_redirect_urls_section(auth_mode);
     let manifest = format!(
-        "_metadata:\n  major_version: 2\n  minor_version: 1\ndisplay_information:\n  name: {}\n  description: Terminal chat client Slack integration\n{}oauth_config:\n  scopes:\n{}{}settings:\n  org_deploy_enabled: false\n  socket_mode_enabled: true\n  token_rotation_enabled: false\n",
+        "_metadata:\n  major_version: 2\n  minor_version: 1\ndisplay_information:\n  name: {}\n  description: Terminal chat client Slack integration\n{}oauth_config:\n{}  scopes:\n{}{}{}settings:\n  org_deploy_enabled: false\n  socket_mode_enabled: true\n  token_rotation_enabled: false\n",
         manifest_yaml_string("chat-cli"),
         bot_user_section,
+        redirect_urls_section,
         user_scope_section,
-        bot_scope_section
+        bot_scope_section,
+        event_subscriptions_section
     );
     format!(
         "https://api.slack.com/apps?new_app=1&manifest_yaml={}",
         url_component(&manifest)
     )
+}
+
+fn manifest_redirect_urls_section(auth_mode: &SlackAuthMode) -> String {
+    if !auth_mode.supports_oauth_code_exchange() {
+        return String::new();
+    }
+
+    format!("  redirect_urls:\n    - {SLACK_OAUTH_REDIRECT_URI}\n")
+}
+
+fn manifest_event_subscriptions_section(auth_mode: &SlackAuthMode) -> String {
+    if !auth_mode.supports_realtime() {
+        return String::new();
+    }
+
+    let user_events = [
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim",
+        "reaction_added",
+        "reaction_removed",
+    ];
+    let bot_events = if auth_mode.bot_scopes().is_empty() {
+        Vec::new()
+    } else {
+        user_events.to_vec()
+    };
+    let user_events_section = manifest_event_list_section("user_events", &user_events, 2);
+    let bot_events_section = manifest_event_list_section("bot_events", &bot_events, 2);
+
+    format!("event_subscriptions:\n{user_events_section}{bot_events_section}")
+}
+
+fn manifest_event_list_section(label: &str, events: &[&str], indent: usize) -> String {
+    if events.is_empty() {
+        return String::new();
+    }
+
+    let prefix = " ".repeat(indent);
+    let item_prefix = " ".repeat(indent + 2);
+    let mut lines = vec![format!("{prefix}{label}:")];
+    lines.extend(events.iter().map(|event| format!("{item_prefix}- {event}")));
+    format!("{}\n", lines.join("\n"))
 }
 
 fn manifest_scope_section(label: &str, scopes: &str, indent: usize) -> String {
@@ -4354,6 +6026,8 @@ mod tests {
     struct FakeSlackApiClient {
         validated_tokens: Mutex<Vec<SlackCredentialKind>>,
         validated_webhooks: Mutex<Vec<String>>,
+        team_info_calls: Mutex<Vec<(SlackCredentialKind, Option<String>)>>,
+        fail_team_info_for: Mutex<Vec<SlackCredentialKind>>,
         posted_messages: Mutex<Vec<PostedCall>>,
         posted_webhooks: Mutex<Vec<(String, String)>>,
         listed_conversations: Mutex<Vec<SlackCredentialKind>>,
@@ -4364,6 +6038,10 @@ mod tests {
         removed_reactions: Mutex<Vec<(String, String, String)>>,
         history_calls: Mutex<Vec<(SlackCredentialKind, ChatId, Option<Timestamp>, usize)>>,
         history_messages: Mutex<Vec<Message>>,
+        opened_socket_modes: Mutex<Vec<SlackCredentialKind>>,
+        oauth_exchanges: Mutex<Vec<(String, String, String, String)>>,
+        oauth_tokens: Mutex<Option<SlackOAuthTokens>>,
+        fail_oauth_exchange: Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -4391,6 +6069,28 @@ mod tests {
                 credential.team_name = Some("Example Workspace".to_owned());
                 Ok(credential)
             }
+        }
+
+        async fn team_info(
+            &self,
+            credential: SlackCredential,
+            team_id: Option<&str>,
+        ) -> Result<Option<SlackTeamInfo>> {
+            let kind = credential.kind.clone();
+            self.team_info_calls
+                .lock()
+                .unwrap()
+                .push((kind.clone(), team_id.map(str::to_owned)));
+            if self.fail_team_info_for.lock().unwrap().contains(&kind) {
+                bail!("Slack team.info failed for {:?}: missing_scope", kind);
+            }
+            Ok(Some(SlackTeamInfo {
+                id: Some("T123".to_owned()),
+                name: Some("Example Workspace".to_owned()),
+                domain: Some("example".to_owned()),
+                email_domain: Some("example.com".to_owned()),
+                icon_url: Some("https://example.com/team-icon-230.png".to_owned()),
+            }))
         }
 
         async fn validate_webhook(&self, webhook_url: &str) -> Result<SlackWebhookValidation> {
@@ -4560,12 +6260,47 @@ mod tests {
             &self,
             app_token: SlackCredential,
         ) -> Result<SlackSocketModeConnection> {
+            self.opened_socket_modes
+                .lock()
+                .unwrap()
+                .push(app_token.kind.clone());
             if !app_token.value().starts_with("xapp-") {
                 bail!("invalid app token")
             }
             Ok(SlackSocketModeConnection {
                 url: "ws://127.0.0.1:9/socket-mode-test".to_owned(),
             })
+        }
+
+        async fn exchange_oauth_code(
+            &self,
+            client_id: &str,
+            client_secret: &str,
+            redirect_uri: &str,
+            code: &str,
+        ) -> Result<SlackOAuthTokens> {
+            self.oauth_exchanges.lock().unwrap().push((
+                client_id.to_owned(),
+                client_secret.to_owned(),
+                redirect_uri.to_owned(),
+                code.to_owned(),
+            ));
+            if let Some(error) = self.fail_oauth_exchange.lock().unwrap().clone() {
+                bail!("Slack oauth.v2.access failed: {error}");
+            }
+            Ok(self
+                .oauth_tokens
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| SlackOAuthTokens {
+                    user_token: Some("xoxp-oauth-user".to_owned()),
+                    user_scopes: Some("channels:history,im:history".to_owned()),
+                    team_id: Some("T123".to_owned()),
+                    team_name: Some("Example Workspace".to_owned()),
+                    user_id: Some("U123".to_owned()),
+                    ..SlackOAuthTokens::default()
+                }))
         }
     }
 
@@ -4685,6 +6420,424 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_uses_bot_team_icon_when_user_team_info_lacks_scope() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::ManualApp);
+        options.user_token = Some("xoxp-user".to_owned());
+        options.bot_token = Some("xoxb-bot".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        client
+            .fail_team_info_for
+            .lock()
+            .unwrap()
+            .push(SlackCredentialKind::UserToken);
+        let provider = provider_with_fake_client(options, client.clone())?;
+
+        provider.connect().await?;
+
+        let account = provider.account_info();
+        assert_eq!(
+            *client.team_info_calls.lock().unwrap(),
+            vec![
+                (SlackCredentialKind::UserToken, Some("T123".to_owned())),
+                (SlackCredentialKind::BotToken, Some("T123".to_owned()))
+            ]
+        );
+        assert_eq!(account.display_name.as_ref(), "Slack (Example Workspace)");
+        assert!(account.avatar.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn slack_user_oauth_scopes_include_team_read_for_workspace_icon() {
+        assert!(SlackAuthMode::UserOAuth.user_scopes().contains("team:read"));
+        assert!(
+            SlackAuthMode::ReadOnlyOAuth
+                .user_scopes()
+                .contains("team:read")
+        );
+        assert!(SlackAuthMode::ManualApp.user_scopes().contains("team:read"));
+    }
+
+    #[test]
+    fn slack_bot_scopes_include_team_read_for_workspace_icon() {
+        assert!(SlackAuthMode::BotToken.bot_scopes().contains("team:read"));
+        assert!(SlackAuthMode::ManualApp.bot_scopes().contains("team:read"));
+    }
+
+    #[test]
+    fn fatal_realtime_auth_errors_are_classified_for_alert_and_fallback() {
+        // The exact failure observed from apps.connections.open in the field.
+        assert!(is_fatal_realtime_auth_error(
+            "Slack apps.connections.open failed: invalid_auth"
+        ));
+        assert!(is_fatal_realtime_auth_error("not_authed"));
+        assert!(is_fatal_realtime_auth_error("token_revoked"));
+        assert!(is_fatal_realtime_auth_error("ACCOUNT_INACTIVE"));
+        assert!(is_fatal_realtime_auth_error("missing_scope"));
+
+        // Recoverable/transient conditions must keep retrying instead of
+        // permanently degrading to history polling.
+        assert!(!is_fatal_realtime_auth_error(
+            "connecting Slack Socket Mode WebSocket: connection reset"
+        ));
+        assert!(!is_fatal_realtime_auth_error(
+            "reading Slack Socket Mode frame"
+        ));
+        assert!(!is_fatal_realtime_auth_error("timed out"));
+    }
+
+    #[test]
+    fn history_poll_only_notifies_for_messages_newer_than_loop_start() {
+        let started_at = Utc::now();
+        let older = started_at - chrono::Duration::hours(6);
+        let newer = started_at + chrono::Duration::seconds(30);
+
+        // Backlog message (older than startup) must never notify, even the
+        // first time it is observed — this is the regression that produced
+        // notifications for long-past conversations when the baseline history
+        // fetch failed and the message only surfaced on a later poll.
+        assert!(!history_poll_message_is_live(started_at, older, true));
+
+        // A genuinely new message (after startup), seen for the first time,
+        // is the only case that should notify.
+        assert!(history_poll_message_is_live(started_at, newer, true));
+
+        // Re-observing the same new message on a subsequent poll must not
+        // notify again.
+        assert!(!history_poll_message_is_live(started_at, newer, false));
+
+        // A message exactly at the startup instant is treated as backlog, not
+        // new, so it is not re-announced on startup.
+        assert!(!history_poll_message_is_live(started_at, started_at, true));
+    }
+
+    #[test]
+    fn history_error_response_without_messages_decodes_and_surfaces_error() {
+        // Slack returns this shape when the token lacks the *:history scopes.
+        // It must decode (not fail as an opaque "decoding ... response" error)
+        // so the real `missing_scope` reason can be reported to the user.
+        let response: SlackConversationsHistoryResponse =
+            serde_json::from_str(r#"{"ok":false,"error":"missing_scope"}"#)
+                .expect("error response without `messages` must still decode");
+
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("missing_scope"));
+        assert!(response.messages.is_empty());
+    }
+
+    #[test]
+    fn history_response_keeps_valid_messages_when_one_message_is_undecodable() {
+        // The second message carries an attachment `ts` as an integer, which
+        // does not match our `Option<String>` model. Strict decoding would fail
+        // the entire response and drop every message in the conversation — so a
+        // genuine message (for example one sent to yourself) would never reach
+        // the sidebar or notifications. Lenient per-message decoding must skip
+        // only the offending entry and keep the valid one.
+        let raw = r#"{
+            "ok": true,
+            "messages": [
+                {"type": "message", "user": "U123", "ts": "1700000000.000100", "text": "hello self"},
+                {"type": "message", "user": "U123", "ts": "1700000001.000200", "text": "broken", "attachments": [{"ts": 1700000001}]}
+            ]
+        }"#;
+        let response: SlackConversationsHistoryResponse =
+            serde_json::from_str(raw).expect("response decodes leniently");
+
+        assert!(response.ok);
+        assert_eq!(response.messages.len(), 1);
+        assert_eq!(response.messages[0].text.as_deref(), Some("hello self"));
+    }
+
+    #[test]
+    fn conversations_list_error_response_without_channels_decodes_and_surfaces_error() {
+        let response: SlackConversationsListResponse =
+            serde_json::from_str(r#"{"ok":false,"error":"missing_scope"}"#)
+                .expect("error response without `channels` must still decode");
+
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("missing_scope"));
+        assert!(response.channels.is_empty());
+    }
+
+    #[test]
+    fn slack_generated_manifest_keeps_realtime_features_for_chat_updates() {
+        let url = slack_app_manifest_url(&SlackAuthMode::ReadOnlyOAuth);
+        let encoded_manifest = url
+            .split("manifest_yaml=")
+            .nth(1)
+            .expect("manifest query is present");
+        let manifest = encoded_manifest
+            .replace("%0A", "\n")
+            .replace("%20", " ")
+            .replace("%3A", ":");
+
+        assert!(manifest.contains("team:read"));
+        assert!(manifest.contains("socket_mode_enabled: true"));
+        assert!(manifest.contains("event_subscriptions:"));
+        assert!(manifest.contains("message.channels"));
+        // Self-DM realtime relies on the im message event, and the history
+        // fallback relies on the *:history scopes. A manifest missing either
+        // reproduces the realtime/missing_scope failures, so lock them in.
+        assert!(manifest.contains("message.im"));
+        assert!(manifest.contains("channels:history"));
+        assert!(manifest.contains("im:history"));
+        assert!(manifest.contains("groups:history"));
+        assert!(manifest.contains("mpim:history"));
+    }
+
+    #[test]
+    fn slack_user_oauth_manifest_requests_realtime_and_history_capabilities() {
+        let url = slack_app_manifest_url(&SlackAuthMode::UserOAuth);
+        let encoded_manifest = url
+            .split("manifest_yaml=")
+            .nth(1)
+            .expect("manifest query is present");
+        let manifest = encoded_manifest
+            .replace("%0A", "\n")
+            .replace("%20", " ")
+            .replace("%3A", ":");
+
+        assert!(manifest.contains("socket_mode_enabled: true"));
+        assert!(manifest.contains("message.im"));
+        assert!(manifest.contains("im:history"));
+        assert!(manifest.contains("team:read"));
+    }
+
+    #[test]
+    fn slack_user_oauth_manifest_registers_loopback_redirect_url() {
+        let url = slack_app_manifest_url(&SlackAuthMode::UserOAuth);
+        let manifest = url
+            .split("manifest_yaml=")
+            .nth(1)
+            .expect("manifest query is present")
+            .replace("%0A", "\n")
+            .replace("%20", " ")
+            .replace("%3A", ":");
+        // Slack matches redirect URIs exactly, so the loopback callback the
+        // local listener binds must be pre-registered in the app manifest or
+        // the browser OAuth exchange fails with a redirect mismatch.
+        assert!(manifest.contains("redirect_urls:"));
+        assert!(manifest.contains("41419"));
+
+        // Bot-token apps use a pasted token, not the loopback browser login, so
+        // they must not advertise a redirect URL.
+        let bot = slack_app_manifest_url(&SlackAuthMode::BotToken);
+        let bot_manifest = bot
+            .split("manifest_yaml=")
+            .nth(1)
+            .expect("manifest query is present");
+        assert!(!bot_manifest.contains("redirect_urls"));
+    }
+
+    #[test]
+    fn slack_oauth_callback_query_parses_code_state_and_error() {
+        let callback =
+            parse_oauth_callback_query("/slack/oauth/callback?code=abc%20123&state=deadbeef");
+        assert_eq!(callback.code.as_deref(), Some("abc 123"));
+        assert_eq!(callback.state.as_deref(), Some("deadbeef"));
+        assert!(callback.error.is_none());
+
+        let denied = parse_oauth_callback_query("/slack/oauth/callback?error=access_denied");
+        assert_eq!(denied.error.as_deref(), Some("access_denied"));
+        assert!(denied.code.is_none());
+    }
+
+    #[test]
+    fn slack_oauth_state_is_unguessable_and_validated() {
+        let first = slack_oauth_state();
+        let second = slack_oauth_state();
+        assert_ne!(first, second, "state values must not repeat");
+        assert_eq!(first.len(), 32, "128 bits of derived hex state");
+        assert!(slack_oauth_state_matches(&first, Some(first.as_str())));
+        assert!(!slack_oauth_state_matches(&first, Some("mismatch")));
+        assert!(!slack_oauth_state_matches(&first, None));
+        // An empty expected state must never match (rejects a missing/cleared
+        // state instead of accepting an empty callback value).
+        assert!(!slack_oauth_state_matches("", Some("")));
+    }
+
+    #[test]
+    fn official_slack_app_requires_client_id_and_secret() {
+        // Both a client ID and secret are mandatory; a missing secret falls
+        // back to manual app creation rather than a half-configured app.
+        assert!(resolve_official_slack_app(None, None, None).is_none());
+        assert!(
+            resolve_official_slack_app(Some("client-id".to_owned()), None, None).is_none(),
+            "client id without secret must not configure an official app"
+        );
+        assert!(
+            resolve_official_slack_app(None, Some("secret".to_owned()), None).is_none(),
+            "secret without client id must not configure an official app"
+        );
+    }
+
+    #[test]
+    fn official_slack_app_defaults_redirect_to_loopback_callback() {
+        let app = resolve_official_slack_app(
+            Some("client-id".to_owned()),
+            Some("client-secret".to_owned()),
+            None,
+        )
+        .expect("client id + secret configure an official app");
+        assert_eq!(app.client_id, "client-id");
+        assert_eq!(app.client_secret, "client-secret");
+        assert_eq!(app.redirect_uri, SLACK_OAUTH_REDIRECT_URI);
+    }
+
+    #[test]
+    fn official_slack_app_keeps_explicit_redirect_uri() {
+        let app = resolve_official_slack_app(
+            Some("client-id".to_owned()),
+            Some("client-secret".to_owned()),
+            Some("https://chat.example/callback".to_owned()),
+        )
+        .expect("client id + secret configure an official app");
+        assert_eq!(app.redirect_uri, "https://chat.example/callback");
+    }
+
+    #[tokio::test]
+    async fn slack_oauth_loopback_flow_returns_authorization_code() -> Result<()> {
+        let flow = begin_slack_oauth_login("client-123", "team:read", "channels:history")?;
+        let authorize_url = flow.authorize_url().to_owned();
+        assert!(authorize_url.contains("client_id=client-123"));
+        assert!(authorize_url.contains("redirect_uri="));
+        let state = authorize_url
+            .split("state=")
+            .nth(1)
+            .expect("authorize URL carries CSRF state")
+            .to_owned();
+
+        let waiter = tokio::spawn(async move { flow.wait_for_authorization_code().await });
+
+        // The listener is already bound (begin_slack_oauth_login bound it), so
+        // simulate Slack's browser redirect to the loopback callback.
+        tokio::task::spawn_blocking(move || {
+            let mut stream = loop {
+                if let Ok(stream) =
+                    std::net::TcpStream::connect(("127.0.0.1", SLACK_OAUTH_REDIRECT_PORT))
+                {
+                    break stream;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let request = format!(
+                "GET /slack/oauth/callback?code=auth-code-xyz&state={state} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).unwrap();
+            let _ = stream.flush();
+        })
+        .await
+        .unwrap();
+
+        let code = waiter.await.unwrap()?;
+        assert_eq!(code, "auth-code-xyz");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn browser_oauth_login_skips_manual_and_unsupported_submissions() -> Result<()> {
+        let provider = provider_with_fake_client(
+            SlackProviderOptions::new(SlackAuthMode::UserOAuth),
+            Arc::new(FakeSlackApiClient::default()),
+        )?;
+
+        // A pasted user token means the user opted into the manual path; the
+        // browser login must not run (and must not bind a socket).
+        let manual = AuthSubmission {
+            mode: Some(AuthSubmissionMode::UserOAuth),
+            client_id: Some("client-123".to_owned()),
+            client_secret: Some("secret".to_owned()),
+            user_token: Some("xoxp-existing".to_owned()),
+            ..AuthSubmission::default()
+        };
+        assert!(
+            provider
+                .maybe_run_browser_oauth_login(manual)
+                .await?
+                .oauth_code
+                .is_none()
+        );
+
+        // Bot-token mode does not support browser-based code exchange.
+        let bot = AuthSubmission {
+            mode: Some(AuthSubmissionMode::BotToken),
+            client_id: Some("client-123".to_owned()),
+            client_secret: Some("secret".to_owned()),
+            ..AuthSubmission::default()
+        };
+        assert!(
+            provider
+                .maybe_run_browser_oauth_login(bot)
+                .await?
+                .oauth_code
+                .is_none()
+        );
+
+        // Without a client secret we cannot exchange a code, so the submission
+        // is left untouched for validation to report the missing secret.
+        let no_secret = AuthSubmission {
+            mode: Some(AuthSubmissionMode::UserOAuth),
+            client_id: Some("client-123".to_owned()),
+            ..AuthSubmission::default()
+        };
+        assert!(
+            provider
+                .maybe_run_browser_oauth_login(no_secret)
+                .await?
+                .oauth_code
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slack_history_poll_limit_catches_more_than_one_message_per_cycle() {
+        // A limit of 1 only fetches the newest message per conversation each
+        // cycle, dropping every earlier message in a burst between polls.
+        assert!(
+            SLACK_HISTORY_POLL_LIMIT > 1,
+            "history fallback must fetch a window, not just the newest message"
+        );
+    }
+
+    #[test]
+    fn slack_team_icon_prefers_original_image_url() {
+        let icon = SlackTeamIconResponse {
+            image_34: Some("https://example.com/icon-34.png".to_owned()),
+            image_44: None,
+            image_68: None,
+            image_88: None,
+            image_102: None,
+            image_132: None,
+            image_230: None,
+            image_original: Some("https://example.com/icon-original.png".to_owned()),
+        };
+
+        assert_eq!(
+            icon.best_image_url().as_deref(),
+            Some("https://example.com/icon-original.png")
+        );
+    }
+
+    #[test]
+    fn slack_team_icon_uses_available_image_even_without_custom_workspace_icon() {
+        let icon = SlackTeamIconResponse {
+            image_34: Some("https://example.com/default-34.png".to_owned()),
+            image_44: None,
+            image_68: None,
+            image_88: None,
+            image_102: None,
+            image_132: None,
+            image_230: None,
+            image_original: None,
+        };
+
+        assert_eq!(
+            icon.best_image_url().as_deref(),
+            Some("https://example.com/default-34.png")
+        );
+    }
+    #[tokio::test]
     async fn connect_user_oauth_stays_connected_when_optional_app_token_is_invalid() -> Result<()> {
         let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
         options.user_token = Some("xoxp-user".to_owned());
@@ -4704,6 +6857,80 @@ mod tests {
                 SlackCredentialKind::UserToken,
                 SlackCredentialKind::AppToken
             ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_alerts_before_history_fallback_when_realtime_is_unavailable() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client.clone())?;
+        let mut events = provider.events();
+
+        provider.connect().await?;
+
+        let mut saw_notice_before_history_poll = false;
+        for _ in 0..20 {
+            match events.try_recv() {
+                Ok(ProviderEvent::AccountNotice {
+                    title,
+                    body,
+                    severity,
+                }) => {
+                    assert_eq!(title.as_ref(), "Slack realtime unavailable");
+                    assert!(body.contains("Using periodic Slack history checks"));
+                    assert!(body.contains("app-level xapp token"));
+                    assert_eq!(severity, AccountNoticeSeverity::SystemAlert);
+                    saw_notice_before_history_poll =
+                        client.history_calls.lock().unwrap().is_empty();
+                    break;
+                }
+                Ok(_) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("unexpected provider event error: {error}"),
+            }
+        }
+        provider.disconnect().await?;
+
+        assert!(
+            saw_notice_before_history_poll,
+            "Slack realtime fallback must alert before starting history polling"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connect_starts_realtime_when_app_token_is_available() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        options.app_token = Some("xapp-realtime".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client.clone())?;
+
+        provider.connect().await?;
+        for _ in 0..20 {
+            if !client.opened_socket_modes.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        provider.disconnect().await?;
+
+        assert!(provider.capabilities().can_realtime);
+        assert_eq!(
+            *client.validated_tokens.lock().unwrap(),
+            vec![
+                SlackCredentialKind::UserToken,
+                SlackCredentialKind::AppToken
+            ]
+        );
+        assert_eq!(
+            *client.opened_socket_modes.lock().unwrap(),
+            vec![SlackCredentialKind::AppToken]
         );
         Ok(())
     }
@@ -4888,25 +7115,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_auth_oauth_code_reports_unimplemented_without_storing_code() -> Result<()> {
+    async fn submit_auth_oauth_code_is_exchanged_into_tokens_without_storing_the_code() -> Result<()>
+    {
+        let client = Arc::new(FakeSlackApiClient::default());
         let provider = provider_with_fake_client(
             SlackProviderOptions::new(SlackAuthMode::UserOAuth),
-            Arc::new(FakeSlackApiClient::default()),
+            client.clone(),
         )?;
 
-        let error = provider
+        provider
             .submit_auth(AuthSubmission {
                 mode: Some(AuthSubmissionMode::UserOAuth),
+                client_id: Some("client-123".to_owned()),
+                client_secret: Some("client-secret".to_owned()),
                 oauth_code: Some("temporary-code".to_owned()),
                 ..AuthSubmission::default()
             })
-            .await
-            .unwrap_err()
-            .to_string();
+            .await?;
 
-        assert!(error.contains("OAuth code exchange is not implemented yet"));
-        assert!(!error.contains("temporary-code"));
-        assert!(!provider.is_connected());
+        // The authorization code was exchanged via oauth.v2.access.
+        let exchanges = client.oauth_exchanges.lock().unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].0, "client-123");
+        assert_eq!(exchanges[0].3, "temporary-code");
+        drop(exchanges);
+
+        // The resulting user token is what gets stored and validated; the raw,
+        // single-use code is never persisted in provider options.
+        assert!(provider.is_connected());
+        assert_eq!(
+            provider.options().user_token.as_deref(),
+            Some("xoxp-oauth-user")
+        );
+        assert_eq!(
+            provider.options().workspace.as_deref(),
+            Some("Example Workspace")
+        );
+        assert_eq!(
+            *client.validated_tokens.lock().unwrap(),
+            vec![SlackCredentialKind::UserToken]
+        );
         Ok(())
     }
 
@@ -5274,9 +7522,11 @@ mod tests {
             None,
             Some("hello".to_owned()),
             None,
+            None,
             Vec::new(),
             None,
             false,
+            None,
         )
         .expect("message should parse");
 
@@ -5375,9 +7625,11 @@ mod tests {
                 reply_count: None,
                 text: Some("deployed :large_green_circle:".to_owned()),
                 attachments: None,
+                files: None,
                 hidden: None,
                 reactions: None,
             },
+            None,
             None,
         )
         .expect("message should parse");
@@ -5386,6 +7638,58 @@ mod tests {
         assert_eq!(message.sender.display_name.as_ref(), "Deploy Bot");
         assert!(message.sender.avatar.is_some());
         assert_eq!(content_text(&message.content), "deployed 🟢");
+    }
+
+    #[test]
+    fn realtime_slack_bot_message_subtype_emits_live_message() {
+        let events = EventBus::new();
+        let mut receiver = events.subscribe();
+        let account = arc_str("slack:test");
+        let users = Arc::new(RwLock::new(HashMap::new()));
+
+        emit_realtime_message(
+            &events,
+            &account,
+            Some("U123"),
+            SlackRealtimeEvent {
+                event_type: "message".to_owned(),
+                channel: Some("C123".to_owned()),
+                user: None,
+                bot_id: Some("BDEPLOY".to_owned()),
+                username: Some("deploy".to_owned()),
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000004.000200".to_owned()),
+                event_ts: None,
+                thread_ts: None,
+                text: Some("deployment finished".to_owned()),
+                attachments: None,
+                subtype: Some("bot_message".to_owned()),
+                files: None,
+                hidden: None,
+                deleted_ts: None,
+                message: None,
+                reaction: None,
+                item: None,
+                item_user: None,
+            },
+            &users,
+        );
+
+        let event = receiver.try_recv().expect("live message event");
+        let ProviderEvent::Message {
+            message,
+            is_historical,
+        } = event
+        else {
+            panic!("expected live message event");
+        };
+        assert!(!is_historical);
+        assert_eq!(message.id.as_ref(), "1710000004.000200");
+        assert_eq!(message.chat_id.as_ref(), "C123");
+        assert_eq!(message.sender.platform_id.as_ref(), "BDEPLOY");
+        assert_eq!(message.sender.display_name.as_ref(), "deploy");
+        assert_eq!(content_text(&message.content), "deployment finished");
     }
 
     #[test]
@@ -5424,9 +7728,11 @@ mod tests {
                     fallback: Some("fallback should not duplicate content".to_owned()),
                     fields: None,
                 }]),
+                files: None,
                 hidden: None,
                 reactions: None,
             },
+            None,
             None,
         )
         .expect("message should parse");
@@ -5455,6 +7761,82 @@ mod tests {
     }
 
     #[test]
+    fn historical_slack_message_renders_image_files_as_media_cards_with_caption() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: None,
+                user: Some("U234".to_owned()),
+                bot_id: None,
+                username: None,
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000005.000200".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: Some("Cica vecini gospodari".to_owned()),
+                attachments: None,
+                files: Some(vec![
+                    SlackFileResponse {
+                        id: Some("F1".to_owned()),
+                        name: Some("first.png".to_owned()),
+                        title: Some("first".to_owned()),
+                        mimetype: Some("image/png".to_owned()),
+                        filetype: Some("png".to_owned()),
+                        size: Some(1234),
+                        url_private: Some("https://files.slack.com/first.png".to_owned()),
+                        url_private_download: None,
+                        thumb_360: None,
+                        thumb_720: None,
+                        thumb_1024: None,
+                        permalink: Some("https://slack.com/files/first".to_owned()),
+                        mode: Some("hosted".to_owned()),
+                    },
+                    SlackFileResponse {
+                        id: Some("F2".to_owned()),
+                        name: Some("second.jpg".to_owned()),
+                        title: Some("second".to_owned()),
+                        mimetype: Some("image/jpeg".to_owned()),
+                        filetype: Some("jpg".to_owned()),
+                        size: Some(5678),
+                        url_private: Some("https://files.slack.com/second.jpg".to_owned()),
+                        url_private_download: None,
+                        thumb_360: None,
+                        thumb_720: None,
+                        thumb_1024: None,
+                        permalink: Some("https://slack.com/files/second".to_owned()),
+                        mode: Some("hosted".to_owned()),
+                    },
+                ]),
+                hidden: None,
+                reactions: None,
+            },
+            None,
+            None,
+        )
+        .expect("message with image files should parse");
+
+        let Content::Cards(cards) = &message.content else {
+            panic!("Slack image files should be preserved as cards");
+        };
+        assert_eq!(cards.len(), 2);
+        assert!(cards.iter().all(|card| card.kind == CardKind::MediaPreview));
+        assert!(cards.iter().all(|card| card.image.is_some()));
+        // The message text is preserved as a caption on the first image card.
+        assert_eq!(cards[0].body.as_deref(), Some("Cica vecini gospodari"));
+        assert_eq!(
+            cards[0]
+                .image
+                .as_ref()
+                .map(|image| image.mime_type.as_ref()),
+            Some("image/png")
+        );
+    }
+
+    #[test]
     fn slack_user_mentions_prefer_cache_label_then_id_fallback() {
         let users = Arc::new(RwLock::new(HashMap::from([(
             "U123".to_owned(),
@@ -5473,6 +7855,30 @@ mod tests {
             replace_slack_user_mentions("hi <@U123> <@U456|Grace> <@U789>", &users),
             "hi @Ada @Grace @U789"
         );
+    }
+
+    #[test]
+    fn slack_text_mentions_user_matches_self_and_broadcast_tokens() {
+        let me = Some("UME123");
+
+        // Explicit mention of the authenticated user.
+        assert!(slack_text_mentions_user("hey <@UME123> look", me));
+        // Mention of someone else does not count.
+        assert!(!slack_text_mentions_user("hey <@UOTHER1> look", me));
+        // No mention at all.
+        assert!(!slack_text_mentions_user("plain channel chatter", me));
+
+        // Broadcast pings count as mentions regardless of the current user id.
+        assert!(slack_text_mentions_user("heads up <!here>", me));
+        assert!(slack_text_mentions_user("ship it <!channel>", me));
+        assert!(slack_text_mentions_user("all hands <!everyone>", me));
+        assert!(slack_text_mentions_user("labelled <!here|here>", me));
+        assert!(slack_text_mentions_user("broadcast <!channel>", None));
+
+        // A non-broadcast bang token is not a mention.
+        assert!(!slack_text_mentions_user("see <!date^123^{date}>", me));
+        // Without a known self id and no broadcast, nothing matches.
+        assert!(!slack_text_mentions_user("hey <@UME123>", None));
     }
 
     #[test]
@@ -5555,6 +7961,7 @@ mod tests {
                 text: None,
                 attachments: None,
                 subtype: None,
+                files: None,
                 hidden: None,
                 deleted_ts: None,
                 message: None,
@@ -5604,9 +8011,11 @@ mod tests {
                 reply_count: None,
                 text: Some("done :white_check_mark: custom :party-parrot:".to_owned()),
                 attachments: None,
+                files: None,
                 hidden: None,
                 reactions: None,
             },
+            None,
             None,
         )
         .expect("message should parse");
@@ -5648,6 +8057,7 @@ mod tests {
                 reply_count: None,
                 text: Some("thread reply".to_owned()),
                 attachments: None,
+                files: None,
                 hidden: None,
                 reactions: Some(vec![SlackReactionResponse {
                     name: Some("eyes".to_owned()),
@@ -5655,6 +8065,7 @@ mod tests {
                 }]),
             },
             Some(&users),
+            None,
         )
         .expect("message should parse");
 
@@ -5686,9 +8097,11 @@ mod tests {
                 reply_count: Some(2),
                 text: Some("thread root".to_owned()),
                 attachments: None,
+                files: None,
                 hidden: None,
                 reactions: None,
             },
+            None,
             None,
         )
         .expect("thread root should parse");
@@ -5717,9 +8130,11 @@ mod tests {
                 reply_count: None,
                 text: Some("plain message".to_owned()),
                 attachments: None,
+                files: None,
                 hidden: None,
                 reactions: None,
             },
+            None,
             None,
         )
         .expect("plain message should parse");

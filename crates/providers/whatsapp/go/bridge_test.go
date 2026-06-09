@@ -24,3 +24,38 @@ func TestChooseCanonicalJIDPrefersPhoneNumberJID(t *testing.T) {
 		t.Fatalf("expected JID without alternate to remain unchanged, got %s", got.String())
 	}
 }
+
+func TestContactRealNameIgnoresBareJIDFallback(t *testing.T) {
+	// A contact that has never resolved a name (e.g. an unsaved group
+	// participant or a @lid sender) must report no real name, so the resolver
+	// chain falls through to the alternate JID / push name instead of locking
+	// in the bare phone number or LID.
+	if name := contactRealName(types.ContactInfo{Found: false}); name != "" {
+		t.Fatalf("expected empty real name for unknown contact, got %q", name)
+	}
+
+	withName := types.ContactInfo{Found: true, FullName: "George Tacciu"}
+	if name := contactRealName(withName); name != "George Tacciu" {
+		t.Fatalf("expected resolved full name, got %q", name)
+	}
+
+	pushOnly := types.ContactInfo{Found: true, PushName: "Sorin"}
+	if name := contactRealName(pushOnly); name != "Sorin" {
+		t.Fatalf("expected push name to count as a real name, got %q", name)
+	}
+}
+
+func TestDisplayNameForContactKeepsBareJIDFallbackForSearch(t *testing.T) {
+	// displayNameForContact (used for the contact picker) still labels unknown
+	// contacts with their bare JID user so search results are never blank.
+	lid := types.NewJID("123884204486851", types.HiddenUserServer)
+	if name := displayNameForContact(types.ContactInfo{}, lid); name != "123884204486851" {
+		t.Fatalf("expected bare JID user fallback for display, got %q", name)
+	}
+
+	phone := types.NewJID("34819417346247", types.DefaultUserServer)
+	named := types.ContactInfo{Found: true, FirstName: "Bogdan"}
+	if name := displayNameForContact(named, phone); name != "Bogdan" {
+		t.Fatalf("expected real name to win over bare JID, got %q", name)
+	}
+}

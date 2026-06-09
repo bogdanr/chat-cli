@@ -163,6 +163,7 @@ impl Provider for MockProvider {
             reactions: Vec::new(),
             receipts: Vec::new(),
             is_from_me: true,
+            mentions_me: false,
             platform_data: PlatformData::default(),
         };
         self.write_messages().push(message.clone());
@@ -942,6 +943,7 @@ fn message(account: &ProviderId, seed: MessageSeed<'_>) -> Message {
         reactions: seed.reactions,
         receipts: seed.receipts,
         is_from_me: seed.is_from_me,
+        mentions_me: false,
         platform_data: PlatformData::default(),
     }
 }

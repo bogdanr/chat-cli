@@ -12,10 +12,10 @@ use arboard::Clipboard;
 ))]
 use arboard::SetExtLinux;
 use chat_core::{
-    Account, AuthChallenge, AuthSubmission, AuthSubmissionMode, Chat, ChatId, ChatKind,
-    ChatMembership, Content, DiscoveryAction, DiscoveryResult, Media, Message, MessageId,
-    NetworkActivityDirection, OutboundCapabilities, Platform, PlatformData, PlatformId, Poll,
-    Provider, ProviderEvent, ProviderId, Reaction, Sender, Timestamp,
+    Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card, Chat,
+    ChatId, ChatKind, ChatMembership, Content, DiscoveryAction, DiscoveryResult, Media, Message,
+    MessageId, NetworkActivityDirection, OutboundCapabilities, Platform, PlatformData, PlatformId,
+    Poll, Provider, ProviderEvent, ProviderId, Reaction, Sender, Timestamp,
 };
 use chat_notify::{DesktopNotifier, MessageNotification};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -56,7 +56,8 @@ use std::{
 };
 use storage::{
     AppSettings, ChatActivityUpdate, ChatInboxStyle, ConversationPresentationSetting,
-    NetworkActivityDisplay, Store, UiThemePreset,
+    NetworkActivityDisplay, NotificationMode, NotificationPauseState, NotificationScope, Store,
+    UiThemePreset,
 };
 use tokio::sync::{broadcast, mpsc};
 use unicode_width::UnicodeWidthStr;
@@ -81,6 +82,70 @@ const ARCHIVE_BACKFILL_WINDOW_DAYS: i64 = 36500;
 const MOUSE_SCROLL_STEP: usize = 1;
 const MESSAGE_SCROLL_STEP: usize = 3;
 const IMAGE_VIEWER_MAX_WIDTH: u16 = 96;
+const EMBEDDED_WHATSAPP_ICON_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00, 0x46, 0x08, 0x03, 0x00, 0x00, 0x00, 0x46, 0xf0, 0x12,
+    0xb6, 0x00, 0x00, 0x00, 0x54, 0x50, 0x4c, 0x54, 0x45, 0x47, 0x70, 0x4c, 0x24, 0xd4, 0x66, 0x24,
+    0xd3, 0x66, 0x20, 0xdf, 0x60, 0x25, 0xd3, 0x65, 0x24, 0xd3, 0x65, 0x24, 0xd4, 0x64, 0x24, 0xd3,
+    0x65, 0x23, 0xd3, 0x66, 0x25, 0xd2, 0x65, 0x24, 0xd2, 0x65, 0x20, 0xd7, 0x68, 0x25, 0xd3, 0x66,
+    0xff, 0xff, 0xff, 0x24, 0xd3, 0x65, 0xa9, 0xed, 0xc3, 0x33, 0xd6, 0x70, 0x8d, 0xe9, 0xaf, 0xe4,
+    0xfa, 0xec, 0x77, 0xe4, 0xa0, 0xc9, 0xf4, 0xd9, 0x5c, 0xde, 0x8d, 0xf2, 0xfc, 0xf6, 0x40, 0xd9,
+    0x79, 0x4e, 0xdb, 0x83, 0xd7, 0xf7, 0xe3, 0xbb, 0xf1, 0xcf, 0x69, 0xe1, 0x96, 0x4c, 0xcb, 0x02,
+    0x5a, 0x00, 0x00, 0x00, 0x0c, 0x74, 0x52, 0x4e, 0x53, 0x00, 0x70, 0x80, 0x10, 0xd0, 0xe0, 0x38,
+    0xbc, 0x54, 0x9f, 0xf0, 0x20, 0xee, 0x27, 0x17, 0xb6, 0x00, 0x00, 0x03, 0x23, 0x49, 0x44, 0x41,
+    0x54, 0x58, 0xc3, 0xad, 0x58, 0xe7, 0xc2, 0xaa, 0x30, 0x0c, 0x15, 0x54, 0x96, 0x9d, 0x40, 0x19,
+    0xf2, 0xfe, 0xef, 0x79, 0x69, 0x59, 0x25, 0x49, 0x19, 0xde, 0x2f, 0xff, 0x14, 0x3d, 0x24, 0xa7,
+    0x27, 0xab, 0x8f, 0x47, 0xd8, 0x92, 0x28, 0x8e, 0xd3, 0xf4, 0xcd, 0xd8, 0x3b, 0x4d, 0xe3, 0x38,
+    0x4a, 0x1e, 0xf7, 0xed, 0x99, 0xe5, 0x05, 0x03, 0x56, 0xe4, 0xd9, 0xf3, 0x16, 0x48, 0x96, 0xda,
+    0xbf, 0x09, 0xe1, 0x83, 0x4c, 0x9f, 0xd2, 0xec, 0x3a, 0xc8, 0x9b, 0x1d, 0xd8, 0xfb, 0x1a, 0x50,
+    0x32, 0x7a, 0x22, 0xc2, 0x28, 0xe3, 0xa3, 0xf4, 0x9c, 0xa5, 0x4f, 0xca, 0x2e, 0x58, 0xfa, 0x39,
+    0x89, 0xa7, 0x60, 0x97, 0xac, 0x38, 0x8c, 0x2c, 0x62, 0x97, 0x2d, 0x0a, 0xa3, 0xe4, 0xec, 0x86,
+    0xe5, 0x21, 0xa9, 0xbc, 0xd8, 0x2d, 0x7b, 0x3d, 0x03, 0x28, 0xe2, 0x0e, 0x8a, 0xa0, 0x71, 0x6e,
+    0xfa, 0xe2, 0xfc, 0xa1, 0x78, 0x11, 0x77, 0x51, 0x04, 0xe6, 0x27, 0x62, 0x3f, 0x19, 0x38, 0xaf,
+    0x8c, 0xfd, 0x68, 0x3b, 0xfd, 0x7c, 0x68, 0xd5, 0xb5, 0x95, 0xac, 0xf9, 0x68, 0x65, 0xfd, 0xad,
+    0xda, 0x80, 0x0e, 0x7d, 0x3d, 0x93, 0x19, 0x30, 0x7c, 0xb9, 0x6f, 0xbd, 0x56, 0x64, 0x5e, 0x78,
+    0xd9, 0x48, 0x3c, 0x36, 0x25, 0x87, 0x56, 0x56, 0x14, 0x4e, 0x72, 0xe0, 0x8c, 0x9a, 0x3d, 0x29,
+    0xa5, 0xd6, 0x46, 0x6b, 0xd9, 0xcf, 0x1f, 0xbb, 0x03, 0x77, 0x30, 0xbf, 0x9d, 0x73, 0xa5, 0x91,
+    0xdd, 0x7c, 0xb0, 0x62, 0xa4, 0xc9, 0x21, 0x35, 0x43, 0x98, 0x65, 0x54, 0xa5, 0xba, 0xc6, 0xfe,
+    0x63, 0xe4, 0x62, 0x27, 0xa5, 0xca, 0x61, 0x6b, 0x5c, 0xc7, 0x16, 0x67, 0x04, 0x81, 0xd2, 0x13,
+    0x47, 0x23, 0x2d, 0x4e, 0x85, 0x44, 0x98, 0x91, 0xcc, 0x28, 0x8b, 0x22, 0xc9, 0x63, 0xa9, 0x2c,
+    0x8e, 0x21, 0xd9, 0x79, 0xc2, 0x6f, 0xad, 0x54, 0x64, 0x40, 0x6d, 0x83, 0x8d, 0x16, 0xf1, 0x4c,
+    0x11, 0xac, 0x6d, 0x44, 0x41, 0xd5, 0xda, 0xa7, 0x35, 0x45, 0x72, 0x8e, 0x43, 0x2a, 0x5d, 0x44,
+    0xca, 0x18, 0x85, 0xb3, 0x51, 0x12, 0x61, 0xd9, 0x0c, 0x2d, 0xf0, 0xeb, 0x1c, 0x8b, 0xaa, 0x27,
+    0x63, 0xb3, 0xaf, 0xa9, 0xf1, 0x59, 0x25, 0xe0, 0x9c, 0xac, 0x33, 0x2b, 0x45, 0x5c, 0xd1, 0x61,
+    0x19, 0xe0, 0x62, 0x32, 0x56, 0x08, 0x01, 0x39, 0x74, 0x12, 0x6b, 0x39, 0xad, 0x12, 0xe7, 0x8e,
+    0x04, 0x30, 0xd1, 0x23, 0x46, 0xd2, 0x68, 0xdc, 0x23, 0x3d, 0xa9, 0x9f, 0x91, 0xea, 0x81, 0x5f,
+    0xc7, 0x90, 0xe1, 0x51, 0xa9, 0xdf, 0xd5, 0x77, 0x4a, 0x24, 0x93, 0x78, 0x3a, 0x08, 0xb3, 0x17,
+    0x9f, 0x5a, 0x65, 0xea, 0x94, 0xc6, 0x1b, 0x82, 0x1c, 0x85, 0xa5, 0x9c, 0x02, 0x18, 0xb3, 0x3a,
+    0x30, 0x71, 0x33, 0x50, 0xda, 0x69, 0x10, 0x67, 0x29, 0xc8, 0x4b, 0xb3, 0x39, 0x5c, 0x53, 0x42,
+    0x5b, 0x9e, 0x68, 0xd8, 0x22, 0xb0, 0xd8, 0x3d, 0x44, 0xde, 0x05, 0x60, 0x20, 0x3e, 0x80, 0x31,
+    0x1b, 0x8c, 0xb0, 0x7a, 0xed, 0xd5, 0x45, 0x18, 0x1c, 0xd4, 0x52, 0x21, 0x44, 0x1f, 0xc0, 0xe9,
+    0x97, 0xd3, 0xf4, 0x82, 0x0a, 0x51, 0x6c, 0x59, 0x6e, 0x56, 0x1c, 0xa1, 0xbd, 0x82, 0xce, 0x09,
+    0x8a, 0x41, 0xb5, 0xd9, 0xfd, 0xc4, 0xd5, 0xaf, 0xd2, 0x4c, 0xc7, 0xdf, 0xc8, 0xd9, 0xcd, 0x96,
+    0x3a, 0xf0, 0xf8, 0xc8, 0x61, 0x87, 0xc3, 0x6b, 0x63, 0xb8, 0x97, 0x1a, 0x95, 0x17, 0xf8, 0x2a,
+    0x3f, 0x9c, 0x0c, 0x7e, 0x3e, 0x76, 0xbb, 0x36, 0x33, 0x11, 0xfb, 0xa5, 0x92, 0x61, 0x9f, 0x9a,
+    0xa2, 0x03, 0x1e, 0x2b, 0xbf, 0xe7, 0xc9, 0x25, 0x26, 0x9c, 0x9a, 0xb0, 0xd5, 0x95, 0xf0, 0x5d,
+    0xc3, 0xe6, 0x50, 0xb7, 0xf8, 0xdb, 0xe1, 0x96, 0x57, 0xe0, 0xc4, 0xd3, 0x64, 0x17, 0x9e, 0x7a,
+    0x5d, 0xcb, 0xc9, 0xb2, 0x85, 0x06, 0xbe, 0x92, 0x28, 0xc5, 0x6a, 0xd0, 0x7a, 0x58, 0xcf, 0x80,
+    0x2c, 0xa2, 0xb0, 0x4d, 0x95, 0xe1, 0xbe, 0x30, 0x87, 0x24, 0xa9, 0x46, 0x05, 0x1a, 0x0c, 0xa1,
+    0x0a, 0x50, 0x41, 0x4b, 0x45, 0x35, 0x98, 0xbd, 0x00, 0x5d, 0xd5, 0x53, 0x47, 0xbe, 0xe0, 0x36,
+    0x95, 0x12, 0x93, 0xc0, 0x77, 0xa1, 0x06, 0x37, 0xdf, 0xb6, 0xe7, 0xa4, 0xab, 0x19, 0x31, 0x0a,
+    0xb8, 0xd8, 0xc7, 0x31, 0xab, 0xe4, 0x72, 0x0f, 0xa4, 0x5c, 0x59, 0x6d, 0xaa, 0xd0, 0x28, 0xb0,
+    0x23, 0xd9, 0xca, 0xbe, 0x5e, 0x94, 0xf2, 0xad, 0xd6, 0xf0, 0x06, 0xe9, 0xf2, 0x02, 0x47, 0x24,
+    0xb6, 0xf1, 0x6f, 0x63, 0xc7, 0x15, 0x99, 0xdd, 0x84, 0x55, 0x8f, 0x43, 0x52, 0x5d, 0x2f, 0xb8,
+    0xea, 0x68, 0x6a, 0xf3, 0x5a, 0x5e, 0xbf, 0x4c, 0x7a, 0x52, 0xa2, 0xa1, 0xad, 0x36, 0xd4, 0x6c,
+    0x9c, 0xf8, 0x23, 0xa4, 0xd8, 0xaa, 0xfe, 0x38, 0xa9, 0xb9, 0xb9, 0xb3, 0x95, 0x7e, 0x5e, 0x36,
+    0xd2, 0xb0, 0x93, 0x11, 0x72, 0x1b, 0x68, 0xab, 0xc6, 0x1b, 0x5d, 0x05, 0xeb, 0xc6, 0x89, 0xd6,
+    0x9a, 0xd4, 0x86, 0x5d, 0x18, 0x68, 0xd7, 0x43, 0x87, 0xb1, 0x8b, 0xb3, 0x0d, 0x20, 0x83, 0xc3,
+    0xfe, 0xed, 0x95, 0x61, 0xaa, 0x10, 0xff, 0xb3, 0x92, 0x1d, 0xac, 0x66, 0xaf, 0xbb, 0xfe, 0x08,
+    0x6a, 0x11, 0xba, 0xbd, 0xdc, 0x89, 0x3f, 0x59, 0xef, 0x42, 0x28, 0x7f, 0xb5, 0xb2, 0x4e, 0xcb,
+    0xd9, 0x55, 0x87, 0xa2, 0x93, 0x75, 0x5e, 0x5c, 0x09, 0xa8, 0xc8, 0xce, 0x2f, 0x17, 0xc4, 0x19,
+    0xc8, 0xe9, 0xe5, 0xc2, 0x7c, 0xd5, 0x71, 0x72, 0x43, 0x91, 0x5c, 0xbf, 0x78, 0x11, 0x01, 0x47,
+    0xae, 0x5e, 0xbc, 0x6c, 0xd7, 0x40, 0xa4, 0x27, 0xd9, 0xbd, 0x5b, 0xa9, 0x2c, 0x47, 0x6b, 0xd6,
+    0x3b, 0xcf, 0x7e, 0xb8, 0xde, 0x9a, 0xaf, 0xc8, 0x46, 0x71, 0xbf, 0x4e, 0xaf, 0xc8, 0xfe, 0x01,
+    0xb6, 0x8d, 0xbf, 0x01, 0x69, 0xa6, 0x27, 0xd4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+];
 const REACTION_OPTIONS: [&str; 6] = ["👍", "❤️", "😂", "🎉", "😮", "🙏"];
 const COMPOSE_EMOTICON_OPTIONS: &[(&str, &str)] = &[
     ("😊", "smile happy"),
@@ -156,6 +221,9 @@ const COMPOSE_EMOTICON_MAX_SUGGESTIONS: usize = 8;
 const LOCAL_REACTION_SENDER: &str = "me";
 const REACTION_OPTION_CELL_WIDTH: u16 = 6;
 const NOTIFICATION_TICKS: u8 = 16;
+const NOTIFICATION_DELIVERY_DELAY: Duration = Duration::from_secs(5);
+const MAX_PENDING_NOTIFICATIONS_PER_TICK: usize = 8;
+const NOTIFICATION_PAUSE_RELOAD_TICKS: u64 = 4;
 const HELP_PAGE_STEP: usize = 8;
 const HELP_MOUSE_SCROLL_STEP: usize = 3;
 const QR_QUIET_ZONE: usize = 2;
@@ -167,11 +235,18 @@ const PERF_LOG_SLOW_MS_ENV: &str = "CHAT_CLI_PERF_SLOW_MS";
 const DEFAULT_PERF_LOG_SLOW_MS: u64 = 25;
 const EVENT_LOOP_STALL_LOG_MS: u64 = 750;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum AvatarPreviewSource {
+    Avatar,
+    AccountBadge,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AvatarPreviewKey {
     path: PathBuf,
     width: u16,
     rows: u16,
+    source: AvatarPreviewSource,
 }
 
 #[derive(Debug)]
@@ -222,6 +297,15 @@ struct PendingSelectedMessagesLoad {
 #[derive(Default)]
 struct ChatAvatarRowsResult {
     rows: HashMap<usize, chat_list::AvatarRows>,
+    cached: usize,
+    pending: usize,
+    queued: usize,
+    errors: usize,
+}
+
+#[derive(Default)]
+struct AccountBadgeRowsResult {
+    rows: HashMap<ProviderId, chat_list::AvatarRows>,
     cached: usize,
     pending: usize,
     queued: usize,
@@ -700,6 +784,8 @@ enum ActionMenuItem {
     Reply,
     ViewThread,
     React,
+    Forward,
+    OpenLink,
     VotePoll,
     CopyText,
     OpenImage,
@@ -707,21 +793,15 @@ enum ActionMenuItem {
 }
 
 impl ActionMenuItem {
-    const ALL: [Self; 7] = [
-        Self::Reply,
-        Self::ViewThread,
-        Self::React,
-        Self::VotePoll,
-        Self::CopyText,
-        Self::OpenImage,
-        Self::Cancel,
-    ];
+    const COMMON: [Self; 4] = [Self::Reply, Self::React, Self::Forward, Self::CopyText];
 
     fn label(self) -> &'static str {
         match self {
             Self::Reply => "Reply",
             Self::ViewThread => "View thread",
             Self::React => "React",
+            Self::Forward => "Forward",
+            Self::OpenLink => "Open link",
             Self::VotePoll => "Vote in poll",
             Self::CopyText => "Copy text",
             Self::OpenImage => "Open image",
@@ -734,6 +814,23 @@ impl ActionMenuItem {
 struct ActionMenu {
     message_id: MessageId,
     selected: usize,
+    items: Vec<ActionMenuItem>,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardPicker {
+    message_id: MessageId,
+    selected: usize,
+    query: String,
+    targets: Vec<ForwardTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardTarget {
+    account: ProviderId,
+    chat_id: ChatId,
+    label: String,
+    subtitle: String,
 }
 
 #[derive(Clone, Debug)]
@@ -840,13 +937,13 @@ impl SlackSetupMode {
     fn credential_hint(self) -> &'static str {
         match self {
             Self::UserOAuth => {
-                "After creating the app, save the manifest, install it from OAuth & Permissions, paste the User OAuth Token, and optionally paste an App-Level Token for realtime."
+                "Create the app from the manifest, then enter Client ID and Client Secret (from Basic Information). chat-cli opens your browser to sign in and captures the token automatically. For realtime, also add an App-Level Token (xapp-...) with connections:write; without it Slack only updates on slow periodic polling."
             }
             Self::ReadOnlyOAuth => {
-                "After creating the app, save the manifest, install it from OAuth & Permissions, paste the User OAuth Token, and optionally paste an App-Level Token for realtime."
+                "Create the app from the manifest, then enter Client ID and Client Secret (from Basic Information). chat-cli opens your browser to sign in and captures the token automatically. For realtime, also add an App-Level Token (xapp-...) with connections:write; without it Slack only updates on slow periodic polling."
             }
             Self::BotToken => {
-                "Enter bot token xoxb-... and optional app token xapp-... for realtime later."
+                "Enter bot token xoxb-..., then add an App-Level Token (xapp-...) with connections:write for realtime. Without it, Slack only updates on slow periodic polling."
             }
             Self::ImportedToken => {
                 "Paste a pre-approved xoxp-, xoxb-, or xapp- token for validation."
@@ -1034,6 +1131,12 @@ struct SlackSetupOverlay {
     oauth_url: Option<String>,
     status: Option<String>,
     capabilities: Option<SlackSetupCapabilities>,
+    /// True when chat-cli ships with a configured official Slack app, so the
+    /// normal OAuth path needs no app creation or client ID/secret entry.
+    bundled_oauth_app: bool,
+    /// When true the overlay renders the Slack help/explanation page instead of
+    /// the current phase. Toggled with `?`; non-destructive to phase state.
+    show_help: bool,
 }
 
 impl SlackSetupOverlay {
@@ -1048,6 +1151,8 @@ impl SlackSetupOverlay {
             oauth_url: None,
             status: Some("Name this Slack workspace, then choose a sign-in method.".to_owned()),
             capabilities: None,
+            bundled_oauth_app: false,
+            show_help: false,
         }
     }
 
@@ -1122,6 +1227,7 @@ impl AccountConnection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AccountStatus {
     display_name: String,
+    avatar: Option<PathBuf>,
     connection: AccountConnection,
     detail: Option<String>,
 }
@@ -1233,6 +1339,7 @@ impl AccountStatus {
     fn new(account: &Account, connection: AccountConnection) -> Self {
         Self {
             display_name: account.display_name.to_string(),
+            avatar: account.avatar.clone(),
             connection,
             detail: None,
         }
@@ -1271,15 +1378,12 @@ enum SettingsItem {
     ShowBrowseChannels,
     ShowEmptyChats,
     ArchiveVisibleAccounts,
-    DesktopNotifications,
-    InAppNotifications,
-    NotificationPreviews,
-    NotifySelectedChat,
-    NotifyMutedChats,
+    Notifications,
+    NotificationScope,
 }
 
 impl SettingsItem {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 10] = [
         Self::InboxStyle,
         Self::Theme,
         Self::ConversationStyle,
@@ -1288,11 +1392,8 @@ impl SettingsItem {
         Self::ShowBrowseChannels,
         Self::ShowEmptyChats,
         Self::ArchiveVisibleAccounts,
-        Self::DesktopNotifications,
-        Self::InAppNotifications,
-        Self::NotificationPreviews,
-        Self::NotifySelectedChat,
-        Self::NotifyMutedChats,
+        Self::Notifications,
+        Self::NotificationScope,
     ];
 
     fn label(self) -> &'static str {
@@ -1305,11 +1406,8 @@ impl SettingsItem {
             Self::ShowBrowseChannels => "Show browse channels",
             Self::ShowEmptyChats => "Show empty chats",
             Self::ArchiveVisibleAccounts => "Archive current accounts",
-            Self::DesktopNotifications => "Desktop notifications",
-            Self::InAppNotifications => "In-app notification card",
-            Self::NotificationPreviews => "Show message previews",
-            Self::NotifySelectedChat => "Notify for active chat",
-            Self::NotifyMutedChats => "Notify muted chats",
+            Self::Notifications => "Notifications",
+            Self::NotificationScope => "Notify for",
         }
     }
 
@@ -1335,13 +1433,12 @@ impl SettingsItem {
             Self::ArchiveVisibleAccounts => {
                 "Smart Sync keeps opened and visible chats fresh. Start on-demand archive sync for the current account filter when you want deeper local search or AI context."
             }
-            Self::DesktopNotifications => {
-                "Send eligible new messages to the desktop notification daemon."
+            Self::Notifications => {
+                "Choose one notification delivery mode: off, desktop, or in-app. Eligible notifications are delayed briefly and cancelled if you attend that chat."
             }
-            Self::InAppNotifications => "Show the small notification card inside chat-cli.",
-            Self::NotificationPreviews => "Include message text/captions in notifications.",
-            Self::NotifySelectedChat => "Notify even when the chat is already selected.",
-            Self::NotifyMutedChats => "Ignore provider muted-chat flags for notifications.",
+            Self::NotificationScope => {
+                "Limit notifications to direct messages and mentions, or allow them for all messages. Group and channel messages without a mention are suppressed when limited. Has no effect while notifications are off."
+            }
         }
     }
 
@@ -1363,11 +1460,8 @@ impl SettingsItem {
                     "start"
                 }
             }
-            Self::DesktopNotifications => on_off(settings.desktop_notifications),
-            Self::InAppNotifications => on_off(settings.in_app_notifications),
-            Self::NotificationPreviews => on_off(settings.notification_previews),
-            Self::NotifySelectedChat => on_off(settings.notify_selected_chat),
-            Self::NotifyMutedChats => on_off(settings.notify_muted_chats),
+            Self::Notifications => notification_mode_label(settings.notifications),
+            Self::NotificationScope => notification_scope_label(settings.notification_scope),
         }
     }
 
@@ -1376,16 +1470,13 @@ impl SettingsItem {
             Self::ShowMutedChats => Some(settings.show_muted_chats),
             Self::ShowBrowseChannels => Some(settings.show_browse_channels),
             Self::ShowEmptyChats => Some(settings.show_empty_chats),
-            Self::DesktopNotifications => Some(settings.desktop_notifications),
-            Self::InAppNotifications => Some(settings.in_app_notifications),
-            Self::NotificationPreviews => Some(settings.notification_previews),
-            Self::NotifySelectedChat => Some(settings.notify_selected_chat),
-            Self::NotifyMutedChats => Some(settings.notify_muted_chats),
             Self::InboxStyle
             | Self::Theme
             | Self::ConversationStyle
             | Self::NetworkActivity
-            | Self::ArchiveVisibleAccounts => None,
+            | Self::ArchiveVisibleAccounts
+            | Self::Notifications
+            | Self::NotificationScope => None,
         }
     }
 
@@ -1422,27 +1513,45 @@ impl SettingsItem {
                 true
             }
             Self::ArchiveVisibleAccounts => false,
-            Self::DesktopNotifications => {
-                settings.desktop_notifications = !settings.desktop_notifications;
+            Self::Notifications => {
+                settings.notifications = next_notification_mode(settings.notifications);
                 false
             }
-            Self::InAppNotifications => {
-                settings.in_app_notifications = !settings.in_app_notifications;
-                false
-            }
-            Self::NotificationPreviews => {
-                settings.notification_previews = !settings.notification_previews;
-                false
-            }
-            Self::NotifySelectedChat => {
-                settings.notify_selected_chat = !settings.notify_selected_chat;
-                false
-            }
-            Self::NotifyMutedChats => {
-                settings.notify_muted_chats = !settings.notify_muted_chats;
+            Self::NotificationScope => {
+                settings.notification_scope = next_notification_scope(settings.notification_scope);
                 false
             }
         }
+    }
+}
+
+fn notification_mode_label(mode: NotificationMode) -> &'static str {
+    match mode {
+        NotificationMode::Off => "off",
+        NotificationMode::Desktop => "desktop",
+        NotificationMode::InApp => "in-app",
+    }
+}
+
+fn next_notification_mode(mode: NotificationMode) -> NotificationMode {
+    match mode {
+        NotificationMode::Off => NotificationMode::Desktop,
+        NotificationMode::Desktop => NotificationMode::InApp,
+        NotificationMode::InApp => NotificationMode::Off,
+    }
+}
+
+fn notification_scope_label(scope: NotificationScope) -> &'static str {
+    match scope {
+        NotificationScope::All => "all messages",
+        NotificationScope::DirectAndMentions => "direct & mentions",
+    }
+}
+
+fn next_notification_scope(scope: NotificationScope) -> NotificationScope {
+    match scope {
+        NotificationScope::All => NotificationScope::DirectAndMentions,
+        NotificationScope::DirectAndMentions => NotificationScope::All,
     }
 }
 
@@ -1588,6 +1697,33 @@ impl NotificationOverlay {
             preview: Some(self.preview.clone()),
         }
     }
+
+    fn account_notice(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            message_id: Arc::from(format!(
+                "account-notice:{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            )),
+            chat_name: title.into(),
+            sender_name: "Account notice".to_owned(),
+            preview: body.into(),
+            ticks_remaining: NOTIFICATION_TICKS,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingNotification {
+    account: ProviderId,
+    chat_id: ChatId,
+    deliver_at: Instant,
+    notification: NotificationOverlay,
+}
+
+impl PendingNotification {
+    fn key_matches(&self, account: &ProviderId, chat_id: &ChatId) -> bool {
+        self.account == *account && self.chat_id == *chat_id
+    }
 }
 
 #[derive(Debug)]
@@ -1614,6 +1750,7 @@ pub struct AppState {
     message_hits: Vec<message_list::MessageHit>,
     selected_message_id: Option<MessageId>,
     action_menu: Option<ActionMenu>,
+    forward_picker: Option<ForwardPicker>,
     reaction_picker: Option<ReactionPicker>,
     compose_emoticon_picker: Option<ComposeEmoticonPicker>,
     compose_attach_menu: Option<ComposeAttachMenu>,
@@ -1622,10 +1759,16 @@ pub struct AppState {
     auth_overlay: Option<AuthOverlay>,
     account_setup: Option<AccountSetupOverlay>,
     slack_setup: Option<SlackSetupOverlay>,
+    // Slack provider whose browser OAuth login was dispatched as a background
+    // task. When its sync completes we run the post-auth chat load that the
+    // inline submission path would otherwise perform synchronously.
+    pending_slack_setup_load: Option<ProviderId>,
     account_switcher: Option<AccountSwitcher>,
     settings_overlay: Option<SettingsOverlay>,
     active_account: Option<ProviderId>,
     notification: Option<NotificationOverlay>,
+    pending_notifications: Vec<PendingNotification>,
+    notification_pause: NotificationPauseState,
     account_statuses: HashMap<ProviderId, AccountStatus>,
     network_activity: HashMap<ProviderId, AccountNetworkActivity>,
     typing_indicators: HashMap<(ProviderId, ChatId), Vec<TypingIndicator>>,
@@ -1678,6 +1821,7 @@ impl Default for AppState {
             message_hits: Vec::new(),
             selected_message_id: None,
             action_menu: None,
+            forward_picker: None,
             reaction_picker: None,
             compose_emoticon_picker: None,
             compose_attach_menu: None,
@@ -1686,10 +1830,13 @@ impl Default for AppState {
             auth_overlay: None,
             account_setup: None,
             slack_setup: None,
+            pending_slack_setup_load: None,
             account_switcher: None,
             settings_overlay: None,
             active_account: None,
             notification: None,
+            pending_notifications: Vec::new(),
+            notification_pause: NotificationPauseState::default(),
             account_statuses: HashMap::new(),
             network_activity: HashMap::new(),
             typing_indicators: HashMap::new(),
@@ -1793,6 +1940,10 @@ impl AppState {
         self.action_menu.is_some()
     }
 
+    pub fn forward_picker_open(&self) -> bool {
+        self.forward_picker.is_some()
+    }
+
     pub fn reaction_picker_open(&self) -> bool {
         self.reaction_picker.is_some()
     }
@@ -1851,6 +2002,10 @@ impl AppState {
         self.notification
             .as_ref()
             .map(|notification| notification.preview.as_str())
+    }
+
+    pub fn pending_notification_count(&self) -> usize {
+        self.pending_notifications.len()
     }
 
     pub fn account_status_summary(&self) -> String {
@@ -1950,13 +2105,16 @@ impl App {
         let (discovery_tx, discovery_rx) = mpsc::unbounded_channel();
         let settings_started = Instant::now();
         let settings = store.app_settings().await?;
+        let notification_pause = store.notification_pause_state().await?;
         let theme = Theme::from_preset(settings.ui_theme);
         let perf_log = PerfLog::from_env()?;
+        let mut state = AppState::default();
+        state.notification_pause = notification_pause;
         let mut app = Self {
             providers,
             provider_receivers,
             store,
-            state: AppState::default(),
+            state,
             settings,
             desktop_notifier: DesktopNotifier::new(),
             media_preview_cache: message_list::MediaPreviewCache::default(),
@@ -2099,7 +2257,7 @@ impl App {
                 self.state.status = format!("terminal resized to {width}x{height}");
             }
             AppEvent::Tick => {
-                self.handle_tick();
+                self.handle_tick().await?;
                 self.schedule_on_demand_archive_sync().await?;
             }
             AppEvent::Provider(provider_id, event) => {
@@ -2881,6 +3039,7 @@ impl App {
             app.draw_slack_setup_overlay(frame, area);
             app.draw_help_overlay(frame, area);
             app.draw_action_menu(frame, area);
+            app.draw_forward_picker(frame, area);
             app.draw_reaction_picker(frame, area);
             app.draw_compose_attach_menu(frame, area);
             app.draw_compose_emoticon_picker(frame, area);
@@ -2988,16 +3147,22 @@ impl App {
         let rendered_chat_indices = chat_layout.rendered_chat_indices();
         let avatars_started = Instant::now();
         let avatar_rows = self.chat_avatar_rows(&rendered_chat_indices);
+        let account_badge_rows = self.account_badge_rows(&rendered_chat_indices);
         self.log_draw_step(
             "draw.chat_list.avatars",
             avatars_started.elapsed(),
             format!(
-                "rendered={} cached={} pending={} queued={} errors={}",
+                "rendered={} cached={} pending={} queued={} errors={} account_badges={} account_cached={} account_pending={} account_queued={} account_errors={}",
                 avatar_rows.rows.len(),
                 avatar_rows.cached,
                 avatar_rows.pending,
                 avatar_rows.queued,
-                avatar_rows.errors
+                avatar_rows.errors,
+                account_badge_rows.rows.len(),
+                account_badge_rows.cached,
+                account_badge_rows.pending,
+                account_badge_rows.queued,
+                account_badge_rows.errors
             ),
         );
         let typing_started = Instant::now();
@@ -3016,13 +3181,15 @@ impl App {
                 visible_chat_indices: &self.state.visible_chat_indices,
                 selected_chat_index: self.state.selected_chat,
                 filter: self.chat_list_filter(),
-                filter_mode: self.state.filter_mode && self.state.filter_scope == FilterScope::Chats,
+                filter_mode: self.state.filter_mode
+                    && self.state.filter_scope == FilterScope::Chats,
                 discovery_results: &self.state.discovery_results,
                 account_filter: &self.account_filter_label(),
                 inbox_style: self.settings.chat_inbox_style,
                 focused: self.state.focus == FocusPane::ChatList,
                 layout: &chat_layout,
                 avatar_rows: &avatar_rows.rows,
+                account_badge_rows: &account_badge_rows.rows,
                 typing_previews: &typing_previews,
                 theme: self.theme,
             },
@@ -3063,6 +3230,7 @@ impl App {
                 path,
                 width: chat_list::CHAT_AVATAR_WIDTH,
                 rows: chat_list::CHAT_AVATAR_ROWS,
+                source: AvatarPreviewSource::Avatar,
             };
 
             match self.avatar_preview_cache.get(&key) {
@@ -3086,6 +3254,122 @@ impl App {
         result
     }
 
+    fn account_badge_rows(&mut self, rendered_chat_indices: &[usize]) -> AccountBadgeRowsResult {
+        let mut result = AccountBadgeRowsResult::default();
+        let mut seen_accounts = HashSet::new();
+        let account_ids = rendered_chat_indices
+            .iter()
+            .filter_map(|chat_index| self.state.chats.get(*chat_index))
+            .map(|chat| chat.account.clone())
+            .filter(|provider_id| seen_accounts.insert(provider_id.clone()))
+            .collect::<Vec<_>>();
+        for provider_id in account_ids {
+            let Some(account) = self.account_for_provider(&provider_id) else {
+                continue;
+            };
+            let fallback = chat_list::account_badge_placeholder(&account, self.theme);
+            result.rows.insert(provider_id.clone(), fallback);
+
+            let Some(path) = self.account_badge_avatar_path(&provider_id, &account) else {
+                continue;
+            };
+
+            let key = AvatarPreviewKey {
+                path,
+                width: chat_list::ACCOUNT_BADGE_WIDTH,
+                rows: chat_list::ACCOUNT_BADGE_ROWS,
+                source: AvatarPreviewSource::AccountBadge,
+            };
+
+            match self.avatar_preview_cache.get(&key) {
+                Some(Ok(avatar)) => {
+                    result.cached += 1;
+                    result.rows.insert(provider_id, avatar.clone());
+                }
+                Some(Err(_)) => {
+                    if key.path.exists() {
+                        self.avatar_preview_cache.remove(&key);
+                        if self.pending_avatar_previews.contains(&key) {
+                            result.pending += 1;
+                        } else {
+                            self.queue_avatar_preview(key);
+                            result.queued += 1;
+                        }
+                    } else {
+                        result.errors += 1;
+                    }
+                }
+                None => {
+                    if self.pending_avatar_previews.contains(&key) {
+                        result.pending += 1;
+                    } else {
+                        self.queue_avatar_preview(key);
+                        result.queued += 1;
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn account_badge_avatar_path(
+        &mut self,
+        provider_id: &ProviderId,
+        account: &Account,
+    ) -> Option<PathBuf> {
+        let account_avatar = account.avatar.as_deref().map(Path::to_path_buf);
+        let status_avatar = self
+            .state
+            .account_statuses
+            .get(provider_id)
+            .and_then(|status| status.avatar.as_deref())
+            .map(Path::to_path_buf);
+        let preferred_avatar = account_avatar.or(status_avatar);
+        if preferred_avatar.is_some() {
+            return preferred_avatar;
+        }
+
+        let icon_bytes = match account.platform {
+            Platform::WhatsApp => Some(EMBEDDED_WHATSAPP_ICON_PNG),
+            Platform::Slack | Platform::Unknown(_) | Platform::Discord => None,
+        }?;
+        let path = static_account_icon_path(provider_id, account.platform.clone());
+        self.queue_static_account_icon_preview(
+            AvatarPreviewKey {
+                path: path.clone(),
+                width: chat_list::ACCOUNT_BADGE_WIDTH,
+                rows: chat_list::ACCOUNT_BADGE_ROWS,
+                source: AvatarPreviewSource::AccountBadge,
+            },
+            icon_bytes,
+        );
+        Some(path)
+    }
+
+    fn queue_static_account_icon_preview(
+        &mut self,
+        key: AvatarPreviewKey,
+        icon_bytes: &'static [u8],
+    ) {
+        if self.avatar_preview_cache.contains_key(&key)
+            || !self.pending_avatar_previews.insert(key.clone())
+        {
+            return;
+        }
+        let tx = self.avatar_preview_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = write_static_account_icon(&key.path, icon_bytes)
+                .and_then(|()| account_badge_image_rows(&key.path).map_err(anyhow::Error::msg))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(AvatarPreviewFetchResult {
+                key,
+                result,
+                elapsed: started.elapsed(),
+            });
+        });
+    }
+
     fn queue_avatar_preview(&mut self, key: AvatarPreviewKey) {
         if !self.pending_avatar_previews.insert(key.clone()) {
             return;
@@ -3093,9 +3377,15 @@ impl App {
         let tx = self.avatar_preview_tx.clone();
         tokio::task::spawn_blocking(move || {
             let started = Instant::now();
-            let mut cache = message_list::MediaPreviewCache::default();
-            let result =
-                message_list::cached_image_preview_rows(&key.path, &mut cache, key.width, key.rows);
+            let result = match key.source {
+                AvatarPreviewSource::Avatar => {
+                    let mut cache = message_list::MediaPreviewCache::default();
+                    message_list::cached_image_preview_rows(
+                        &key.path, &mut cache, key.width, key.rows,
+                    )
+                }
+                AvatarPreviewSource::AccountBadge => account_badge_image_rows(&key.path),
+            };
             let _ = tx.send(AvatarPreviewFetchResult {
                 key,
                 result,
@@ -3155,8 +3445,8 @@ impl App {
             .state
             .selected_chat()
             .map(|chat| {
-                let messages_filter_scope = self.state.filter_mode
-                    && self.state.filter_scope == FilterScope::Messages;
+                let messages_filter_scope =
+                    self.state.filter_mode && self.state.filter_scope == FilterScope::Messages;
                 if messages_filter_scope || self.message_filter_active() {
                     let query = if self.state.filter.is_empty() {
                         "(type to filter)".to_owned()
@@ -3444,6 +3734,8 @@ impl App {
         if area.is_empty() {
             return;
         }
+
+        frame.render_widget(Clear, area);
 
         if self.thread_filter_active() && !self.state.filter.is_empty() {
             self.draw_filtered_thread_details(frame, area);
@@ -4158,7 +4450,7 @@ impl App {
             return;
         };
 
-        let modal = self.action_menu_rect(area, &menu.message_id);
+        let modal = self.action_menu_rect(area, menu);
         if modal.is_empty() {
             return;
         }
@@ -4167,7 +4459,7 @@ impl App {
             "Message actions",
             self.theme.pane_title(),
         ))];
-        for (index, item) in ActionMenuItem::ALL.iter().enumerate() {
+        for (index, item) in menu.items.iter().enumerate() {
             let selected = index == menu.selected;
             let prefix = if selected { "› " } else { "  " };
             let style = if selected {
@@ -4191,6 +4483,89 @@ impl App {
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
+    fn draw_forward_picker(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(picker) = &self.state.forward_picker else {
+            return;
+        };
+        let modal = self.forward_picker_rect(area, picker);
+        if modal.is_empty() {
+            return;
+        }
+        let matches = forward_picker_filtered_indices(picker);
+        let visible_rows = forward_picker_visible_rows(modal);
+        let start = forward_picker_scroll_start(picker.selected, visible_rows, matches.len());
+        let end = matches.len().min(start.saturating_add(visible_rows));
+        let query = if picker.query.is_empty() {
+            "type to search".to_owned()
+        } else {
+            picker.query.clone()
+        };
+        let mut lines = vec![
+            Line::from(Span::styled("Forward message", self.theme.pane_title())),
+            Line::from(vec![
+                Span::styled("Search: ", self.theme.muted()),
+                Span::styled(
+                    truncate_chars(&query, modal.width.saturating_sub(12) as usize),
+                    if picker.query.is_empty() {
+                        self.theme.muted()
+                    } else {
+                        self.theme.status_key()
+                    },
+                ),
+            ]),
+        ];
+        if matches.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No matching destinations",
+                self.theme.muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "Backspace clears · Esc cancels",
+                self.theme.muted(),
+            )));
+        } else {
+            for (index, target_index) in matches[start..end].iter().copied().enumerate() {
+                let match_index = start + index;
+                let target = &picker.targets[target_index];
+                let selected = match_index == picker.selected;
+                let prefix = if selected { "› " } else { "  " };
+                let style = if selected {
+                    self.theme.status_key()
+                } else {
+                    self.theme.status_bar()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_owned(), style),
+                    Span::styled(
+                        truncate_chars(&target.label, modal.width.saturating_sub(8) as usize),
+                        style,
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        truncate_chars(&target.subtitle, modal.width.saturating_sub(6) as usize),
+                        self.theme.muted(),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "Enter forwards · type filters · Esc cancels",
+                self.theme.muted(),
+            )));
+        }
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Forward")
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.overlay_border()),
+            )
+            .wrap(Wrap { trim: true });
         frame.render_widget(Clear, modal);
         frame.render_widget(paragraph, modal);
     }
@@ -4383,6 +4758,28 @@ impl App {
             Line::from(""),
         ];
 
+        if setup.show_help {
+            for line in slack_setup_help_lines(self.theme) {
+                lines.push(line);
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "? back · Esc hide",
+                self.theme.muted(),
+            )));
+            let paragraph = Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .title("Slack help")
+                        .borders(Borders::ALL)
+                        .border_style(self.theme.overlay_border()),
+                )
+                .wrap(Wrap { trim: true });
+            frame.render_widget(Clear, modal);
+            frame.render_widget(paragraph, modal);
+            return;
+        }
+
         match setup.phase {
             SlackSetupPhase::ChooseWorkspace => {
                 lines.extend([
@@ -4455,7 +4852,57 @@ impl App {
                     setup.selected_mode().label(),
                     self.theme.status_key(),
                 )));
-                if let Some(url) = &setup.oauth_url {
+                if setup.bundled_oauth_app
+                    && matches!(
+                        setup.selected_mode(),
+                        SlackSetupMode::UserOAuth | SlackSetupMode::ReadOnlyOAuth
+                    )
+                {
+                    lines.push(Line::from(Span::styled(
+                        "chat-cli has a built-in Slack app — no app creation or Client ID/Secret needed.",
+                        self.theme.status_key(),
+                    )));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(
+                        "  1. Press Enter to open your browser and sign in to Slack.",
+                    ));
+                    lines.push(Line::from(
+                        "  2. Approve the requested permissions for this workspace.",
+                    ));
+                    lines.push(Line::from(
+                        "  3. chat-cli captures the result automatically and finishes sign-in.",
+                    ));
+                    lines.push(Line::from(Span::styled(
+                        "Each workspace is approved separately; an admin may need to approve the requested scopes.",
+                        self.theme.muted(),
+                    )));
+                    lines.push(Line::from(Span::styled(
+                        "For optional realtime, paste an App-Level Token (xapp-...) with connections:write; otherwise Slack falls back to periodic polling.",
+                        self.theme.muted(),
+                    )));
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "Optional credential fields",
+                        self.theme.status_key(),
+                    )));
+                    for (index, field) in setup.credential_fields().iter().copied().enumerate() {
+                        let selected = index == setup.selected_credential_field;
+                        let prefix = if selected { "› " } else { "  " };
+                        let style = if selected {
+                            self.theme.status_key()
+                        } else {
+                            self.theme.status_bar()
+                        };
+                        let display_value = slack_setup_display_value(
+                            setup.credentials.value(field),
+                            field.is_secret(),
+                        );
+                        lines.push(Line::from(Span::styled(
+                            format!("{prefix}{}: {display_value}", field.label()),
+                            style,
+                        )));
+                    }
+                } else if let Some(url) = &setup.oauth_url {
                     lines.push(Line::from(format!(
                         "Slack app creation URL: {}",
                         slack_app_creation_url_display(url)
@@ -4471,11 +4918,15 @@ impl App {
                     lines.push(Line::from(
                         "  2. Open OAuth & Permissions from the left sidebar.",
                     ));
-                    lines.push(Line::from("  3. Click Install/Reinstall to Workspace and approve the requested scopes."));
+                    lines.push(Line::from("  3. Open Basic Information and copy the Client ID and Client Secret into the fields below."));
                     lines.push(Line::from(
-                        "  4. Copy the User OAuth Token (xoxp-...) into the field below.",
+                        "  4. Submit: chat-cli opens your browser to sign in and captures the token automatically (no copy/paste).",
                     ));
-                    lines.push(Line::from("  5. Optional realtime: Basic Information → App-Level Tokens → create xapp-... with connections:write."));
+                    lines.push(Line::from("  5. For realtime: Basic Information → App-Level Tokens → create xapp-... with connections:write, then paste it in App token. Without it, Slack falls back to slow periodic polling."));
+                    lines.push(Line::from(Span::styled(
+                        "If you later change scopes, Reinstall to Workspace or history reads fail with missing_scope.",
+                        self.theme.muted(),
+                    )));
                     lines.push(Line::from(Span::styled(
                         "Use xapp-... only in the App token field; ignore Signing Secret and Verification Token.",
                         self.theme.muted(),
@@ -4538,6 +4989,12 @@ impl App {
                 } else {
                     lines.push(Line::from("  Waiting for Slack validation results."));
                 }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Connect more workspaces independently of this one:",
+                    self.theme.status_key(),
+                )));
+                lines.push(Line::from("  a  Add another Slack workspace"));
             }
             SlackSetupPhase::Failed => {
                 lines.push(Line::from(Span::styled(
@@ -4563,7 +5020,7 @@ impl App {
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "↑/↓ choose · Tab fields · 1-6 quick select · Enter continue · Esc hide",
+            "↑/↓ choose · Tab fields · 1-6 quick select · Enter continue · a add workspace · ? help · Esc hide",
             self.theme.muted(),
         )));
 
@@ -5204,7 +5661,13 @@ impl App {
             status.detail = None;
         }
 
-        if account.platform == Platform::Slack && !self.providers[provider_index].is_connected() {
+        let refreshed_account = self.providers[provider_index].account_info();
+        self.refresh_account_metadata(&refreshed_account, AccountConnection::Syncing(0))
+            .await?;
+
+        if refreshed_account.platform == Platform::Slack
+            && !self.providers[provider_index].is_connected()
+        {
             self.set_account_status(
                 &account.id,
                 AccountConnection::NeedsAuth,
@@ -5215,8 +5678,8 @@ impl App {
         }
 
         self.sync_provider_chats(provider_index).await?;
-        if matches!(account.platform, Platform::Unknown(_)) {
-            let chats = self.store.get_chats(&account.id).await?;
+        if matches!(refreshed_account.platform, Platform::Unknown(_)) {
+            let chats = self.store.get_chats(&refreshed_account.id).await?;
             for chat in &chats {
                 let messages = self.providers[provider_index]
                     .history(&chat.id, None, HISTORY_LIMIT)
@@ -5224,7 +5687,50 @@ impl App {
                 self.store.upsert_messages(&messages).await?;
             }
         }
-        self.set_account_status(&account.id, AccountConnection::Online, None);
+        self.set_account_status(&refreshed_account.id, AccountConnection::Online, None);
+        Ok(())
+    }
+
+    async fn refresh_account_metadata(
+        &mut self,
+        account: &Account,
+        connection: AccountConnection,
+    ) -> Result<()> {
+        if let Some(provider) = self.provider_for_id(&account.id) {
+            let config_json = provider.config_json().unwrap_or_else(|| "{}".to_owned());
+            self.store.upsert_account(account, &config_json).await?;
+        }
+        if account.platform == Platform::Slack {
+            self.log_perf_marker(
+                "slack.account_metadata",
+                format!(
+                    "account={} display_name={} avatar={}",
+                    account.id,
+                    account.display_name,
+                    account
+                        .avatar
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_owned())
+                ),
+            );
+        }
+        self.state
+            .account_statuses
+            .insert(account.id.clone(), AccountStatus::new(account, connection));
+        Ok(())
+    }
+
+    async fn refresh_provider_account_metadata(
+        &mut self,
+        provider_id: &ProviderId,
+        connection: AccountConnection,
+    ) -> Result<()> {
+        if let Some(account) = self.account_for_provider(provider_id) {
+            self.refresh_account_metadata(&account, connection).await?;
+        } else {
+            self.set_account_status(provider_id, connection, None);
+        }
         Ok(())
     }
 
@@ -5360,17 +5866,20 @@ impl App {
                 message,
                 is_historical,
             } => {
+                let is_placeholder_whatsapp = is_placeholder_whatsapp_message(&message);
                 let selected_chat_id = self.state.selected_chat().map(|chat| chat.id.clone());
                 let should_update_selected = selected_chat_id.as_ref() == Some(&message.chat_id);
-                let store_started = Instant::now();
-                self.store.upsert_message(&message).await?;
-                self.log_slow_perf_duration(
-                    "provider.message.store",
-                    store_started,
-                    format!(
-                        "provider={provider_id} historical={is_historical} selected={should_update_selected}"
-                    ),
-                );
+                if !is_placeholder_whatsapp {
+                    let store_started = Instant::now();
+                    self.store.upsert_message(&message).await?;
+                    self.log_slow_perf_duration(
+                        "provider.message.store",
+                        store_started,
+                        format!(
+                            "provider={provider_id} historical={is_historical} selected={should_update_selected}"
+                        ),
+                    );
+                }
                 let preview_started = Instant::now();
                 self.refresh_chat_preview_from_message(&message).await?;
                 self.log_slow_perf_duration(
@@ -5380,7 +5889,7 @@ impl App {
                         "provider={provider_id} historical={is_historical} selected={should_update_selected}"
                     ),
                 );
-                if should_update_selected {
+                if should_update_selected && !is_placeholder_whatsapp {
                     let selected_started = Instant::now();
                     if is_historical {
                         self.append_historical_message_to_current_chat(message.clone());
@@ -5401,16 +5910,20 @@ impl App {
                         reload_started,
                         format!("provider={provider_id}"),
                     );
-                    self.maybe_show_notification(
-                        &message,
-                        selected_chat_id.as_ref(),
-                        is_historical,
-                    );
-                    if self
-                        .state
-                        .notification
-                        .as_ref()
-                        .is_none_or(|notification| notification.message_id != message.id)
+                    if !is_placeholder_whatsapp {
+                        self.maybe_queue_notification(&message, is_historical);
+                    }
+                    if !is_placeholder_whatsapp
+                        && self
+                            .state
+                            .pending_notifications
+                            .iter()
+                            .all(|notification| notification.notification.message_id != message.id)
+                        && self
+                            .state
+                            .notification
+                            .as_ref()
+                            .is_none_or(|notification| notification.message_id != message.id)
                     {
                         self.state.status = format!("message event from {provider_id}");
                     }
@@ -5521,7 +6034,17 @@ impl App {
                     AccountConnection::NeedsAuth,
                     Some(auth_challenge_label(&challenge).to_owned()),
                 );
-                if self.account_platform(&provider_id) == Some(Platform::Slack) {
+                // During a background browser OAuth login the provider emits an
+                // `OAuthUrl` challenge so we open the browser. Don't rebuild the
+                // setup overlay (which would wipe the entered credentials and
+                // show paste instructions); just launch the authorize URL.
+                if self.state.pending_slack_setup_load.as_ref() == Some(&provider_id) {
+                    if let AuthChallenge::OAuthUrl(url) = &challenge {
+                        open_and_copy_slack_oauth_url(url.as_ref());
+                        self.state.status =
+                            format!("opened Slack sign-in in browser for {provider_id}");
+                    }
+                } else if self.account_platform(&provider_id) == Some(Platform::Slack) {
                     self.open_slack_setup_for_provider(&provider_id, Some(&challenge), None);
                 } else {
                     self.state.auth_overlay = Some(AuthOverlay {
@@ -5541,7 +6064,8 @@ impl App {
                     self.state.auth_overlay = None;
                 }
                 self.update_slack_setup_success(&provider_id, SlackSetupPhase::CapabilityReview);
-                self.set_account_status(&provider_id, AccountConnection::Online, None);
+                self.refresh_provider_account_metadata(&provider_id, AccountConnection::Online)
+                    .await?;
                 self.state.status = format!("authenticated {provider_id}");
             }
             ProviderEvent::SyncProgress(progress) => {
@@ -5566,8 +6090,20 @@ impl App {
                     self.state.auth_overlay = None;
                 }
                 self.update_slack_setup_success(&provider_id, SlackSetupPhase::Connected);
-                self.set_account_status(&provider_id, AccountConnection::Online, None);
+                self.refresh_provider_account_metadata(&provider_id, AccountConnection::Online)
+                    .await?;
+                if self.state.pending_slack_setup_load.as_ref() == Some(&provider_id) {
+                    self.state.pending_slack_setup_load = None;
+                    self.load_slack_setup_account(&provider_id).await?;
+                }
                 self.state.status = format!("sync complete for {provider_id}");
+            }
+            ProviderEvent::AccountNotice {
+                title,
+                body,
+                severity,
+            } => {
+                self.deliver_account_notice(title.as_ref(), body.as_ref(), severity);
             }
             ProviderEvent::Disconnected(reason) => {
                 if self
@@ -5579,6 +6115,9 @@ impl App {
                     self.state.auth_overlay = None;
                 }
                 let detail = reason.as_deref().map(str::to_owned);
+                if self.state.pending_slack_setup_load.as_ref() == Some(&provider_id) {
+                    self.state.pending_slack_setup_load = None;
+                }
                 if self.account_platform(&provider_id) == Some(Platform::Slack) {
                     self.open_slack_setup_for_provider(&provider_id, None, detail.clone());
                 }
@@ -5659,16 +6198,78 @@ impl App {
                 menu.selected = menu.selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                menu.selected = menu
-                    .selected
-                    .saturating_add(1)
-                    .min(ActionMenuItem::ALL.len().saturating_sub(1));
+                let max = menu.items.len().saturating_sub(1);
+                menu.selected = menu.selected.saturating_add(1).min(max);
             }
             KeyCode::Enter => {
                 let message_id = menu.message_id.clone();
-                let item = ActionMenuItem::ALL[menu.selected];
+                let item = menu.items[menu.selected];
                 self.state.action_menu = None;
                 self.perform_action_menu_item(message_id, item).await?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    async fn handle_forward_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(picker) = &mut self.state.forward_picker else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.state.forward_picker = None;
+                self.state.status = "forward cancelled".to_owned();
+            }
+            KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = forward_picker_filtered_len(picker).saturating_sub(1);
+                picker.selected = picker.selected.saturating_add(1).min(max);
+            }
+            KeyCode::Home => {
+                picker.selected = 0;
+            }
+            KeyCode::End => {
+                picker.selected = forward_picker_filtered_len(picker).saturating_sub(1);
+            }
+            KeyCode::PageUp => {
+                picker.selected = picker.selected.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                let max = forward_picker_filtered_len(picker).saturating_sub(1);
+                picker.selected = picker.selected.saturating_add(5).min(max);
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.selected = 0;
+            }
+            KeyCode::Delete => {
+                picker.query.clear();
+                picker.selected = 0;
+            }
+            KeyCode::Char(character) => {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    picker.query.push(character);
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::Enter => {
+                let Some((message_id, target)) = self
+                    .state
+                    .forward_picker
+                    .as_ref()
+                    .and_then(forward_picker_selected_target)
+                else {
+                    self.state.status = "no matching forward destination".to_owned();
+                    return Ok(false);
+                };
+                self.state.forward_picker = None;
+                self.forward_message_to_target(message_id, target).await?;
             }
             _ => {}
         }
@@ -5831,6 +6432,12 @@ impl App {
                 });
                 self.state.status = "choose a reaction".to_owned();
             }
+            ActionMenuItem::Forward => self.open_forward_picker(message_id),
+            ActionMenuItem::OpenLink => {
+                if !self.open_message_link(&message_id) {
+                    self.state.status = "selected message has no link".to_owned();
+                }
+            }
             ActionMenuItem::CopyText => self.copy_message_text(&message_id),
             ActionMenuItem::VotePoll => self.open_poll_vote_picker(message_id),
             ActionMenuItem::OpenImage => {
@@ -5881,6 +6488,10 @@ impl App {
 
         if self.state.action_menu.is_some() {
             return self.handle_action_menu_key(key).await;
+        }
+
+        if self.state.forward_picker.is_some() {
+            return self.handle_forward_picker_key(key).await;
         }
 
         if self.state.reaction_picker.is_some() {
@@ -6063,6 +6674,18 @@ impl App {
             return Ok(false);
         };
 
+        // When the help page is open it captures input until dismissed.
+        if setup.show_help {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => {
+                    setup.show_help = false;
+                    self.state.status = "Slack help closed".to_owned();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.state.slack_setup = None;
@@ -6078,6 +6701,18 @@ impl App {
             {
                 self.state.slack_setup = None;
                 self.state.status = "Slack setup hidden".to_owned();
+            }
+            KeyCode::F(1) => {
+                setup.show_help = true;
+                self.state.status = "Slack help".to_owned();
+            }
+            KeyCode::Char('?')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                setup.show_help = true;
+                self.state.status = "Slack help".to_owned();
             }
             KeyCode::Down | KeyCode::Right | KeyCode::Tab => match setup.phase {
                 SlackSetupPhase::ChooseAuthMode => {
@@ -6218,6 +6853,17 @@ impl App {
                 if submit {
                     self.submit_current_slack_setup().await?;
                 }
+            }
+            KeyCode::Char('a')
+                if matches!(
+                    setup.phase,
+                    SlackSetupPhase::CapabilityReview | SlackSetupPhase::Connected
+                ) =>
+            {
+                self.state.slack_setup = None;
+                self.state.status = "add another Slack workspace".to_owned();
+                self.start_account_setup(AccountProviderKind::Slack).await?;
+                return Ok(false);
             }
             KeyCode::Char(value)
                 if !key
@@ -6466,6 +7112,7 @@ impl App {
     }
 
     async fn handle_message_key(&mut self, key: KeyEvent) -> Result<bool> {
+        self.attend_selected_chat("message_key");
         let changed = match key.code {
             KeyCode::Esc => {
                 if self.state.selected_message_id.take().is_some() {
@@ -6576,6 +7223,17 @@ impl App {
             return Ok(false);
         }
 
+        if self.state.forward_picker.is_some()
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            if self.handle_forward_picker_click(mouse).await? {
+                return Ok(false);
+            }
+            self.state.forward_picker = None;
+            self.state.status = "forward cancelled".to_owned();
+            return Ok(false);
+        }
+
         if self.state.reaction_picker.is_some()
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
@@ -6647,6 +7305,16 @@ impl App {
         }
         let scope_selection_changed = self.sync_filter_scope_to_focus();
 
+        if matches!(
+            (pane, mouse.kind),
+            (FocusPane::Messages, MouseEventKind::Down(MouseButton::Left))
+                | (FocusPane::Messages, MouseEventKind::ScrollDown)
+                | (FocusPane::Messages, MouseEventKind::ScrollUp)
+                | (FocusPane::Compose, MouseEventKind::Down(MouseButton::Left))
+        ) {
+            self.attend_selected_chat("chat_mouse");
+        }
+
         let changed = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => self.handle_left_click(pane, mouse),
             MouseEventKind::ScrollDown => self.handle_scroll_down(pane),
@@ -6675,9 +7343,26 @@ impl App {
             return Ok(false);
         };
 
-        let item = ActionMenuItem::ALL[index];
+        let item = menu.items[index];
         self.state.action_menu = None;
         self.perform_action_menu_item(menu.message_id, item).await?;
+        Ok(true)
+    }
+
+    async fn handle_forward_picker_click(&mut self, mouse: MouseEvent) -> Result<bool> {
+        let Some(picker) = self.state.forward_picker.clone() else {
+            return Ok(false);
+        };
+        let Some(index) = self.forward_picker_option_at(mouse.column, mouse.row, &picker) else {
+            return Ok(false);
+        };
+        let Some(target_index) = forward_picker_filtered_indices(&picker).get(index).copied()
+        else {
+            return Ok(false);
+        };
+        self.state.forward_picker = None;
+        self.forward_message_to_target(picker.message_id, picker.targets[target_index].clone())
+            .await?;
         Ok(true)
     }
 
@@ -6785,6 +7470,9 @@ impl App {
         match pane {
             FocusPane::ChatList => {
                 if self.open_chat_avatar_at(mouse.column, mouse.row) {
+                    return false;
+                }
+                if self.open_account_badge_at(mouse.column, mouse.row) {
                     return false;
                 }
                 if let Some(chat_index) = chat_list::chat_at(
@@ -7108,6 +7796,7 @@ impl App {
     }
 
     async fn handle_compose_key(&mut self, key: KeyEvent) -> Result<bool> {
+        self.attend_selected_chat("compose_key");
         if self.handle_compose_emoticon_picker_key(key) {
             return Ok(false);
         }
@@ -7404,6 +8093,7 @@ impl App {
             reactions: Vec::new(),
             receipts: Vec::new(),
             is_from_me: true,
+            mentions_me: false,
             platform_data: PlatformData::default(),
         };
 
@@ -7503,6 +8193,7 @@ impl App {
             reactions: Vec::new(),
             receipts: Vec::new(),
             is_from_me: true,
+            mentions_me: false,
             platform_data: PlatformData::default(),
         };
 
@@ -7645,6 +8336,12 @@ impl App {
             return false;
         }
 
+        if self.state.forward_picker.is_some() {
+            self.state.forward_picker = None;
+            self.state.status = "forward cancelled".to_owned();
+            return false;
+        }
+
         if self.state.action_menu.is_some() {
             self.state.action_menu = None;
             self.state.status = "message actions closed".to_owned();
@@ -7711,6 +8408,7 @@ impl App {
         let should_sync_if_empty = self.state.messages.is_empty();
         if let Some(chat_name) = self.state.selected_chat().map(|chat| chat.name.to_string()) {
             self.state.focus = FocusPane::Messages;
+            self.attend_selected_chat("activate_selected_chat");
             self.request_selected_chat_history_sync();
             self.state.status = format!("opened {chat_name}");
         }
@@ -7723,6 +8421,7 @@ impl App {
         let should_sync_if_empty = self.state.messages.is_empty();
         self.state.selected_chat = chat_index;
         self.state.focus = FocusPane::Messages;
+        self.attend_selected_chat("activate_chat_index");
         self.state.message_scroll = 0;
         self.state.pending_scroll_to_latest = true;
         if changed {
@@ -7832,6 +8531,7 @@ impl App {
         let changed = chat_index != self.state.selected_chat;
         self.state.selected_chat = chat_index;
         if changed {
+            self.attend_selected_chat("select_chat");
             self.state.message_scroll = 0;
             self.state.details_scroll = 0;
             self.state.pending_scroll_to_latest = true;
@@ -8048,6 +8748,65 @@ impl App {
         true
     }
 
+    fn open_account_badge_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(chat_index) = chat_list::account_badge_chat_at(
+            &self.state.chats,
+            &self.state.visible_chat_indices,
+            self.state.selected_chat,
+            self.state.pane_areas.chat_list,
+            column,
+            row,
+            self.settings.chat_inbox_style,
+        ) else {
+            return false;
+        };
+        let Some(provider_id) = self
+            .state
+            .chats
+            .get(chat_index)
+            .map(|chat| chat.account.clone())
+        else {
+            return false;
+        };
+        let Some(account) = self.account_for_provider(&provider_id) else {
+            return false;
+        };
+        let Some(path) = self.account_badge_avatar_path(&provider_id, &account) else {
+            self.log_perf_marker(
+                "slack.account_badge.missing_icon_url",
+                format!(
+                    "provider={} display_name={} platform={:?}",
+                    provider_id, account.display_name, account.platform
+                ),
+            );
+            self.state.status =
+                format!("{} has no workspace icon URL loaded", account.display_name);
+            return true;
+        };
+        if !path.exists() {
+            self.log_perf_marker(
+                "slack.account_badge.cache_missing",
+                format!(
+                    "provider={} display_name={} path={}",
+                    provider_id,
+                    account.display_name,
+                    path.display()
+                ),
+            );
+            self.state.status = format!(
+                "{} workspace icon is still downloading or failed to cache: {}",
+                account.display_name,
+                path.display()
+            );
+            return true;
+        }
+        self.state.action_menu = None;
+        self.state.reaction_picker = None;
+        self.state.status = format!("viewing account icon {}", path.display());
+        self.state.image_viewer = Some(ImageViewer { path });
+        true
+    }
+
     fn open_media_at(&mut self, column: u16, row: u16) -> bool {
         let content_area = inner_area(self.state.pane_areas.messages);
         if !rect_contains(content_area, column, row) {
@@ -8176,6 +8935,7 @@ impl App {
         });
         self.state.selected_message_id = Some(hit.message_id.clone());
         self.state.action_menu = None;
+        self.state.forward_picker = None;
         self.state.reaction_picker = None;
         self.state.thread_root = None;
         if clicked_thread_summary {
@@ -8199,13 +8959,6 @@ impl App {
             .enumerate()
             .filter_map(|(index, message)| (!is_slack_thread_reply(message)).then_some(index))
             .collect()
-    }
-
-    fn selected_message_source_position(&self) -> Option<usize> {
-        let selected = self.state.selected_message_id.as_ref()?;
-        self.message_source()
-            .iter()
-            .position(|message| message.id == *selected)
     }
 
     fn selected_visible_message_position(&self) -> Option<usize> {
@@ -8363,11 +9116,19 @@ impl App {
 
     fn open_action_menu(&mut self) {
         if let Some(message_id) = self.state.selected_message_id.clone() {
+            let Some(message) = self.message_by_id(&message_id) else {
+                self.state.status = "selected message was not found".to_owned();
+                return;
+            };
+            let items =
+                action_menu_items_for_message(message, self.thread_reply_count(&message_id));
             self.state.reaction_picker = None;
             self.state.poll_vote_picker = None;
+            self.state.forward_picker = None;
             self.state.action_menu = Some(ActionMenu {
                 message_id,
                 selected: 0,
+                items,
             });
             self.state.status = "message actions opened".to_owned();
         } else {
@@ -8396,6 +9157,126 @@ impl App {
         } else {
             format!("thread opened with {reply_count} replies")
         };
+    }
+
+    fn open_forward_picker(&mut self, message_id: MessageId) {
+        let Some(message) = self.message_by_id(&message_id).cloned() else {
+            self.state.status = "selected message was not found".to_owned();
+            return;
+        };
+        let targets = self.forward_targets_for_message(&message);
+        if targets.is_empty() {
+            self.state.status = "no compatible forward destinations".to_owned();
+            return;
+        }
+        self.state.action_menu = None;
+        self.state.reaction_picker = None;
+        self.state.poll_vote_picker = None;
+        self.state.forward_picker = Some(ForwardPicker {
+            message_id,
+            selected: 0,
+            query: String::new(),
+            targets,
+        });
+        self.state.status = "choose where to forward".to_owned();
+    }
+
+    async fn forward_message_to_target(
+        &mut self,
+        message_id: MessageId,
+        target: ForwardTarget,
+    ) -> Result<()> {
+        let Some(source) = self.message_by_id(&message_id).cloned() else {
+            self.state.status = "selected message was not found".to_owned();
+            return Ok(());
+        };
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == target.account.as_ref())
+            .cloned()
+        else {
+            self.state.status = format!("no provider registered for {}", target.account);
+            return Ok(());
+        };
+        let Some(content) =
+            forward_content_for_capabilities(&source.content, &provider.outbound_capabilities())
+        else {
+            self.state.status = format!("{} cannot send this forwarded content", target.label);
+            return Ok(());
+        };
+        let preview = content_send_preview(&content);
+        let account = provider.account_info();
+        let sent_id = provider
+            .send(&target.chat_id, content.clone(), None)
+            .await?;
+        let timestamp = Utc::now();
+        let message = Message {
+            id: sent_id,
+            chat_id: target.chat_id.clone(),
+            account: target.account.clone(),
+            sender: Sender {
+                platform_id: Arc::from("me"),
+                display_name: account.display_name,
+                avatar: account.avatar,
+            },
+            timestamp,
+            edited_at: None,
+            content,
+            reply_to: None,
+            thread_id: None,
+            reactions: Vec::new(),
+            receipts: Vec::new(),
+            is_from_me: true,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        };
+        self.store.upsert_message(&message).await?;
+        if let Some(chat) = self
+            .state
+            .chats
+            .iter()
+            .find(|chat| chat.account == target.account && chat.id == target.chat_id)
+            .cloned()
+        {
+            self.update_chat_after_send(&chat, timestamp, &preview)
+                .await?;
+        }
+        self.reload_chats().await?;
+        if self
+            .state
+            .selected_chat()
+            .is_some_and(|chat| chat.account == target.account && chat.id == target.chat_id)
+        {
+            self.reload_selected_messages().await?;
+            self.scroll_messages_to_bottom();
+        }
+        self.state.status = format!("forwarded to {}", target.label);
+        Ok(())
+    }
+
+    fn forward_targets_for_message(&self, message: &Message) -> Vec<ForwardTarget> {
+        self.state
+            .chats
+            .iter()
+            .filter_map(|chat| {
+                let provider = self.provider_for_id(&chat.account)?;
+                let capabilities = provider.outbound_capabilities();
+                forward_content_for_capabilities(&message.content, &capabilities)?;
+                let account_label = self
+                    .state
+                    .account_statuses
+                    .get(&chat.account)
+                    .map(|status| status.display_name.as_str())
+                    .unwrap_or(chat.account.as_ref());
+                Some(ForwardTarget {
+                    account: chat.account.clone(),
+                    chat_id: chat.id.clone(),
+                    label: chat.name.to_string(),
+                    subtitle: format!("{account_label} · {}", platform_label(&chat.platform)),
+                })
+            })
+            .collect()
     }
 
     fn open_poll_vote_picker(&mut self, message_id: MessageId) {
@@ -8603,6 +9484,18 @@ impl App {
         true
     }
 
+    fn open_message_link(&mut self, message_id: &MessageId) -> bool {
+        let Some(message) = self.message_by_id(message_id) else {
+            return false;
+        };
+        let Some(url) = first_content_url(&message.content) else {
+            return false;
+        };
+        open_url(&url);
+        self.state.status = format!("opened link {url}");
+        true
+    }
+
     fn record_network_activity(
         &mut self,
         provider_id: &ProviderId,
@@ -8703,6 +9596,7 @@ impl App {
             .entry(provider_id.clone())
             .or_insert_with(|| AccountStatus {
                 display_name: provider_id.to_string(),
+                avatar: None,
                 connection: AccountConnection::Connecting,
                 detail: None,
             });
@@ -8737,7 +9631,7 @@ impl App {
         let selected_mode = setup.selected_mode().to_auth_submission_mode();
         let submission = AuthSubmission {
             workspace_label: trimmed_option(&setup.workspace_label),
-            mode: Some(selected_mode),
+            mode: Some(selected_mode.clone()),
             client_id: trimmed_option(&setup.credentials.client_id),
             client_secret: trimmed_option(&setup.credentials.client_secret),
             redirect_uri: trimmed_option(&setup.credentials.redirect_uri),
@@ -8747,6 +9641,51 @@ impl App {
             app_token: trimmed_option(&setup.credentials.app_token),
             webhook_url: trimmed_option(&setup.credentials.webhook_url),
         };
+
+        // Browser OAuth login (no pasted token) blocks on a loopback redirect
+        // that can take a while, so dispatch it as a background task to keep the
+        // event loop responsive. The provider emits an `OAuthUrl` challenge to
+        // open the browser and `AuthSucceeded`/`SyncComplete`/`Disconnected`
+        // events drive the UI; `pending_slack_setup_load` defers the post-auth
+        // chat load until that sync completes.
+        //
+        // The browser login needs client credentials. They can come from the
+        // user (manual app entry) or from an official/bundled app the provider
+        // exposes via `has_bundled_oauth_app()` — when the latter is configured,
+        // the normal connect path needs no client ID/secret at all.
+        let provider_index = self.provider_index_for_id(&setup.provider_id);
+        let has_bundled_oauth_app = provider_index
+            .map(|index| self.providers[index].has_bundled_oauth_app())
+            .unwrap_or(false);
+        let has_client_credentials =
+            submission.client_id.is_some() && submission.client_secret.is_some();
+        let is_browser_oauth_login = matches!(
+            selected_mode,
+            AuthSubmissionMode::UserOAuth | AuthSubmissionMode::ReadOnlyOAuth
+        ) && (has_client_credentials || has_bundled_oauth_app)
+            && submission.user_token.is_none()
+            && submission.bot_token.is_none();
+        if is_browser_oauth_login && let Some(provider_index) = provider_index {
+            let provider = Arc::clone(&self.providers[provider_index]);
+            self.state.pending_slack_setup_load = Some(setup.provider_id.clone());
+            tokio::spawn(async move {
+                let _ = provider.submit_auth(submission).await;
+            });
+            if let Some(current_setup) = &mut self.state.slack_setup
+                && current_setup.provider_id == setup.provider_id
+            {
+                current_setup.status = Some(
+                    "Opening your browser to sign in to Slack; chat-cli will finish automatically."
+                        .to_owned(),
+                );
+            }
+            self.state.status = format!(
+                "waiting for Slack browser sign-in for {}",
+                setup.provider_id
+            );
+            return Ok(());
+        }
+
         let result = if let Some(provider) = self.provider_for_id(&setup.provider_id) {
             provider.submit_auth(submission).await
         } else {
@@ -8762,28 +9701,7 @@ impl App {
                     &setup.provider_id,
                     SlackSetupPhase::CapabilityReview,
                 );
-                if let Some(provider_index) = self.provider_index_for_id(&setup.provider_id) {
-                    let provider = self.providers[provider_index].as_ref();
-                    let account = provider.account_info();
-                    let config_json = provider.config_json().unwrap_or_else(|| "{}".to_owned());
-                    self.store.upsert_account(&account, &config_json).await?;
-                    self.state.account_statuses.insert(
-                        account.id.clone(),
-                        AccountStatus::new(&account, AccountConnection::Online),
-                    );
-                    self.sync_provider_chats(provider_index).await?;
-                    self.reload_chats().await?;
-                    self.state.active_account = Some(account.id.clone());
-                    let selection_changed = self.apply_filter();
-                    if selection_changed {
-                        self.reset_history_window_state();
-                    }
-                    self.request_selected_chat_history_sync();
-                    self.reload_selected_messages_after_navigation().await?;
-                    self.state.pending_scroll_to_latest = true;
-                } else {
-                    self.set_account_status(&setup.provider_id, AccountConnection::Online, None);
-                }
+                self.load_slack_setup_account(&setup.provider_id).await?;
                 self.state.status = format!("Slack setup submitted for {}", setup.provider_id);
             }
             Err(error) => {
@@ -8805,14 +9723,47 @@ impl App {
         Ok(())
     }
 
+    /// Load chats and select the first conversation for a Slack account whose
+    /// authentication just succeeded. Shared by the inline submission path and
+    /// the background browser-OAuth path (driven by `SyncComplete`).
+    async fn load_slack_setup_account(&mut self, provider_id: &ProviderId) -> Result<()> {
+        if let Some(provider_index) = self.provider_index_for_id(provider_id) {
+            let provider = self.providers[provider_index].as_ref();
+            let account = provider.account_info();
+            let config_json = provider.config_json().unwrap_or_else(|| "{}".to_owned());
+            self.store.upsert_account(&account, &config_json).await?;
+            self.state.account_statuses.insert(
+                account.id.clone(),
+                AccountStatus::new(&account, AccountConnection::Online),
+            );
+            self.sync_provider_chats(provider_index).await?;
+            self.reload_chats().await?;
+            self.state.active_account = Some(account.id.clone());
+            let selection_changed = self.apply_filter();
+            if selection_changed {
+                self.reset_history_window_state();
+            }
+            self.request_selected_chat_history_sync();
+            self.reload_selected_messages_after_navigation().await?;
+            self.state.pending_scroll_to_latest = true;
+        } else {
+            self.set_account_status(provider_id, AccountConnection::Online, None);
+        }
+        Ok(())
+    }
+
     fn account_platform(&self, provider_id: &ProviderId) -> Option<Platform> {
         self.account_for_provider(provider_id)
             .map(|account| account.platform)
     }
 
     fn open_slack_setup_for_account(&mut self, account: &Account, status: Option<String>) {
-        let mut overlay =
-            SlackSetupOverlay::new(account.id.clone(), account.display_name.to_string());
+        let workspace_label = slack_setup_workspace_seed(&account.display_name);
+        let mut overlay = SlackSetupOverlay::new(account.id.clone(), workspace_label);
+        overlay.bundled_oauth_app = self
+            .provider_for_id(&account.id)
+            .map(|provider| provider.has_bundled_oauth_app())
+            .unwrap_or(false);
         if let Some(status) = status {
             overlay.phase = SlackSetupPhase::Failed;
             overlay.status = Some(status);
@@ -8829,16 +9780,20 @@ impl App {
         let account = self.account_for_provider(provider_id);
         let workspace_label = account
             .as_ref()
-            .map(|account| account.display_name.to_string())
+            .map(|account| slack_setup_workspace_seed(&account.display_name))
             .unwrap_or_else(|| provider_id.to_string());
         let mut overlay = SlackSetupOverlay::new(provider_id.clone(), workspace_label);
+        overlay.bundled_oauth_app = self
+            .provider_for_id(provider_id)
+            .map(|provider| provider.has_bundled_oauth_app())
+            .unwrap_or(false);
         if let Some(challenge) = challenge {
             match challenge {
                 AuthChallenge::OAuthUrl(url) => {
                     overlay.phase = SlackSetupPhase::OAuthPrompt;
                     overlay.oauth_url = Some(url.to_string());
                     overlay.status = Some(
-                        "Create the Slack app, then paste Client ID, Client Secret, Redirect URL, and User OAuth Token here.".to_owned(),
+                        "Create the Slack app, then enter Client ID and Client Secret here; chat-cli opens your browser to finish sign-in automatically.".to_owned(),
                     );
                     open_and_copy_slack_oauth_url(url.as_ref());
                 }
@@ -8876,21 +9831,134 @@ impl App {
         );
     }
 
-    fn maybe_show_notification(
-        &mut self,
-        message: &Message,
-        selected_chat_id: Option<&chat_core::ChatId>,
-        is_historical: bool,
-    ) {
-        if is_historical || message.is_from_me {
+    fn maybe_queue_notification(&mut self, message: &Message, is_historical: bool) {
+        if is_historical {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=historical account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
             return;
         }
-        if !self.settings.notify_selected_chat && selected_chat_id == Some(&message.chat_id) {
+        if message.is_from_me && !self.settings.notify_self_messages {
+            // Messages the user sent (including ones echoed back from another
+            // device, e.g. replying on the phone) must never notify the user
+            // about their own activity, unless `notify_self_messages` is enabled
+            // (a testing aid for exercising the notification pipeline by sending
+            // yourself a message from a web client).
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=from_me account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
+            return;
+        }
+        if self.settings.notifications == NotificationMode::Off {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=off account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
+            return;
+        }
+        if self.state.notification_pause.is_paused_at(Utc::now()) {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=paused account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
             return;
         }
 
-        let Some(chat) = self
+        let Some(chat) = self.notification_chat_for(message) else {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=chat_missing account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
+            return;
+        };
+        if chat.muted {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=muted account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
+            return;
+        }
+        if self.settings.notification_scope == NotificationScope::DirectAndMentions
+            && !matches!(chat.kind, ChatKind::Direct)
+            && !message.mentions_me
+        {
+            // Scope restricts notifications to direct messages and mentions:
+            // group/channel messages are only eligible when they mention the
+            // authenticated user.
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=scope_group_no_mention account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
+            return;
+        }
+
+        let chat_name = chat.name.to_string();
+        let notification = NotificationOverlay::new(chat, message, true);
+        let deliver_at = Instant::now() + NOTIFICATION_DELIVERY_DELAY;
+        if let Some(pending) = self
             .state
+            .pending_notifications
+            .iter_mut()
+            .find(|pending| pending.key_matches(&message.account, &message.chat_id))
+        {
+            pending.deliver_at = deliver_at;
+            pending.notification = notification;
+            self.log_perf_marker(
+                "notification.coalesce",
+                format!(
+                    "account={} chat={} message={} delay_ms={}",
+                    message.account,
+                    message.chat_id,
+                    message.id,
+                    NOTIFICATION_DELIVERY_DELAY.as_millis()
+                ),
+            );
+        } else {
+            self.state.pending_notifications.push(PendingNotification {
+                account: message.account.clone(),
+                chat_id: message.chat_id.clone(),
+                deliver_at,
+                notification,
+            });
+            self.log_perf_marker(
+                "notification.queue",
+                format!(
+                    "account={} chat={} message={} delay_ms={}",
+                    message.account,
+                    message.chat_id,
+                    message.id,
+                    NOTIFICATION_DELIVERY_DELAY.as_millis()
+                ),
+            );
+        }
+        self.state.status = format!("notification queued for {chat_name}");
+    }
+
+    fn notification_chat_for(&self, message: &Message) -> Option<&Chat> {
+        self.state
             .chats
             .iter()
             .find(|chat| chat.id == message.chat_id && chat.account == message.account)
@@ -8900,32 +9968,220 @@ impl App {
                     .iter()
                     .find(|chat| chat.id == message.chat_id)
             })
-        else {
+    }
+
+    fn selected_chat_key(&self) -> Option<(ProviderId, ChatId)> {
+        self.state
+            .selected_chat()
+            .map(|chat| (chat.account.clone(), chat.id.clone()))
+    }
+
+    fn attend_selected_chat(&mut self, reason: &str) {
+        let Some((account, chat_id)) = self.selected_chat_key() else {
             return;
         };
-        if chat.muted && !self.settings.notify_muted_chats {
+        self.cancel_pending_notifications_for_chat(&account, &chat_id, reason);
+    }
+
+    fn cancel_pending_notifications_for_chat(
+        &mut self,
+        account: &ProviderId,
+        chat_id: &ChatId,
+        reason: &str,
+    ) {
+        let before = self.state.pending_notifications.len();
+        self.state
+            .pending_notifications
+            .retain(|pending| !pending.key_matches(account, chat_id));
+        let cancelled = before.saturating_sub(self.state.pending_notifications.len());
+        if cancelled > 0 {
+            self.log_perf_marker(
+                "notification.cancel",
+                format!("reason={reason} account={account} chat={chat_id} count={cancelled}"),
+            );
+        }
+    }
+
+    fn drain_due_pending_notifications(&mut self) {
+        let now = Instant::now();
+        let mut drained = 0usize;
+        while drained < MAX_PENDING_NOTIFICATIONS_PER_TICK {
+            let Some(index) = self
+                .state
+                .pending_notifications
+                .iter()
+                .position(|pending| pending.deliver_at <= now)
+            else {
+                break;
+            };
+            let pending = self.state.pending_notifications.remove(index);
+            drained += 1;
+            self.deliver_pending_notification(pending);
+        }
+    }
+
+    fn deliver_pending_notification(&mut self, pending: PendingNotification) {
+        if self.settings.notifications == NotificationMode::Off {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=off_at_delivery account={} chat={} message={}",
+                    pending.account, pending.chat_id, pending.notification.message_id
+                ),
+            );
+            return;
+        }
+        if self.state.notification_pause.is_paused_at(Utc::now()) {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=paused_at_delivery account={} chat={} message={}",
+                    pending.account, pending.chat_id, pending.notification.message_id
+                ),
+            );
+            return;
+        }
+        if self
+            .state
+            .chats
+            .iter()
+            .find(|chat| pending.key_matches(&chat.account, &chat.id))
+            .is_some_and(|chat| chat.muted)
+        {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=muted_at_delivery account={} chat={} message={}",
+                    pending.account, pending.chat_id, pending.notification.message_id
+                ),
+            );
             return;
         }
 
-        let notification =
-            NotificationOverlay::new(chat, message, self.settings.notification_previews);
-        let chat_name = chat.name.to_string();
-        if self.settings.desktop_notifications {
+        let chat_name = pending.notification.chat_name.clone();
+        match self.settings.notifications {
+            NotificationMode::Off => {}
+            NotificationMode::Desktop => {
+                let desktop_notification = pending.notification.to_desktop_notification();
+                match self.desktop_notifier.send_message(&desktop_notification) {
+                    Ok(()) => {
+                        self.state.status = format!("new message in {chat_name}");
+                        self.log_perf_marker(
+                            "notification.deliver",
+                            format!(
+                                "mode=desktop account={} chat={} message={}",
+                                pending.account, pending.chat_id, pending.notification.message_id
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        self.state.status =
+                            format!("desktop notification failed for {chat_name}: {error}");
+                        self.log_perf_marker(
+                            "notification.error",
+                            format!(
+                                "mode=desktop account={} chat={} message={} error={error}",
+                                pending.account, pending.chat_id, pending.notification.message_id
+                            ),
+                        );
+                    }
+                }
+            }
+            NotificationMode::InApp => {
+                self.state.notification = Some(pending.notification);
+                self.state.status = format!("new message in {chat_name}");
+                self.log_perf_marker(
+                    "notification.deliver",
+                    format!(
+                        "mode=in_app account={} chat={}",
+                        pending.account, pending.chat_id
+                    ),
+                );
+            }
+        }
+    }
+
+    fn deliver_account_notice(&mut self, title: &str, body: &str, severity: AccountNoticeSeverity) {
+        self.state.status = format!("{title}: {body}");
+        let notification = NotificationOverlay::account_notice(title, body);
+
+        // System alerts (for example, realtime messaging unavailable) defeat the
+        // core purpose of the app, so they must always raise a desktop/system
+        // notification regardless of the user's notification mode, in addition to
+        // the in-app overlay.
+        if severity == AccountNoticeSeverity::SystemAlert {
+            self.state.notification = Some(notification.clone());
             let desktop_notification = notification.to_desktop_notification();
-            let _ = self.desktop_notifier.send_message(&desktop_notification);
+            match self.desktop_notifier.send_message(&desktop_notification) {
+                Ok(()) => {
+                    self.log_perf_marker(
+                        "notification.deliver",
+                        format!("mode=system_alert account_notice title={title}"),
+                    );
+                }
+                Err(error) => {
+                    self.state.status =
+                        format!("{title}: {body} (desktop notification failed: {error})");
+                    self.log_perf_marker(
+                        "notification.error",
+                        format!("mode=system_alert account_notice title={title} error={error:#}"),
+                    );
+                }
+            }
+            return;
         }
-        if self.settings.in_app_notifications {
-            self.state.notification = Some(notification);
+
+        match self.settings.notifications {
+            NotificationMode::Off | NotificationMode::InApp => {
+                self.state.notification = Some(notification);
+                self.log_perf_marker(
+                    "notification.deliver",
+                    format!("mode=in_app account_notice title={title}"),
+                );
+            }
+            NotificationMode::Desktop => {
+                let desktop_notification = notification.to_desktop_notification();
+                match self.desktop_notifier.send_message(&desktop_notification) {
+                    Ok(()) => {
+                        self.log_perf_marker(
+                            "notification.deliver",
+                            format!("mode=desktop account_notice title={title}"),
+                        );
+                    }
+                    Err(error) => {
+                        self.state.notification = Some(notification);
+                        self.state.status =
+                            format!("{title}: {body} (desktop notification failed: {error})");
+                        self.log_perf_marker(
+                            "notification.error",
+                            format!("mode=desktop account_notice title={title} error={error:#}"),
+                        );
+                    }
+                }
+            }
         }
-        self.state.status = format!("new message in {chat_name}");
     }
 
     fn dismiss_notification(&mut self) {
         self.state.notification = None;
     }
 
-    fn handle_tick(&mut self) {
+    async fn handle_tick(&mut self) -> Result<()> {
         self.state.monthly_backfill_tick = self.state.monthly_backfill_tick.wrapping_add(1);
+        if self
+            .state
+            .monthly_backfill_tick
+            .is_multiple_of(NOTIFICATION_PAUSE_RELOAD_TICKS)
+        {
+            match self.store.notification_pause_state().await {
+                Ok(state) => self.state.notification_pause = state,
+                Err(error) => {
+                    self.state.status = format!("failed to reload notification pause: {error}");
+                    self.log_perf_marker("notification.pause_reload_error", error.to_string());
+                }
+            }
+        }
+        self.drain_due_pending_notifications();
         let metadata_changed = self.drain_link_metadata_fetches();
         let members_changed = self.drain_chat_member_fetches();
         let expired = if let Some(notification) = &mut self.state.notification {
@@ -8940,6 +10196,7 @@ impl App {
         if metadata_changed || members_changed {
             self.state.status = "background details updated".to_owned();
         }
+        Ok(())
     }
 
     fn open_account_setup(&mut self) {
@@ -9023,6 +10280,7 @@ impl App {
             .position(|option| option.provider_id == self.state.active_account)
             .unwrap_or_default();
         self.state.action_menu = None;
+        self.state.forward_picker = None;
         self.state.reaction_picker = None;
         self.state.account_switcher = Some(AccountSwitcher {
             selected,
@@ -9224,8 +10482,15 @@ impl App {
         (index < ComposeAttachMenuItem::ALL.len()).then_some(index)
     }
 
-    fn action_menu_rect(&self, area: Rect, message_id: &MessageId) -> Rect {
-        self.anchored_message_popup_rect(area, message_id, 34, ActionMenuItem::ALL.len() as u16 + 4)
+    fn action_menu_rect(&self, area: Rect, menu: &ActionMenu) -> Rect {
+        self.anchored_message_popup_rect(area, &menu.message_id, 34, menu.items.len() as u16 + 4)
+    }
+
+    fn forward_picker_rect(&self, area: Rect, picker: &ForwardPicker) -> Rect {
+        let target_rows = forward_picker_filtered_len(picker).saturating_mul(2);
+        let height = target_rows.saturating_add(5).clamp(7, 18) as u16;
+        let width = area.width.saturating_sub(4).clamp(42, 78);
+        self.anchored_message_popup_rect(area, &picker.message_id, width, height)
     }
 
     fn reaction_picker_rect(&self, area: Rect, message_id: &MessageId) -> Rect {
@@ -9402,13 +10667,35 @@ impl App {
     }
 
     fn action_menu_item_at(&self, column: u16, row: u16, menu: &ActionMenu) -> Option<usize> {
-        let modal = self.action_menu_rect(self.state.frame_area, &menu.message_id);
+        let modal = self.action_menu_rect(self.state.frame_area, menu);
         if !rect_contains(modal, column, row) {
             return None;
         }
         let first_item_row = modal.y.saturating_add(2);
         let index = row.checked_sub(first_item_row)? as usize;
-        (index < ActionMenuItem::ALL.len()).then_some(index)
+        (index < menu.items.len()).then_some(index)
+    }
+
+    fn forward_picker_option_at(
+        &self,
+        column: u16,
+        row: u16,
+        picker: &ForwardPicker,
+    ) -> Option<usize> {
+        let modal = self.forward_picker_rect(self.state.frame_area, picker);
+        if !rect_contains(modal, column, row) {
+            return None;
+        }
+        let first_option_row = modal.y.saturating_add(3);
+        let relative = row.checked_sub(first_option_row)? as usize;
+        if !relative.is_multiple_of(2) {
+            return None;
+        }
+        let matches = forward_picker_filtered_indices(picker);
+        let visible_rows = forward_picker_visible_rows(modal);
+        let start = forward_picker_scroll_start(picker.selected, visible_rows, matches.len());
+        let index = start.saturating_add(relative / 2);
+        (index < matches.len()).then_some(index)
     }
 
     fn reaction_picker_option_at(
@@ -9624,7 +10911,8 @@ impl App {
         } else {
             ""
         };
-        self.state.visible_chat_indices = chat_list::filter_chat_indices(&self.state.chats, chat_filter)
+        self.state.visible_chat_indices =
+            chat_list::filter_chat_indices(&self.state.chats, chat_filter)
                 .into_iter()
                 .filter(|index| self.chat_is_visible_in_sidebar(*index))
                 .filter(|index| {
@@ -9931,7 +11219,13 @@ impl App {
         );
         let latest_by_chat = latest_messages
             .into_iter()
-            .map(|latest| ((latest.account_id, latest.chat_id), latest.message))
+            .filter_map(|latest| {
+                if is_placeholder_whatsapp_message(&latest.message) {
+                    None
+                } else {
+                    Some(((latest.account_id, latest.chat_id), latest.message))
+                }
+            })
             .collect::<HashMap<_, _>>();
 
         let updates = chats
@@ -9969,7 +11263,11 @@ impl App {
         chat_id: &ChatId,
         messages: &[Message],
     ) -> Result<()> {
-        if let Some(message) = messages.iter().max_by_key(|message| message.timestamp) {
+        if let Some(message) = messages
+            .iter()
+            .filter(|message| !is_placeholder_whatsapp_message(message))
+            .max_by_key(|message| message.timestamp)
+        {
             self.refresh_chat_preview(
                 account,
                 chat_id,
@@ -9982,6 +11280,9 @@ impl App {
     }
 
     async fn refresh_chat_preview_from_message(&mut self, message: &Message) -> Result<()> {
+        if is_placeholder_whatsapp_message(message) {
+            return Ok(());
+        }
         self.refresh_chat_preview(
             &message.account,
             &message.chat_id,
@@ -10608,43 +11909,44 @@ fn compose_emoticon_query(text: &str, cursor: usize) -> Option<(String, usize)> 
     Some((query.to_owned(), token.chars().count()))
 }
 
+const EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER: &str = "[empty WhatsApp message]";
+
 fn message_sidebar_preview(message: &Message) -> Arc<str> {
     Arc::from(content_send_preview(&message.content))
+}
+
+fn is_placeholder_whatsapp_message(message: &Message) -> bool {
+    message.platform_data.whatsapp.is_some()
+        && matches!(
+            &message.content,
+            Content::Text(text) | Content::Unsupported(text)
+                if text.trim() == EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER
+        )
 }
 
 fn content_send_preview(content: &Content) -> String {
     match content {
         Content::Text(text) | Content::Unsupported(text) => text.to_string(),
-        Content::Image(media) => media
-            .caption
-            .as_deref()
+        Content::Image(media) => visible_media_caption(media)
             .map(|caption| format!("Image: {caption}"))
-            .unwrap_or_else(|| format!("Image: {}", media.file_name)),
-        Content::Video(media) => media
-            .caption
-            .as_deref()
+            .unwrap_or_else(|| "Image".to_owned()),
+        Content::Video(media) => visible_media_caption(media)
             .map(|caption| format!("Video: {caption}"))
             .unwrap_or_else(|| format!("Video: {}", media.file_name)),
-        Content::Audio(media) => media
-            .caption
-            .as_deref()
+        Content::Audio(media) => visible_media_caption(media)
             .map(|caption| format!("Audio: {caption}"))
             .unwrap_or_else(|| format!("Audio: {}", media.file_name)),
-        Content::File(media) => media
-            .caption
-            .as_deref()
+        Content::File(media) => visible_media_caption(media)
             .map(|caption| format!("File: {caption}"))
             .unwrap_or_else(|| format!("File: {}", media.file_name)),
-        Content::Sticker(media) => media
-            .caption
-            .as_deref()
+        Content::Sticker(media) => visible_media_caption(media)
             .map(|caption| format!("Sticker: {caption}"))
-            .unwrap_or_else(|| format!("Sticker: {}", media.file_name)),
+            .unwrap_or_else(|| "Sticker".to_owned()),
         Content::LinkPreview(link) => link
             .title
             .as_deref()
-            .unwrap_or(link.url.as_ref())
-            .to_owned(),
+            .and_then(clean_html_text)
+            .unwrap_or_else(|| link.url.to_string()),
         Content::Cards(cards) => cards
             .first()
             .and_then(|card| card.title.as_deref().or(card.body.as_deref()))
@@ -10915,6 +12217,7 @@ fn provider_event_label(event: &ProviderEvent) -> &'static str {
         ProviderEvent::AuthSucceeded => "auth_succeeded",
         ProviderEvent::SyncProgress(_) => "sync_progress",
         ProviderEvent::SyncComplete => "sync_complete",
+        ProviderEvent::AccountNotice { .. } => "account_notice",
         ProviderEvent::Disconnected(_) => "disconnected",
         ProviderEvent::Reconnecting => "reconnecting",
         ProviderEvent::Typing { .. } => "typing",
@@ -10973,6 +12276,9 @@ fn preserve_sidebar_activity_metadata(chat: &mut Chat, existing: Option<&Chat>) 
 
     if chat.platform == Platform::WhatsApp {
         chat.unread_count = chat.unread_count.max(existing.unread_count);
+        if existing.last_message_preview.as_deref() == Some(EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER) {
+            return;
+        }
     }
 
     let existing_is_newer = match (existing.last_message_at, chat.last_message_at) {
@@ -11359,6 +12665,35 @@ fn slack_setup_display_value(value: &str, is_secret: bool) -> String {
     truncate_chars(trimmed, 72)
 }
 
+fn slack_setup_help_lines(theme: Theme) -> Vec<Line<'static>> {
+    let heading = |text: &'static str| Line::from(Span::styled(text, theme.status_key()));
+    let body = |text: &'static str| Line::from(Span::styled(text, theme.status_bar()));
+    let note = |text: &'static str| Line::from(Span::styled(text, theme.muted()));
+
+    vec![
+        heading("How Slack sign-in works"),
+        body("chat-cli signs in to one Slack workspace at a time."),
+        Line::from(""),
+        heading("Multiple workspaces"),
+        body("Each workspace is a separate connection with its own approval."),
+        body("Use \"Add another Slack workspace\" to connect more than one."),
+        note("Workspaces stay isolated; signing into one never affects another."),
+        Line::from(""),
+        heading("Approvals"),
+        body("Some workspaces require an admin to approve the requested scopes."),
+        note("If approval is pending, sign-in completes once an admin allows it."),
+        Line::from(""),
+        heading("Permissions we request"),
+        body("team:read lets chat-cli show the real workspace name and icon."),
+        body("History scopes let chat-cli read recent messages per channel."),
+        Line::from(""),
+        heading("Realtime vs polling"),
+        body("An App-Level Token (xapp-...) with connections:write enables instant"),
+        body("delivery via Socket Mode."),
+        note("Without it, chat-cli falls back to periodic history polling."),
+    ]
+}
+
 fn slack_app_creation_url_display(url: &str) -> String {
     const MARKER: &str = "new_app=1";
     url.find(MARKER)
@@ -11488,6 +12823,21 @@ fn reaction_sender_fallback(sender: &str) -> String {
         .next()
         .unwrap_or(sender);
     short_id(jid)
+}
+
+fn slack_setup_workspace_seed(display_name: &str) -> String {
+    let mut seed = display_name.trim();
+    while let Some(inner) = seed
+        .strip_prefix("Slack (")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .map(str::trim)
+    {
+        if inner.is_empty() {
+            break;
+        }
+        seed = inner;
+    }
+    seed.to_owned()
 }
 
 fn account_status_summary(statuses: &HashMap<ProviderId, AccountStatus>) -> String {
@@ -11647,6 +12997,204 @@ fn thread_message_card_lines(
     lines
 }
 
+fn action_menu_items_for_message(
+    message: &Message,
+    thread_reply_count: usize,
+) -> Vec<ActionMenuItem> {
+    let mut items = Vec::from(ActionMenuItem::COMMON);
+    if thread_reply_count > 0 || message.thread_id.as_ref() == Some(&message.id) {
+        items.insert(1, ActionMenuItem::ViewThread);
+    }
+    if first_content_url(&message.content).is_some() {
+        items.push(ActionMenuItem::OpenLink);
+    }
+    if matches!(message.content, Content::Poll(_)) {
+        items.push(ActionMenuItem::VotePoll);
+    }
+    if message_has_direct_image_preview(&message.content) {
+        items.push(ActionMenuItem::OpenImage);
+    }
+    items.push(ActionMenuItem::Cancel);
+    items
+}
+
+fn forward_content_for_capabilities(
+    content: &Content,
+    capabilities: &OutboundCapabilities,
+) -> Option<Content> {
+    let portable = portable_forward_content(content)?;
+    capabilities.supports_content(&portable).then_some(portable)
+}
+
+fn portable_forward_content(content: &Content) -> Option<Content> {
+    match content {
+        Content::Text(text) => non_empty_text_content(text.as_ref()),
+        Content::Image(_)
+        | Content::Video(_)
+        | Content::Audio(_)
+        | Content::File(_)
+        | Content::Sticker(_) => Some(content.clone()),
+        Content::LinkPreview(link) => non_empty_text_content(&link.url),
+        Content::Cards(cards) => cards.iter().find_map(card_forward_text).and_then(|text| {
+            let text: Arc<str> = Arc::from(text);
+            non_empty_text_content(text.as_ref())
+        }),
+        Content::Poll(_) | Content::Deleted | Content::Unsupported(_) => None,
+    }
+}
+
+fn non_empty_text_content(text: &str) -> Option<Content> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| Content::Text(Arc::from(text)))
+}
+
+fn card_forward_text(card: &Card) -> Option<String> {
+    if let Some(url) = card
+        .url
+        .as_deref()
+        .or_else(|| card.actions.iter().find_map(|action| action.url.as_deref()))
+    {
+        return Some(url.to_owned());
+    }
+    card.title
+        .as_deref()
+        .or(card.body.as_deref())
+        .map(str::to_owned)
+}
+
+fn platform_label(platform: &Platform) -> &'static str {
+    match platform {
+        Platform::WhatsApp => "WhatsApp",
+        Platform::Slack => "Slack",
+        Platform::Discord => "Discord",
+        Platform::Unknown(_) => "Unknown",
+    }
+}
+
+fn forward_picker_visible_rows(modal: Rect) -> usize {
+    modal.height.saturating_sub(5).max(1) as usize / 2
+}
+
+fn forward_picker_scroll_start(selected: usize, visible_rows: usize, filtered_len: usize) -> usize {
+    if visible_rows == 0 || filtered_len == 0 {
+        return 0;
+    }
+    selected
+        .min(filtered_len.saturating_sub(1))
+        .saturating_add(1)
+        .saturating_sub(visible_rows)
+}
+
+fn forward_picker_filtered_len(picker: &ForwardPicker) -> usize {
+    forward_picker_filtered_indices(picker).len()
+}
+
+fn forward_picker_selected_target(picker: &ForwardPicker) -> Option<(MessageId, ForwardTarget)> {
+    let target_index = forward_picker_filtered_indices(picker)
+        .get(picker.selected)
+        .copied()?;
+    Some((
+        picker.message_id.clone(),
+        picker.targets.get(target_index)?.clone(),
+    ))
+}
+
+fn forward_picker_filtered_indices(picker: &ForwardPicker) -> Vec<usize> {
+    let terms = search_terms(&picker.query);
+    picker
+        .targets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target)| {
+            (terms.is_empty()
+                || terms
+                    .iter()
+                    .all(|term| forward_target_matches(target, term)))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn forward_target_matches(target: &ForwardTarget, term: &str) -> bool {
+    target.label.to_lowercase().contains(term) || target.subtitle.to_lowercase().contains(term)
+}
+
+fn search_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+fn first_content_url(content: &Content) -> Option<String> {
+    match content {
+        Content::LinkPreview(link) => Some(link.url.to_string()),
+        Content::Cards(cards) => cards
+            .iter()
+            .find_map(|card| {
+                card.url
+                    .as_deref()
+                    .or_else(|| card.actions.iter().find_map(|action| action.url.as_deref()))
+            })
+            .map(str::to_owned),
+        Content::Text(text) | Content::Unsupported(text) => first_url_in_text(text),
+        Content::Image(_)
+        | Content::Video(_)
+        | Content::Audio(_)
+        | Content::File(_)
+        | Content::Sticker(_)
+        | Content::Poll(_)
+        | Content::Deleted => None,
+    }
+}
+
+fn message_has_direct_image_preview(content: &Content) -> bool {
+    match content {
+        Content::Image(media) | Content::Sticker(media) => {
+            media.local_path.as_ref().is_some_and(|path| path.exists())
+                || media.thumbnail.as_ref().is_some_and(|path| path.exists())
+        }
+        Content::Text(_)
+        | Content::Video(_)
+        | Content::Audio(_)
+        | Content::File(_)
+        | Content::LinkPreview(_)
+        | Content::Cards(_)
+        | Content::Poll(_)
+        | Content::Deleted
+        | Content::Unsupported(_) => false,
+    }
+}
+
+fn first_url_in_text(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| {
+            token.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\'' | ',' | '.'
+                )
+            })
+        })
+        .find(|token| is_openable_url(token))
+        .map(str::to_owned)
+}
+
+fn is_openable_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+}
+
+#[cfg(not(test))]
+fn open_url(url: &str) {
+    let _ = open::that_detached(url);
+}
+
+#[cfg(test)]
+fn open_url(_url: &str) {}
+
 fn content_copy_text(content: &Content) -> String {
     match content {
         Content::Text(text) => text.to_string(),
@@ -11654,16 +13202,19 @@ fn content_copy_text(content: &Content) -> String {
         | Content::Video(media)
         | Content::Audio(media)
         | Content::File(media)
-        | Content::Sticker(media) => media
-            .caption
-            .as_deref()
+        | Content::Sticker(media) => visible_media_caption(media)
             .map(str::to_owned)
             .unwrap_or_else(|| media.file_name.to_string()),
         Content::LinkPreview(link) => {
-            let title = link.title.as_deref().unwrap_or("Link");
+            let title = link
+                .title
+                .as_deref()
+                .and_then(clean_html_text)
+                .unwrap_or_else(|| "Link".to_owned());
             let description = link
                 .description
                 .as_deref()
+                .and_then(clean_html_text)
                 .map(|description| format!(" — {description}"))
                 .unwrap_or_default();
             format!("{title}: {}{description}", link.url)
@@ -11718,8 +13269,110 @@ fn media_image_preview(media: &Media) -> Option<(PathBuf, String, Option<String>
     Some((
         path,
         media.file_name.to_string(),
-        media.caption.as_deref().map(str::to_owned),
+        visible_media_caption(media).map(str::to_owned),
     ))
+}
+
+fn visible_media_caption(media: &Media) -> Option<&str> {
+    media
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .filter(|caption| !caption.eq_ignore_ascii_case(EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER))
+}
+
+fn static_account_icon_path(provider_id: &ProviderId, platform: Platform) -> PathBuf {
+    let prefix = match platform {
+        Platform::Slack => "slack",
+        Platform::WhatsApp => "whatsapp",
+        Platform::Unknown(_) | Platform::Discord => "unknown",
+    };
+    let safe_id = provider_id
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '-' | '_') {
+                value
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    std::env::temp_dir()
+        .join("chat-cli-account-icons")
+        .join(format!("{prefix}-embedded-v3-{safe_id}.png"))
+}
+
+fn account_badge_image_rows(path: &Path) -> Result<chat_list::AvatarRows, String> {
+    let image = image::open(path)
+        .map_err(|error| format!("decoding account badge image {}: {error}", path.display()))?
+        .to_rgba8();
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err(format!("account badge image {} is empty", path.display()));
+    }
+
+    let left_top = sample_image_region(&image, 0, 0, width / 2, height / 2);
+    let left_bottom = sample_image_region(&image, 0, height / 2, width / 2, height);
+    let right_top = sample_image_region(&image, width / 2, 0, width, height / 2);
+    let right_bottom = sample_image_region(&image, width / 2, height / 2, width, height);
+
+    Ok(vec![vec![
+        Span::styled("▀", Style::default().fg(left_top).bg(left_bottom)),
+        Span::styled("▀", Style::default().fg(right_top).bg(right_bottom)),
+    ]])
+}
+
+fn sample_image_region(
+    image: &image::RgbaImage,
+    x_start: u32,
+    y_start: u32,
+    x_end: u32,
+    y_end: u32,
+) -> Color {
+    let x_end = x_end.max(x_start + 1).min(image.width());
+    let y_end = y_end.max(y_start + 1).min(image.height());
+    let mut total_r = 0_u64;
+    let mut total_g = 0_u64;
+    let mut total_b = 0_u64;
+    let mut total_a = 0_u64;
+    let mut count = 0_u64;
+
+    for y in y_start.min(image.height().saturating_sub(1))..y_end {
+        for x in x_start.min(image.width().saturating_sub(1))..x_end {
+            let pixel = image.get_pixel(x, y);
+            let [r, g, b, a] = pixel.0;
+            total_r += u64::from(r) * u64::from(a);
+            total_g += u64::from(g) * u64::from(a);
+            total_b += u64::from(b) * u64::from(a);
+            total_a += u64::from(a);
+            count += 1;
+        }
+    }
+
+    if total_a == 0 || count == 0 {
+        return Color::Black;
+    }
+
+    Color::Rgb(
+        (total_r / total_a).min(u64::from(u8::MAX)) as u8,
+        (total_g / total_a).min(u64::from(u8::MAX)) as u8,
+        (total_b / total_a).min(u64::from(u8::MAX)) as u8,
+    )
+}
+
+fn write_static_account_icon(path: &Path, icon_bytes: &[u8]) -> Result<()> {
+    if path.exists() {
+        image::open(path)
+            .with_context(|| format!("decoding cached account icon {}", path.display()))?;
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    image::load_from_memory(icon_bytes).context("decoding embedded account icon")?;
+    fs::write(path, icon_bytes).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 async fn fetch_link_metadata(url: &str) -> Result<message_list::LinkMetadata> {
@@ -11932,31 +13585,104 @@ fn html_attr_value(tag: &str, name: &str) -> Option<String> {
         if quote == '"' || quote == '\'' {
             let rest = &value[quote.len_utf8()..];
             let end = rest.find(quote)?;
-            return Some(html_unescape(&rest[..end]));
+            return Some(rest[..end].to_owned());
         }
         let end = value
             .find(|character: char| character.is_whitespace() || character == '>')
             .unwrap_or(value.len());
-        return Some(html_unescape(&value[..end]));
+        return Some(value[..end].to_owned());
     }
     None
 }
 
 fn clean_html_text(value: &str) -> Option<String> {
-    let text = html_unescape(value)
+    // Decode entities first (real metadata encodes markup as `&lt;p&gt;`), then
+    // drop any resulting tags so card text never shows raw markup.
+    let text = strip_html_tags(&html_unescape(value))
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Removes HTML tags (e.g. `<p>`, `</p>`, `<br>`) so fetched card text never
+/// shows raw markup. A `<` is only treated as a tag start when followed by a
+/// letter, `/`, or `!`, so plain text like `< 10` is preserved.
+fn strip_html_tags(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '<'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphabetic() || matches!(next, '/' | '!'))
+        {
+            for inner in chars.by_ref() {
+                if inner == '>' {
+                    break;
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 fn html_unescape(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        output.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let resolved = after.find(';').and_then(|semi| {
+            let entity = &after[..semi];
+            if entity.is_empty()
+                || entity.len() > 10
+                || !entity
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '#')
+            {
+                return None;
+            }
+            decode_html_entity(entity).map(|decoded| (decoded, semi))
+        });
+        match resolved {
+            Some((decoded, semi)) => {
+                output.push_str(&decoded);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                output.push('&');
+                rest = after;
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Decodes a single HTML entity body (the text between `&` and `;`), supporting
+/// named entities and numeric references such as `&#xce;` and `&#206;`.
+fn decode_html_entity(entity: &str) -> Option<String> {
+    if let Some(numeric) = entity.strip_prefix('#') {
+        let code = if let Some(hex) = numeric.strip_prefix(['x', 'X']) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            numeric.parse::<u32>().ok()?
+        };
+        return char::from_u32(code).map(String::from);
+    }
+    let decoded = match entity {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => ' ',
+        _ => return None,
+    };
+    Some(decoded.to_string())
 }
 
 fn message_reacted_by_sender(message: &Message, emoji: &str, sender: &str) -> bool {
@@ -12236,6 +13962,7 @@ mod tests {
             reactions: Vec::new(),
             receipts: Vec::new(),
             is_from_me: false,
+            mentions_me: false,
             platform_data: PlatformData::default(),
         }];
         let provider = StaticTestProvider::with_account(
@@ -12562,6 +14289,149 @@ mod tests {
         assert_eq!(
             app.state().active_account().map(|id| id.as_ref()),
             Some("slack:runtime")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_bundled_oauth_app_starts_browser_login_without_client_credentials() -> Result<()> {
+        let provider = StaticTestProvider::slack_setup("slack:bundled", "Bundled Slack")
+            .requiring_auth_until_submit()
+            .with_bundled_oauth_app();
+        let submissions = provider.auth_submissions.clone();
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+
+        app.drain_provider_events().await?;
+        assert!(app.state().slack_setup_open());
+        // The overlay records that a bundled official app is available so the UI
+        // can skip manual app creation and client ID/secret entry.
+        assert!(
+            app.state
+                .slack_setup
+                .as_ref()
+                .expect("slack setup overlay")
+                .bundled_oauth_app
+        );
+
+        // Move to the OAuth prompt for the default User OAuth mode and submit
+        // without entering any client ID/secret or token.
+        {
+            let setup = app.state.slack_setup.as_mut().expect("slack setup overlay");
+            setup.phase = SlackSetupPhase::OAuthPrompt;
+            setup.selected_mode = 0; // User OAuth
+            setup.credentials = SlackSetupCredentials::default();
+        }
+
+        app.submit_current_slack_setup().await?;
+
+        // The submission is dispatched as a background browser login (deferred
+        // post-auth load) even though no client credentials were entered.
+        assert!(app.state.pending_slack_setup_load.is_some());
+        assert!(
+            app.state()
+                .status()
+                .contains("waiting for Slack browser sign-in")
+        );
+
+        // Let the spawned background submission run, then confirm it ran with no
+        // client credentials (the official/bundled app supplies them).
+        for _ in 0..16 {
+            if !submissions.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let recorded = submissions.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        let submission = &recorded[0];
+        assert!(submission.client_id.is_none());
+        assert!(submission.client_secret.is_none());
+        assert!(submission.user_token.is_none());
+        assert_eq!(submission.mode, Some(AuthSubmissionMode::UserOAuth));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_slack_setup_help_page_explains_workspaces_and_toggles() -> Result<()> {
+        let provider = StaticTestProvider::slack_setup("slack:help", "Help Slack")
+            .requiring_auth_until_submit();
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.drain_provider_events().await?;
+        assert!(app.state().slack_setup_open());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+
+        // '?' opens the contextual help page.
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('?'), KeyModifiers::NONE)))
+            .await?;
+        assert!(
+            app.state
+                .slack_setup
+                .as_ref()
+                .expect("slack setup overlay")
+                .show_help
+        );
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("How Slack sign-in works"));
+        assert!(content.contains("Multiple workspaces"));
+        assert!(content.contains("Approvals"));
+        assert!(content.contains("team:read"));
+
+        // '?' again closes it and returns to the setup flow.
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('?'), KeyModifiers::NONE)))
+            .await?;
+        assert!(
+            !app.state
+                .slack_setup
+                .as_ref()
+                .expect("slack setup overlay")
+                .show_help
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_slack_setup_connected_can_add_another_workspace() -> Result<()> {
+        let factory: AccountProviderFactory = Arc::new(|kind| match kind {
+            AccountProviderKind::Slack => Ok(Arc::new(
+                StaticTestProvider::slack_setup("slack:second", "Second Slack")
+                    .requiring_auth_until_submit(),
+            ) as ProviderBox),
+            _ => bail!("unexpected provider kind"),
+        });
+        let first = StaticTestProvider::slack_setup("slack:first", "First Slack");
+        let mut app = test_app_with_factory(vec![Arc::new(first)], factory).await?;
+
+        // Simulate a finished first-workspace sign-in sitting on the Connected
+        // screen, where the "Add another Slack workspace" action is offered.
+        let mut overlay =
+            SlackSetupOverlay::new(Arc::from("slack:first"), "First Slack".to_owned());
+        overlay.phase = SlackSetupPhase::Connected;
+        app.state.slack_setup = Some(overlay);
+
+        // 'a' starts an independent setup for a brand-new workspace.
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('a'), KeyModifiers::NONE)))
+            .await?;
+
+        // A second Slack provider now exists and its own setup overlay is open.
+        assert!(
+            app.providers
+                .iter()
+                .any(|provider| provider.id().as_ref() == "slack:second")
+        );
+        assert!(app.state().slack_setup_open());
+        assert_eq!(
+            app.state
+                .slack_setup
+                .as_ref()
+                .expect("slack setup overlay")
+                .provider_id
+                .as_ref(),
+            "slack:second"
         );
 
         Ok(())
@@ -13521,10 +15391,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(content.contains("Photo"));
         assert!(!content.contains("actual image:"));
-        assert!(content.contains("mock-screenshot.png"));
-        assert!(content.contains("caption: Shared an image attachment"));
+        assert!(!content.contains("mock-screenshot.png"));
+        assert!(content.contains("Shared an image attachment"));
         assert!(!content.contains("Click to preview"));
         assert!(content.contains("▀"));
         assert!(content.contains("╭"));
@@ -13633,10 +15502,11 @@ mod tests {
         assert!(app.state().action_menu_open());
 
         let menu = app.state.action_menu.clone().unwrap();
-        let menu_rect = app.action_menu_rect(app.state.frame_area, &menu.message_id);
+        let menu_rect = app.action_menu_rect(app.state.frame_area, &menu);
         let react_row = menu_rect.y
             + 2
-            + ActionMenuItem::ALL
+            + menu
+                .items
                 .iter()
                 .position(|item| *item == ActionMenuItem::React)
                 .unwrap() as u16;
@@ -13671,7 +15541,8 @@ mod tests {
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
         let mut menu = app.state.action_menu.clone().unwrap();
-        menu.selected = ActionMenuItem::ALL
+        menu.selected = menu
+            .items
             .iter()
             .position(|item| *item == ActionMenuItem::React)
             .unwrap();
@@ -14365,6 +16236,7 @@ mod tests {
     #[tokio::test]
     async fn app_shows_and_expires_notification_overlay_for_background_messages() -> Result<()> {
         let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::InApp;
         let background_chat = app
             .state()
             .chats()
@@ -14387,6 +16259,11 @@ mod tests {
             }),
         ))
         .await?;
+
+        assert!(!app.state().notification_visible());
+        assert_eq!(app.state().pending_notification_count(), 1);
+        app.state.pending_notifications[0].deliver_at = Instant::now();
+        app.handle_event(AppEvent::Tick).await?;
 
         assert!(app.state().notification_visible());
         assert_eq!(
@@ -14412,8 +16289,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_shows_account_notice_overlay_even_when_notifications_are_off() -> Result<()> {
+        let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::Off;
+        let provider_id = app.state().selected_chat().unwrap().account.clone();
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::AccountNotice {
+                title: Arc::from("Slack realtime unavailable"),
+                body: Arc::from(
+                    "Using periodic Slack history checks because realtime is unavailable.",
+                ),
+                severity: AccountNoticeSeverity::Info,
+            }),
+        ))
+        .await?;
+
+        assert!(app.state().notification_visible());
+        assert_eq!(
+            app.state().notification_preview(),
+            Some("Using periodic Slack history checks because realtime is unavailable.")
+        );
+        assert!(app.state().status().contains("Slack realtime unavailable"));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Notification"));
+        assert!(content.contains("Slack realtime unavailable"));
+        assert!(content.contains("Using periodic Slack history checks"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_system_alert_notice_triggers_system_notification_even_when_off() -> Result<()> {
+        let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::Off;
+        let capture = capture_desktop_notifications(&mut app);
+        let provider_id = app.state().selected_chat().unwrap().account.clone();
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::AccountNotice {
+                title: Arc::from("Slack realtime unavailable"),
+                body: Arc::from(
+                    "Using periodic Slack history checks because realtime is unavailable.",
+                ),
+                severity: AccountNoticeSeverity::SystemAlert,
+            }),
+        ))
+        .await?;
+
+        let sent = capture.lock().expect("capture poisoned").clone();
+        assert_eq!(sent.len(), 1, "system alert must dispatch one notification");
+        assert_eq!(sent[0].chat_name, "Slack realtime unavailable");
+        assert_eq!(
+            sent[0].preview.as_deref(),
+            Some("Using periodic Slack history checks because realtime is unavailable.")
+        );
+
+        // The in-app overlay must still appear alongside the system notification.
+        assert!(app.state().notification_visible());
+        assert!(app.state().status().contains("Slack realtime unavailable"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_suppresses_and_dismisses_notification_overlay() -> Result<()> {
         let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::InApp;
         let active_chat = app.state().selected_chat().unwrap().clone();
         let muted_chat = app
             .state()
@@ -14437,13 +16384,17 @@ mod tests {
                     &active_chat,
                     "mock:msg:notify:active",
                     "Maya",
-                    "Active chat should stay quiet",
+                    "Active chat queues unless attended",
                 ),
                 is_historical: false,
             }),
         ))
         .await?;
         assert!(!app.state().notification_visible());
+        assert_eq!(app.state().pending_notification_count(), 1);
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().pending_notification_count(), 0);
 
         app.handle_event(AppEvent::Provider(
             muted_chat.account.clone(),
@@ -14459,6 +16410,7 @@ mod tests {
         ))
         .await?;
         assert!(!app.state().notification_visible());
+        assert_eq!(app.state().pending_notification_count(), 0);
 
         app.handle_event(AppEvent::Provider(
             background_chat.account.clone(),
@@ -14474,6 +16426,7 @@ mod tests {
         ))
         .await?;
         assert!(!app.state().notification_visible());
+        assert_eq!(app.state().pending_notification_count(), 0);
 
         app.handle_event(AppEvent::Provider(
             background_chat.account.clone(),
@@ -14488,11 +16441,228 @@ mod tests {
             }),
         ))
         .await?;
+        app.state.pending_notifications[0].deliver_at = Instant::now();
+        app.handle_event(AppEvent::Tick).await?;
         assert!(app.state().notification_visible());
 
         app.handle_event(AppEvent::Key(key(KeyCode::Right, KeyModifiers::NONE)))
             .await?;
         assert!(!app.state().notification_visible());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_notification_scope_direct_and_mentions_filters_groups() -> Result<()> {
+        let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::InApp;
+        app.settings.notification_scope = NotificationScope::DirectAndMentions;
+
+        let direct_chat = app
+            .state()
+            .chats()
+            .iter()
+            .find(|chat| chat.name.as_ref() == "Alice Chen")
+            .unwrap()
+            .clone();
+        assert!(matches!(direct_chat.kind, ChatKind::Direct));
+
+        let group_chat = app
+            .state()
+            .chats()
+            .iter()
+            .find(|chat| matches!(chat.kind, ChatKind::Group) && !chat.muted)
+            .unwrap()
+            .clone();
+
+        // Direct messages always notify under the restricted scope.
+        app.handle_event(AppEvent::Provider(
+            direct_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: test_incoming_message(
+                    &direct_chat,
+                    "mock:msg:scope:direct",
+                    "Alice Chen",
+                    "Direct hello",
+                ),
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 1);
+
+        // Group messages without a mention are suppressed.
+        app.handle_event(AppEvent::Provider(
+            group_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: test_incoming_message(
+                    &group_chat,
+                    "mock:msg:scope:group",
+                    "Maya",
+                    "Group chatter",
+                ),
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 1);
+
+        // Group messages that mention the user are eligible.
+        let mut mention = test_incoming_message(
+            &group_chat,
+            "mock:msg:scope:mention",
+            "Maya",
+            "Hey @me, look here",
+        );
+        mention.mentions_me = true;
+        app.handle_event(AppEvent::Provider(
+            group_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: mention,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_notify_self_messages_defaults_on_and_can_still_be_disabled_by_config() -> Result<()>
+    {
+        let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::InApp;
+
+        let direct_chat = app
+            .state()
+            .chats()
+            .iter()
+            .find(|chat| chat.name.as_ref() == "Alice Chen")
+            .unwrap()
+            .clone();
+
+        // Default (on): a message the user sent themselves is eligible, so
+        // sending yourself a note from a web client exercises notifications.
+        let mut own_on =
+            test_incoming_message(&direct_chat, "mock:msg:self:on", "Me", "note to self");
+        own_on.is_from_me = true;
+        app.handle_event(AppEvent::Provider(
+            direct_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: own_on,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 1);
+
+        // Existing config files that explicitly stored false still preserve that
+        // value, even though the menu no longer exposes the setting.
+        app.settings.notify_self_messages = false;
+        let mut own_off = test_incoming_message(
+            &direct_chat,
+            "mock:msg:self:off",
+            "Me",
+            "note to self suppressed",
+        );
+        own_off.is_from_me = true;
+        app.handle_event(AppEvent::Provider(
+            direct_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: own_off,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_notification_modes_pause_incoming_and_suppress_self() -> Result<()> {
+        let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::Off;
+        let background_chat = app
+            .state()
+            .chats()
+            .iter()
+            .find(|chat| chat.name.as_ref() == "Alice Chen")
+            .unwrap()
+            .clone();
+
+        let incoming =
+            |id: &str, text: &str| test_incoming_message(&background_chat, id, "Alice Chen", text);
+
+        // Notifications off: nothing queued.
+        app.handle_event(AppEvent::Provider(
+            background_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: incoming("mock:msg:notify:off", "Off mode message"),
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 0);
+
+        // Paused: still nothing queued even though notifications are enabled.
+        app.settings.notifications = NotificationMode::InApp;
+        app.state.notification_pause.paused_until = Some(Utc::now() + ChronoDuration::minutes(25));
+        app.handle_event(AppEvent::Provider(
+            background_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: incoming("mock:msg:notify:paused", "Paused message"),
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 0);
+
+        // Existing config files can still suppress the user's own outgoing
+        // messages, even though notify-self defaults to enabled.
+        app.settings.notify_self_messages = false;
+        app.state.notification_pause.paused_until = Some(Utc::now() - ChronoDuration::seconds(1));
+        let mut self_message = incoming("mock:msg:notify:self", "My own reply");
+        self_message.is_from_me = true;
+        app.handle_event(AppEvent::Provider(
+            background_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: self_message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 0);
+
+        // A genuine incoming message now queues a notification.
+        app.handle_event(AppEvent::Provider(
+            background_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: incoming("mock:msg:notify:one", "First incoming"),
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 1);
+        assert!(!app.state().notification_visible());
+
+        // A second incoming message for the same chat coalesces into one pending.
+        app.handle_event(AppEvent::Provider(
+            background_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message: incoming("mock:msg:notify:two", "Latest coalesced message"),
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 1);
+        app.state.pending_notifications[0].deliver_at = Instant::now();
+        app.handle_event(AppEvent::Tick).await?;
+        assert_eq!(
+            app.state().notification_preview(),
+            Some("Latest coalesced message")
+        );
 
         Ok(())
     }
@@ -14873,7 +17043,7 @@ mod tests {
         }));
         assert!(render.lines.iter().any(|line| {
             line.alignment == Some(ratatui::layout::Alignment::Left)
-                && line_text(line).contains("Photo")
+                && line_text(line).contains("Shared an image attachment")
         }));
 
         Ok(())
@@ -14906,6 +17076,149 @@ mod tests {
             Some("https://example.com/card.jpg")
         );
         assert_eq!(html_title(html).as_deref(), Some("Fallback Title"));
+    }
+
+    #[test]
+    fn html_metadata_parser_decodes_numeric_entities_and_strips_markup() {
+        let html = r#"
+            <html>
+              <head>
+                <meta property="og:title" content="&#xce;n drume&#x21b;ie">
+                <meta property="og:description" content="&lt;p&gt;Cele 7 Legi Universale &amp; mai mult&lt;/p&gt;">
+              </head>
+            </html>
+        "#;
+
+        assert_eq!(
+            html_meta_content(html, "og:title").as_deref(),
+            Some("În drumeție")
+        );
+        assert_eq!(
+            html_meta_content(html, "og:description").as_deref(),
+            Some("Cele 7 Legi Universale & mai mult")
+        );
+    }
+
+    #[test]
+    fn action_menu_items_are_specific_to_message_content() {
+        let link_message =
+            test_message_with_content(Content::LinkPreview(chat_core::LinkPreview {
+                url: Arc::<str>::from("https://example.com/story"),
+                title: Some(Arc::<str>::from("Story")),
+                description: None,
+                image: None,
+            }));
+        let link_items = action_menu_items_for_message(&link_message, 0);
+        assert!(link_items.contains(&ActionMenuItem::OpenLink));
+        assert!(link_items.contains(&ActionMenuItem::Forward));
+        assert!(!link_items.contains(&ActionMenuItem::OpenImage));
+        assert!(!link_items.contains(&ActionMenuItem::VotePoll));
+
+        let poll_content = Content::Poll(test_poll());
+        let poll_message = test_message_with_content(poll_content.clone());
+        let poll_items = action_menu_items_for_message(&poll_message, 0);
+        assert!(poll_items.contains(&ActionMenuItem::VotePoll));
+        assert!(poll_items.contains(&ActionMenuItem::Forward));
+        assert!(!poll_items.contains(&ActionMenuItem::OpenLink));
+        assert!(!poll_items.contains(&ActionMenuItem::OpenImage));
+    }
+
+    #[test]
+    fn forward_content_uses_portable_form_and_provider_capabilities() {
+        let text_only = OutboundCapabilities::default();
+        let link = Content::LinkPreview(chat_core::LinkPreview {
+            url: Arc::<str>::from("https://example.com/story"),
+            title: Some(Arc::<str>::from("Story")),
+            description: None,
+            image: None,
+        });
+        assert!(matches!(
+            forward_content_for_capabilities(&link, &text_only),
+            Some(Content::Text(text)) if text.as_ref() == "https://example.com/story"
+        ));
+
+        let media = Media {
+            id: Arc::<str>::from("photo-1"),
+            file_name: Arc::<str>::from("photo.jpg"),
+            mime_type: Arc::<str>::from("image/jpeg"),
+            size_bytes: None,
+            caption: None,
+            local_path: Some(PathBuf::from("/tmp/photo.jpg")),
+            thumbnail: None,
+        };
+        assert!(
+            forward_content_for_capabilities(&Content::Image(media.clone()), &text_only).is_none()
+        );
+        assert!(matches!(
+            forward_content_for_capabilities(&Content::Image(media), &OutboundCapabilities::all()),
+            Some(Content::Image(_))
+        ));
+        let poll_content = Content::Poll(test_poll());
+        assert!(
+            forward_content_for_capabilities(&poll_content, &OutboundCapabilities::all()).is_none()
+        );
+    }
+
+    #[test]
+    fn forward_picker_filters_destinations_by_chat_and_account_text() {
+        let picker = ForwardPicker {
+            message_id: Arc::from("source"),
+            selected: 0,
+            query: "slack maria".to_owned(),
+            targets: vec![
+                test_forward_target("whatsapp", "Mihai", "WhatsApp · WhatsApp"),
+                test_forward_target("slack", "Maria Popescu", "Erepublik · Slack"),
+                test_forward_target("slack-2", "General", "Work · Slack"),
+            ],
+        };
+
+        assert_eq!(forward_picker_filtered_indices(&picker), vec![1]);
+        assert_eq!(forward_picker_filtered_len(&picker), 1);
+        let (_, target) = forward_picker_selected_target(&picker).expect("matching target");
+        assert_eq!(target.label, "Maria Popescu");
+
+        let empty = ForwardPicker {
+            query: "missing".to_owned(),
+            ..picker
+        };
+        assert!(forward_picker_filtered_indices(&empty).is_empty());
+        assert!(forward_picker_selected_target(&empty).is_none());
+    }
+
+    #[test]
+    fn forward_picker_scroll_start_uses_filtered_length() {
+        assert_eq!(forward_picker_scroll_start(10, 5, 3), 0);
+        assert_eq!(forward_picker_scroll_start(7, 5, 20), 3);
+        assert_eq!(forward_picker_scroll_start(0, 5, 0), 0);
+    }
+
+    #[test]
+    fn display_helpers_hide_placeholder_captions_and_clean_link_text() {
+        let media = Media {
+            id: Arc::<str>::from("photo-1"),
+            file_name: Arc::<str>::from("photo.jpg"),
+            mime_type: Arc::<str>::from("image/jpeg"),
+            size_bytes: None,
+            caption: Some(Arc::<str>::from("[empty WhatsApp message]")),
+            local_path: Some(PathBuf::from("/tmp/photo.jpg")),
+            thumbnail: None,
+        };
+        let image = Content::Image(media.clone());
+        assert_eq!(content_send_preview(&image), "Image");
+        assert_eq!(content_copy_text(&image), "photo.jpg");
+        assert_eq!(media_image_preview(&media), None);
+
+        let link = Content::LinkPreview(chat_core::LinkPreview {
+            url: Arc::<str>::from("https://example.com/story"),
+            title: Some(Arc::<str>::from("&#xce;n drume&#x21b;ie")),
+            description: Some(Arc::<str>::from("&lt;p&gt;Cele 7 Legi&lt;/p&gt;")),
+            image: None,
+        });
+        assert_eq!(content_send_preview(&link), "În drumeție");
+        assert_eq!(
+            content_copy_text(&link),
+            "În drumeție: https://example.com/story — Cele 7 Legi"
+        );
     }
 
     #[test]
@@ -15029,6 +17342,14 @@ mod tests {
         App::new_with_factory(store, providers, Some(factory)).await
     }
 
+    /// Replace the app's desktop notifier with a capturing one so tests can
+    /// assert which system notifications were dispatched.
+    fn capture_desktop_notifications(app: &mut App) -> Arc<Mutex<Vec<MessageNotification>>> {
+        let (notifier, capture) = DesktopNotifier::with_capture();
+        app.desktop_notifier = notifier;
+        capture
+    }
+
     #[derive(Clone, Debug)]
     struct StaticTestProvider {
         id: ProviderId,
@@ -15040,6 +17361,7 @@ mod tests {
         submit_error: Option<Arc<str>>,
         outbound_capabilities: OutboundCapabilities,
         require_auth_until_submit: bool,
+        bundled_oauth_app: bool,
     }
 
     impl StaticTestProvider {
@@ -15087,6 +17409,7 @@ mod tests {
                 submit_error: None,
                 outbound_capabilities,
                 require_auth_until_submit: false,
+                bundled_oauth_app: false,
             }
         }
 
@@ -15142,6 +17465,7 @@ mod tests {
                 submit_error: None,
                 outbound_capabilities: OutboundCapabilities::all(),
                 require_auth_until_submit: false,
+                bundled_oauth_app: false,
             })
         }
 
@@ -15152,6 +17476,11 @@ mod tests {
 
         fn requiring_auth_until_submit(mut self) -> Self {
             self.require_auth_until_submit = true;
+            self
+        }
+
+        fn with_bundled_oauth_app(mut self) -> Self {
+            self.bundled_oauth_app = true;
             self
         }
 
@@ -15273,6 +17602,10 @@ mod tests {
             self.events.send(ProviderEvent::AuthSucceeded);
             self.events.send(ProviderEvent::SyncComplete);
             Ok(())
+        }
+
+        fn has_bundled_oauth_app(&self) -> bool {
+            self.bundled_oauth_app
         }
 
         async fn search(&self, query: &str, limit: usize) -> Result<Vec<Message>> {
@@ -15563,6 +17896,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn account_badge_image_rows_sample_actual_image_pixels() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("badge.png");
+        let mut image = image::RgbaImage::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                let pixel = match (x < 2, y < 2) {
+                    (true, true) => image::Rgba([255, 0, 0, 255]),
+                    (false, true) => image::Rgba([0, 255, 0, 255]),
+                    (true, false) => image::Rgba([0, 0, 255, 255]),
+                    (false, false) => image::Rgba([255, 255, 0, 255]),
+                };
+                image.put_pixel(x, y, pixel);
+            }
+        }
+        image.save(&path)?;
+
+        let rows = account_badge_image_rows(&path).map_err(anyhow::Error::msg)?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(rows[0][0].content.as_ref(), "▀");
+        assert_eq!(rows[0][0].style.fg, Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(rows[0][0].style.bg, Some(Color::Rgb(0, 0, 255)));
+        assert_eq!(rows[0][1].style.fg, Some(Color::Rgb(0, 255, 0)));
+        assert_eq!(rows[0][1].style.bg, Some(Color::Rgb(255, 255, 0)));
+        Ok(())
+    }
+
     fn test_incoming_message(chat: &Chat, id: &str, sender: &str, text: &str) -> Message {
         Message {
             id: Arc::from(id),
@@ -15581,7 +17944,52 @@ mod tests {
             reactions: Vec::new(),
             receipts: Vec::new(),
             is_from_me: false,
+            mentions_me: false,
             platform_data: PlatformData::default(),
+        }
+    }
+
+    fn test_message_with_content(content: Content) -> Message {
+        Message {
+            id: Arc::from("test-message"),
+            chat_id: Arc::from("test-chat"),
+            account: Arc::from("mock:test"),
+            sender: Sender {
+                platform_id: Arc::from("mock:user:sender"),
+                display_name: Arc::from("Sender"),
+                avatar: None,
+            },
+            timestamp: Utc::now(),
+            edited_at: None,
+            content,
+            reply_to: None,
+            thread_id: None,
+            reactions: Vec::new(),
+            receipts: Vec::new(),
+            is_from_me: false,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        }
+    }
+
+    fn test_forward_target(account: &str, label: &str, subtitle: &str) -> ForwardTarget {
+        ForwardTarget {
+            account: Arc::from(account),
+            chat_id: Arc::from(label),
+            label: label.to_owned(),
+            subtitle: subtitle.to_owned(),
+        }
+    }
+
+    fn test_poll() -> Poll {
+        Poll {
+            question: Arc::<str>::from("Lunch?"),
+            options: vec![chat_core::PollOption {
+                id: Arc::<str>::from("pizza"),
+                label: Arc::<str>::from("Pizza"),
+            }],
+            selectable_options_count: Some(1),
+            votes: Vec::new(),
         }
     }
 

@@ -21,6 +21,11 @@ const MEDIA_PREVIEW_MAX_WIDTH: u16 = 48;
 const MEDIA_PREVIEW_ROWS: u16 = 8;
 const LINK_PREVIEW_CARD_WIDTH: u16 = 42;
 const LINK_PREVIEW_THUMBNAIL_ROWS: u16 = 4;
+/// Width (in terminal cells) of a single image thumbnail when laying inline
+/// image cards out side by side, and the gap between adjacent thumbnails. Fixed
+/// so the line-count pass can mirror the rendered layout without decoding.
+const INLINE_IMAGE_COLUMN_WIDTH: u16 = 24;
+const INLINE_IMAGE_COLUMN_GAP: u16 = 2;
 pub const MESSAGE_AVATAR_WIDTH: u16 = 2;
 pub const MESSAGE_AVATAR_ROWS: u16 = 1;
 const BUBBLE_MAX_PERCENT: u16 = 72;
@@ -1356,21 +1361,27 @@ fn content_lines(
         Content::Text(text) => {
             text_with_link_preview_lines(text, accent, context, start_line, is_from_me, message_id)
         }
-        Content::Image(media) => {
-            media_card_lines("Photo", media, accent, context, start_line, is_from_me)
-        }
-        Content::Video(media) => {
-            media_card_lines("Video", media, accent, context, start_line, is_from_me)
-        }
-        Content::Audio(media) => {
-            media_card_lines("Voice note", media, accent, context, start_line, is_from_me)
-        }
-        Content::File(media) => {
-            media_card_lines("File", media, accent, context, start_line, is_from_me)
-        }
-        Content::Sticker(media) => {
-            media_card_lines("Sticker", media, accent, context, start_line, is_from_me)
-        }
+        Content::Image(media) => media_card_lines(
+            "Photo", media, accent, context, start_line, is_from_me, true,
+        ),
+        Content::Video(media) => media_card_lines(
+            "Video", media, accent, context, start_line, is_from_me, false,
+        ),
+        Content::Audio(media) => media_card_lines(
+            "Voice note",
+            media,
+            accent,
+            context,
+            start_line,
+            is_from_me,
+            false,
+        ),
+        Content::File(media) => media_card_lines(
+            "File", media, accent, context, start_line, is_from_me, false,
+        ),
+        Content::Sticker(media) => media_card_lines(
+            "Sticker", media, accent, context, start_line, is_from_me, true,
+        ),
         Content::LinkPreview(link) => {
             link_preview_card_lines(link, accent, context, start_line, is_from_me)
         }
@@ -1585,16 +1596,157 @@ fn card_collection_lines(
     is_from_me: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for card in cards {
-        lines.extend(generic_card_lines(
-            card,
-            accent,
-            context,
-            start_line + lines.len(),
-            is_from_me,
-        ));
+    let mut index = 0;
+    while index < cards.len() {
+        let run = inline_image_run_len(&cards[index..]);
+        // Lay two or more consecutive image attachments out side by side (Flat
+        // presentation only) to save vertical space.
+        if run >= 2 && context.presentation == ConversationPresentation::Flat {
+            lines.extend(inline_image_grid_lines(
+                &cards[index..index + run],
+                accent,
+                context,
+                start_line + lines.len(),
+                is_from_me,
+            ));
+            index += run;
+        } else {
+            lines.extend(generic_card_lines(
+                &cards[index],
+                accent,
+                context,
+                start_line + lines.len(),
+                is_from_me,
+            ));
+            index += 1;
+        }
     }
     lines
+}
+
+/// True for an image attachment card (one we render as a bare thumbnail without
+/// its filename/URL). Used to decide both suppression and side-by-side layout.
+fn card_is_media_preview(card: &chat_core::Card) -> bool {
+    matches!(card.kind, chat_core::CardKind::MediaPreview)
+}
+
+fn is_inline_image_card(card: &chat_core::Card) -> bool {
+    card_is_media_preview(card) && (card.image.is_some() || card.thumbnail.is_some())
+}
+
+/// Number of consecutive inline image cards at the front of `cards`.
+fn inline_image_run_len(cards: &[chat_core::Card]) -> usize {
+    cards
+        .iter()
+        .take_while(|card| is_inline_image_card(card))
+        .count()
+}
+
+/// How many fixed-width image thumbnails fit across `content_width`, clamped to
+/// at least one. Pure function of the width so the layout and the line-count
+/// pass agree without decoding any image.
+fn inline_image_columns_per_row(content_width: u16) -> usize {
+    let column = INLINE_IMAGE_COLUMN_WIDTH;
+    let gap = INLINE_IMAGE_COLUMN_GAP;
+    (content_width.saturating_add(gap) / column.saturating_add(gap)).max(1) as usize
+}
+
+/// Renders a run of image cards as a grid of fixed-width thumbnails followed by
+/// any captions, instead of one full-width image per line.
+fn inline_image_grid_lines(
+    cards: &[chat_core::Card],
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    let _ = is_from_me;
+    let accent = card_accent_style(cards[0].accent_color.as_ref(), accent);
+    let preview_color = accent.fg.unwrap_or(Color::DarkGray);
+    let columns = inline_image_columns_per_row(context.content_width)
+        .min(cards.len())
+        .max(1);
+    let column_width = INLINE_IMAGE_COLUMN_WIDTH;
+    let gap = INLINE_IMAGE_COLUMN_GAP as usize;
+    let rows = LINK_PREVIEW_THUMBNAIL_ROWS as usize;
+    let mut lines = Vec::new();
+
+    for chunk in cards.chunks(columns) {
+        let row_base = start_line + lines.len();
+        let mut column_rows: Vec<Vec<Vec<Span<'static>>>> = Vec::with_capacity(chunk.len());
+        for (column_index, card) in chunk.iter().enumerate() {
+            let image = card
+                .image
+                .as_ref()
+                .or(card.thumbnail.as_ref())
+                .expect("inline image card always has an image");
+            let (preview_rows, source, error, ready) = media_preview_rows(
+                image,
+                context,
+                column_width,
+                LINK_PREVIEW_THUMBNAIL_ROWS,
+                preview_color,
+            );
+            if let (Some(path), None) = (&source, &error)
+                && ready
+            {
+                let start_col = column_index * (column_width as usize + gap);
+                context.media_hits.push(MediaHit {
+                    start_line: row_base,
+                    end_line: row_base + preview_rows.len().saturating_sub(1),
+                    start_col: start_col as u16,
+                    end_col: (start_col + column_width as usize) as u16,
+                    path: path.clone(),
+                    title: card
+                        .title
+                        .as_deref()
+                        .unwrap_or(image.file_name.as_ref())
+                        .to_owned(),
+                    caption: card.body.as_deref().map(str::to_owned),
+                });
+            }
+            column_rows.push(preview_rows);
+        }
+
+        for row in 0..rows {
+            let mut spans = Vec::new();
+            for (column_index, preview_rows) in column_rows.iter().enumerate() {
+                if column_index > 0 {
+                    spans.push(Span::raw(" ".repeat(gap)));
+                }
+                let mut cells = preview_rows
+                    .get(row)
+                    .cloned()
+                    .unwrap_or_else(|| empty_preview_row(column_width));
+                pad_spans_to_width(&mut cells, column_width);
+                spans.extend(cells);
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    // Captions live below the thumbnail grid, wrapped to the full body width.
+    let caption_width = flat_text_width(context.content_width).max(1);
+    for card in cards {
+        if let Some(body) = card.body.as_deref() {
+            let body = sanitize_flat_provider_text(body);
+            for row in wrap_markdown_text(&body, caption_width) {
+                lines.push(flat_card_spans_line(accent, row));
+            }
+        }
+    }
+
+    lines
+}
+
+/// Right-pads a preview row with blanks so it occupies exactly `width` cells,
+/// keeping adjacent grid columns aligned even when a thumbnail decodes narrow.
+fn pad_spans_to_width(spans: &mut Vec<Span<'static>>, width: u16) {
+    let current = spans_width(spans);
+    let target = width as usize;
+    if current < target {
+        spans.push(Span::raw(" ".repeat(target - current)));
+    }
 }
 
 fn flat_card_lines(
@@ -1606,6 +1758,10 @@ fn flat_card_lines(
 ) -> Vec<Line<'static>> {
     let card_width = flat_text_width(context.content_width).max(1) as u16;
     let accent = card_accent_style(card.accent_color.as_ref(), accent);
+    // Image attachment cards are self-describing: the thumbnail and any caption
+    // are enough, so the filename (`title`) and download `url` are noise in the
+    // transcript. They remain on the card for the Details pane.
+    let hide_filename_and_url = card_is_media_preview(card);
     let mut lines = Vec::new();
 
     if let Some(image) = card.image.as_ref().or(card.thumbnail.as_ref()) {
@@ -1654,7 +1810,7 @@ fn flat_card_lines(
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if let Some(title) = card.title.as_deref() {
+    if let Some(title) = card.title.as_deref().filter(|_| !hide_filename_and_url) {
         lines.push(flat_card_text_line(
             accent,
             title,
@@ -1689,7 +1845,7 @@ fn flat_card_lines(
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if let Some(url) = card.url.as_deref() {
+    if let Some(url) = card.url.as_deref().filter(|_| !hide_filename_and_url) {
         lines.push(flat_card_text_line(
             accent,
             url,
@@ -1722,6 +1878,7 @@ fn generic_card_lines(
 
     let card_width = link_preview_card_width(context.content_width);
     let accent = card_accent_style(card.accent_color.as_ref(), media_card_accent(accent));
+    let hide_filename_and_url = card_is_media_preview(card);
     let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
 
     if let Some(image) = card.image.as_ref().or(card.thumbnail.as_ref()) {
@@ -1770,7 +1927,7 @@ fn generic_card_lines(
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if let Some(title) = card.title.as_deref() {
+    if let Some(title) = card.title.as_deref().filter(|_| !hide_filename_and_url) {
         lines.push(card_text_line(
             accent,
             title,
@@ -1804,7 +1961,7 @@ fn generic_card_lines(
             Style::default().fg(Color::DarkGray),
         ));
     }
-    if let Some(url) = card.url.as_deref() {
+    if let Some(url) = card.url.as_deref().filter(|_| !hide_filename_and_url) {
         lines.push(card_text_line(
             accent,
             url,
@@ -1920,12 +2077,9 @@ fn link_preview_card_lines(
                 start_col,
                 end_col: start_col.saturating_add(hit_width),
                 path: path.clone(),
-                title: link
-                    .title
-                    .as_deref()
-                    .unwrap_or("Link preview image")
-                    .to_owned(),
-                caption: link.description.as_deref().map(str::to_owned),
+                title: clean_link_preview_text(link.title.as_deref())
+                    .unwrap_or_else(|| "Link preview image".to_owned()),
+                caption: clean_link_preview_text(link.description.as_deref()),
             });
         }
 
@@ -1936,16 +2090,17 @@ fn link_preview_card_lines(
         );
     }
 
-    let title = link.title.as_deref().unwrap_or("Link");
+    let title = clean_link_preview_text(link.title.as_deref()).unwrap_or_else(|| "Link".to_owned());
+    let description = clean_link_preview_text(link.description.as_deref());
     let source = link_preview_source_label(link.url.as_ref());
 
     lines.push(card_text_line(
         accent,
-        title,
+        &title,
         card_width,
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    if let Some(description) = link.description.as_deref() {
+    if let Some(description) = description.as_deref() {
         lines.push(card_text_line(
             accent,
             description,
@@ -1991,12 +2146,9 @@ fn flat_link_preview_card_lines(
                 start_col: 0,
                 end_col: card_width,
                 path: path.clone(),
-                title: link
-                    .title
-                    .as_deref()
-                    .unwrap_or("Link preview image")
-                    .to_owned(),
-                caption: link.description.as_deref().map(str::to_owned),
+                title: clean_link_preview_text(link.title.as_deref())
+                    .unwrap_or_else(|| "Link preview image".to_owned()),
+                caption: clean_link_preview_text(link.description.as_deref()),
             });
         }
 
@@ -2007,16 +2159,17 @@ fn flat_link_preview_card_lines(
         );
     }
 
-    let title = link.title.as_deref().unwrap_or("Link");
+    let title = clean_link_preview_text(link.title.as_deref()).unwrap_or_else(|| "Link".to_owned());
+    let description = clean_link_preview_text(link.description.as_deref());
     let source = link_preview_source_label(link.url.as_ref());
 
     lines.push(flat_card_text_line(
         accent,
-        title,
+        &title,
         card_width,
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    if let Some(description) = link.description.as_deref() {
+    if let Some(description) = description.as_deref() {
         let description = sanitize_flat_provider_text(description);
         for row in wrap_markdown_text(&description, card_width as usize) {
             lines.push(flat_card_spans_line(accent, row));
@@ -2047,6 +2200,93 @@ fn link_preview_source_label(url: &str) -> String {
     } else {
         host.to_owned()
     }
+}
+
+fn clean_link_preview_text(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let text = strip_html_tags(&decode_html_entities(value))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() { None } else { Some(text) }
+}
+
+fn strip_html_tags(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '<'
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphabetic() || matches!(next, '/' | '!'))
+        {
+            for inner in chars.by_ref() {
+                if inner == '>' {
+                    break;
+                }
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn decode_html_entities(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        output.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let resolved = after.find(';').and_then(|semi| {
+            let entity = &after[..semi];
+            if entity.is_empty()
+                || entity.len() > 10
+                || !entity
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '#')
+            {
+                return None;
+            }
+            decode_html_entity(entity).map(|decoded| (decoded, semi))
+        });
+        match resolved {
+            Some((decoded, semi)) => {
+                output.push_str(&decoded);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                output.push('&');
+                rest = after;
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn decode_html_entity(entity: &str) -> Option<String> {
+    if let Some(numeric) = entity.strip_prefix('#') {
+        let code = if let Some(hex) = numeric.strip_prefix(['x', 'X']) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            numeric.parse::<u32>().ok()?
+        };
+        return char::from_u32(code).map(String::from);
+    }
+    let decoded = match entity {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => ' ',
+        _ => return None,
+    };
+    Some(decoded.to_string())
 }
 
 fn link_image_card_lines(
@@ -2105,13 +2345,10 @@ fn link_image_card_lines(
         card_width,
         Style::default(),
     ));
-    if let Some(caption) = &media.caption {
-        lines.push(card_text_line(
-            accent,
-            &format!("caption: {caption}"),
-            card_width,
-            Style::default(),
-        ));
+    if let Some(caption) = visible_media_caption(media) {
+        for row in wrap_markdown_text(caption, card_width as usize) {
+            lines.push(card_spans_line(accent, row, card_width));
+        }
     }
     lines.push(card_border_line('╰', '─', '╯', card_width, accent));
     Some(lines)
@@ -2124,30 +2361,61 @@ fn media_card_lines(
     context: &mut MessageRenderContext<'_>,
     start_line: usize,
     is_from_me: bool,
+    visual: bool,
 ) -> Vec<Line<'static>> {
     if context.presentation == ConversationPresentation::Flat {
         return flat_media_card_lines(label, media, accent, context, start_line);
     }
 
-    let card_width =
-        media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
     let accent = media_card_accent(accent);
-    let (preview_rows, source, error, ready) = media_preview_rows(
-        media,
-        context,
-        card_width,
-        MEDIA_PREVIEW_ROWS,
-        accent.fg.unwrap_or(Color::DarkGray),
-    );
-    let mut lines = vec![
-        card_border_line('╭', '─', '╮', card_width, accent),
-        card_text_line(
+    let caption = visible_media_caption(media);
+
+    // Visual media (photos, stickers) speak for themselves: skip the label and
+    // filename rows and shrink the card so the border hugs the image's form
+    // factor. Other media (files, voice notes) keep the descriptive rows.
+    let (preview_rows, card_width, source, error, ready) = if visual {
+        let max_width = media_card_width(context.content_width);
+        let (rows, source, error, ready) = media_preview_rows(
+            media,
+            context,
+            max_width,
+            MEDIA_PREVIEW_ROWS,
+            accent.fg.unwrap_or(Color::DarkGray),
+        );
+        let trimmed: Vec<Vec<Span<'static>>> =
+            rows.into_iter().map(strip_preview_padding).collect();
+        let image_width = trimmed
+            .iter()
+            .map(|row| spans_width(row))
+            .max()
+            .unwrap_or_default() as u16;
+        let caption_width = caption
+            .map(|caption| UnicodeWidthStr::width(caption) as u16)
+            .unwrap_or_default();
+        let card_width = image_width.max(caption_width).max(1).min(max_width);
+        (trimmed, card_width, source, error, ready)
+    } else {
+        let card_width =
+            media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
+        let (rows, source, error, ready) = media_preview_rows(
+            media,
+            context,
+            card_width,
+            MEDIA_PREVIEW_ROWS,
+            accent.fg.unwrap_or(Color::DarkGray),
+        );
+        (rows, card_width, source, error, ready)
+    };
+
+    let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
+    if !visual {
+        lines.push(card_text_line(
             accent,
             label,
             card_width,
             accent.add_modifier(Modifier::BOLD),
-        ),
-    ];
+        ));
+    }
 
     if let (Some(path), None) = (&source, &error)
         && ready
@@ -2165,22 +2433,24 @@ fn media_card_lines(
             end_col: start_col.saturating_add(hit_width),
             path: path.clone(),
             title: media.file_name.to_string(),
-            caption: media.caption.as_deref().map(str::to_owned),
+            caption: caption.map(str::to_owned),
         });
     }
 
     lines.extend(
         preview_rows
             .into_iter()
-            .map(|row| card_preview_line(accent, row, card_width)),
+            .map(|row| card_preview_line(accent, center_preview_row(row, card_width), card_width)),
     );
 
-    lines.push(card_text_line(
-        accent,
-        &format!("file: {}{}", media.file_name, format_media_size(media)),
-        card_width,
-        Style::default(),
-    ));
+    if !visual {
+        lines.push(card_text_line(
+            accent,
+            &format!("file: {}{}", media.file_name, format_media_size(media)),
+            card_width,
+            Style::default(),
+        ));
+    }
 
     if error.is_some() || source.is_none() {
         lines.push(card_text_line(
@@ -2195,17 +2465,56 @@ fn media_card_lines(
         ));
     }
 
-    if let Some(caption) = &media.caption {
-        lines.push(card_text_line(
-            accent,
-            &format!("caption: {caption}"),
-            card_width,
-            Style::default(),
-        ));
+    if let Some(caption) = caption {
+        for row in wrap_markdown_text(caption, card_width as usize) {
+            lines.push(card_spans_line(accent, row, card_width));
+        }
     }
 
     lines.push(card_border_line('╰', '─', '╯', card_width, accent));
     lines
+}
+
+/// Returns the media caption only when it carries real text, treating blank or
+/// whitespace-only captions as absent.
+fn visible_media_caption(media: &chat_core::Media) -> Option<&str> {
+    media
+        .caption
+        .as_deref()
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .filter(|caption| !caption.eq_ignore_ascii_case("[empty WhatsApp message]"))
+}
+
+/// Drops the surrounding blank padding spans from a decoded preview row so the
+/// card border can be shrunk to the image's natural width.
+fn strip_preview_padding(row: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let is_blank = |span: &Span<'static>| span.content.chars().all(|character| character == ' ');
+    let Some(start) = row.iter().position(|span| !is_blank(span)) else {
+        return Vec::new();
+    };
+    let end = row
+        .iter()
+        .rposition(|span| !is_blank(span))
+        .unwrap_or(start);
+    row[start..=end].to_vec()
+}
+
+/// Centers a (already trimmed) preview row inside `width`, padding both sides
+/// equally so the image sits in the middle of the card.
+fn center_preview_row(row: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    let content_width = spans_width(&row);
+    let total_padding = (width as usize).saturating_sub(content_width);
+    if total_padding == 0 {
+        return row;
+    }
+    let left = total_padding / 2;
+    let mut centered = Vec::with_capacity(row.len() + 1);
+    if left > 0 {
+        centered.push(Span::raw(" ".repeat(left)));
+    }
+    centered.extend(row);
+    centered
 }
 
 fn flat_media_card_lines(
@@ -2242,7 +2551,7 @@ fn flat_media_card_lines(
             end_col: card_width,
             path: path.clone(),
             title: media.file_name.to_string(),
-            caption: media.caption.as_deref().map(str::to_owned),
+            caption: visible_media_caption(media).map(str::to_owned),
         });
     }
 
@@ -2265,13 +2574,10 @@ fn flat_media_card_lines(
         ));
     }
 
-    if let Some(caption) = &media.caption {
-        lines.push(flat_card_text_line(
-            accent,
-            caption,
-            card_width,
-            Style::default(),
-        ));
+    if let Some(caption) = visible_media_caption(media) {
+        for row in wrap_markdown_text(caption, card_width as usize) {
+            lines.push(flat_card_spans_line(accent, row));
+        }
     }
 
     lines
@@ -2576,10 +2882,8 @@ fn media_card_width_for_media(
     let file_line_width = UnicodeWidthStr::width(
         format!("file: {}{}", media.file_name, format_media_size(media)).as_str(),
     );
-    let caption_line_width = media
-        .caption
-        .as_deref()
-        .map(|caption| UnicodeWidthStr::width(format!("caption: {caption}").as_str()))
+    let caption_line_width = visible_media_caption(media)
+        .map(UnicodeWidthStr::width)
         .unwrap_or_default();
     let min_width = UnicodeWidthStr::width(label)
         .max(file_line_width)
@@ -3471,11 +3775,12 @@ fn content_lines_len(
         Content::Poll(poll) => {
             text_content_line_count(&poll_text(poll), content_width, presentation)
         }
-        Content::Image(media)
-        | Content::Video(media)
-        | Content::Audio(media)
-        | Content::File(media)
-        | Content::Sticker(media) => media_card_line_count(media, presentation),
+        Content::Image(media) | Content::Sticker(media) => {
+            media_card_line_count(media, content_width, presentation, true)
+        }
+        Content::Video(media) | Content::Audio(media) | Content::File(media) => {
+            media_card_line_count(media, content_width, presentation, false)
+        }
         Content::LinkPreview(link) => link_preview_card_line_count(link, presentation),
         Content::Cards(cards) => card_collection_line_count(cards, content_width, presentation),
         Content::Unsupported(kind) => text_content_line_count(
@@ -3525,12 +3830,12 @@ fn text_with_link_preview_line_count(
     };
 
     if let Some(image) = &metadata.image {
-        text_lines + media_card_line_count(image, presentation)
+        text_lines + media_card_line_count(image, content_width, presentation, false)
     } else {
         text_lines
             + link_preview_card_line_count_for_image(
                 false,
-                metadata.description.is_some(),
+                clean_link_preview_text(metadata.description.as_deref()).is_some(),
                 presentation,
             )
     }
@@ -3538,16 +3843,37 @@ fn text_with_link_preview_line_count(
 
 fn media_card_line_count(
     media: &chat_core::Media,
+    content_width: u16,
     presentation: ConversationPresentation,
+    visual: bool,
 ) -> usize {
+    let caption = media_caption_line_count(media, content_width, presentation, visual);
     match presentation {
         ConversationPresentation::Bubbles => {
-            4 + MEDIA_PREVIEW_ROWS as usize + usize::from(media.caption.is_some())
+            // Two border rows plus, for non-visual media, a label and filename row.
+            let chrome = if visual { 2 } else { 4 };
+            chrome + MEDIA_PREVIEW_ROWS as usize + caption
         }
-        ConversationPresentation::Flat => {
-            1 + MEDIA_PREVIEW_ROWS as usize + 1 + usize::from(media.caption.is_some())
-        }
+        ConversationPresentation::Flat => 1 + MEDIA_PREVIEW_ROWS as usize + 1 + caption,
     }
+}
+
+fn media_caption_line_count(
+    media: &chat_core::Media,
+    content_width: u16,
+    presentation: ConversationPresentation,
+    visual: bool,
+) -> usize {
+    let Some(caption) = visible_media_caption(media) else {
+        return 0;
+    };
+    let card_width = match presentation {
+        ConversationPresentation::Bubbles if visual => media_card_width(content_width),
+        ConversationPresentation::Bubbles | ConversationPresentation::Flat => {
+            media_card_width_for_media(media, content_width, MEDIA_PREVIEW_ROWS, "")
+        }
+    };
+    wrap_markdown_text(caption, card_width as usize).len()
 }
 
 fn card_collection_line_count(
@@ -3555,10 +3881,36 @@ fn card_collection_line_count(
     content_width: u16,
     presentation: ConversationPresentation,
 ) -> usize {
-    cards
+    let mut total = 0;
+    let mut index = 0;
+    while index < cards.len() {
+        let run = inline_image_run_len(&cards[index..]);
+        if run >= 2 && presentation == ConversationPresentation::Flat {
+            total += inline_image_grid_line_count(&cards[index..index + run], content_width);
+            index += run;
+        } else {
+            total += generic_card_line_count(&cards[index], content_width, presentation);
+            index += 1;
+        }
+    }
+    total
+}
+
+/// Mirror of [`inline_image_grid_lines`]: grid rows of fixed-height thumbnails
+/// plus the wrapped captions rendered below them.
+fn inline_image_grid_line_count(cards: &[chat_core::Card], content_width: u16) -> usize {
+    let columns = inline_image_columns_per_row(content_width)
+        .min(cards.len())
+        .max(1);
+    let grid_rows = cards.len().div_ceil(columns);
+    let image_lines = grid_rows * LINK_PREVIEW_THUMBNAIL_ROWS as usize;
+    let caption_width = flat_text_width(content_width).max(1);
+    let caption_lines: usize = cards
         .iter()
-        .map(|card| generic_card_line_count(card, content_width, presentation))
-        .sum()
+        .filter_map(|card| card.body.as_deref())
+        .map(|body| wrap_text(&sanitize_flat_provider_text(body), caption_width).len())
+        .sum();
+    image_lines + caption_lines
 }
 
 fn generic_card_line_count(
@@ -3570,6 +3922,11 @@ fn generic_card_line_count(
         ConversationPresentation::Bubbles => link_preview_card_width(content_width) as usize,
         ConversationPresentation::Flat => flat_text_width(content_width),
     };
+    // Image attachment cards hide their filename (`title`) and `url` in the
+    // transcript, so exclude those rows here to keep counts in sync.
+    let hide_filename_and_url = card_is_media_preview(card);
+    let counts_title = card.title.is_some() && !hide_filename_and_url;
+    let counts_url = card.url.is_some() && !hide_filename_and_url;
     let body_lines = card
         .body
         .as_deref()
@@ -3578,18 +3935,20 @@ fn generic_card_line_count(
     let content_lines = usize::from(card.image.is_some() || card.thumbnail.is_some())
         * LINK_PREVIEW_THUMBNAIL_ROWS as usize
         + usize::from(card.subtitle.is_some())
-        + usize::from(card.title.is_some())
+        + usize::from(counts_title)
         + body_lines
         + card.fields.len()
         + usize::from(card.footer.is_some())
-        + usize::from(card.url.is_some())
+        + usize::from(counts_url)
         + usize::from(
-            card.title.is_none()
+            !counts_title
                 && card.subtitle.is_none()
                 && card.body.is_none()
                 && card.footer.is_none()
-                && card.url.is_none()
-                && card.fields.is_empty(),
+                && !counts_url
+                && card.fields.is_empty()
+                && card.image.is_none()
+                && card.thumbnail.is_none(),
         );
 
     match presentation {
@@ -3604,7 +3963,7 @@ fn link_preview_card_line_count(
 ) -> usize {
     link_preview_card_line_count_for_image(
         link.image.is_some(),
-        link.description.is_some(),
+        clean_link_preview_text(link.description.as_deref()).is_some(),
         presentation,
     )
 }
@@ -4049,8 +4408,8 @@ mod tests {
 
         let media_line = rendered_lines
             .iter()
-            .position(|line| line.contains("photo.jpg"))
-            .expect("media card file line");
+            .position(|line| line.contains("last image"))
+            .expect("media card caption line");
         let reaction_line = rendered_lines
             .iter()
             .position(|line| line.contains("🔥1"))
@@ -4141,8 +4500,10 @@ mod tests {
         metadata.insert(
             Arc::<str>::from("https://example.com/story"),
             LinkMetadata {
-                title: Some(Arc::<str>::from("Actual article title")),
-                description: Some(Arc::<str>::from("Fetched Open Graph description")),
+                title: Some(Arc::<str>::from("&#xce;n drume&#x21b;ie")),
+                description: Some(Arc::<str>::from(
+                    "&lt;p&gt;Cele 7 Legi Universale &amp; mai mult&lt;/p&gt;",
+                )),
                 image_url: Some(Arc::<str>::from("https://example.com/preview.jpg")),
                 image: None,
             },
@@ -4165,13 +4526,16 @@ mod tests {
         assert!(
             rendered_lines
                 .iter()
-                .any(|line| line.contains("Actual article title"))
+                .any(|line| line.contains("În drumeție"))
         );
         assert!(
             rendered_lines
                 .iter()
-                .any(|line| line.contains("Fetched Open Graph description"))
+                .any(|line| line.contains("Cele 7 Legi Universale & mai mult"))
         );
+        assert!(!rendered_lines.iter().any(|line| line.contains("&#xce;")
+            || line.contains("&#x21b;")
+            || line.contains("<p>")));
         assert!(
             !rendered_lines
                 .iter()
@@ -4893,6 +5257,171 @@ mod tests {
         assert!(!rendered.contains('╰'));
     }
 
+    fn image_preview_card(title: &str, caption: Option<&str>) -> Card {
+        Card {
+            kind: CardKind::MediaPreview,
+            source: CardSource::Slack,
+            title: Some(arc_str(title)),
+            subtitle: None,
+            body: caption.map(arc_str),
+            footer: None,
+            url: Some(arc_str("https://erpk.slack.com/files/example.jpg")),
+            accent_color: None,
+            thumbnail: None,
+            image: Some(chat_core::Media {
+                id: arc_str("https://erpk.slack.com/files/example.jpg"),
+                file_name: arc_str(title),
+                mime_type: arc_str("image/jpeg"),
+                size_bytes: None,
+                caption: None,
+                local_path: None,
+                thumbnail: None,
+            }),
+            fields: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    fn flat_render_context<'a>(
+        cache: &'a mut MediaPreviewCache,
+        media_hits: &'a mut Vec<MediaHit>,
+        link_preview_requests: &'a mut Vec<LinkPreviewRequest>,
+        media_preview_requests: &'a mut Vec<MediaPreviewRequest>,
+        link_metadata: &'a LinkMetadataCache,
+        reply_previews: &'a HashMap<Arc<str>, String>,
+        thread_summaries: &'a HashMap<MessageId, ThreadSummary>,
+    ) -> MessageRenderContext<'a> {
+        MessageRenderContext {
+            content_width: 90,
+            media_cache: cache,
+            media_hits,
+            link_metadata,
+            link_preview_requests,
+            media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation: ConversationPresentation::Flat,
+            reply_previews,
+            thread_summaries,
+        }
+    }
+
+    #[test]
+    fn image_card_line_count_excludes_filename_and_url() {
+        // image rows + caption row only; filename (title) and url are hidden.
+        let with_caption = image_preview_card("IMG-0001.jpg", Some("a caption"));
+        assert_eq!(
+            generic_card_line_count(&with_caption, 90, ConversationPresentation::Flat),
+            LINK_PREVIEW_THUMBNAIL_ROWS as usize + 1
+        );
+
+        let without_caption = image_preview_card("IMG-0002.jpg", None);
+        assert_eq!(
+            generic_card_line_count(&without_caption, 90, ConversationPresentation::Flat),
+            LINK_PREVIEW_THUMBNAIL_ROWS as usize
+        );
+    }
+
+    #[test]
+    fn consecutive_image_cards_render_side_by_side_without_filenames_or_urls() {
+        let cards = vec![
+            image_preview_card("IMG-20260608-WA0001.jpg", Some("Casa de vizavi de mine")),
+            image_preview_card("IMG-20260608-WA0000.jpg", None),
+        ];
+
+        let mut cache = MediaPreviewCache::default();
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = flat_render_context(
+            &mut cache,
+            &mut media_hits,
+            &mut link_preview_requests,
+            &mut media_preview_requests,
+            &link_metadata,
+            &reply_previews,
+            &thread_summaries,
+        );
+
+        let lines = card_collection_lines(&cards, Style::default(), &mut context, 0, false);
+        let count = card_collection_line_count(&cards, 90, ConversationPresentation::Flat);
+
+        // Rendered height and the cached line-count must agree.
+        assert_eq!(lines.len(), count);
+        // Both thumbnails share a single grid row (4 image lines) plus one caption.
+        assert_eq!(lines.len(), LINK_PREVIEW_THUMBNAIL_ROWS as usize + 1);
+
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(rendered.contains("Casa de vizavi de mine"));
+        assert!(!rendered.contains("IMG-20260608-WA0001.jpg"));
+        assert!(!rendered.contains("IMG-20260608-WA0000.jpg"));
+        assert!(!rendered.contains("https://"));
+    }
+
+    #[test]
+    fn visual_media_captions_wrap_inside_bubble_cards() {
+        let account = Arc::<str>::from("mock:local");
+        let chat_id = Arc::<str>::from("mock:chat:media");
+        let sender = Sender {
+            platform_id: Arc::<str>::from("alice"),
+            display_name: Arc::<str>::from("Alice"),
+            avatar: None,
+        };
+        let caption = "Buna ziua, Comanda dvs. 6351726 a fost procesata insa din pacate produsele Math Without Numbers si The Golden Age Ovid s Metamorphoses nu s-au gasit fizic.";
+        let mut message = text_message(
+            "image-with-long-caption",
+            &chat_id,
+            &account,
+            sender,
+            "",
+            10,
+            0,
+            false,
+        );
+        message.content = Content::Image(chat_core::Media {
+            id: Arc::<str>::from("media-1"),
+            file_name: Arc::<str>::from("photo.jpg"),
+            mime_type: Arc::<str>::from("image/jpeg"),
+            size_bytes: Some(2048),
+            caption: Some(Arc::<str>::from(caption)),
+            local_path: Some(PathBuf::from("/tmp/missing-photo.jpg")),
+            thumbnail: None,
+        });
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[message],
+            80,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+        );
+        let rendered_lines = rendered_lines(&render.lines);
+        let caption_lines = rendered_lines
+            .iter()
+            .filter(|line| line.contains("Buna ziua") || line.contains("Math Without Numbers"))
+            .count();
+
+        assert!(
+            caption_lines >= 2,
+            "caption should wrap: {rendered_lines:?}"
+        );
+        assert!(
+            rendered_lines
+                .iter()
+                .any(|line| line.contains("Math Without Numbers")),
+            "wrapped caption should keep text past the first row: {rendered_lines:?}"
+        );
+        assert_eq!(render.total_lines, rendered_lines.len());
+    }
+
     #[test]
     fn flat_provider_card_artifact_text_is_sanitized() {
         let card = Card {
@@ -5204,6 +5733,7 @@ mod tests {
             reactions: Vec::new(),
             receipts: Vec::new(),
             is_from_me,
+            mentions_me: false,
             platform_data: PlatformData::default(),
         }
     }

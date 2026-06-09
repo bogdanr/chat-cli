@@ -162,6 +162,13 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
     pub receipts: Vec<Receipt>,
     pub is_from_me: bool,
+    /// True when this message mentions the authenticated user (an explicit
+    /// @-mention of the user, or a provider broadcast ping such as Slack's
+    /// `@here`/`@channel`/`@everyone`). Computed by each provider because only
+    /// the provider knows the account's authenticated identity. Used by the
+    /// notification scope filter to decide whether group/channel messages are
+    /// notification-eligible.
+    pub mentions_me: bool,
     pub platform_data: PlatformData,
 }
 

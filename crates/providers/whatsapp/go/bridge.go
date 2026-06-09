@@ -79,6 +79,7 @@ type bridgeEvent struct {
 	Text         string `json:"text,omitempty"`
 	Timestamp    string `json:"timestamp,omitempty"`
 	FromMe       bool   `json:"from_me,omitempty"`
+	MentionsMe   bool   `json:"mentions_me,omitempty"`
 	IsGroup      bool   `json:"is_group,omitempty"`
 	Muted        *bool  `json:"muted,omitempty"`
 	Progress     uint8  `json:"progress,omitempty"`
@@ -205,6 +206,7 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 
 	if wa.Store.ID != nil {
 		emit(bridgeEvent{Type: "connected", JID: wa.Store.ID.String()})
+		go c.fetchAndEmitProfile(context.Background(), *wa.Store.ID, "WhatsApp", false)
 		go c.syncChatMuteSettings(context.Background())
 		go c.emitJoinedGroups(context.Background())
 	}
@@ -918,6 +920,12 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		senderName = participantName(c, ctx, message.Info.Sender, message.Info.SenderAlt, senderName)
 	}
 
+	ownJID := ""
+	if c != nil {
+		ownJID = c.ownJID()
+	}
+	mentionsMe := !message.Info.IsFromMe && messageMentionsUser(message.Message, ownJID)
+
 	if reaction := message.Message.GetReactionMessage(); reaction != nil {
 		emitReactionMessageEvent(c, message, reaction, chatJID, chatName, senderName, isGroup)
 		return
@@ -954,6 +962,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		Text:       messageText(message.Message),
 		Timestamp:  message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
 		FromMe:     message.Info.IsFromMe,
+		MentionsMe: mentionsMe,
 		IsGroup:    isGroup,
 		Muted:      boolPtr(chatMuted(c, ctx, chatJID)),
 		Reactions:  messageReactions(message),
@@ -1151,26 +1160,81 @@ func contactDisplayName(c *client, ctx context.Context, jid types.JID) (string, 
 	if name, ok := contactDisplayNameForJID(c, ctx, jid); ok {
 		return name, true
 	}
-	if alt, err := c.wa.Store.GetAltJID(ctx, jid); err == nil && !alt.IsEmpty() {
-		return contactDisplayNameForJID(c, ctx, alt)
-	}
-	return "", false
-}
-
-func contactDisplayNameForJID(c *client, ctx context.Context, jid types.JID) (string, bool) {
-	if contact, err := c.wa.Store.Contacts.GetContact(ctx, jid); err == nil {
-		if name := displayNameForContact(contact, jid); name != "" {
+	for _, alt := range alternateContactJIDs(c, ctx, jid) {
+		if name, ok := contactDisplayNameForJID(c, ctx, alt); ok {
 			return name, true
 		}
 	}
 	return "", false
 }
 
-func displayNameForContact(contact types.ContactInfo, jid types.JID) string {
+// alternateContactJIDs returns the other JIDs a contact may be stored under.
+// A group sender is frequently addressed by a privacy @lid that has no contact
+// entry of its own, while the saved address-book contact lives under the
+// phone-number JID (and vice versa). We consult both the generic alt-JID record
+// and the dedicated LID<->PN mapping store so the contact resolves regardless of
+// which identity the message carried.
+func alternateContactJIDs(c *client, ctx context.Context, jid types.JID) []types.JID {
+	if c == nil || c.wa == nil || c.wa.Store == nil || jid.IsEmpty() {
+		return nil
+	}
+	seen := map[string]struct{}{jid.String(): {}}
+	var alts []types.JID
+	add := func(candidate types.JID, err error) {
+		if err != nil || candidate.IsEmpty() {
+			return
+		}
+		key := candidate.String()
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		alts = append(alts, candidate)
+	}
+
+	alt, err := c.wa.Store.GetAltJID(ctx, jid)
+	add(alt, err)
+
+	if c.wa.Store.LIDs != nil {
+		switch jid.Server {
+		case types.HiddenUserServer:
+			pn, err := c.wa.Store.LIDs.GetPNForLID(ctx, jid)
+			add(pn, err)
+		case types.DefaultUserServer:
+			lid, err := c.wa.Store.LIDs.GetLIDForPN(ctx, jid)
+			add(lid, err)
+		}
+	}
+	return alts
+}
+
+func contactDisplayNameForJID(c *client, ctx context.Context, jid types.JID) (string, bool) {
+	if contact, err := c.wa.Store.Contacts.GetContact(ctx, jid); err == nil {
+		if name := contactRealName(contact); name != "" {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// contactRealName returns the first genuine name stored for a contact. It never
+// falls back to the bare JID user (phone number / LID) so callers can tell a
+// real resolution apart from "no name known". This is critical for the resolver
+// chain in participantName/conversationName: treating the bare number as a
+// successful resolution would short-circuit before trying the alternate JID
+// (e.g. the phone number behind a @lid sender) or the message push name.
+func contactRealName(contact types.ContactInfo) string {
 	for _, name := range []string{contact.FullName, contact.FirstName, contact.BusinessName, contact.PushName} {
 		if strings.TrimSpace(name) != "" {
 			return name
 		}
+	}
+	return ""
+}
+
+func displayNameForContact(contact types.ContactInfo, jid types.JID) string {
+	if name := contactRealName(contact); name != "" {
+		return name
 	}
 	return jid.User
 }
@@ -1763,17 +1827,71 @@ func firstNonEmpty(values ...string) string {
 }
 
 func mediaCacheDir(dbPath string) string {
-	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
-		return filepath.Join(os.TempDir(), "chat-cli-whatsapp-media")
-	}
-	return dbPath + ".media"
+	return filepath.Join(whatsappCacheRoot(), "media")
 }
 
 func profileCacheDir(dbPath string) string {
-	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
-		return filepath.Join(os.TempDir(), "chat-cli-whatsapp-avatars")
+	return filepath.Join(whatsappCacheRoot(), "avatars")
+}
+
+func whatsappCacheRoot() string {
+	if cacheHome := strings.TrimSpace(os.Getenv("XDG_CACHE_HOME")); cacheHome != "" {
+		return filepath.Join(cacheHome, "chat-cli", "whatsapp")
 	}
-	return dbPath + ".avatars"
+	if home := strings.TrimSpace(os.Getenv("HOME")); home != "" {
+		return filepath.Join(home, ".cache", "chat-cli", "whatsapp")
+	}
+	return filepath.Join(os.TempDir(), "chat-cli", "whatsapp")
+}
+
+// messageMentionedJID returns the list of JIDs mentioned in the message via the
+// protocol ContextInfo, across the common message variants that carry it.
+func messageMentionedJID(message *waProto.Message) []string {
+	if message == nil {
+		return nil
+	}
+	var info *waProto.ContextInfo
+	switch {
+	case message.GetExtendedTextMessage() != nil:
+		info = message.GetExtendedTextMessage().GetContextInfo()
+	case message.GetImageMessage() != nil:
+		info = message.GetImageMessage().GetContextInfo()
+	case message.GetVideoMessage() != nil:
+		info = message.GetVideoMessage().GetContextInfo()
+	case message.GetAudioMessage() != nil:
+		info = message.GetAudioMessage().GetContextInfo()
+	case message.GetDocumentMessage() != nil:
+		info = message.GetDocumentMessage().GetContextInfo()
+	case message.GetStickerMessage() != nil:
+		info = message.GetStickerMessage().GetContextInfo()
+	}
+	if info == nil {
+		return nil
+	}
+	return info.GetMentionedJID()
+}
+
+// messageMentionsUser reports whether the authenticated user (ownJID) is among
+// the JIDs mentioned in the message. Comparison is on the JID user-part so that
+// device/agent suffixes do not affect the match.
+func messageMentionsUser(message *waProto.Message, ownJID string) bool {
+	if ownJID == "" {
+		return false
+	}
+	own, err := types.ParseJID(ownJID)
+	if err != nil {
+		return false
+	}
+	for _, mentioned := range messageMentionedJID(message) {
+		parsed, err := types.ParseJID(mentioned)
+		if err != nil {
+			continue
+		}
+		if parsed.User != "" && parsed.User == own.User {
+			return true
+		}
+	}
+	return false
 }
 
 func messageText(message *waProto.Message) string {

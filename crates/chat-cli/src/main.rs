@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chat_core::{MockProvider, Provider};
-use clap::Parser;
+use chrono::{Duration as ChronoDuration, Utc};
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use slack::{SlackAuthMode, SlackProvider, SlackProviderOptions};
 use std::{
@@ -106,11 +107,34 @@ struct Args {
     /// Remove the selected test databases before startup and after exit.
     #[arg(long)]
     test_cleanup: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Control notification pause state without launching the TUI.
+    Notifications {
+        #[command(subcommand)]
+        action: NotificationCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum NotificationCommand {
+    /// Pause notifications for a duration such as 25m, 1h, or 90s.
+    Pause { duration: String },
+    /// Resume notifications immediately.
+    Resume,
+    /// Show current notification pause status.
+    Status,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    configure_diagnostic_log(&args);
     let cleanup_paths = cleanup_paths(&args);
     if args.test_cleanup {
         cleanup_databases(&cleanup_paths)?;
@@ -120,6 +144,15 @@ async fn main() -> Result<()> {
         Some(path) => Store::open(path).await?,
         None => Store::open_default().await?,
     };
+
+    if let Some(command) = &args.command {
+        handle_command(command, &store).await?;
+        if args.test_cleanup {
+            cleanup_databases(&cleanup_paths)?;
+        }
+        return Ok(());
+    }
+
     let persisted_accounts = store.get_account_configs().await?;
     let providers = build_providers_with_persisted(&args, persisted_accounts)?;
     let existing_provider_ids = providers
@@ -133,6 +166,98 @@ async fn main() -> Result<()> {
         cleanup_databases(&cleanup_paths)?;
     }
     result
+}
+
+/// Environment variable consumed by the shared diagnostic/perf log used across
+/// the TUI and the Slack provider.
+const PERF_LOG_FILE_ENV: &str = "CHAT_CLI_PERF_LOG_FILE";
+
+/// Route diagnostics for every crate (TUI perf markers and Slack realtime
+/// tracing) into the same `--log-file` the user already tails. Without this,
+/// only the WhatsApp bridge writes there and the Slack realtime path is
+/// completely silent, making "no realtime messages" impossible to diagnose.
+fn configure_diagnostic_log(args: &Args) {
+    let Some(log_file) = args.log_file.as_ref() else {
+        return;
+    };
+    // Start each run with a clean log so the file only ever contains the
+    // current session. The shared writers (TUI perf markers, Slack realtime
+    // diagnostics, WhatsApp bridge) all open the path in append mode, so
+    // truncating once here — before any of them spawn — keeps the session's
+    // entries intact while discarding stale output from previous runs. A
+    // failure to truncate must not abort startup; logging is best-effort.
+    if let Err(error) = fs::write(log_file, b"") {
+        eprintln!(
+            "warning: could not truncate diagnostic log {}: {error}",
+            log_file.display()
+        );
+    }
+    if std::env::var_os(PERF_LOG_FILE_ENV).is_some() {
+        return;
+    }
+    // Safe: executed at the very top of `main`, before any provider tasks,
+    // background threads, or socket-mode loops are spawned, so no other thread
+    // is concurrently reading or writing the process environment.
+    unsafe {
+        std::env::set_var(PERF_LOG_FILE_ENV, log_file);
+    }
+}
+
+async fn handle_command(command: &Command, store: &Store) -> Result<()> {
+    match command {
+        Command::Notifications { action } => handle_notification_command(action, store).await,
+    }
+}
+
+async fn handle_notification_command(action: &NotificationCommand, store: &Store) -> Result<()> {
+    match action {
+        NotificationCommand::Pause { duration } => {
+            let duration = parse_pause_duration(duration)?;
+            let paused_until = Utc::now() + duration;
+            store.pause_notifications_until(paused_until).await?;
+            println!("notifications paused until {}", paused_until.to_rfc3339());
+        }
+        NotificationCommand::Resume => {
+            store.resume_notifications().await?;
+            println!("notifications resumed");
+        }
+        NotificationCommand::Status => {
+            let state = store.notification_pause_state().await?;
+            if let Some(paused_until) = state
+                .paused_until
+                .filter(|paused_until| *paused_until > Utc::now())
+            {
+                println!("notifications paused until {}", paused_until.to_rfc3339());
+            } else {
+                println!("notifications not paused");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_pause_duration(value: &str) -> Result<ChronoDuration> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("pause duration cannot be empty");
+    }
+    let (number, unit) = trimmed.split_at(
+        trimmed
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(trimmed.len()),
+    );
+    let amount: i64 = number
+        .parse()
+        .with_context(|| format!("invalid pause duration {value:?}"))?;
+    if amount <= 0 {
+        bail!("pause duration must be positive");
+    }
+    match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "m" | "min" | "mins" | "minute" | "minutes" => Ok(ChronoDuration::minutes(amount)),
+        "s" | "sec" | "secs" | "second" | "seconds" => Ok(ChronoDuration::seconds(amount)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Ok(ChronoDuration::hours(amount)),
+        _ => bail!("unsupported pause duration unit in {value:?}; use s, m, or h"),
+    }
 }
 
 fn build_account_provider_factory(
@@ -429,18 +554,8 @@ fn cleanup_paths(args: &Args) -> Vec<PathBuf> {
     }
     if args.whatsapp || !provider_flags_specified(args) {
         paths.push(args.whatsapp_db.clone());
-        paths.push(whatsapp_avatar_cache_path(&args.whatsapp_db));
-        paths.push(whatsapp_media_cache_path(&args.whatsapp_db));
     }
     paths
-}
-
-fn whatsapp_avatar_cache_path(db_path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.avatars", db_path.to_string_lossy()))
-}
-
-fn whatsapp_media_cache_path(db_path: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.media", db_path.to_string_lossy()))
 }
 
 fn cleanup_databases(paths: &[PathBuf]) -> Result<()> {
@@ -497,6 +612,7 @@ mod tests {
             log_file: None,
             db: None,
             test_cleanup: false,
+            command: None,
         }
     }
 
@@ -516,6 +632,22 @@ mod tests {
             display_name: Arc::from(format!("Slack ({workspace})")),
             config_json: serde_json::to_string(&options)?,
         })
+    }
+
+    #[test]
+    fn parse_pause_duration_accepts_seconds_minutes_and_hours() -> Result<()> {
+        assert_eq!(parse_pause_duration("90s")?, ChronoDuration::seconds(90));
+        assert_eq!(parse_pause_duration("25m")?, ChronoDuration::minutes(25));
+        assert_eq!(parse_pause_duration("1h")?, ChronoDuration::hours(1));
+        assert_eq!(parse_pause_duration("15")?, ChronoDuration::minutes(15));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_pause_duration_rejects_empty_non_positive_and_unknown_units() {
+        assert!(parse_pause_duration("").is_err());
+        assert!(parse_pause_duration("0m").is_err());
+        assert!(parse_pause_duration("25d").is_err());
     }
 
     #[test]
@@ -764,9 +896,7 @@ bot_token = "xoxb-ops"
             cleanup_paths(&args),
             vec![
                 PathBuf::from("/tmp/chat-cli-app-cleanup.sqlite"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.avatars"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.media")
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db")
             ]
         );
     }
@@ -785,9 +915,7 @@ bot_token = "xoxb-ops"
             cleanup_paths(&args),
             vec![
                 PathBuf::from("/tmp/chat-cli-app-cleanup.sqlite"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.avatars"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.media")
+                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db")
             ]
         );
     }
@@ -802,11 +930,7 @@ bot_token = "xoxb-ops"
 
         assert_eq!(
             cleanup_paths(&args),
-            vec![
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.avatars"),
-                PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db.media")
-            ]
+            vec![PathBuf::from("/tmp/chat-cli-whatsapp-cleanup.db")]
         );
     }
 
@@ -815,27 +939,17 @@ bot_token = "xoxb-ops"
         let dir = tempfile::tempdir()?;
         let app_db = dir.path().join("app.sqlite");
         let whatsapp_db = dir.path().join("whatsapp.db");
-        let avatar_dir = dir.path().join("whatsapp.db.avatars");
-        let media_dir = dir.path().join("whatsapp.db.media");
         fs::write(&app_db, b"app")?;
         fs::write(&whatsapp_db, b"whatsapp")?;
-        fs::create_dir(&avatar_dir)?;
-        fs::write(avatar_dir.join("avatar.jpg"), b"avatar")?;
-        fs::create_dir(&media_dir)?;
-        fs::write(media_dir.join("photo.jpg"), b"photo")?;
 
         cleanup_databases(&[
             app_db.clone(),
             whatsapp_db.clone(),
-            avatar_dir.clone(),
-            media_dir.clone(),
             dir.path().join("missing.db"),
         ])?;
 
         assert!(!app_db.exists());
         assert!(!whatsapp_db.exists());
-        assert!(!avatar_dir.exists());
-        assert!(!media_dir.exists());
         Ok(())
     }
 }

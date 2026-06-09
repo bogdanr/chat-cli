@@ -9,6 +9,7 @@
 - Preserve selection and scroll state when background work completes unless the user explicitly navigated elsewhere.
 - Add or update opt-in performance instrumentation for any new async pipeline or suspected slow path. Prefer labels that identify the phase and include counts, account/chat identifiers, and stale/error totals.
 - Treat performance logs as evidence. Do not optimize blindly; inspect the latest log and target the largest blocking label first.
+- Never read the entire `tmp/debug.log` or any large debug log into context. Check its size first, then inspect only targeted slices using bounded commands or focused searches.
 - Keep expensive image/media work on blocking worker threads, never on the async runtime hot path or terminal draw path.
 - Cache layout and preview work by stable keys that include dimensions and presentation mode. Invalidate caches deliberately when inputs change.
 - Tests for asynchronous UI work should assert both phases: immediate placeholder/loading state after input, then final state after draining background completions.

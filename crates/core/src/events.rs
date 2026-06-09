@@ -58,6 +58,11 @@ pub enum ProviderEvent {
     AuthSucceeded,
     SyncProgress(u8),
     SyncComplete,
+    AccountNotice {
+        title: Arc<str>,
+        body: Arc<str>,
+        severity: AccountNoticeSeverity,
+    },
     Disconnected(Option<Arc<str>>),
     Reconnecting,
     Typing {
@@ -69,6 +74,18 @@ pub enum ProviderEvent {
         direction: NetworkActivityDirection,
         kind: NetworkActivityKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AccountNoticeSeverity {
+    /// Informational notice. Surfaced in-app and follows the user's
+    /// notification mode preference for any desktop delivery.
+    #[default]
+    Info,
+    /// Critical account condition that undermines the app's core purpose
+    /// (for example, realtime messaging is unavailable). Always raises a
+    /// system notification so the user is aware even when away from the TUI.
+    SystemAlert,
 }
 
 #[derive(Clone, Debug)]

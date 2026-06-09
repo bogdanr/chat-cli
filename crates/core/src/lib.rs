@@ -4,7 +4,8 @@ pub mod provider;
 pub mod types;
 
 pub use events::{
-    AuthChallenge, EventBus, NetworkActivityDirection, NetworkActivityKind, ProviderEvent,
+    AccountNoticeSeverity, AuthChallenge, EventBus, NetworkActivityDirection, NetworkActivityKind,
+    ProviderEvent,
 };
 pub use mock::MockProvider;
 pub use provider::{AuthSubmission, AuthSubmissionMode, OutboundCapabilities, Provider};

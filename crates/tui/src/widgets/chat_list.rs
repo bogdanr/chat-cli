@@ -1,6 +1,7 @@
 use crate::{theme::Theme, widgets::message_list};
 use chat_core::{
-    Chat, ChatKind, ChatMembership, DiscoveryAction, DiscoveryResult, DiscoveryResultKind, Platform,
+    Account, Chat, ChatKind, ChatMembership, DiscoveryAction, DiscoveryResult, DiscoveryResultKind,
+    Platform, ProviderId,
 };
 use chrono::{Local, NaiveDateTime};
 use ratatui::{
@@ -20,6 +21,8 @@ const CHAT_RIGHT_PADDING: usize = 1;
 const SELECTED_CHAT_BG: Color = Color::Rgb(0, 48, 48);
 pub const CHAT_AVATAR_WIDTH: u16 = 4;
 pub const CHAT_AVATAR_ROWS: u16 = CHAT_ROW_HEIGHT;
+pub const ACCOUNT_BADGE_WIDTH: u16 = 2;
+pub const ACCOUNT_BADGE_ROWS: u16 = 1;
 pub type AvatarRows = Vec<Vec<Span<'static>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +43,7 @@ pub struct ChatListProps<'a> {
     pub focused: bool,
     pub layout: &'a ChatListLayout,
     pub avatar_rows: &'a HashMap<usize, AvatarRows>,
+    pub account_badge_rows: &'a HashMap<ProviderId, AvatarRows>,
     pub typing_previews: &'a HashMap<usize, String>,
     pub theme: Theme,
 }
@@ -73,6 +77,10 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
             ChatListRow::Chat { chat_index } => chat_item(
                 &props.chats[*chat_index],
                 props.avatar_rows.get(chat_index).map(Vec::as_slice),
+                props
+                    .account_badge_rows
+                    .get(&props.chats[*chat_index].account)
+                    .map(Vec::as_slice),
                 props.typing_previews.get(chat_index).map(String::as_str),
                 props.theme,
                 inner_width,
@@ -362,6 +370,53 @@ pub fn avatar_column_bounds(list_area: Rect) -> (u16, u16) {
     (start, start.saturating_add(CHAT_AVATAR_WIDTH))
 }
 
+pub fn account_badge_column_bounds(list_area: Rect) -> (u16, u16) {
+    let inner = inner_area(list_area);
+    let start = inner.x.saturating_add(CHAT_AVATAR_WIDTH).saturating_add(1);
+    (start, start.saturating_add(ACCOUNT_BADGE_WIDTH))
+}
+
+pub fn account_badge_chat_at(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    list_area: Rect,
+    column: u16,
+    row: u16,
+    inbox_style: ChatInboxStyle,
+) -> Option<usize> {
+    let (badge_start, badge_end) = account_badge_column_bounds(list_area);
+    if column < badge_start || column >= badge_end {
+        return None;
+    }
+
+    let inner = inner_area(list_area);
+    if !contains(inner, column, row) {
+        return None;
+    }
+
+    let rows = build_rows(chats, visible_chat_indices, inbox_style);
+    let offset = first_visible_row_offset(&rows, selected_chat_index, inner.height as usize);
+    let relative_row = row.saturating_sub(inner.y);
+    let mut y = 0;
+
+    for chat_row in rows.iter().skip(offset) {
+        let height = row_height(chat_row);
+        if relative_row < y + height {
+            return match chat_row {
+                ChatListRow::Chat { chat_index } => Some(*chat_index),
+                _ => None,
+            };
+        }
+        y += height;
+        if y >= inner.height {
+            break;
+        }
+    }
+
+    None
+}
+
 pub fn rendered_chat_indices(
     chats: &[Chat],
     visible_chat_indices: &[usize],
@@ -427,6 +482,7 @@ fn unread_marker(unread_count: u32) -> String {
 fn chat_item(
     chat: &Chat,
     avatar_rows: Option<&[Vec<Span<'static>>]>,
+    account_badge_rows: Option<&[Vec<Span<'static>>]>,
     typing_preview: Option<&str>,
     theme: Theme,
     row_width: usize,
@@ -466,12 +522,13 @@ fn chat_item(
     let timestamp_padding = meta_width.saturating_sub(UnicodeWidthStr::width(timestamp.as_str()));
     let unread_padding = meta_width.saturating_sub(UnicodeWidthStr::width(unread_marker.as_str()));
 
-    let first_prefix_width = CHAT_AVATAR_WIDTH as usize
-        + 1
-        + platform_badge(&chat.platform).len()
-        + pinned_marker.len()
-        + muted_marker.len()
-        + 1;
+    let first_badge_line = account_badge_rows.and_then(|rows| rows.first()).cloned();
+    let badge_width = first_badge_line
+        .as_ref()
+        .map(|line| spans_width(line))
+        .unwrap_or_else(|| platform_badge(&chat.platform).len());
+    let first_prefix_width =
+        CHAT_AVATAR_WIDTH as usize + 1 + badge_width + pinned_marker.len() + muted_marker.len() + 1;
     let name_budget = content_width.saturating_sub(first_prefix_width);
     let name = truncate_to_width(&chat.name, name_budget);
     let used_first_width = first_prefix_width + UnicodeWidthStr::width(name.as_str());
@@ -498,12 +555,16 @@ fn chat_item(
     ListItem::new(vec![
         Line::from({
             let mut spans = first_avatar_line;
-            spans.extend([
-                styled_raw(" ", selected_bg),
-                Span::styled(
+            spans.extend([styled_raw(" ", selected_bg)]);
+            if let Some(badge_line) = first_badge_line.clone() {
+                spans.extend(badge_line);
+            } else {
+                spans.extend([Span::styled(
                     platform_badge(&chat.platform),
                     style_with_optional_bg(platform_style(&chat.platform), selected_bg),
-                ),
+                )]);
+            }
+            spans.extend([
                 styled_raw(format!("{pinned_marker}{muted_marker} "), selected_bg),
                 Span::styled(name, style_with_optional_bg(name_style, selected_bg)),
                 styled_raw(" ".repeat(first_gap + timestamp_padding), selected_bg),
@@ -867,6 +928,68 @@ fn avatar_label(chat: &Chat) -> String {
     }
 }
 
+pub fn account_badge_placeholder(account: &Account, _theme: Theme) -> AvatarRows {
+    match account.platform {
+        Platform::WhatsApp => two_cell_icon(
+            Color::White,
+            Color::Rgb(37, 211, 102),
+            Color::Rgb(37, 211, 102),
+            Color::White,
+        ),
+        Platform::Slack => two_cell_icon(
+            Color::Rgb(46, 182, 125),
+            Color::Rgb(54, 197, 240),
+            Color::Rgb(236, 178, 46),
+            Color::Rgb(224, 30, 90),
+        ),
+        Platform::Discord => two_cell_icon(
+            Color::Rgb(88, 101, 242),
+            Color::Rgb(88, 101, 242),
+            Color::White,
+            Color::Rgb(88, 101, 242),
+        ),
+        Platform::Unknown(_) => {
+            let color = stable_badge_color(&account.id, &account.display_name);
+            two_cell_icon(color, color, color, color)
+        }
+    }
+}
+
+fn two_cell_icon(
+    top_left: Color,
+    bottom_left: Color,
+    top_right: Color,
+    bottom_right: Color,
+) -> AvatarRows {
+    vec![vec![
+        Span::styled("▀", Style::default().fg(top_left).bg(bottom_left)),
+        Span::styled("▀", Style::default().fg(top_right).bg(bottom_right)),
+    ]]
+}
+
+fn stable_badge_color(id: &str, display_name: &str) -> Color {
+    const PALETTE: [Color; 12] = [
+        Color::Rgb(97, 31, 105),
+        Color::Rgb(54, 88, 153),
+        Color::Rgb(18, 140, 126),
+        Color::Rgb(203, 75, 22),
+        Color::Rgb(133, 92, 197),
+        Color::Rgb(176, 48, 96),
+        Color::Rgb(42, 124, 111),
+        Color::Rgb(189, 95, 27),
+        Color::Rgb(80, 112, 60),
+        Color::Rgb(122, 85, 46),
+        Color::Rgb(48, 105, 152),
+        Color::Rgb(154, 68, 82),
+    ];
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in id.bytes().chain(display_name.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    PALETTE[(hash as usize) % PALETTE.len()]
+}
+
 fn avatar_placeholder(chat: &Chat, theme: Theme) -> [Vec<Span<'static>>; 2] {
     let label = avatar_label(chat);
     let tile_style = Style::default().fg(theme.foreground).bg(avatar_color(chat));
@@ -899,6 +1022,13 @@ fn styled_raw(
     bg: Option<Color>,
 ) -> Span<'static> {
     Span::styled(value, style_with_optional_bg(Style::default(), bg))
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 fn truncate_to_width(value: &str, max_width: usize) -> String {
@@ -1439,6 +1569,55 @@ mod tests {
     }
 
     #[test]
+    fn account_badge_hit_test_accepts_full_visible_chat_item() {
+        let mut chats = sample_chats();
+        let base = Utc::now();
+        for (index, chat) in chats.iter_mut().enumerate() {
+            chat.last_message_at = Some(base - Duration::minutes(index as i64));
+            chat.muted = false;
+        }
+        let area = Rect::new(0, 0, 40, 8);
+        let (badge_start, _) = account_badge_column_bounds(area);
+
+        assert_eq!(
+            account_badge_chat_at(
+                &chats,
+                &[0, 1, 2],
+                0,
+                area,
+                badge_start,
+                2,
+                ChatInboxStyle::ActivityFirst
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            account_badge_chat_at(
+                &chats,
+                &[0, 1, 2],
+                0,
+                area,
+                badge_start,
+                3,
+                ChatInboxStyle::ActivityFirst
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            account_badge_chat_at(
+                &chats,
+                &[0, 1, 2],
+                0,
+                area,
+                badge_start.saturating_sub(1),
+                2,
+                ChatInboxStyle::ActivityFirst
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn discovery_result_labels_make_destination_actions_clear() {
         let result = DiscoveryResult {
             account: arc_str("slack:test"),
@@ -1462,6 +1641,54 @@ mod tests {
             discovery_default_subtitle(&result),
             "Discoverable public channel; join before opening"
         );
+    }
+
+    #[test]
+    fn account_badge_placeholder_generates_whatsapp_icon_tile() {
+        let account = Account {
+            id: arc_str("whatsapp:bridge"),
+            platform: Platform::WhatsApp,
+            display_name: arc_str("WhatsApp"),
+            avatar: None,
+        };
+
+        let rows = account_badge_placeholder(&account, Theme::default());
+
+        assert_eq!(rows.len(), ACCOUNT_BADGE_ROWS as usize);
+        assert_eq!(rows[0].len(), ACCOUNT_BADGE_WIDTH as usize);
+        assert_eq!(
+            rows[0]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "▀▀"
+        );
+    }
+
+    #[test]
+    fn account_badge_placeholder_uses_slack_icon_colors() {
+        let account = Account {
+            id: arc_str("slack:workspace-1"),
+            platform: Platform::Slack,
+            display_name: arc_str("Slack (erepublik.com)"),
+            avatar: None,
+        };
+
+        let rows = account_badge_placeholder(&account, Theme::default());
+
+        assert_eq!(rows.len(), ACCOUNT_BADGE_ROWS as usize);
+        assert_eq!(rows[0].len(), ACCOUNT_BADGE_WIDTH as usize);
+        assert_eq!(
+            rows[0]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "▀▀"
+        );
+        assert_eq!(rows[0][0].style.fg, Some(Color::Rgb(46, 182, 125)));
+        assert_eq!(rows[0][0].style.bg, Some(Color::Rgb(54, 197, 240)));
+        assert_eq!(rows[0][1].style.fg, Some(Color::Rgb(236, 178, 46)));
+        assert_eq!(rows[0][1].style.bg, Some(Color::Rgb(224, 30, 90)));
     }
 
     fn sample_chats() -> Vec<Chat> {
