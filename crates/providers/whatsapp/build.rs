@@ -33,4 +33,14 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Security");
     }
+
+    // System libraries required by the Go runtime when linking a cgo
+    // c-archive on Windows (GNU toolchain).
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rustc-link-lib=ws2_32");
+        println!("cargo:rustc-link-lib=winmm");
+        println!("cargo:rustc-link-lib=ntdll");
+        println!("cargo:rustc-link-lib=userenv");
+    }
 }

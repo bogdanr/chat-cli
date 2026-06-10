@@ -145,3 +145,104 @@ jobs:
             dist/chat-cli-x86_64-linux-musl.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
+
+  macos-artifact:
+    name: macOS binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: aarch64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: crates/providers/whatsapp/go/go.sum
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-artifact-${{ matrix.arch }}
+
+      - name: Build release binary
+        run: cargo build --release -p chat-cli
+
+      - name: Package macOS binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist/chat-cli-${{ matrix.arch }}-macos
+          cp target/release/chat-cli dist/chat-cli-${{ matrix.arch }}-macos/chat-cli
+          tar -C dist -czf dist/chat-cli-${{ matrix.arch }}-macos.tar.gz chat-cli-${{ matrix.arch }}-macos
+          (cd dist && shasum -a 256 chat-cli-${{ matrix.arch }}-macos.tar.gz > SHA256SUMS)
+
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-cli-macos-${{ matrix.arch }}
+          path: |
+            dist/chat-cli-${{ matrix.arch }}-macos.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  windows-artifact:
+    name: Windows portable binary (x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          cache-dependency-path: crates/providers/whatsapp/go/go.sum
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-artifact
+
+      # The WhatsApp bridge is a cgo c-archive, which requires a GNU-compatible
+      # toolchain on Windows; the runner's preinstalled mingw-w64 gcc is used by
+      # both cgo and the x86_64-pc-windows-gnu Rust target.
+      - name: Build release binary
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: cargo build --release -p chat-cli --target x86_64-pc-windows-gnu
+
+      - name: Package Windows binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/chat-cli-x86_64-windows | Out-Null
+          Copy-Item target/x86_64-pc-windows-gnu/release/chat-cli.exe dist/chat-cli-x86_64-windows/chat-cli.exe
+          Compress-Archive -Path dist/chat-cli-x86_64-windows -DestinationPath dist/chat-cli-x86_64-windows.zip
+          $hash = (Get-FileHash -Algorithm SHA256 dist/chat-cli-x86_64-windows.zip).Hash.ToLower()
+          "$hash  chat-cli-x86_64-windows.zip" | Out-File -Encoding ascii dist/SHA256SUMS
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-cli-windows-x86_64
+          path: |
+            dist/chat-cli-x86_64-windows.zip
+            dist/SHA256SUMS
+          if-no-files-found: error

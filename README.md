@@ -10,7 +10,7 @@ WhatsApp and Slack in one tidy inbox — no browser tabs, no clutter, no waiting
 
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
-![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS-lightgrey)
+![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-lightgrey)
 
 </div>
 
