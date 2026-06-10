@@ -92,4 +92,35 @@ CREATE TABLE IF NOT EXISTS settings (
     value_json TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS avatar_thumbnail_cache (
+    cache_key     TEXT PRIMARY KEY,
+    source_kind   TEXT NOT NULL,
+    source_path   TEXT NOT NULL,
+    source_mtime  INTEGER,
+    source_size   INTEGER,
+    image_format  TEXT NOT NULL,
+    image_blob    BLOB NOT NULL,
+    blob_bytes    INTEGER NOT NULL,
+    cache_version INTEGER NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    last_accessed_at INTEGER NOT NULL,
+    error_json    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_avatar_thumbnail_cache_accessed
+    ON avatar_thumbnail_cache (last_accessed_at);
+
+-- Per-thread read state. Threads are identified by their thread_id (the root
+-- message id / Slack thread_ts). This is intentionally separate from
+-- chats.unread_count so thread unread can be tracked without disturbing
+-- chat-level activity ordering.
+CREATE TABLE IF NOT EXISTS thread_reads (
+    account_id           TEXT NOT NULL,
+    thread_id            TEXT NOT NULL,
+    unread_count         INTEGER NOT NULL DEFAULT 0,
+    last_read_at         INTEGER,
+    last_read_message_id TEXT,
+    PRIMARY KEY (account_id, thread_id)
+);
 "#;

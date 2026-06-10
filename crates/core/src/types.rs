@@ -5,9 +5,42 @@ use uuid::Uuid;
 pub type ProviderId = Arc<str>;
 pub type ChatId = Arc<str>;
 pub type MessageId = Arc<str>;
+pub type ThreadId = Arc<str>;
 pub type PersonId = Uuid;
 pub type PlatformId = Arc<str>;
 pub type Timestamp = DateTime<Utc>;
+
+/// Aggregated view of a single conversation thread, used to surface thread
+/// activity (reply counts, unread replies, participants) in the sidebar, the
+/// timeline summary line, and the dedicated Threads inbox view.
+///
+/// A thread is identified by its [`ThreadId`] (the root message id / Slack
+/// `thread_ts`). The `root_id` is the id of the thread's first message; replies
+/// are all messages sharing the `thread_id` whose id differs from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSummary {
+    pub account: ProviderId,
+    pub chat_id: ChatId,
+    pub thread_id: ThreadId,
+    pub root_id: MessageId,
+    /// Preview text of the thread's root message, when available.
+    pub root_preview: Option<Arc<str>>,
+    /// Number of replies in the thread (excludes the root message).
+    pub reply_count: u32,
+    /// Replies the user has not yet seen (excludes the user's own replies).
+    pub unread_reply_count: u32,
+    /// Timestamp of the most recent reply, when the thread has any.
+    pub last_reply_at: Option<Timestamp>,
+    /// Distinct display names of reply authors, ordered by first appearance.
+    pub participants: Vec<Arc<str>>,
+}
+
+impl ThreadSummary {
+    /// Whether the thread has replies the user has not yet seen.
+    pub fn has_unread(&self) -> bool {
+        self.unread_reply_count > 0
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Platform {

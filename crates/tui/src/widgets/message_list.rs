@@ -19,6 +19,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MEDIA_PREVIEW_MAX_WIDTH: u16 = 48;
 const MEDIA_PREVIEW_ROWS: u16 = 8;
+const ROUNDED_THUMBNAIL_CORNER_RADIUS_RATIO: f32 = 10.0 / 32.0;
+const ROUNDED_THUMBNAIL_MASK_SAMPLES: u32 = 4;
 const LINK_PREVIEW_CARD_WIDTH: u16 = 42;
 const LINK_PREVIEW_THUMBNAIL_ROWS: u16 = 4;
 /// Width (in terminal cells) of a single image thumbnail when laying inline
@@ -74,7 +76,10 @@ pub struct MediaHit {
     pub end_line: usize,
     pub start_col: u16,
     pub end_col: u16,
+    pub preview_start_col: u16,
+    pub preview_end_col: u16,
     pub path: PathBuf,
+    pub preview_path: PathBuf,
     pub title: String,
     pub caption: Option<String>,
 }
@@ -93,6 +98,7 @@ pub struct MessageHit {
     pub message_id: Arc<str>,
     pub line_hits: Vec<MessageLineHit>,
     pub avatar_hit: Option<MessageLineHit>,
+    pub avatar_path: Option<PathBuf>,
     pub thread_summary_hit: Option<MessageLineHit>,
 }
 
@@ -171,6 +177,69 @@ pub struct MessageListRender {
     pub media_preview_requests: Vec<MediaPreviewRequest>,
 }
 
+pub struct ThreadMessageCardRender {
+    pub lines: Vec<Line<'static>>,
+    pub link_preview_requests: Vec<LinkPreviewRequest>,
+    pub media_preview_requests: Vec<MediaPreviewRequest>,
+}
+
+pub fn thread_message_card_content_line_count(
+    message: &Message,
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+) -> usize {
+    content_lines_len(
+        &message.content,
+        content_width,
+        link_metadata,
+        ConversationPresentation::Flat,
+    )
+}
+
+pub fn build_thread_message_card_lines(
+    message: &Message,
+    content_width: u16,
+    media_cache: &mut MediaPreviewCache,
+    link_metadata: &LinkMetadataCache,
+    theme: Theme,
+) -> ThreadMessageCardRender {
+    let mut media_hits = Vec::new();
+    let mut link_preview_requests = Vec::new();
+    let mut media_preview_requests = Vec::new();
+    let reply_previews = HashMap::new();
+    let thread_summaries = HashMap::new();
+    let thread_unread = HashMap::new();
+    let mut context = MessageRenderContext {
+        media_cache,
+        content_width,
+        media_hits: &mut media_hits,
+        theme,
+        previous_sender: None,
+        reply_previews: &reply_previews,
+        thread_summaries: &thread_summaries,
+        thread_unread: &thread_unread,
+        link_metadata,
+        link_preview_requests: &mut link_preview_requests,
+        media_preview_requests: &mut media_preview_requests,
+        presentation: ConversationPresentation::Flat,
+    };
+
+    let lines = content_lines(
+        &message.content,
+        &mut context,
+        0,
+        false,
+        bubble_accent(theme, message.is_from_me, false),
+        Some(&message.id),
+    );
+
+    ThreadMessageCardRender {
+        lines,
+        link_preview_requests,
+        media_preview_requests,
+    }
+}
+
 pub fn render_message_list(frame: &mut Frame<'_>, area: Rect, props: MessageListProps<'_>) {
     frame.render_widget(Clear, area);
     let viewport_rows = inner_area(area).height as usize;
@@ -215,6 +284,7 @@ pub fn build_message_lines(
     viewport_rows: usize,
     selected_message_id: Option<&str>,
     unread_message_ids: &HashSet<Arc<str>>,
+    thread_unread: &HashMap<MessageId, u32>,
     media_cache: &mut MediaPreviewCache,
     link_metadata: &LinkMetadataCache,
     theme: Theme,
@@ -226,6 +296,7 @@ pub fn build_message_lines(
         viewport_rows,
         selected_message_id,
         unread_message_ids,
+        thread_unread,
         media_cache,
         link_metadata,
         theme,
@@ -241,6 +312,7 @@ pub fn build_message_lines_with_cache(
     viewport_rows: usize,
     selected_message_id: Option<&str>,
     unread_message_ids: &HashSet<Arc<str>>,
+    thread_unread: &HashMap<MessageId, u32>,
     media_cache: &mut MediaPreviewCache,
     link_metadata: &LinkMetadataCache,
     link_metadata_revision: u64,
@@ -272,6 +344,7 @@ pub fn build_message_lines_with_cache(
         viewport_rows,
         selected_message_id,
         unread_message_ids,
+        thread_unread,
         media_cache,
         link_metadata,
         cache,
@@ -288,6 +361,7 @@ pub fn build_message_lines_with_presentation(
     viewport_rows: usize,
     selected_message_id: Option<&str>,
     unread_message_ids: &HashSet<Arc<str>>,
+    thread_unread: &HashMap<MessageId, u32>,
     media_cache: &mut MediaPreviewCache,
     link_metadata: &LinkMetadataCache,
     theme: Theme,
@@ -324,6 +398,7 @@ pub fn build_message_lines_with_presentation(
         previous_sender: None,
         reply_previews: &reply_previews,
         thread_summaries: &thread_summaries,
+        thread_unread,
         link_metadata,
         link_preview_requests: &mut link_preview_requests,
         media_preview_requests: &mut media_preview_requests,
@@ -380,11 +455,15 @@ pub fn build_message_lines_with_presentation(
             grouped,
             presentation,
         );
+        let avatar_path = avatar_hit
+            .as_ref()
+            .and_then(|_| message.sender.avatar.clone())
+            .filter(|path| path.exists());
         let thread_summary_hit = message_thread_summary_hit(
             &message_lines,
             message_start,
             content_width,
-            context.thread_summaries.get(&message.id).is_some(),
+            context.thread_summaries.contains_key(&message.id),
         );
         let end_line = message_start + message_lines.len().saturating_sub(1);
         if end_line >= message_start {
@@ -394,6 +473,7 @@ pub fn build_message_lines_with_presentation(
                 message_id: message.id.clone(),
                 line_hits,
                 avatar_hit,
+                avatar_path,
                 thread_summary_hit,
             });
         }
@@ -468,6 +548,7 @@ fn build_message_lines_from_layout_cache(
     viewport_rows: usize,
     selected_message_id: Option<&str>,
     unread_message_ids: &HashSet<Arc<str>>,
+    thread_unread: &HashMap<MessageId, u32>,
     media_cache: &mut MediaPreviewCache,
     link_metadata: &LinkMetadataCache,
     cache: &mut MessageLayoutCache,
@@ -493,6 +574,7 @@ fn build_message_lines_from_layout_cache(
         previous_sender: None,
         reply_previews: &cache.reply_previews,
         thread_summaries: &cache.thread_summaries,
+        thread_unread,
         link_metadata,
         link_preview_requests: &mut link_preview_requests,
         media_preview_requests: &mut media_preview_requests,
@@ -543,11 +625,15 @@ fn build_message_lines_from_layout_cache(
             entry.grouped,
             presentation,
         );
+        let avatar_path = avatar_hit
+            .as_ref()
+            .and_then(|_| message.sender.avatar.clone())
+            .filter(|path| path.exists());
         let thread_summary_hit = message_thread_summary_hit(
             &message_lines,
             message_start,
             content_width,
-            context.thread_summaries.get(&message.id).is_some(),
+            cache.thread_summaries.contains_key(&message.id),
         );
         let end_line = message_start + message_lines.len().saturating_sub(1);
         if end_line >= message_start {
@@ -557,6 +643,7 @@ fn build_message_lines_from_layout_cache(
                 message_id: message.id.clone(),
                 line_hits,
                 avatar_hit,
+                avatar_path,
                 thread_summary_hit,
             });
         }
@@ -944,6 +1031,35 @@ pub fn decode_image_preview_rows_for_key(
     decode_image_preview_rows(&key.path, key.width, key.rows)
 }
 
+pub fn image_preview_rows_from_rgba(
+    image: &image::RgbaImage,
+    width: u16,
+    rows: u16,
+) -> Vec<Vec<Span<'static>>> {
+    let (fit_width, fit_rows) =
+        fit_halfblock_cell_size(image.width(), image.height(), width.max(1), rows.max(1));
+    let mut resized = image::DynamicImage::ImageRgba8(image.clone())
+        .resize_exact(
+            u32::from(fit_width.max(1)),
+            u32::from(fit_rows.max(1)) * 2,
+            FilterType::Triangle,
+        )
+        .to_rgba8();
+    apply_rounded_thumbnail_mask(&mut resized);
+    preview_rows_from_resized_rgba(&resized, fit_width, fit_rows, width.max(1), rows.max(1))
+}
+
+pub fn image_preview_rows_from_bytes(
+    bytes: &[u8],
+    width: u16,
+    rows: u16,
+) -> Result<Vec<Vec<Span<'static>>>, String> {
+    let image = image::load_from_memory(bytes)
+        .map_err(|error| format!("decoding cached avatar thumbnail: {error}"))?
+        .to_rgba8();
+    Ok(image_preview_rows_from_rgba(&image, width, rows))
+}
+
 pub fn image_cell_size(path: &Path, max_width: u16, max_rows: u16) -> Result<(u16, u16), String> {
     let reader = image::ImageReader::open(path)
         .map_err(|error| format!("opening {}: {error}", path.display()))?
@@ -1024,6 +1140,9 @@ struct MessageRenderContext<'a> {
     previous_sender: Option<Arc<str>>,
     reply_previews: &'a HashMap<Arc<str>, String>,
     thread_summaries: &'a HashMap<MessageId, ThreadSummary>,
+    /// Per-thread unread reply counts keyed by thread root message id. Applied
+    /// at render time (not cached) so marking a thread read clears its badge.
+    thread_unread: &'a HashMap<MessageId, u32>,
     link_metadata: &'a LinkMetadataCache,
     link_preview_requests: &'a mut Vec<LinkPreviewRequest>,
     media_preview_requests: &'a mut Vec<MediaPreviewRequest>,
@@ -1112,7 +1231,13 @@ fn message_lines(
     }
 
     if let Some(summary) = context.thread_summaries.get(&message.id) {
-        lines.push(thread_summary_line(summary, message.is_from_me, context));
+        let unread = context.thread_unread.get(&message.id).copied().unwrap_or(0) as usize;
+        lines.push(thread_summary_line(
+            summary,
+            message.is_from_me,
+            unread,
+            context,
+        ));
     }
 
     for line in &mut lines {
@@ -1209,7 +1334,8 @@ fn slack_message_lines(
     }
 
     if let Some(summary) = context.thread_summaries.get(&message.id) {
-        let summary_spans = thread_summary_spans(summary, context);
+        let unread = context.thread_unread.get(&message.id).copied().unwrap_or(0) as usize;
+        let summary_spans = thread_summary_spans(summary, unread, context);
         lines.push(slack_indented_line(summary_spans));
     }
 
@@ -1288,8 +1414,11 @@ fn slack_content_lines(
     );
     context.content_width = original_width;
     for hit in &mut context.media_hits[media_hit_start..] {
-        hit.start_col = hit.start_col.saturating_add(SLACK_BODY_INDENT_WIDTH as u16);
-        hit.end_col = hit.end_col.saturating_add(SLACK_BODY_INDENT_WIDTH as u16);
+        let offset = SLACK_BODY_INDENT_WIDTH as u16;
+        hit.start_col = hit.start_col.saturating_add(offset);
+        hit.end_col = hit.end_col.saturating_add(offset);
+        hit.preview_start_col = hit.preview_start_col.saturating_add(offset);
+        hit.preview_end_col = hit.preview_end_col.saturating_add(offset);
     }
     lines
 }
@@ -1444,18 +1573,17 @@ fn text_with_link_preview_lines(
     is_from_me: bool,
     message_id: Option<&Arc<str>>,
 ) -> Vec<Line<'static>> {
-    let Some(url) = first_url_in_text(text) else {
+    let Some(detected_url) = first_url_in_text(text) else {
         return text_content_lines(text, context.content_width, accent, context.presentation);
     };
 
-    let url = Arc::<str>::from(url);
-    let metadata = context.link_metadata.get(&url);
+    let metadata = context.link_metadata.get(detected_url.url);
     if metadata.is_none()
         && let Some(message_id) = message_id
     {
         context.link_preview_requests.push(LinkPreviewRequest {
             message_id: message_id.clone(),
-            url,
+            url: Arc::<str>::from(detected_url.url),
         });
         return text_content_lines(text, context.content_width, accent, context.presentation);
     }
@@ -1493,7 +1621,7 @@ fn text_with_link_preview_lines(
         lines.extend(image_lines);
     } else {
         let link = chat_core::LinkPreview {
-            url,
+            url: Arc::<str>::from(detected_url.url),
             title: metadata.title.clone(),
             description: metadata.description.clone(),
             image: None,
@@ -1509,18 +1637,65 @@ fn text_with_link_preview_lines(
     lines
 }
 
-fn first_url_in_text(text: &str) -> Option<&str> {
-    text.split_whitespace()
-        .find(|part| part.starts_with("https://") || part.starts_with("http://"))
-        .map(|part| part.trim_end_matches(['.', ',', ')', ']', '}']))
-        .filter(|url| !url.is_empty())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UrlInText<'a> {
+    token: &'a str,
+    url: &'a str,
+}
+
+fn first_url_in_text(text: &str) -> Option<UrlInText<'_>> {
+    slack_url_in_text(text).or_else(|| text.split_whitespace().find_map(url_in_token))
+}
+
+fn slack_url_in_text(text: &str) -> Option<UrlInText<'_>> {
+    let mut search_start = 0;
+    while let Some(relative_start) = text[search_start..].find('<') {
+        let start = search_start + relative_start;
+        let inner_start = start + 1;
+        let Some(relative_end) = text[inner_start..].find('>') else {
+            break;
+        };
+        let end = inner_start + relative_end;
+        let token = &text[start..=end];
+        let inner = &text[inner_start..end];
+        let url = inner
+            .split_once('|')
+            .map(|(url, _label)| url)
+            .unwrap_or(inner)
+            .trim();
+
+        if url.starts_with("https://") || url.starts_with("http://") {
+            return Some(UrlInText { token, url });
+        }
+        search_start = end + 1;
+    }
+    None
+}
+
+fn url_in_token(token: &str) -> Option<UrlInText<'_>> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    let candidate = token
+        .trim_start_matches(['<', '(', '[', '{'])
+        .trim_end_matches(['.', ',', ')', ']', '}', '>']);
+    let url = candidate
+        .split_once('|')
+        .map(|(url, _label)| url)
+        .unwrap_or(candidate);
+
+    (url.starts_with("https://") || url.starts_with("http://"))
+        .then_some(UrlInText { token, url })
+        .filter(|detected| !detected.url.is_empty())
 }
 
 fn remove_first_url_from_text(text: &str) -> String {
-    let Some(url) = first_url_in_text(text) else {
+    let Some(detected_url) = first_url_in_text(text) else {
         return text.trim().to_owned();
     };
-    text.replacen(url, "", 1)
+    text.replacen(detected_url.token, "", 1)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -1680,23 +1855,24 @@ fn inline_image_grid_lines(
                 .as_ref()
                 .or(card.thumbnail.as_ref())
                 .expect("inline image card always has an image");
-            let (preview_rows, source, error, ready) = media_preview_rows(
+            let (preview_rows, source, error, _ready) = media_preview_rows(
                 image,
                 context,
                 column_width,
                 LINK_PREVIEW_THUMBNAIL_ROWS,
                 preview_color,
             );
-            if let (Some(path), None) = (&source, &error)
-                && ready
-            {
+            if let (Some(preview_path), None) = (&source, &error) {
                 let start_col = column_index * (column_width as usize + gap);
                 context.media_hits.push(MediaHit {
                     start_line: row_base,
                     end_line: row_base + preview_rows.len().saturating_sub(1),
                     start_col: start_col as u16,
                     end_col: (start_col + column_width as usize) as u16,
-                    path: path.clone(),
+                    preview_start_col: start_col as u16,
+                    preview_end_col: (start_col + column_width as usize) as u16,
+                    path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
+                    preview_path: preview_path.clone(),
                     title: card
                         .title
                         .as_deref()
@@ -1765,16 +1941,14 @@ fn flat_card_lines(
     let mut lines = Vec::new();
 
     if let Some(image) = card.image.as_ref().or(card.thumbnail.as_ref()) {
-        let (preview_rows, source, error, ready) = media_preview_rows(
+        let (preview_rows, source, error, _ready) = media_preview_rows(
             image,
             context,
             card_width,
             LINK_PREVIEW_THUMBNAIL_ROWS,
             accent.fg.unwrap_or(Color::DarkGray),
         );
-        if let (Some(path), None) = (&source, &error)
-            && ready
-        {
+        if let (Some(preview_path), None) = (&source, &error) {
             context.media_hits.push(MediaHit {
                 start_line: start_line + lines.len(),
                 end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
@@ -1786,7 +1960,16 @@ fn flat_card_lines(
                     0
                 },
                 end_col: context.content_width,
-                path: path.clone(),
+                preview_start_col: if is_from_me {
+                    context
+                        .content_width
+                        .saturating_sub(card_width.saturating_add(4))
+                } else {
+                    0
+                },
+                preview_end_col: context.content_width,
+                path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
+                preview_path: preview_path.clone(),
                 title: card
                     .title
                     .as_deref()
@@ -1882,16 +2065,14 @@ fn generic_card_lines(
     let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
 
     if let Some(image) = card.image.as_ref().or(card.thumbnail.as_ref()) {
-        let (preview_rows, source, error, ready) = media_preview_rows(
+        let (preview_rows, source, error, _ready) = media_preview_rows(
             image,
             context,
             card_width,
             LINK_PREVIEW_THUMBNAIL_ROWS,
             accent.fg.unwrap_or(Color::DarkGray),
         );
-        if let (Some(path), None) = (&source, &error)
-            && ready
-        {
+        if let (Some(preview_path), None) = (&source, &error) {
             let hit_width = card_width.saturating_add(4).min(context.content_width);
             let start_col = if is_from_me {
                 context.content_width.saturating_sub(hit_width)
@@ -1903,7 +2084,10 @@ fn generic_card_lines(
                 end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
                 start_col,
                 end_col: start_col.saturating_add(hit_width),
-                path: path.clone(),
+                preview_start_col: start_col.saturating_add(2),
+                preview_end_col: start_col.saturating_add(2).saturating_add(card_width),
+                path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
+                preview_path: preview_path.clone(),
                 title: card
                     .title
                     .as_deref()
@@ -2054,7 +2238,7 @@ fn link_preview_card_lines(
     let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
 
     if let Some(image) = &link.image {
-        let (preview_rows, source, error, ready) = media_preview_rows(
+        let (preview_rows, source, error, _ready) = media_preview_rows(
             image,
             context,
             card_width,
@@ -2062,9 +2246,7 @@ fn link_preview_card_lines(
             accent.fg.unwrap_or(Color::DarkGray),
         );
 
-        if let (Some(path), None) = (&source, &error)
-            && ready
-        {
+        if let (Some(preview_path), None) = (&source, &error) {
             let hit_width = card_width.saturating_add(4).min(context.content_width);
             let start_col = if is_from_me {
                 context.content_width.saturating_sub(hit_width)
@@ -2076,7 +2258,10 @@ fn link_preview_card_lines(
                 end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
                 start_col,
                 end_col: start_col.saturating_add(hit_width),
-                path: path.clone(),
+                preview_start_col: start_col.saturating_add(2),
+                preview_end_col: start_col.saturating_add(2).saturating_add(card_width),
+                path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
+                preview_path: preview_path.clone(),
                 title: clean_link_preview_text(link.title.as_deref())
                     .unwrap_or_else(|| "Link preview image".to_owned()),
                 caption: clean_link_preview_text(link.description.as_deref()),
@@ -2129,7 +2314,7 @@ fn flat_link_preview_card_lines(
     let mut lines = Vec::new();
 
     if let Some(image) = &link.image {
-        let (preview_rows, source, error, ready) = media_preview_rows(
+        let (preview_rows, source, error, _ready) = media_preview_rows(
             image,
             context,
             card_width,
@@ -2137,15 +2322,16 @@ fn flat_link_preview_card_lines(
             accent.fg.unwrap_or(Color::DarkGray),
         );
 
-        if let (Some(path), None) = (&source, &error)
-            && ready
-        {
+        if let (Some(preview_path), None) = (&source, &error) {
             context.media_hits.push(MediaHit {
                 start_line: start_line + lines.len(),
                 end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
                 start_col: 0,
                 end_col: card_width,
-                path: path.clone(),
+                preview_start_col: 0,
+                preview_end_col: card_width,
+                path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
+                preview_path: preview_path.clone(),
                 title: clean_link_preview_text(link.title.as_deref())
                     .unwrap_or_else(|| "Link preview image".to_owned()),
                 caption: clean_link_preview_text(link.description.as_deref()),
@@ -2307,7 +2493,10 @@ fn link_image_card_lines(
         MEDIA_PREVIEW_ROWS,
         accent.fg.unwrap_or(Color::DarkGray),
     );
-    let path = source.filter(|_| error.is_none() && ready)?;
+    if !ready {
+        return None;
+    }
+    let preview_path = source.filter(|_| error.is_none())?;
     let mut lines = vec![
         card_border_line('╭', '─', '╮', card_width, accent),
         card_text_line(
@@ -2329,7 +2518,10 @@ fn link_image_card_lines(
         end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
         start_col,
         end_col: start_col.saturating_add(hit_width),
-        path,
+        preview_start_col: start_col.saturating_add(2),
+        preview_end_col: start_col.saturating_add(2).saturating_add(card_width),
+        path: media_open_source(media).unwrap_or_else(|| preview_path.clone()),
+        preview_path,
         title: media.file_name.to_string(),
         caption: media.caption.as_deref().map(str::to_owned),
     });
@@ -2373,9 +2565,9 @@ fn media_card_lines(
     // Visual media (photos, stickers) speak for themselves: skip the label and
     // filename rows and shrink the card so the border hugs the image's form
     // factor. Other media (files, voice notes) keep the descriptive rows.
-    let (preview_rows, card_width, source, error, ready) = if visual {
+    let (preview_rows, card_width, source, error, _ready) = if visual {
         let max_width = media_card_width(context.content_width);
-        let (rows, source, error, ready) = media_preview_rows(
+        let (rows, source, error, _ready) = media_preview_rows(
             media,
             context,
             max_width,
@@ -2393,18 +2585,18 @@ fn media_card_lines(
             .map(|caption| UnicodeWidthStr::width(caption) as u16)
             .unwrap_or_default();
         let card_width = image_width.max(caption_width).max(1).min(max_width);
-        (trimmed, card_width, source, error, ready)
+        (trimmed, card_width, source, error, _ready)
     } else {
         let card_width =
             media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
-        let (rows, source, error, ready) = media_preview_rows(
+        let (rows, source, error, _ready) = media_preview_rows(
             media,
             context,
             card_width,
             MEDIA_PREVIEW_ROWS,
             accent.fg.unwrap_or(Color::DarkGray),
         );
-        (rows, card_width, source, error, ready)
+        (rows, card_width, source, error, _ready)
     };
 
     let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
@@ -2417,9 +2609,7 @@ fn media_card_lines(
         ));
     }
 
-    if let (Some(path), None) = (&source, &error)
-        && ready
-    {
+    if let (Some(preview_path), None) = (&source, &error) {
         let hit_width = card_width.saturating_add(4).min(context.content_width);
         let start_col = if is_from_me {
             context.content_width.saturating_sub(hit_width)
@@ -2431,7 +2621,10 @@ fn media_card_lines(
             end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
             start_col,
             end_col: start_col.saturating_add(hit_width),
-            path: path.clone(),
+            preview_start_col: start_col.saturating_add(2),
+            preview_end_col: start_col.saturating_add(2).saturating_add(card_width),
+            path: media_open_source(media).unwrap_or_else(|| preview_path.clone()),
+            preview_path: preview_path.clone(),
             title: media.file_name.to_string(),
             caption: caption.map(str::to_owned),
         });
@@ -2527,7 +2720,7 @@ fn flat_media_card_lines(
     let card_width =
         media_card_width_for_media(media, context.content_width, MEDIA_PREVIEW_ROWS, label);
     let accent = media_card_accent(accent);
-    let (preview_rows, source, error, ready) = media_preview_rows(
+    let (preview_rows, source, error, _ready) = media_preview_rows(
         media,
         context,
         card_width,
@@ -2541,15 +2734,16 @@ fn flat_media_card_lines(
         Style::default().add_modifier(Modifier::BOLD),
     )];
 
-    if let (Some(path), None) = (&source, &error)
-        && ready
-    {
+    if let (Some(preview_path), None) = (&source, &error) {
         context.media_hits.push(MediaHit {
             start_line: start_line + lines.len(),
             end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
             start_col: 0,
             end_col: card_width,
-            path: path.clone(),
+            preview_start_col: 0,
+            preview_end_col: card_width,
+            path: media_open_source(media).unwrap_or_else(|| preview_path.clone()),
+            preview_path: preview_path.clone(),
             title: media.file_name.to_string(),
             caption: visible_media_caption(media).map(str::to_owned),
         });
@@ -2632,7 +2826,7 @@ fn media_preview_rows(
     }
 }
 
-fn media_preview_source(media: &chat_core::Media) -> Option<PathBuf> {
+fn media_open_source(media: &chat_core::Media) -> Option<PathBuf> {
     media
         .local_path
         .as_ref()
@@ -2643,6 +2837,22 @@ fn media_preview_source(media: &chat_core::Media) -> Option<PathBuf> {
             media
                 .thumbnail
                 .as_ref()
+                .filter(|path| path.exists())
+                .cloned()
+        })
+}
+
+fn media_preview_source(media: &chat_core::Media) -> Option<PathBuf> {
+    media
+        .thumbnail
+        .as_ref()
+        .filter(|path| path.exists())
+        .cloned()
+        .or_else(|| {
+            media
+                .local_path
+                .as_ref()
+                .filter(|path| is_supported_image(media, path))
                 .filter(|path| path.exists())
                 .cloned()
         })
@@ -2674,13 +2884,97 @@ fn decode_image_preview_rows(
         .map_err(|error| format!("decoding {}: {error}", path.display()))?;
     let (fit_width, fit_rows) =
         fit_halfblock_cell_size(image.width(), image.height(), width.max(1), rows.max(1));
-    let resized = image
+    let mut resized = image
         .resize_exact(
             u32::from(fit_width.max(1)),
             u32::from(fit_rows.max(1)) * 2,
             FilterType::Triangle,
         )
         .to_rgba8();
+    apply_rounded_thumbnail_mask(&mut resized);
+    Ok(preview_rows_from_resized_rgba(
+        &resized, fit_width, fit_rows, width, rows,
+    ))
+}
+
+pub fn apply_rounded_thumbnail_mask(image: &mut image::RgbaImage) {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let radius = rounded_thumbnail_corner_radius(width, height);
+    if radius <= 0.0 {
+        return;
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let coverage = rounded_rect_pixel_coverage(x, y, width, height, radius);
+            if coverage >= 1.0 {
+                continue;
+            }
+
+            let pixel = image.get_pixel_mut(x, y);
+            pixel.0[3] = (f32::from(pixel.0[3]) * coverage).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+fn rounded_thumbnail_corner_radius(width: u32, height: u32) -> f32 {
+    let shortest_side = width.min(height) as f32;
+    (shortest_side * ROUNDED_THUMBNAIL_CORNER_RADIUS_RATIO).clamp(1.0, shortest_side / 2.0)
+}
+
+fn rounded_rect_pixel_coverage(x: u32, y: u32, width: u32, height: u32, radius: f32) -> f32 {
+    let samples = ROUNDED_THUMBNAIL_MASK_SAMPLES;
+    let mut covered = 0_u32;
+    let width = width as f32;
+    let height = height as f32;
+
+    for sample_y in 0..samples {
+        for sample_x in 0..samples {
+            let px = x as f32 + (sample_x as f32 + 0.5) / samples as f32;
+            let py = y as f32 + (sample_y as f32 + 0.5) / samples as f32;
+            if point_inside_rounded_rect(px, py, width, height, radius) {
+                covered += 1;
+            }
+        }
+    }
+
+    covered as f32 / (samples * samples) as f32
+}
+
+fn point_inside_rounded_rect(x: f32, y: f32, width: f32, height: f32, radius: f32) -> bool {
+    let left = radius.min(width / 2.0);
+    let right = (width - radius).max(left);
+    let top = radius.min(height / 2.0);
+    let bottom = (height - radius).max(top);
+    let dx = if x < left {
+        left - x
+    } else if x > right {
+        x - right
+    } else {
+        0.0
+    };
+    let dy = if y < top {
+        top - y
+    } else if y > bottom {
+        y - bottom
+    } else {
+        0.0
+    };
+    dx.mul_add(dx, dy * dy) <= radius * radius
+}
+
+fn preview_rows_from_resized_rgba(
+    resized: &image::RgbaImage,
+    fit_width: u16,
+    fit_rows: u16,
+    width: u16,
+    rows: u16,
+) -> Vec<Vec<Span<'static>>> {
     let top_padding = rows.saturating_sub(fit_rows) / 2;
     let bottom_padding = rows.saturating_sub(fit_rows).saturating_sub(top_padding);
 
@@ -2696,12 +2990,7 @@ fn decode_image_preview_rows(
             let x = u32::from(column);
             let top = resized.get_pixel(x, top_y);
             let bottom = resized.get_pixel(x, bottom_y);
-            spans.push(Span::styled(
-                "▀",
-                Style::default()
-                    .fg(rgba_to_color(top.0))
-                    .bg(rgba_to_color(bottom.0)),
-            ));
+            spans.push(halfblock_span(top.0, bottom.0));
         }
         rendered_rows.push(pad_preview_row(spans, fit_width, width));
     }
@@ -2709,7 +2998,7 @@ fn decode_image_preview_rows(
         rendered_rows.push(empty_preview_row(width));
     }
 
-    Ok(rendered_rows)
+    rendered_rows
 }
 
 fn fit_halfblock_cell_size(
@@ -3255,6 +3544,26 @@ fn fit_cell_text(text: &str, width: u16) -> String {
     value
 }
 
+fn halfblock_span(top: [u8; 4], bottom: [u8; 4]) -> Span<'static> {
+    match (top[3] == 0, bottom[3] == 0) {
+        (true, true) => Span::raw(" "),
+        (true, false) => Span::styled(
+            "▄",
+            Style::default().fg(rgba_to_color(bottom)).bg(Color::Reset),
+        ),
+        (false, true) => Span::styled(
+            "▀",
+            Style::default().fg(rgba_to_color(top)).bg(Color::Reset),
+        ),
+        (false, false) => Span::styled(
+            "▀",
+            Style::default()
+                .fg(rgba_to_color(top))
+                .bg(rgba_to_color(bottom)),
+        ),
+    }
+}
+
 fn rgba_to_color([red, green, blue, alpha]: [u8; 4]) -> Color {
     match alpha {
         0 => Color::Reset,
@@ -3474,6 +3783,7 @@ fn is_slack_thread_reply(message: &Message) -> bool {
 fn thread_summary_line(
     summary: &ThreadSummary,
     is_from_me: bool,
+    unread_reply_count: usize,
     context: &mut MessageRenderContext<'_>,
 ) -> Line<'static> {
     let mut spans = Vec::new();
@@ -3481,7 +3791,7 @@ fn thread_summary_line(
         spans.push(Span::raw("  "));
     }
 
-    spans.extend(thread_summary_spans(summary, context));
+    spans.extend(thread_summary_spans(summary, unread_reply_count, context));
 
     if is_from_me {
         spans.push(Span::raw("  "));
@@ -3491,6 +3801,7 @@ fn thread_summary_line(
 
 fn thread_summary_spans(
     summary: &ThreadSummary,
+    unread_reply_count: usize,
     context: &mut MessageRenderContext<'_>,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -3502,6 +3813,12 @@ fn thread_summary_spans(
         reply_count_text(summary.reply_count),
         context.theme.status_key().add_modifier(Modifier::BOLD),
     ));
+    if unread_reply_count > 0 {
+        spans.push(Span::styled(
+            format!(" · {unread_reply_count} new"),
+            context.theme.unread().add_modifier(Modifier::BOLD),
+        ));
+    }
     spans.push(Span::styled(
         format!(
             " · Last reply {}",
@@ -3812,10 +4129,10 @@ fn text_with_link_preview_line_count(
     link_metadata: &LinkMetadataCache,
     presentation: ConversationPresentation,
 ) -> usize {
-    let Some(url) = first_url_in_text(text) else {
+    let Some(detected_url) = first_url_in_text(text) else {
         return text_content_line_count(text, content_width, presentation);
     };
-    let Some(metadata) = link_metadata.get(url) else {
+    let Some(metadata) = link_metadata.get(detected_url.url) else {
         return text_content_line_count(text, content_width, presentation);
     };
     if !link_metadata_is_useful(metadata) {
@@ -4035,6 +4352,58 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn halfblock_span_preserves_transparent_halves() {
+        assert_eq!(halfblock_span([1, 2, 3, 0], [4, 5, 6, 0]).content, " ");
+        assert_eq!(halfblock_span([1, 2, 3, 255], [4, 5, 6, 0]).content, "▀");
+        assert_eq!(halfblock_span([1, 2, 3, 0], [4, 5, 6, 255]).content, "▄");
+        assert_eq!(halfblock_span([1, 2, 3, 255], [4, 5, 6, 255]).content, "▀");
+    }
+
+    #[test]
+    fn rounded_thumbnail_mask_clears_corners_and_keeps_center_opaque() {
+        let mut image = image::RgbaImage::from_pixel(32, 32, image::Rgba([10, 20, 30, 255]));
+
+        apply_rounded_thumbnail_mask(&mut image);
+
+        assert_eq!(image.get_pixel(0, 0).0[3], 0);
+        assert_eq!(image.get_pixel(31, 0).0[3], 0);
+        assert_eq!(image.get_pixel(0, 31).0[3], 0);
+        assert_eq!(image.get_pixel(31, 31).0[3], 0);
+        assert_eq!(image.get_pixel(16, 16).0[3], 255);
+        assert!(image.get_pixel(7, 0).0[3] > 0);
+        assert!(image.get_pixel(7, 0).0[3] < 255);
+    }
+
+    #[test]
+    fn first_url_in_text_accepts_slack_angle_links() {
+        let detected = first_url_in_text("<https://example.com/path?x=1>")
+            .expect("Slack-wrapped URL should be detected");
+
+        assert_eq!(detected.url, "https://example.com/path?x=1");
+        assert_eq!(detected.token, "<https://example.com/path?x=1>");
+    }
+
+    #[test]
+    fn first_url_in_text_accepts_slack_labelled_links() {
+        let detected = first_url_in_text("read <https://example.com/release|release notes>")
+            .expect("Slack labelled URL should be detected");
+
+        assert_eq!(detected.url, "https://example.com/release");
+        assert_eq!(
+            detected.token,
+            "<https://example.com/release|release notes>"
+        );
+    }
+
+    #[test]
+    fn remove_first_url_from_text_removes_slack_wrapped_token() {
+        assert_eq!(
+            remove_first_url_from_text("cornel shared <https://example.com/image.png>"),
+            "cornel shared"
+        );
+    }
+
+    #[test]
     fn grouped_outgoing_messages_render_a_timestamp_per_bubble() {
         let account = Arc::<str>::from("mock:local");
         let chat_id = Arc::<str>::from("mock:chat:alice");
@@ -4074,6 +4443,7 @@ mod tests {
             200,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4142,6 +4512,7 @@ mod tests {
             40,
             Some("incoming"),
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4159,6 +4530,7 @@ mod tests {
             40,
             Some("outgoing"),
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4197,6 +4569,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4210,6 +4583,7 @@ mod tests {
             40,
             Some("selected-flat"),
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4322,6 +4696,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4391,6 +4766,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4452,6 +4828,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4517,6 +4894,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &metadata,
             Theme::default(),
@@ -4595,6 +4973,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &metadata,
             Theme::default(),
@@ -4613,6 +4992,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &metadata,
             Theme::default(),
@@ -4661,6 +5041,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &metadata,
             Theme::default(),
@@ -4707,6 +5088,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &metadata,
             Theme::default(),
@@ -4769,6 +5151,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &metadata,
             Theme::default(),
@@ -4817,6 +5200,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -4887,6 +5271,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -5039,6 +5424,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -5064,6 +5450,69 @@ mod tests {
                 .iter()
                 .any(|hit| hit.line > root_hit.start_line),
             "thread summary row should be clickable as part of the message"
+        );
+    }
+
+    #[test]
+    fn threaded_root_message_shows_new_badge_when_thread_has_unread_replies() {
+        let account = Arc::<str>::from("slack:workspace");
+        let chat_id = Arc::<str>::from("slack:channel:design");
+        let priya = Sender {
+            platform_id: Arc::<str>::from("U_priya"),
+            display_name: Arc::<str>::from("Priya"),
+            avatar: None,
+        };
+        let sam = Sender {
+            platform_id: Arc::<str>::from("U_sam"),
+            display_name: Arc::<str>::from("Sam"),
+            avatar: None,
+        };
+        let mut root = text_message(
+            "root-unread",
+            &chat_id,
+            &account,
+            priya,
+            "Can we finalise the token names?",
+            14,
+            20,
+            false,
+        );
+        root.thread_id = Some(root.id.clone());
+        let mut reply = text_message(
+            "reply-unread",
+            &chat_id,
+            &account,
+            sam,
+            "Shipping it.",
+            14,
+            31,
+            false,
+        );
+        reply.reply_to = Some(root.id.clone());
+        reply.thread_id = Some(root.id.clone());
+
+        let mut thread_unread: HashMap<MessageId, u32> = HashMap::new();
+        thread_unread.insert(root.id.clone(), 2);
+
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines(
+            &[root.clone(), reply],
+            120,
+            0,
+            40,
+            None,
+            &HashSet::new(),
+            &thread_unread,
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+        );
+        let rendered = rendered_lines(&render.lines).join("\n");
+
+        assert!(rendered.contains("1 reply"), "reply count still shown");
+        assert!(
+            rendered.contains("2 new"),
+            "unread reply count should render the \"N new\" badge: {rendered}"
         );
     }
 
@@ -5108,6 +5557,7 @@ mod tests {
             8,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -5161,6 +5611,7 @@ mod tests {
             80,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -5229,6 +5680,7 @@ mod tests {
         let mut media_preview_requests = Vec::new();
         let reply_previews = HashMap::new();
         let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
         let link_metadata = LinkMetadataCache::default();
         let mut context = MessageRenderContext {
             content_width: 90,
@@ -5242,6 +5694,7 @@ mod tests {
             presentation: ConversationPresentation::Flat,
             reply_previews: &reply_previews,
             thread_summaries: &thread_summaries,
+            thread_unread: &thread_unread,
         };
 
         let lines = card_collection_lines(&[card], Style::default(), &mut context, 0, false);
@@ -5290,6 +5743,7 @@ mod tests {
         link_metadata: &'a LinkMetadataCache,
         reply_previews: &'a HashMap<Arc<str>, String>,
         thread_summaries: &'a HashMap<MessageId, ThreadSummary>,
+        thread_unread: &'a HashMap<MessageId, u32>,
     ) -> MessageRenderContext<'a> {
         MessageRenderContext {
             content_width: 90,
@@ -5303,6 +5757,7 @@ mod tests {
             presentation: ConversationPresentation::Flat,
             reply_previews,
             thread_summaries,
+            thread_unread,
         }
     }
 
@@ -5335,6 +5790,7 @@ mod tests {
         let mut media_preview_requests = Vec::new();
         let reply_previews = HashMap::new();
         let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
         let link_metadata = LinkMetadataCache::default();
         let mut context = flat_render_context(
             &mut cache,
@@ -5344,6 +5800,7 @@ mod tests {
             &link_metadata,
             &reply_previews,
             &thread_summaries,
+            &thread_unread,
         );
 
         let lines = card_collection_lines(&cards, Style::default(), &mut context, 0, false);
@@ -5399,6 +5856,7 @@ mod tests {
             40,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -5444,6 +5902,7 @@ mod tests {
         let mut media_preview_requests = Vec::new();
         let reply_previews = HashMap::new();
         let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
         let link_metadata = LinkMetadataCache::default();
         let mut context = MessageRenderContext {
             content_width: 90,
@@ -5457,6 +5916,7 @@ mod tests {
             presentation: ConversationPresentation::Flat,
             reply_previews: &reply_previews,
             thread_summaries: &thread_summaries,
+            thread_unread: &thread_unread,
         };
 
         let lines = card_collection_lines(&[card], Style::default(), &mut context, 0, false);
@@ -5488,6 +5948,7 @@ mod tests {
         let mut media_preview_requests = Vec::new();
         let reply_previews = HashMap::new();
         let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
         let link_metadata = LinkMetadataCache::default();
         let mut context = MessageRenderContext {
             content_width: 90,
@@ -5501,6 +5962,7 @@ mod tests {
             presentation: ConversationPresentation::Bubbles,
             reply_previews: &reply_previews,
             thread_summaries: &thread_summaries,
+            thread_unread: &thread_unread,
         };
 
         let lines = card_collection_lines(&[card], Style::default(), &mut context, 0, false);
@@ -5552,6 +6014,7 @@ mod tests {
             80,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),
@@ -5613,6 +6076,7 @@ mod tests {
             viewport_rows,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut cache,
             &LinkMetadataCache::default(),
             Theme::default(),

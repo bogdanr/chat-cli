@@ -1,7 +1,7 @@
 use crate::{theme::Theme, widgets::message_list};
 use chat_core::{
-    Account, Chat, ChatKind, ChatMembership, DiscoveryAction, DiscoveryResult, DiscoveryResultKind,
-    Platform, ProviderId,
+    Account, Chat, ChatId, ChatKind, ChatMembership, DiscoveryAction, DiscoveryResult,
+    DiscoveryResultKind, Platform, ProviderId,
 };
 use chrono::{Local, NaiveDateTime};
 use ratatui::{
@@ -45,6 +45,9 @@ pub struct ChatListProps<'a> {
     pub avatar_rows: &'a HashMap<usize, AvatarRows>,
     pub account_badge_rows: &'a HashMap<ProviderId, AvatarRows>,
     pub typing_previews: &'a HashMap<usize, String>,
+    /// Aggregated unread thread-reply counts per chat id, used to render the
+    /// `⤷N` thread-activity marker distinct from the channel unread badge.
+    pub thread_unread_by_chat: &'a HashMap<ChatId, u32>,
     pub theme: Theme,
 }
 
@@ -82,6 +85,11 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
                     .get(&props.chats[*chat_index].account)
                     .map(Vec::as_slice),
                 props.typing_previews.get(chat_index).map(String::as_str),
+                props
+                    .thread_unread_by_chat
+                    .get(&props.chats[*chat_index].id)
+                    .copied()
+                    .unwrap_or(0),
                 props.theme,
                 inner_width,
                 *chat_index == props.selected_chat_index,
@@ -479,11 +487,13 @@ fn unread_marker(unread_count: u32) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chat_item(
     chat: &Chat,
     avatar_rows: Option<&[Vec<Span<'static>>]>,
     account_badge_rows: Option<&[Vec<Span<'static>>]>,
     typing_preview: Option<&str>,
+    thread_unread: u32,
     theme: Theme,
     row_width: usize,
     selected: bool,
@@ -545,9 +555,18 @@ fn chat_item(
         })
         .unwrap_or_else(|| "No messages yet".to_owned());
     let second_prefix_width = CHAT_AVATAR_WIDTH as usize + 1;
-    let preview_budget = content_width.saturating_sub(second_prefix_width);
+    let thread_marker = if thread_unread > 0 {
+        format!("\u{2937}{} ", thread_unread.min(99))
+    } else {
+        String::new()
+    };
+    let thread_marker_width = UnicodeWidthStr::width(thread_marker.as_str());
+    let preview_budget = content_width
+        .saturating_sub(second_prefix_width)
+        .saturating_sub(thread_marker_width);
     let preview = truncate_to_width(&preview, preview_budget);
-    let used_second_width = second_prefix_width + UnicodeWidthStr::width(preview.as_str());
+    let used_second_width =
+        second_prefix_width + thread_marker_width + UnicodeWidthStr::width(preview.as_str());
     let second_gap = effective_width
         .saturating_sub(meta_width)
         .saturating_sub(used_second_width);
@@ -575,8 +594,14 @@ fn chat_item(
         }),
         Line::from({
             let mut spans = second_avatar_line;
+            spans.extend([styled_raw(" ", selected_bg)]);
+            if !thread_marker.is_empty() {
+                spans.push(Span::styled(
+                    thread_marker,
+                    style_with_optional_bg(theme.unread(), selected_bg),
+                ));
+            }
             spans.extend([
-                styled_raw(" ", selected_bg),
                 Span::styled(preview, selected_message_style),
                 styled_raw(" ".repeat(second_gap + unread_padding), selected_bg),
                 Span::styled(unread_marker, unread_style),

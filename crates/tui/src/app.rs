@@ -15,7 +15,7 @@ use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card, Chat,
     ChatId, ChatKind, ChatMembership, Content, DiscoveryAction, DiscoveryResult, Media, Message,
     MessageId, NetworkActivityDirection, OutboundCapabilities, Platform, PlatformData, PlatformId,
-    Poll, Provider, ProviderEvent, ProviderId, Reaction, Sender, Timestamp,
+    Poll, Provider, ProviderEvent, ProviderId, Reaction, Sender, ThreadId, Timestamp,
 };
 use chat_notify::{DesktopNotifier, MessageNotification};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -47,17 +47,18 @@ use ratatui_image::{
 };
 use ratatui_textarea::{Input as TextAreaInput, Key as TextAreaKey, TextArea};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
     fs::{self, OpenOptions},
+    hash::{Hash, Hasher},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use storage::{
-    AppSettings, ChatActivityUpdate, ChatInboxStyle, ConversationPresentationSetting,
-    NetworkActivityDisplay, NotificationMode, NotificationPauseState, NotificationScope, Store,
-    UiThemePreset,
+    AppSettings, AvatarThumbnailCacheRecord, AvatarThumbnailCacheUpsert, ChatActivityUpdate,
+    ChatInboxStyle, ConversationPresentationSetting, ImagePreviewMode, NetworkActivityDisplay,
+    NotificationMode, NotificationPauseState, NotificationScope, Store, UiThemePreset,
 };
 use tokio::sync::{broadcast, mpsc};
 use unicode_width::UnicodeWidthStr;
@@ -234,6 +235,8 @@ const PERF_LOG_FILE_ENV: &str = "CHAT_CLI_PERF_LOG_FILE";
 const PERF_LOG_SLOW_MS_ENV: &str = "CHAT_CLI_PERF_SLOW_MS";
 const DEFAULT_PERF_LOG_SLOW_MS: u64 = 25;
 const EVENT_LOOP_STALL_LOG_MS: u64 = 750;
+const AVATAR_THUMBNAIL_SIZE: u32 = 32;
+const AVATAR_THUMBNAIL_CACHE_VERSION: i64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum AvatarPreviewSource {
@@ -252,14 +255,86 @@ struct AvatarPreviewKey {
 #[derive(Debug)]
 struct AvatarPreviewFetchResult {
     key: AvatarPreviewKey,
-    result: Result<chat_list::AvatarRows, String>,
+    result: Option<Result<AvatarPreviewData, String>>,
     elapsed: Duration,
+    sqlite_hit: bool,
+    stale: bool,
+    refresh_on_stale: bool,
+    generated: bool,
+    persisted: bool,
+    cache_miss: bool,
+}
+
+impl AvatarPreviewFetchResult {
+    fn generated(
+        key: AvatarPreviewKey,
+        result: Result<AvatarPreviewData, String>,
+        elapsed: Duration,
+        persisted: bool,
+    ) -> Self {
+        Self {
+            key,
+            result: Some(result),
+            elapsed,
+            sqlite_hit: false,
+            stale: false,
+            refresh_on_stale: false,
+            generated: true,
+            persisted,
+            cache_miss: false,
+        }
+    }
+
+    fn sqlite_hit(
+        key: AvatarPreviewKey,
+        result: Result<AvatarPreviewData, String>,
+        elapsed: Duration,
+        stale: bool,
+    ) -> Self {
+        Self {
+            key,
+            result: Some(result),
+            elapsed,
+            sqlite_hit: true,
+            stale,
+            refresh_on_stale: stale,
+            generated: false,
+            persisted: false,
+            cache_miss: false,
+        }
+    }
+
+    fn sqlite_miss(key: AvatarPreviewKey, elapsed: Duration) -> Self {
+        Self {
+            key,
+            result: None,
+            elapsed,
+            sqlite_hit: false,
+            stale: false,
+            refresh_on_stale: false,
+            generated: false,
+            persisted: false,
+            cache_miss: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AvatarPreviewData {
+    rows: chat_list::AvatarRows,
+    thumbnail: Option<Arc<[u8]>>,
 }
 
 #[derive(Debug)]
 struct MediaPreviewFetchResult {
     key: message_list::MediaPreviewKey,
     result: Result<Vec<Vec<Span<'static>>>, String>,
+    elapsed: Duration,
+}
+
+struct ImageProtocolFetchResult {
+    key: ImageProtocolKey,
+    result: Result<Protocol, String>,
     elapsed: Duration,
 }
 
@@ -772,11 +847,19 @@ struct ImageViewer {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum TerminalImageResizeMode {
+    Fit,
+    Scale,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ImageProtocolKey {
     path: PathBuf,
+    bytes_hash: Option<u64>,
     width: u16,
     height: u16,
+    resize_mode: TerminalImageResizeMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -894,6 +977,7 @@ impl SlackSetupPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlackSetupMode {
+    Automatic,
     UserOAuth,
     ReadOnlyOAuth,
     BotToken,
@@ -903,7 +987,16 @@ enum SlackSetupMode {
 }
 
 impl SlackSetupMode {
-    const ALL: [Self; 6] = [
+    const BUNDLED: [Self; 7] = [
+        Self::Automatic,
+        Self::UserOAuth,
+        Self::ReadOnlyOAuth,
+        Self::BotToken,
+        Self::ImportedToken,
+        Self::ManualApp,
+        Self::Webhook,
+    ];
+    const MANUAL: [Self; 6] = [
         Self::UserOAuth,
         Self::ReadOnlyOAuth,
         Self::BotToken,
@@ -914,6 +1007,7 @@ impl SlackSetupMode {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Automatic => "Automatic (built-in Slack app)",
             Self::UserOAuth => "User OAuth",
             Self::ReadOnlyOAuth => "User OAuth read-only",
             Self::BotToken => "Workspace-approved bot/app tokens",
@@ -925,8 +1019,13 @@ impl SlackSetupMode {
 
     fn description(self) -> &'static str {
         match self {
-            Self::UserOAuth => "Recommended: send as yourself when Slack grants user write scopes.",
-            Self::ReadOnlyOAuth => "Fallback: read conversations when write scopes are blocked.",
+            Self::Automatic => {
+                "Recommended: use chat-cli's configured Slack app; no app template, Client ID, or Client Secret."
+            }
+            Self::UserOAuth => "Advanced: use your own Slack app to send as yourself.",
+            Self::ReadOnlyOAuth => {
+                "Advanced fallback: read conversations when write scopes are blocked."
+            }
             Self::BotToken => "Approved deployment: bot identity with optional Socket Mode.",
             Self::ImportedToken => "Advanced: validate a pre-issued user, bot, or app token.",
             Self::ManualApp => "Advanced: configure client ID, secret, redirect URI, and scopes.",
@@ -936,6 +1035,9 @@ impl SlackSetupMode {
 
     fn credential_hint(self) -> &'static str {
         match self {
+            Self::Automatic => {
+                "Press Enter to open Slack's authorization page for the built-in chat-cli app. No Client ID, Client Secret, User token, or app-template URL is needed. Optionally paste an xapp- App-Level Token for realtime."
+            }
             Self::UserOAuth => {
                 "Create the app from the manifest, then enter Client ID and Client Secret (from Basic Information). chat-cli opens your browser to sign in and captures the token automatically. For realtime, also add an App-Level Token (xapp-...) with connections:write; without it Slack only updates on slow periodic polling."
             }
@@ -957,7 +1059,7 @@ impl SlackSetupMode {
 
     fn to_auth_submission_mode(self) -> AuthSubmissionMode {
         match self {
-            Self::UserOAuth => AuthSubmissionMode::UserOAuth,
+            Self::Automatic | Self::UserOAuth => AuthSubmissionMode::UserOAuth,
             Self::ReadOnlyOAuth => AuthSubmissionMode::ReadOnlyOAuth,
             Self::BotToken => AuthSubmissionMode::BotToken,
             Self::ImportedToken => AuthSubmissionMode::ImportedToken,
@@ -968,7 +1070,9 @@ impl SlackSetupMode {
 
     fn next_phase(self) -> SlackSetupPhase {
         match self {
-            Self::UserOAuth | Self::ReadOnlyOAuth | Self::ManualApp => SlackSetupPhase::OAuthPrompt,
+            Self::Automatic | Self::UserOAuth | Self::ReadOnlyOAuth | Self::ManualApp => {
+                SlackSetupPhase::OAuthPrompt
+            }
             Self::BotToken | Self::ImportedToken | Self::Webhook => {
                 SlackSetupPhase::EnterCredentials
             }
@@ -991,7 +1095,7 @@ struct SlackSetupCapabilities {
 impl SlackSetupCapabilities {
     fn from_mode(mode: SlackSetupMode) -> Self {
         match mode {
-            SlackSetupMode::UserOAuth => Self {
+            SlackSetupMode::Automatic | SlackSetupMode::UserOAuth => Self {
                 can_read_history: true,
                 can_send_as_user: true,
                 can_react: true,
@@ -1134,6 +1238,10 @@ struct SlackSetupOverlay {
     /// True when chat-cli ships with a configured official Slack app, so the
     /// normal OAuth path needs no app creation or client ID/secret entry.
     bundled_oauth_app: bool,
+    /// True when the provider already has realtime configured externally (for
+    /// example via `CHAT_CLI_SLACK_APP_TOKEN`). The setup UI uses this to hide
+    /// the optional app-token field in Automatic mode.
+    configured_realtime: bool,
     /// When true the overlay renders the Slack help/explanation page instead of
     /// the current phase. Toggled with `?`; non-destructive to phase state.
     show_help: bool,
@@ -1152,19 +1260,30 @@ impl SlackSetupOverlay {
             status: Some("Name this Slack workspace, then choose a sign-in method.".to_owned()),
             capabilities: None,
             bundled_oauth_app: false,
+            configured_realtime: false,
             show_help: false,
         }
     }
 
     fn selected_mode(&self) -> SlackSetupMode {
-        SlackSetupMode::ALL
+        self.available_modes()
             .get(self.selected_mode)
             .copied()
             .unwrap_or(SlackSetupMode::UserOAuth)
     }
 
+    fn available_modes(&self) -> &'static [SlackSetupMode] {
+        if self.bundled_oauth_app {
+            &SlackSetupMode::BUNDLED
+        } else {
+            &SlackSetupMode::MANUAL
+        }
+    }
+
     fn credential_fields(&self) -> &'static [SlackSetupCredentialField] {
         match self.selected_mode() {
+            SlackSetupMode::Automatic if self.configured_realtime => &[],
+            SlackSetupMode::Automatic => &[SlackSetupCredentialField::AppToken],
             SlackSetupMode::UserOAuth | SlackSetupMode::ReadOnlyOAuth => &[
                 SlackSetupCredentialField::UserToken,
                 SlackSetupCredentialField::AppToken,
@@ -1363,6 +1482,30 @@ struct AccountSwitcher {
     confirm_remove: Option<ProviderId>,
 }
 
+/// A single row in the Threads inbox overlay: one thread that currently has
+/// unread replies, resolved with its parent chat name for display.
+#[derive(Clone, Debug)]
+struct ThreadInboxEntry {
+    account: ProviderId,
+    chat_id: ChatId,
+    root_id: MessageId,
+    chat_name: String,
+    preview: String,
+    unread_reply_count: u32,
+    reply_count: u32,
+    last_reply_at: Option<Timestamp>,
+}
+
+/// Aggregated, account-wide view of threads with unread replies. Mirrors the
+/// "Threads" entry found in native chat apps so unread replies are discoverable
+/// in one place. Navigated with the existing arrows/Enter/Esc; opening an entry
+/// selects its chat and opens the thread pane.
+#[derive(Clone, Debug)]
+struct ThreadsInbox {
+    entries: Vec<ThreadInboxEntry>,
+    selected: usize,
+}
+
 #[derive(Clone, Debug)]
 struct SettingsOverlay {
     selected: usize,
@@ -1373,6 +1516,7 @@ enum SettingsItem {
     InboxStyle,
     Theme,
     ConversationStyle,
+    ImagePreviewMode,
     NetworkActivity,
     ShowMutedChats,
     ShowBrowseChannels,
@@ -1383,10 +1527,11 @@ enum SettingsItem {
 }
 
 impl SettingsItem {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::InboxStyle,
         Self::Theme,
         Self::ConversationStyle,
+        Self::ImagePreviewMode,
         Self::NetworkActivity,
         Self::ShowMutedChats,
         Self::ShowBrowseChannels,
@@ -1401,6 +1546,7 @@ impl SettingsItem {
             Self::InboxStyle => "Inbox style",
             Self::Theme => "Theme",
             Self::ConversationStyle => "Conversation style",
+            Self::ImagePreviewMode => "Image previews",
             Self::NetworkActivity => "Network activity",
             Self::ShowMutedChats => "Show muted chats",
             Self::ShowBrowseChannels => "Show browse channels",
@@ -1421,6 +1567,9 @@ impl SettingsItem {
             }
             Self::ConversationStyle => {
                 "Choose whether each conversation matches its service or always uses a fixed WhatsApp/Slack layout."
+            }
+            Self::ImagePreviewMode => {
+                "Choose Matrix blocks or HD terminal-native image previews. HD falls back to Matrix when the terminal cannot show images."
             }
             Self::NetworkActivity => {
                 "Choose whether the status bar hides network activity, shows combined RX/TX lights, or shows recent per-account RX/TX counts."
@@ -1449,6 +1598,7 @@ impl SettingsItem {
             Self::ConversationStyle => {
                 conversation_presentation_label(settings.conversation_presentation)
             }
+            Self::ImagePreviewMode => image_preview_mode_label(settings.image_preview_mode),
             Self::NetworkActivity => network_activity_display_label(settings.network_activity),
             Self::ShowMutedChats => on_off(settings.show_muted_chats),
             Self::ShowBrowseChannels => on_off(settings.show_browse_channels),
@@ -1473,6 +1623,7 @@ impl SettingsItem {
             Self::InboxStyle
             | Self::Theme
             | Self::ConversationStyle
+            | Self::ImagePreviewMode
             | Self::NetworkActivity
             | Self::ArchiveVisibleAccounts
             | Self::Notifications
@@ -1493,6 +1644,10 @@ impl SettingsItem {
             Self::ConversationStyle => {
                 settings.conversation_presentation =
                     next_conversation_presentation(settings.conversation_presentation);
+                false
+            }
+            Self::ImagePreviewMode => {
+                settings.image_preview_mode = next_image_preview_mode(settings.image_preview_mode);
                 false
             }
             Self::NetworkActivity => {
@@ -1587,6 +1742,13 @@ fn conversation_presentation_label(style: ConversationPresentationSetting) -> &'
     }
 }
 
+fn image_preview_mode_label(mode: ImagePreviewMode) -> &'static str {
+    match mode {
+        ImagePreviewMode::Matrix => "Matrix",
+        ImagePreviewMode::Hd => "HD",
+    }
+}
+
 fn network_activity_display_label(display: NetworkActivityDisplay) -> &'static str {
     match display {
         NetworkActivityDisplay::Hidden => "Hidden",
@@ -1614,6 +1776,13 @@ fn next_conversation_presentation(
         }
         ConversationPresentationSetting::WhatsApp => ConversationPresentationSetting::Slack,
         ConversationPresentationSetting::Slack => ConversationPresentationSetting::ProviderNative,
+    }
+}
+
+fn next_image_preview_mode(mode: ImagePreviewMode) -> ImagePreviewMode {
+    match mode {
+        ImagePreviewMode::Matrix => ImagePreviewMode::Hd,
+        ImagePreviewMode::Hd => ImagePreviewMode::Matrix,
     }
 }
 
@@ -1672,20 +1841,27 @@ struct NotificationOverlay {
     chat_name: String,
     sender_name: String,
     preview: String,
+    is_thread_reply: bool,
     ticks_remaining: u8,
 }
 
 impl NotificationOverlay {
     fn new(chat: &Chat, message: &Message, show_preview: bool) -> Self {
+        let is_thread_reply = is_slack_thread_reply(message);
         Self {
             message_id: message.id.clone(),
             chat_name: chat.name.to_string(),
             sender_name: message.sender.display_name.to_string(),
             preview: if show_preview {
-                notification_preview(message)
+                if is_thread_reply {
+                    format!("↪ {}", notification_preview(message))
+                } else {
+                    notification_preview(message)
+                }
             } else {
                 "New message".to_owned()
             },
+            is_thread_reply,
             ticks_remaining: NOTIFICATION_TICKS,
         }
     }
@@ -1693,7 +1869,11 @@ impl NotificationOverlay {
     fn to_desktop_notification(&self) -> MessageNotification {
         MessageNotification {
             chat_name: self.chat_name.clone(),
-            sender_name: self.sender_name.clone(),
+            sender_name: if self.is_thread_reply && !self.sender_name.trim().is_empty() {
+                format!("{} replied to a thread", self.sender_name)
+            } else {
+                self.sender_name.clone()
+            },
             preview: Some(self.preview.clone()),
         }
     }
@@ -1707,6 +1887,7 @@ impl NotificationOverlay {
             chat_name: title.into(),
             sender_name: "Account notice".to_owned(),
             preview: body.into(),
+            is_thread_reply: false,
             ticks_remaining: NOTIFICATION_TICKS,
         }
     }
@@ -1764,6 +1945,12 @@ pub struct AppState {
     // inline submission path would otherwise perform synchronously.
     pending_slack_setup_load: Option<ProviderId>,
     account_switcher: Option<AccountSwitcher>,
+    /// The Threads inbox overlay, when open.
+    threads_inbox: Option<ThreadsInbox>,
+    /// A thread to open once the target chat's messages have loaded. Set when
+    /// activating a Threads-inbox entry for a chat that is not yet loaded;
+    /// consumed by the message-load drain (and immediately when already loaded).
+    pending_thread_open: Option<MessageId>,
     settings_overlay: Option<SettingsOverlay>,
     active_account: Option<ProviderId>,
     notification: Option<NotificationOverlay>,
@@ -1775,6 +1962,15 @@ pub struct AppState {
     reply_to: Option<MessageId>,
     pending_attachment: Option<PendingAttachment>,
     thread_root: Option<MessageId>,
+    /// Number of replies that were unread when the currently open thread was
+    /// opened. Captured synchronously in `open_thread` (before the async
+    /// mark-read flush clears the counter) so the thread pane can render a
+    /// "new replies" divider above the first previously-unread reply.
+    thread_open_unread: u32,
+    /// A thread that was just opened and needs its unread counter cleared. Set
+    /// synchronously by `open_thread` and drained asynchronously after event
+    /// handling so the sync open path does not block on storage.
+    pending_thread_read: Option<(ProviderId, ThreadId)>,
     image_viewer: Option<ImageViewer>,
     message_scroll: usize,
     message_top_padding: usize,
@@ -1794,6 +1990,14 @@ pub struct AppState {
     monthly_backfill_tick: u64,
     chat_members: HashMap<(ProviderId, ChatId), Vec<Sender>>,
     loading_chat_members: HashSet<(ProviderId, ChatId)>,
+    /// Per-thread unread reply counts for the selected chat, keyed by the
+    /// thread's root message id. Populated asynchronously after messages load
+    /// so the draw path can render the "N new" badge without touching storage.
+    thread_unread: HashMap<MessageId, u32>,
+    /// Aggregated unread thread-reply counts per chat id across loaded
+    /// accounts, used to render the sidebar `⤷N` thread-activity marker.
+    /// Refreshed off the draw path alongside `thread_unread`.
+    thread_unread_by_chat: HashMap<ChatId, u32>,
 }
 
 impl Default for AppState {
@@ -1832,6 +2036,8 @@ impl Default for AppState {
             slack_setup: None,
             pending_slack_setup_load: None,
             account_switcher: None,
+            threads_inbox: None,
+            pending_thread_open: None,
             settings_overlay: None,
             active_account: None,
             notification: None,
@@ -1843,6 +2049,8 @@ impl Default for AppState {
             reply_to: None,
             pending_attachment: None,
             thread_root: None,
+            thread_open_unread: 0,
+            pending_thread_read: None,
             image_viewer: None,
             message_scroll: 0,
             message_top_padding: 0,
@@ -1862,6 +2070,8 @@ impl Default for AppState {
             monthly_backfill_tick: 0,
             chat_members: HashMap::new(),
             loading_chat_members: HashSet::new(),
+            thread_unread: HashMap::new(),
+            thread_unread_by_chat: HashMap::new(),
         };
         state.sync_compose_cache();
         state.sync_thread_compose_cache();
@@ -2053,7 +2263,7 @@ pub struct App {
     media_preview_tx: mpsc::UnboundedSender<MediaPreviewFetchResult>,
     media_preview_rx: mpsc::UnboundedReceiver<MediaPreviewFetchResult>,
     message_layout_cache: message_list::MessageLayoutCache,
-    avatar_preview_cache: HashMap<AvatarPreviewKey, Result<chat_list::AvatarRows, String>>,
+    avatar_preview_cache: HashMap<AvatarPreviewKey, Result<AvatarPreviewData, String>>,
     pending_avatar_previews: HashSet<AvatarPreviewKey>,
     avatar_preview_tx: mpsc::UnboundedSender<AvatarPreviewFetchResult>,
     avatar_preview_rx: mpsc::UnboundedReceiver<AvatarPreviewFetchResult>,
@@ -2076,6 +2286,9 @@ pub struct App {
     pending_discovery_query: Option<(String, u64)>,
     image_picker: Option<Picker>,
     image_protocol_cache: HashMap<ImageProtocolKey, Result<Protocol, String>>,
+    pending_image_protocols: HashSet<ImageProtocolKey>,
+    image_protocol_tx: mpsc::UnboundedSender<ImageProtocolFetchResult>,
+    image_protocol_rx: mpsc::UnboundedReceiver<ImageProtocolFetchResult>,
     provider_factory: Option<AccountProviderFactory>,
     theme: Theme,
     perf_log: Option<PerfLog>,
@@ -2099,6 +2312,7 @@ impl App {
         let (link_metadata_tx, link_metadata_rx) = mpsc::unbounded_channel();
         let (media_preview_tx, media_preview_rx) = mpsc::unbounded_channel();
         let (avatar_preview_tx, avatar_preview_rx) = mpsc::unbounded_channel();
+        let (image_protocol_tx, image_protocol_rx) = mpsc::unbounded_channel();
         let (history_tx, history_rx) = mpsc::unbounded_channel();
         let (chat_members_tx, chat_members_rx) = mpsc::unbounded_channel();
         let (selected_messages_tx, selected_messages_rx) = mpsc::unbounded_channel();
@@ -2108,8 +2322,10 @@ impl App {
         let notification_pause = store.notification_pause_state().await?;
         let theme = Theme::from_preset(settings.ui_theme);
         let perf_log = PerfLog::from_env()?;
-        let mut state = AppState::default();
-        state.notification_pause = notification_pause;
+        let state = AppState {
+            notification_pause,
+            ..AppState::default()
+        };
         let mut app = Self {
             providers,
             provider_receivers,
@@ -2145,6 +2361,9 @@ impl App {
             pending_discovery_query: None,
             image_picker: None,
             image_protocol_cache: HashMap::new(),
+            pending_image_protocols: HashSet::new(),
+            image_protocol_tx,
+            image_protocol_rx,
             provider_factory,
             theme,
             perf_log,
@@ -2176,6 +2395,12 @@ impl App {
         if let Some(perf_log) = &mut self.perf_log {
             perf_log.log(label, Some(started.elapsed()), details);
         }
+    }
+
+    fn clear_message_layout_cache(&mut self) {
+        self.message_layout_cache.clear();
+        self.state.media_hits.clear();
+        self.state.message_hits.clear();
     }
 
     fn log_slow_perf_duration(&mut self, label: &str, started: Instant, details: impl AsRef<str>) {
@@ -2239,6 +2464,7 @@ impl App {
                     )
                     .await?;
                 }
+                self.flush_pending_thread_read().await?;
             }
             AppEvent::Mouse(mouse) => {
                 self.dismiss_notification();
@@ -2250,10 +2476,11 @@ impl App {
                     )
                     .await?;
                 }
+                self.flush_pending_thread_read().await?;
             }
             AppEvent::Resize(width, height) => {
                 self.dismiss_notification();
-                self.image_protocol_cache.clear();
+                self.clear_image_protocol_work();
                 self.state.status = format!("terminal resized to {width}x{height}");
             }
             AppEvent::Tick => {
@@ -2503,38 +2730,114 @@ impl App {
         changed
     }
 
-    fn drain_avatar_preview_fetches(&mut self) -> bool {
+    fn drain_image_protocol_fetches(&mut self) -> bool {
         let drain_started = Instant::now();
         let mut changed = false;
         let mut drained = 0;
         let mut errors = 0;
         while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
             && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
-            && let Ok(result) = self.avatar_preview_rx.try_recv()
+            && let Ok(result) = self.image_protocol_rx.try_recv()
         {
             drained += 1;
-            self.pending_avatar_previews.remove(&result.key);
+            self.pending_image_protocols.remove(&result.key);
             if result.result.is_err() {
                 errors += 1;
             }
             self.log_slow_perf_elapsed(
-                "avatar_preview.decode",
+                "image_protocol.decode",
                 result.elapsed,
                 format!(
-                    "path={} result={}",
+                    "path={} width={} height={} result={}",
                     result.key.path.display(),
+                    result.key.width,
+                    result.key.height,
                     if result.result.is_ok() { "ok" } else { "err" }
                 ),
             );
-            self.avatar_preview_cache.insert(result.key, result.result);
+            self.image_protocol_cache.insert(result.key, result.result);
             changed = true;
         }
         if changed {
             self.log_slow_perf_duration(
-                "avatar_preview.drain",
+                "image_protocol.drain",
                 drain_started,
                 format!(
                     "count={drained} errors={errors} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
+            );
+        }
+        changed
+    }
+
+    fn drain_avatar_preview_fetches(&mut self) -> bool {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        let mut errors = 0;
+        let mut sqlite_hits = 0;
+        let mut sqlite_misses = 0;
+        let mut stale = 0;
+        let mut generated = 0;
+        let mut persisted = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.avatar_preview_rx.try_recv()
+        {
+            drained += 1;
+            self.pending_avatar_previews.remove(&result.key);
+            if result.sqlite_hit {
+                sqlite_hits += 1;
+            }
+            if result.cache_miss {
+                sqlite_misses += 1;
+                self.queue_avatar_preview_decode(result.key.clone());
+            }
+            if result.stale {
+                stale += 1;
+            }
+            if result.generated {
+                generated += 1;
+            }
+            if result.persisted {
+                persisted += 1;
+            }
+            if result.refresh_on_stale {
+                self.queue_avatar_preview_decode(result.key.clone());
+            }
+            if result.result.as_ref().is_some_and(Result::is_err) {
+                errors += 1;
+            }
+            self.log_slow_perf_elapsed(
+                "avatar_preview.complete",
+                result.elapsed,
+                format!(
+                    "path={} result={} sqlite_hit={} sqlite_miss={} stale={} generated={} persisted={}",
+                    result.key.path.display(),
+                    match &result.result {
+                        Some(Ok(_)) => "ok",
+                        Some(Err(_)) => "err",
+                        None => "none",
+                    },
+                    result.sqlite_hit,
+                    result.cache_miss,
+                    result.stale,
+                    result.generated,
+                    result.persisted,
+                ),
+            );
+            if let Some(data) = result.result {
+                self.avatar_preview_cache.insert(result.key, data);
+                changed = true;
+            }
+        }
+        if changed || drained > 0 {
+            self.log_slow_perf_duration(
+                "avatar_preview.drain",
+                drain_started,
+                format!(
+                    "count={drained} errors={errors} sqlite_hits={sqlite_hits} sqlite_misses={sqlite_misses} stale={stale} generated={generated} persisted={persisted} budget_exhausted={}",
                     drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
                 ),
             );
@@ -2550,7 +2853,7 @@ impl App {
         let Some(chat) = self.state.selected_chat().cloned() else {
             self.state.messages.clear();
             self.state.filtered_messages.clear();
-            self.message_layout_cache.clear();
+            self.clear_message_layout_cache();
             self.pending_selected_messages = None;
             return;
         };
@@ -2566,7 +2869,7 @@ impl App {
             generation,
         });
         self.state.messages.clear();
-        self.message_layout_cache.clear();
+        self.clear_message_layout_cache();
         let previous_status = self.state.status.clone();
         self.state.status = if previous_status.is_empty() {
             format!("loading messages for {}", chat.name)
@@ -2655,8 +2958,10 @@ impl App {
                     let message_count = messages.len();
                     self.state.messages = messages;
                     self.apply_message_filter();
-                    self.message_layout_cache.clear();
+                    self.clear_message_layout_cache();
                     self.apply_cached_member_names_to_selected_messages();
+                    self.refresh_thread_unread_for_selected_chat().await?;
+                    self.try_open_pending_thread();
                     if result.scroll_to_bottom {
                         self.scroll_messages_to_bottom();
                     } else {
@@ -2762,7 +3067,7 @@ impl App {
                                 self.selected_messages_generation.wrapping_add(1);
                             self.state.messages = messages;
                             self.apply_message_filter();
-                            self.message_layout_cache.clear();
+                            self.clear_message_layout_cache();
                             self.apply_cached_member_names_to_selected_messages();
                             self.scroll_messages_to_bottom();
                             self.schedule_older_history_prefetch_if_needed();
@@ -2915,8 +3220,13 @@ impl App {
         }
         let history_changed = self.drain_history_fetches().await?;
         let selected_messages_changed = self.drain_selected_messages_fetches().await?;
+        // A thread queued from the inbox opens once its root is present in the
+        // current chat. The root can arrive via the storage fetch above or via
+        // historical catch-up appends, so retry here to cover every path.
+        self.try_open_pending_thread();
         let discovery_changed = self.drain_discovery_fetches();
         let media_preview_changed = self.drain_media_preview_fetches();
+        let image_protocol_changed = self.drain_image_protocol_fetches();
         let avatar_preview_changed = self.drain_avatar_preview_fetches();
         let link_metadata_changed = self.drain_link_metadata_fetches();
         let chat_members_changed = self.drain_chat_member_fetches();
@@ -2924,6 +3234,7 @@ impl App {
             || selected_messages_changed
             || discovery_changed
             || media_preview_changed
+            || image_protocol_changed
             || avatar_preview_changed
             || link_metadata_changed
             || chat_members_changed
@@ -2933,7 +3244,7 @@ impl App {
                 "event_drain.batch",
                 drain_started,
                 format!(
-                    "provider_events={provider_event_count} provider_draw_events={provider_draw_event_count} event_types={} history_changed={history_changed} selected_messages_changed={selected_messages_changed} discovery_changed={discovery_changed} media_preview_changed={media_preview_changed} avatar_preview_changed={avatar_preview_changed} link_metadata_changed={link_metadata_changed} chat_members_changed={chat_members_changed}",
+                    "provider_events={provider_event_count} provider_draw_events={provider_draw_event_count} event_types={} history_changed={history_changed} selected_messages_changed={selected_messages_changed} discovery_changed={discovery_changed} media_preview_changed={media_preview_changed} image_protocol_changed={image_protocol_changed} avatar_preview_changed={avatar_preview_changed} link_metadata_changed={link_metadata_changed} chat_members_changed={chat_members_changed}",
                     format_event_type_counts(&event_type_counts)
                 ),
             );
@@ -3032,6 +3343,7 @@ impl App {
             let area = frame.area();
             app.draw_notification_overlay(frame, area);
             app.draw_account_switcher(frame, area);
+            app.draw_threads_inbox(frame, area);
             app.draw_settings_overlay(frame, area);
             app.draw_image_viewer(frame, area);
             app.draw_auth_overlay(frame, area);
@@ -3191,9 +3503,11 @@ impl App {
                 avatar_rows: &avatar_rows.rows,
                 account_badge_rows: &account_badge_rows.rows,
                 typing_previews: &typing_previews,
+                thread_unread_by_chat: &self.state.thread_unread_by_chat,
                 theme: self.theme,
             },
         );
+        self.render_chat_list_hd_avatars(frame, area, &chat_layout);
         self.log_draw_step(
             "draw.chat_list.render",
             render_started.elapsed(),
@@ -3215,14 +3529,12 @@ impl App {
 
     fn chat_avatar_rows(&mut self, rendered_chat_indices: &[usize]) -> ChatAvatarRowsResult {
         let mut result = ChatAvatarRowsResult::default();
+        self.queue_chat_avatar_lookahead(rendered_chat_indices);
         for chat_index in rendered_chat_indices.iter().copied() {
-            let Some(path) = self
-                .state
-                .chats
-                .get(chat_index)
-                .and_then(|chat| chat.avatar.as_deref())
-                .map(Path::to_path_buf)
-            else {
+            let Some(chat) = self.state.chats.get(chat_index).cloned() else {
+                continue;
+            };
+            let Some(path) = self.chat_avatar_path(&chat) else {
                 continue;
             };
 
@@ -3236,7 +3548,7 @@ impl App {
             match self.avatar_preview_cache.get(&key) {
                 Some(Ok(avatar)) => {
                     result.cached += 1;
-                    result.rows.insert(chat_index, avatar.clone());
+                    result.rows.insert(chat_index, avatar.rows.clone());
                 }
                 Some(Err(_)) => {
                     result.errors += 1;
@@ -3252,6 +3564,80 @@ impl App {
             }
         }
         result
+    }
+
+    fn chat_avatar_path(&mut self, chat: &Chat) -> Option<PathBuf> {
+        if let Some(path) = chat.avatar.clone() {
+            return Some(path);
+        }
+        if !is_whatsapp_status_chat(chat) {
+            return None;
+        }
+        let account = self.account_for_provider(&chat.account)?;
+        if let Some(path) = account.avatar {
+            return Some(path);
+        }
+
+        let path = static_account_icon_path(&chat.account, Platform::WhatsApp);
+        self.queue_static_account_icon_preview(
+            AvatarPreviewKey {
+                path: path.clone(),
+                width: chat_list::CHAT_AVATAR_WIDTH,
+                rows: chat_list::CHAT_AVATAR_ROWS,
+                source: AvatarPreviewSource::Avatar,
+            },
+            EMBEDDED_WHATSAPP_ICON_PNG,
+        );
+        Some(path)
+    }
+
+    fn queue_chat_avatar_lookahead(&mut self, rendered_chat_indices: &[usize]) {
+        if rendered_chat_indices.is_empty() || self.state.visible_chat_indices.is_empty() {
+            return;
+        }
+
+        let first_rendered = rendered_chat_indices.iter().min().copied().unwrap_or(0);
+        let last_rendered = rendered_chat_indices
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(first_rendered);
+        let visible_positions = self
+            .state
+            .visible_chat_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(position, chat_index)| {
+                ((*chat_index >= first_rendered) && (*chat_index <= last_rendered))
+                    .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        let first_position = visible_positions.iter().min().copied().unwrap_or(0);
+        let last_position = visible_positions
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(first_position);
+        let window = rendered_chat_indices.len().max(8);
+        let start = first_position.saturating_sub(window);
+        let end = (last_position + window + 1).min(self.state.visible_chat_indices.len());
+
+        let chats = self.state.visible_chat_indices[start..end]
+            .iter()
+            .filter_map(|chat_index| self.state.chats.get(*chat_index).cloned())
+            .collect::<Vec<_>>();
+        let keys = chats
+            .iter()
+            .filter_map(|chat| {
+                self.chat_avatar_path(chat).map(|path| AvatarPreviewKey {
+                    path,
+                    width: chat_list::CHAT_AVATAR_WIDTH,
+                    rows: chat_list::CHAT_AVATAR_ROWS,
+                    source: AvatarPreviewSource::Avatar,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.queue_avatar_preview_loads(keys);
     }
 
     fn account_badge_rows(&mut self, rendered_chat_indices: &[usize]) -> AccountBadgeRowsResult {
@@ -3284,7 +3670,7 @@ impl App {
             match self.avatar_preview_cache.get(&key) {
                 Some(Ok(avatar)) => {
                     result.cached += 1;
-                    result.rows.insert(provider_id, avatar.clone());
+                    result.rows.insert(provider_id, avatar.rows.clone());
                 }
                 Some(Err(_)) => {
                     if key.path.exists() {
@@ -3317,14 +3703,15 @@ impl App {
         provider_id: &ProviderId,
         account: &Account,
     ) -> Option<PathBuf> {
-        let account_avatar = account.avatar.as_deref().map(Path::to_path_buf);
         let status_avatar = self
             .state
             .account_statuses
             .get(provider_id)
             .and_then(|status| status.avatar.as_deref())
+            .filter(|_| account.platform != Platform::WhatsApp)
             .map(Path::to_path_buf);
-        let preferred_avatar = account_avatar.or(status_avatar);
+        let account_avatar = account.avatar.as_deref().map(Path::to_path_buf);
+        let preferred_avatar = status_avatar.or(account_avatar);
         if preferred_avatar.is_some() {
             return preferred_avatar;
         }
@@ -3357,40 +3744,120 @@ impl App {
             return;
         }
         let tx = self.avatar_preview_tx.clone();
-        tokio::task::spawn_blocking(move || {
+        let store = Arc::clone(&self.store);
+        tokio::spawn(async move {
             let started = Instant::now();
-            let result = write_static_account_icon(&key.path, icon_bytes)
-                .and_then(|()| account_badge_image_rows(&key.path).map_err(anyhow::Error::msg))
-                .map_err(|error| error.to_string());
-            let _ = tx.send(AvatarPreviewFetchResult {
+            let result = tokio::task::spawn_blocking({
+                let key = key.clone();
+                move || {
+                    write_static_account_icon(&key.path, icon_bytes)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| decode_avatar_preview_with_thumbnail(&key))
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            let mut persisted = false;
+            let result = match (result, &store) {
+                (Ok((rows, upsert)), store) => {
+                    persisted = store.upsert_avatar_thumbnail_cache(&upsert).await.is_ok();
+                    Ok(rows)
+                }
+                (Err(error), _) => Err(error),
+            };
+            let _ = tx.send(AvatarPreviewFetchResult::generated(
                 key,
                 result,
-                elapsed: started.elapsed(),
-            });
+                started.elapsed(),
+                persisted,
+            ));
         });
     }
 
     fn queue_avatar_preview(&mut self, key: AvatarPreviewKey) {
+        self.queue_avatar_preview_loads(vec![key]);
+    }
+
+    fn queue_avatar_preview_loads(&mut self, keys: Vec<AvatarPreviewKey>) {
+        let mut seen = HashSet::new();
+        let keys = keys
+            .into_iter()
+            .filter(|key| seen.insert(key.clone()))
+            .filter(|key| {
+                !self.avatar_preview_cache.contains_key(key)
+                    && self.pending_avatar_previews.insert(key.clone())
+            })
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return;
+        }
+        let tx = self.avatar_preview_tx.clone();
+        let store = Arc::clone(&self.store);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let cache_keys = keys
+                .iter()
+                .map(avatar_thumbnail_cache_key)
+                .collect::<Vec<_>>();
+            let records = store
+                .avatar_thumbnail_cache_entries(&cache_keys)
+                .await
+                .unwrap_or_default();
+            let mut records_by_key = records
+                .into_iter()
+                .map(|record| (record.cache_key.clone(), record))
+                .collect::<HashMap<_, _>>();
+            for key in keys {
+                let cache_key = avatar_thumbnail_cache_key(&key);
+                let Some(record) = records_by_key.remove(&cache_key) else {
+                    let _ = tx.send(AvatarPreviewFetchResult::sqlite_miss(
+                        key,
+                        started.elapsed(),
+                    ));
+                    continue;
+                };
+                let stale = avatar_thumbnail_record_is_stale(&key, &record);
+                let rows = avatar_thumbnail_record_to_rows(&key, record);
+                let _ = tx.send(AvatarPreviewFetchResult::sqlite_hit(
+                    key,
+                    rows,
+                    started.elapsed(),
+                    stale,
+                ));
+            }
+        });
+    }
+
+    fn queue_avatar_preview_decode(&mut self, key: AvatarPreviewKey) {
         if !self.pending_avatar_previews.insert(key.clone()) {
             return;
         }
         let tx = self.avatar_preview_tx.clone();
-        tokio::task::spawn_blocking(move || {
+        let store = Arc::clone(&self.store);
+        tokio::spawn(async move {
             let started = Instant::now();
-            let result = match key.source {
-                AvatarPreviewSource::Avatar => {
-                    let mut cache = message_list::MediaPreviewCache::default();
-                    message_list::cached_image_preview_rows(
-                        &key.path, &mut cache, key.width, key.rows,
-                    )
+            let result = tokio::task::spawn_blocking({
+                let key = key.clone();
+                move || decode_avatar_preview_with_thumbnail(&key)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            let mut persisted = false;
+            let result = match result {
+                Ok((rows, upsert)) => {
+                    persisted = store.upsert_avatar_thumbnail_cache(&upsert).await.is_ok();
+                    Ok(rows)
                 }
-                AvatarPreviewSource::AccountBadge => account_badge_image_rows(&key.path),
+                Err(error) => Err(error),
             };
-            let _ = tx.send(AvatarPreviewFetchResult {
+            let _ = tx.send(AvatarPreviewFetchResult::generated(
                 key,
                 result,
-                elapsed: started.elapsed(),
-            });
+                started.elapsed(),
+                persisted,
+            ));
         });
     }
 
@@ -3494,6 +3961,7 @@ impl App {
             vec![Line::from(Span::styled(empty_message, self.theme.muted()))]
         } else {
             let unread_message_ids = self.unread_message_ids();
+            let thread_unread = HashMap::new();
             let render = message_list::build_message_lines_with_cache(
                 messages,
                 area.width.saturating_sub(2),
@@ -3501,6 +3969,7 @@ impl App {
                 area.height.saturating_sub(2) as usize,
                 self.state.selected_message_id.as_deref(),
                 &unread_message_ids,
+                &thread_unread,
                 &mut self.media_preview_cache,
                 &self.link_metadata_cache,
                 self.link_metadata_revision,
@@ -3543,6 +4012,8 @@ impl App {
                 theme: self.theme,
             },
         );
+        self.render_inline_hd_image_previews(frame, area);
+        self.render_message_hd_avatars(frame, area);
         self.log_draw_step(
             "draw.messages.render",
             render_started.elapsed(),
@@ -3742,8 +4213,8 @@ impl App {
             return;
         }
 
-        if let Some(thread_root) = &self.state.thread_root {
-            self.draw_thread_details(frame, area, thread_root);
+        if let Some(thread_root) = self.state.thread_root.clone() {
+            self.draw_thread_details(frame, area, &thread_root);
             return;
         }
 
@@ -3860,6 +4331,7 @@ impl App {
             Line::from("  Ctrl+A: account filter"),
             Line::from("  Ctrl+F: text filter"),
             Line::from("  Ctrl+S: settings"),
+            Line::from("  Ctrl+X: image previews Matrix/HD"),
             Line::from("  PageUp/PageDown: faster"),
             Line::from("  Home/End: edges"),
             Line::from("  Ctrl+Q or Ctrl+C: quit"),
@@ -4013,15 +4485,20 @@ impl App {
     }
 
     fn draw_thread_details(
-        &self,
+        &mut self,
         frame: &mut Frame<'_>,
         area: ratatui::layout::Rect,
         thread_root: &MessageId,
     ) {
-        let root = self.message_by_id(thread_root);
-        let replies = self.thread_replies(thread_root);
+        let root = self.message_by_id(thread_root).cloned();
+        let replies = self
+            .thread_replies(thread_root)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let reply_title = reply_count_label(replies.len());
         let chat_name = root
+            .as_ref()
             .and_then(|message| {
                 self.state
                     .chats
@@ -4080,12 +4557,17 @@ impl App {
             self.theme.status_key(),
         )));
         if let Some(root) = root {
-            body_lines.extend(thread_message_card_lines(
-                root,
+            let render = thread_message_card_lines(
+                &root,
                 self.theme,
                 true,
                 chunks[1].width,
-            ));
+                &mut self.media_preview_cache,
+                &self.link_metadata_cache,
+            );
+            self.queue_link_metadata_fetches(render.link_preview_requests);
+            self.queue_media_preview_fetches(render.media_preview_requests);
+            body_lines.extend(render.lines);
         } else {
             body_lines.push(Line::from(Span::styled(
                 format!("  Original message {} is not loaded", short_id(thread_root)),
@@ -4101,13 +4583,26 @@ impl App {
                 self.theme.muted(),
             )));
         } else {
-            for reply in replies {
-                body_lines.extend(thread_message_card_lines(
+            // Index of the first previously-unread reply, so we can draw a
+            // "new replies" divider above it (Slack-style). Captured at open
+            // time in `thread_open_unread`; clamped to the reply range.
+            let unread = (self.state.thread_open_unread as usize).min(replies.len());
+            let divider_at = replies.len().saturating_sub(unread);
+            for (index, reply) in replies.iter().enumerate() {
+                if unread > 0 && index == divider_at {
+                    body_lines.push(thread_reply_divider(&new_replies_label(unread), self.theme));
+                }
+                let render = thread_message_card_lines(
                     reply,
                     self.theme,
                     false,
                     chunks[1].width,
-                ));
+                    &mut self.media_preview_cache,
+                    &self.link_metadata_cache,
+                );
+                self.queue_link_metadata_fetches(render.link_preview_requests);
+                self.queue_media_preview_fetches(render.media_preview_requests);
+                body_lines.extend(render.lines);
             }
         }
 
@@ -4140,8 +4635,12 @@ impl App {
         matches
     }
 
-    fn draw_filtered_thread_details(&self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-        let matches = self.filtered_thread_matches();
+    fn draw_filtered_thread_details(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let matches = self
+            .filtered_thread_matches()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let chat_name = self
             .state
             .thread_root
@@ -4204,12 +4703,17 @@ impl App {
                     .thread_root
                     .as_ref()
                     .is_some_and(|root| root.as_ref() == message.id.as_ref());
-                body_lines.extend(thread_message_card_lines(
-                    message,
+                let render = thread_message_card_lines(
+                    &message,
                     self.theme,
                     is_root,
                     chunks[1].width,
-                ));
+                    &mut self.media_preview_cache,
+                    &self.link_metadata_cache,
+                );
+                self.queue_link_metadata_fetches(render.link_preview_requests);
+                self.queue_media_preview_fetches(render.media_preview_requests);
+                body_lines.extend(render.lines);
             }
         }
 
@@ -4796,7 +5300,7 @@ impl App {
                     "Choose a setup method, ordered by robustness:",
                     self.theme.status_key(),
                 )));
-                for (index, mode) in SlackSetupMode::ALL.iter().copied().enumerate() {
+                for (index, mode) in setup.available_modes().iter().copied().enumerate() {
                     let selected = index == setup.selected_mode;
                     let prefix = if selected { "› " } else { "  " };
                     let style = if selected {
@@ -4852,12 +5356,7 @@ impl App {
                     setup.selected_mode().label(),
                     self.theme.status_key(),
                 )));
-                if setup.bundled_oauth_app
-                    && matches!(
-                        setup.selected_mode(),
-                        SlackSetupMode::UserOAuth | SlackSetupMode::ReadOnlyOAuth
-                    )
-                {
+                if setup.bundled_oauth_app && setup.selected_mode() == SlackSetupMode::Automatic {
                     lines.push(Line::from(Span::styled(
                         "chat-cli has a built-in Slack app — no app creation or Client ID/Secret needed.",
                         self.theme.status_key(),
@@ -4876,31 +5375,50 @@ impl App {
                         "Each workspace is approved separately; an admin may need to approve the requested scopes.",
                         self.theme.muted(),
                     )));
-                    lines.push(Line::from(Span::styled(
-                        "For optional realtime, paste an App-Level Token (xapp-...) with connections:write; otherwise Slack falls back to periodic polling.",
-                        self.theme.muted(),
-                    )));
+                    if setup.configured_realtime {
+                        lines.push(Line::from(Span::styled(
+                            "Realtime is already configured from startup settings; no App-Level Token input is needed here.",
+                            self.theme.status_key(),
+                        )));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            "Realtime is not configured yet. Slack will use periodic polling unless you provide an xapp- App-Level Token with connections:write.",
+                            self.theme.muted(),
+                        )));
+                    }
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        "Optional credential fields",
+                        "Primary action: press Enter to open Slack and sign in automatically.",
                         self.theme.status_key(),
                     )));
-                    for (index, field) in setup.credential_fields().iter().copied().enumerate() {
-                        let selected = index == setup.selected_credential_field;
-                        let prefix = if selected { "› " } else { "  " };
-                        let style = if selected {
-                            self.theme.status_key()
-                        } else {
-                            self.theme.status_bar()
-                        };
-                        let display_value = slack_setup_display_value(
-                            setup.credentials.value(field),
-                            field.is_secret(),
-                        );
+                    lines.push(Line::from(Span::styled(
+                        "Advanced: choose User OAuth/Manual App if you want to use your own Slack app instead.",
+                        self.theme.muted(),
+                    )));
+                    if !setup.credential_fields().is_empty() {
+                        lines.push(Line::from(""));
                         lines.push(Line::from(Span::styled(
-                            format!("{prefix}{}: {display_value}", field.label()),
-                            style,
+                            "Optional realtime field",
+                            self.theme.status_key(),
                         )));
+                        for (index, field) in setup.credential_fields().iter().copied().enumerate()
+                        {
+                            let selected = index == setup.selected_credential_field;
+                            let prefix = if selected { "› " } else { "  " };
+                            let style = if selected {
+                                self.theme.status_key()
+                            } else {
+                                self.theme.status_bar()
+                            };
+                            let display_value = slack_setup_display_value(
+                                setup.credentials.value(field),
+                                field.is_secret(),
+                            );
+                            lines.push(Line::from(Span::styled(
+                                format!("{prefix}{}: {display_value}", field.label()),
+                                style,
+                            )));
+                        }
                     }
                 } else if let Some(url) = &setup.oauth_url {
                     lines.push(Line::from(format!(
@@ -5215,6 +5733,7 @@ impl App {
             Line::from("  F1: open or close this help"),
             Line::from("  ?: open or close this help outside compose"),
             Line::from("  Ctrl+S: open settings"),
+            Line::from("  Ctrl+X: toggle image previews Matrix/HD"),
             Line::from("  Ctrl+Q or Ctrl+C: quit"),
             Line::from("  Esc: close popup, cancel reply, or move back"),
             Line::from("  Left/Right: move between panes"),
@@ -5492,6 +6011,96 @@ impl App {
         frame.render_widget(paragraph, modal);
     }
 
+    fn draw_threads_inbox(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(inbox) = &self.state.threads_inbox else {
+            return;
+        };
+        if area.width < 32 || area.height < 8 {
+            return;
+        }
+
+        let unread_threads = inbox.entries.len();
+        let title = if unread_threads == 0 {
+            "Threads · all caught up".to_owned()
+        } else {
+            format!("Threads · {unread_threads} unread")
+        };
+        let width = area.width.saturating_sub(4).clamp(40, 80);
+        let visible = (area.height.saturating_sub(6)) as usize;
+        let height = ((inbox.entries.len().max(1) * 2) as u16)
+            .saturating_add(5)
+            .clamp(8, area.height.saturating_sub(2));
+        let modal = centered_fixed_rect(area, width, height);
+
+        let mut lines = vec![Line::from(Span::styled(
+            "Threads with new replies",
+            self.theme.muted(),
+        ))];
+
+        if inbox.entries.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  You're all caught up. No threads have new replies.",
+                self.theme.muted(),
+            )));
+        } else {
+            // Keep the selected entry visible with a simple window.
+            let start = inbox
+                .selected
+                .saturating_sub(visible.saturating_sub(1).max(1) / 2);
+            for (index, entry) in inbox
+                .entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible.max(1))
+            {
+                let selected = index == inbox.selected;
+                let marker = if selected { "›" } else { " " };
+                let header_style = if selected {
+                    self.theme.status_key()
+                } else {
+                    self.theme.status_bar()
+                };
+                let when = entry
+                    .last_reply_at
+                    .map(format_relative_time)
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} "), header_style),
+                    Span::styled(truncate_chars(&entry.chat_name, 24), header_style),
+                    Span::styled(
+                        format!(
+                            "  {} new of {}",
+                            entry.unread_reply_count, entry.reply_count
+                        ),
+                        self.theme.unread(),
+                    ),
+                    Span::styled(format!("   {when}"), self.theme.muted()),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!("    ↪ {}", truncate_chars(&entry.preview, 52)),
+                    self.theme.muted(),
+                )));
+            }
+        }
+
+        lines.push(Line::from(Span::styled(
+            "↑/↓ move · Enter open thread · Esc back",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.overlay_border()),
+            )
+            .wrap(Wrap { trim: true });
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
     fn draw_image_viewer(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let Some(viewer) = self.state.image_viewer.clone() else {
             return;
@@ -5505,9 +6114,12 @@ impl App {
             area.width.saturating_sub(4).min(IMAGE_VIEWER_MAX_WIDTH),
             area.height.saturating_sub(4),
         );
-        let protocol = self
-            .cached_terminal_image_protocol(&viewer.path, max_inner_size)
-            .and_then(Result::ok);
+        let protocol = if self.settings.image_preview_mode == ImagePreviewMode::Hd {
+            self.cached_terminal_image_protocol(&viewer.path, max_inner_size)
+                .and_then(Result::ok)
+        } else {
+            None
+        };
         let inner_size = protocol
             .as_ref()
             .map(Protocol::size)
@@ -5538,6 +6150,276 @@ impl App {
         path: &Path,
         size: Size,
     ) -> Option<std::result::Result<Protocol, String>> {
+        let key = self.queue_terminal_image_protocol(path, size, TerminalImageResizeMode::Fit)?;
+        self.image_protocol_cache.get(&key).cloned()
+    }
+
+    fn cached_scaled_terminal_image_protocol(
+        &mut self,
+        path: &Path,
+        size: Size,
+    ) -> Option<std::result::Result<Protocol, String>> {
+        let key = self.queue_terminal_image_protocol(path, size, TerminalImageResizeMode::Scale)?;
+        self.image_protocol_cache.get(&key).cloned()
+    }
+
+    fn cached_terminal_image_protocol_from_bytes(
+        &mut self,
+        label_path: &Path,
+        bytes: Arc<[u8]>,
+        size: Size,
+    ) -> Option<std::result::Result<Protocol, String>> {
+        let key = self.queue_terminal_image_protocol_from_bytes(label_path, bytes, size)?;
+        self.image_protocol_cache.get(&key).cloned()
+    }
+
+    fn render_inline_hd_image_previews(&mut self, frame: &mut Frame<'_>, messages_area: Rect) {
+        if self.settings.image_preview_mode != ImagePreviewMode::Hd {
+            return;
+        }
+        if self
+            .image_picker
+            .as_ref()
+            .is_none_or(|picker| picker.protocol_type() == ProtocolType::Halfblocks)
+        {
+            return;
+        }
+        let content_area = inner_area(messages_area);
+        if content_area.is_empty() {
+            return;
+        }
+
+        let hits = self.state.media_hits.clone();
+        for hit in hits {
+            if hit.end_line < self.state.message_scroll {
+                continue;
+            }
+            let relative_start = hit.start_line.saturating_sub(self.state.message_scroll);
+            let top_padding = self.state.message_top_padding;
+            if relative_start.saturating_add(top_padding) >= content_area.height as usize {
+                continue;
+            }
+            let relative_end = hit.end_line.saturating_sub(self.state.message_scroll);
+            let start_y = content_area
+                .y
+                .saturating_add(relative_start.saturating_add(top_padding) as u16);
+            let end_y = content_area.y.saturating_add(
+                relative_end
+                    .saturating_add(top_padding)
+                    .min(content_area.height as usize - 1) as u16,
+            );
+            if end_y < start_y {
+                continue;
+            }
+            let preview_start_x = content_area.x.saturating_add(hit.preview_start_col);
+            let preview_end_x = content_area
+                .x
+                .saturating_add(hit.preview_end_col.min(content_area.width));
+            let preview_width = preview_end_x.saturating_sub(preview_start_x);
+            let height = end_y.saturating_sub(start_y).saturating_add(1);
+            if preview_width == 0 || height == 0 {
+                continue;
+            }
+            let preview_area = Rect::new(preview_start_x, start_y, preview_width, height);
+            if let Some(Ok(protocol)) = self.cached_scaled_terminal_image_protocol(
+                &hit.path,
+                Size::new(preview_area.width, preview_area.height),
+            ) {
+                let clear_start_x = content_area.x.saturating_add(hit.start_col);
+                let clear_end_x = content_area
+                    .x
+                    .saturating_add(hit.end_col.min(content_area.width));
+                let clear_width = clear_end_x.saturating_sub(clear_start_x);
+                let clear_area = if clear_width > 0 {
+                    Rect::new(clear_start_x, start_y, clear_width, height)
+                } else {
+                    preview_area
+                };
+                frame.render_widget(Clear, clear_area);
+
+                let protocol_size = protocol.size();
+                let image_width = protocol_size.width.min(preview_area.width).max(1);
+                let image_height = protocol_size.height.min(preview_area.height).max(1);
+                let image_x = preview_area
+                    .x
+                    .saturating_add(preview_area.width.saturating_sub(image_width) / 2);
+                let image_y = preview_area
+                    .y
+                    .saturating_add(preview_area.height.saturating_sub(image_height) / 2);
+                let image_area = Rect::new(image_x, image_y, image_width, image_height);
+                let image = TerminalImage::new(&protocol).allow_clipping(true);
+                frame.render_widget(image, image_area);
+            }
+        }
+    }
+
+    fn render_chat_list_hd_avatars(
+        &mut self,
+        frame: &mut Frame<'_>,
+        list_area: Rect,
+        layout: &chat_list::ChatListLayout,
+    ) {
+        if self.settings.image_preview_mode != ImagePreviewMode::Hd
+            || !self.terminal_hd_images_supported()
+        {
+            return;
+        }
+        let inner = inner_area(list_area);
+        if inner.is_empty() {
+            return;
+        }
+
+        let mut y = inner.y;
+        for row in &layout.visible_rows {
+            match row {
+                chat_list::ChatListRow::Section { .. } => {
+                    y = y.saturating_add(1);
+                }
+                chat_list::ChatListRow::Chat { chat_index } => {
+                    if y >= inner.y.saturating_add(inner.height) {
+                        break;
+                    }
+                    let Some(chat) = self.state.chats.get(*chat_index).cloned() else {
+                        y = y.saturating_add(chat_list::CHAT_AVATAR_ROWS);
+                        continue;
+                    };
+                    if let Some(path) = self.chat_avatar_path(&chat) {
+                        let key = AvatarPreviewKey {
+                            path,
+                            width: chat_list::CHAT_AVATAR_WIDTH,
+                            rows: chat_list::CHAT_AVATAR_ROWS,
+                            source: AvatarPreviewSource::Avatar,
+                        };
+                        let area = Rect::new(
+                            inner.x,
+                            y,
+                            chat_list::CHAT_AVATAR_WIDTH,
+                            chat_list::CHAT_AVATAR_ROWS
+                                .min(inner.y.saturating_add(inner.height).saturating_sub(y)),
+                        );
+                        self.render_hd_avatar_for_key(frame, area, &key);
+                    }
+
+                    if let Some(account) = self.account_for_provider(&chat.account)
+                        && let Some(path) = self.account_badge_avatar_path(&chat.account, &account)
+                    {
+                        let key = AvatarPreviewKey {
+                            path,
+                            width: chat_list::ACCOUNT_BADGE_WIDTH,
+                            rows: chat_list::ACCOUNT_BADGE_ROWS,
+                            source: AvatarPreviewSource::AccountBadge,
+                        };
+                        let area = Rect::new(
+                            inner
+                                .x
+                                .saturating_add(chat_list::CHAT_AVATAR_WIDTH)
+                                .saturating_add(1),
+                            y,
+                            chat_list::ACCOUNT_BADGE_WIDTH,
+                            chat_list::ACCOUNT_BADGE_ROWS,
+                        );
+                        self.render_hd_avatar_for_key(frame, area, &key);
+                    }
+                    y = y.saturating_add(chat_list::CHAT_AVATAR_ROWS);
+                }
+            }
+        }
+    }
+
+    fn render_message_hd_avatars(&mut self, frame: &mut Frame<'_>, messages_area: Rect) {
+        if self.settings.image_preview_mode != ImagePreviewMode::Hd
+            || !self.terminal_hd_images_supported()
+        {
+            return;
+        }
+        let content_area = inner_area(messages_area);
+        if content_area.is_empty() {
+            return;
+        }
+
+        let hits = self.state.message_hits.clone();
+        for hit in hits {
+            let Some(avatar_hit) = hit.avatar_hit else {
+                continue;
+            };
+            let Some(path) = hit.avatar_path else {
+                continue;
+            };
+            if avatar_hit.line < self.state.message_scroll {
+                continue;
+            }
+            let relative = avatar_hit.line.saturating_sub(self.state.message_scroll);
+            let top_padding = self.state.message_top_padding;
+            if relative.saturating_add(top_padding) >= content_area.height as usize {
+                continue;
+            }
+            let y = content_area
+                .y
+                .saturating_add(relative.saturating_add(top_padding) as u16);
+            let x = content_area.x.saturating_add(avatar_hit.start_col);
+            let width = avatar_hit.end_col.saturating_sub(avatar_hit.start_col).min(
+                content_area
+                    .x
+                    .saturating_add(content_area.width)
+                    .saturating_sub(x),
+            );
+            if width == 0 {
+                continue;
+            }
+            let area = Rect::new(x, y, width, message_list::MESSAGE_AVATAR_ROWS);
+            let key = AvatarPreviewKey {
+                path,
+                width: message_list::MESSAGE_AVATAR_WIDTH,
+                rows: message_list::MESSAGE_AVATAR_ROWS,
+                source: AvatarPreviewSource::Avatar,
+            };
+            self.render_hd_avatar_for_key(frame, area, &key);
+        }
+    }
+
+    fn render_hd_avatar_for_key(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        key: &AvatarPreviewKey,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        let Some(bytes) = self
+            .avatar_preview_cache
+            .get(key)
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|avatar| avatar.thumbnail.clone())
+        else {
+            if !self.pending_avatar_previews.contains(key) {
+                self.queue_avatar_preview(key.clone());
+            }
+            return;
+        };
+        if let Some(Ok(protocol)) = self.cached_terminal_image_protocol_from_bytes(
+            &key.path,
+            bytes,
+            Size::new(area.width, area.height),
+        ) {
+            frame.render_widget(Clear, area);
+            let image = TerminalImage::new(&protocol).allow_clipping(true);
+            frame.render_widget(image, area);
+        }
+    }
+
+    fn terminal_hd_images_supported(&self) -> bool {
+        self.image_picker
+            .as_ref()
+            .is_some_and(|picker| picker.protocol_type() != ProtocolType::Halfblocks)
+    }
+
+    fn queue_terminal_image_protocol(
+        &mut self,
+        path: &Path,
+        size: Size,
+        resize_mode: TerminalImageResizeMode,
+    ) -> Option<ImageProtocolKey> {
         let picker = self.image_picker.as_ref()?;
         if picker.protocol_type() == ProtocolType::Halfblocks {
             return None;
@@ -5545,16 +6427,85 @@ impl App {
 
         let key = ImageProtocolKey {
             path: path.to_path_buf(),
+            bytes_hash: None,
             width: size.width,
             height: size.height,
+            resize_mode,
         };
-        let picker = picker.clone();
-        Some(
+        if size.width == 0 || size.height == 0 {
             self.image_protocol_cache
-                .entry(key)
-                .or_insert_with(|| build_terminal_image_protocol(&picker, path, size))
-                .clone(),
-        )
+                .insert(key.clone(), Err("image area is too small".to_owned()));
+            return Some(key);
+        }
+        if self.image_protocol_cache.contains_key(&key)
+            || !self.pending_image_protocols.insert(key.clone())
+        {
+            return Some(key);
+        }
+
+        let picker = picker.clone();
+        let tx = self.image_protocol_tx.clone();
+        let path = path.to_path_buf();
+        let request_key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = build_terminal_image_protocol(&picker, &path, size, resize_mode);
+            let _ = tx.send(ImageProtocolFetchResult {
+                key: request_key,
+                result,
+                elapsed: started.elapsed(),
+            });
+        });
+        Some(key)
+    }
+
+    fn queue_terminal_image_protocol_from_bytes(
+        &mut self,
+        label_path: &Path,
+        bytes: Arc<[u8]>,
+        size: Size,
+    ) -> Option<ImageProtocolKey> {
+        let picker = self.image_picker.as_ref()?;
+        if picker.protocol_type() == ProtocolType::Halfblocks {
+            return None;
+        }
+        let key = ImageProtocolKey {
+            path: label_path.to_path_buf(),
+            bytes_hash: Some(stable_bytes_hash(&bytes)),
+            width: size.width,
+            height: size.height,
+            resize_mode: TerminalImageResizeMode::Fit,
+        };
+        if size.width == 0 || size.height == 0 {
+            self.image_protocol_cache
+                .insert(key.clone(), Err("image area is too small".to_owned()));
+            return Some(key);
+        }
+        if self.image_protocol_cache.contains_key(&key)
+            || !self.pending_image_protocols.insert(key.clone())
+        {
+            return Some(key);
+        }
+
+        let picker = picker.clone();
+        let tx = self.image_protocol_tx.clone();
+        let request_key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = build_terminal_image_protocol_from_bytes(&picker, &bytes, size);
+            let _ = tx.send(ImageProtocolFetchResult {
+                key: request_key,
+                result,
+                elapsed: started.elapsed(),
+            });
+        });
+        Some(key)
+    }
+
+    fn clear_image_protocol_work(&mut self) {
+        self.image_protocol_cache.clear();
+        self.pending_image_protocols.clear();
+        while self.image_protocol_rx.try_recv().is_ok() {}
     }
 
     fn render_halfblock_image(
@@ -5882,6 +6833,12 @@ impl App {
                 }
                 let preview_started = Instant::now();
                 self.refresh_chat_preview_from_message(&message).await?;
+                if !is_historical {
+                    self.mark_slack_live_message_unread_if_needed(&message)
+                        .await?;
+                    self.mark_live_thread_reply_unread_if_needed(&message)
+                        .await?;
+                }
                 self.log_slow_perf_duration(
                     "provider.message.preview",
                     preview_started,
@@ -6153,7 +7110,7 @@ impl App {
                         remove_reaction(message, emoji.as_ref(), &sender);
                     }
                     updated = Some(message.clone());
-                    self.message_layout_cache.clear();
+                    self.clear_message_layout_cache();
                 }
                 if let Some(message) = updated {
                     self.store.upsert_message(&message).await?;
@@ -6458,8 +7415,17 @@ impl App {
             return Ok(false);
         }
 
+        if is_ctrl_char(key, 'x') {
+            self.toggle_image_preview_mode().await?;
+            return Ok(false);
+        }
+
         if self.state.account_switcher.is_some() {
             return self.handle_account_switcher_key(key).await;
+        }
+
+        if self.state.threads_inbox.is_some() {
+            return self.handle_threads_inbox_key(key).await;
         }
 
         if self.state.account_setup.is_some() {
@@ -6566,7 +7532,19 @@ impl App {
                 }
                 KeyCode::Enter => self.activate_selected_chat(),
                 KeyCode::Down => self.select_next_chat(),
-                KeyCode::Up => self.select_previous_chat(),
+                KeyCode::Up => {
+                    // At the top of the chat list, Up reveals the Threads inbox
+                    // (an account-wide view of threads with new replies),
+                    // mirroring native apps without introducing a new shortcut.
+                    if self.state.focus == FocusPane::ChatList
+                        && self.selected_visible_position() == Some(0)
+                    {
+                        self.open_threads_inbox().await?;
+                        false
+                    } else {
+                        self.select_previous_chat()
+                    }
+                }
                 KeyCode::Home => self.select_first_chat(),
                 KeyCode::End => self.select_last_chat(),
                 KeyCode::PageDown => self.page_down_chats(),
@@ -6719,10 +7697,12 @@ impl App {
                     setup.selected_mode = setup
                         .selected_mode
                         .saturating_add(1)
-                        .min(SlackSetupMode::ALL.len().saturating_sub(1));
+                        .min(setup.available_modes().len().saturating_sub(1));
                     self.state.status = format!("selected {}", setup.selected_mode().label());
                 }
-                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt
+                    if !setup.credential_fields().is_empty() =>
+                {
                     setup.selected_credential_field = setup
                         .selected_credential_field
                         .saturating_add(1)
@@ -6738,7 +7718,9 @@ impl App {
                     setup.selected_mode = setup.selected_mode.saturating_sub(1);
                     self.state.status = format!("selected {}", setup.selected_mode().label());
                 }
-                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt
+                    if !setup.credential_fields().is_empty() =>
+                {
                     setup.selected_credential_field =
                         setup.selected_credential_field.saturating_sub(1);
                     if let Some(field) = setup.selected_credential_field() {
@@ -6752,7 +7734,9 @@ impl App {
                     setup.selected_mode = 0;
                     self.state.status = format!("selected {}", setup.selected_mode().label());
                 }
-                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt
+                    if !setup.credential_fields().is_empty() =>
+                {
                     setup.selected_credential_field = 0;
                     if let Some(field) = setup.selected_credential_field() {
                         self.state.status = format!("editing Slack {}", field.label());
@@ -6762,10 +7746,12 @@ impl App {
             },
             KeyCode::End => match setup.phase {
                 SlackSetupPhase::ChooseAuthMode => {
-                    setup.selected_mode = SlackSetupMode::ALL.len().saturating_sub(1);
+                    setup.selected_mode = setup.available_modes().len().saturating_sub(1);
                     self.state.status = format!("selected {}", setup.selected_mode().label());
                 }
-                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt => {
+                SlackSetupPhase::EnterCredentials | SlackSetupPhase::OAuthPrompt
+                    if !setup.credential_fields().is_empty() =>
+                {
                     setup.selected_credential_field =
                         setup.credential_fields().len().saturating_sub(1);
                     if let Some(field) = setup.selected_credential_field() {
@@ -6802,9 +7788,10 @@ impl App {
             },
             KeyCode::Char(value)
                 if setup.phase == SlackSetupPhase::ChooseAuthMode
-                    && ('1'..='6').contains(&value) =>
+                    && ('1'..='7').contains(&value) =>
             {
-                setup.selected_mode = (value as usize).saturating_sub('1' as usize);
+                let selected = (value as usize).saturating_sub('1' as usize);
+                setup.selected_mode = selected.min(setup.available_modes().len().saturating_sub(1));
                 self.state.status = format!("selected {}", setup.selected_mode().label());
             }
             KeyCode::Enter => {
@@ -6992,6 +7979,9 @@ impl App {
                 if item == SettingsItem::ConversationStyle {
                     self.clamp_message_scroll();
                 }
+                if item == SettingsItem::ImagePreviewMode {
+                    self.clear_image_protocol_work();
+                }
                 let value =
                     item.value_text(&self.settings, self.archive_running_for_current_accounts());
                 self.state.status = format!("{}: {value}", item.label());
@@ -6999,6 +7989,16 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    async fn toggle_image_preview_mode(&mut self) -> Result<()> {
+        self.settings.image_preview_mode =
+            next_image_preview_mode(self.settings.image_preview_mode);
+        self.clear_image_protocol_work();
+        self.store.save_app_settings(&self.settings).await?;
+        let value = image_preview_mode_label(self.settings.image_preview_mode);
+        self.state.status = format!("Image previews: {value}");
+        Ok(())
     }
     async fn handle_account_setup_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(setup) = &mut self.state.account_setup else {
@@ -8265,6 +9265,199 @@ impl App {
         self.unread_message_ids_for_chat(chat.unread_count)
     }
 
+    /// Refresh the per-thread unread map for the selected chat from storage.
+    /// Runs off the draw path (after message loads, live thread bumps, and
+    /// thread-read flushes) so `draw` can render the "N new" badge from cached
+    /// state without touching the database.
+    async fn refresh_thread_unread_for_selected_chat(&mut self) -> Result<()> {
+        let Some((account, chat_id)) = self
+            .state
+            .selected_chat()
+            .map(|chat| (chat.account.clone(), chat.id.clone()))
+        else {
+            self.state.thread_unread.clear();
+            return Ok(());
+        };
+        let summaries = self
+            .store
+            .thread_summaries_for_chat(&account, &chat_id)
+            .await?;
+        self.state.thread_unread = summaries
+            .into_iter()
+            .filter(|summary| summary.unread_reply_count > 0)
+            .map(|summary| (summary.root_id, summary.unread_reply_count))
+            .collect();
+        self.refresh_thread_unread_by_chat().await?;
+        Ok(())
+    }
+
+    /// Refresh the account-wide per-chat unread thread map that backs the
+    /// sidebar `⤷N` marker. Aggregates unread thread summaries by chat id for
+    /// every distinct account currently present in the chat list. Runs off the
+    /// draw path.
+    async fn refresh_thread_unread_by_chat(&mut self) -> Result<()> {
+        let accounts: Vec<ProviderId> = {
+            let mut seen = HashSet::new();
+            self.state
+                .chats
+                .iter()
+                .filter(|chat| seen.insert(chat.account.clone()))
+                .map(|chat| chat.account.clone())
+                .collect()
+        };
+        let mut by_chat: HashMap<ChatId, u32> = HashMap::new();
+        for account in accounts {
+            let summaries = self.store.unread_thread_summaries(&account).await?;
+            for summary in summaries {
+                *by_chat.entry(summary.chat_id).or_insert(0) += summary.unread_reply_count;
+            }
+        }
+        self.state.thread_unread_by_chat = by_chat;
+        Ok(())
+    }
+
+    /// Build and open the Threads inbox overlay from unread thread summaries
+    /// across every loaded account. Runs off the draw path. Closing other
+    /// overlays first keeps the modal stack predictable.
+    async fn open_threads_inbox(&mut self) -> Result<()> {
+        let accounts: Vec<ProviderId> = {
+            let mut seen = HashSet::new();
+            self.state
+                .chats
+                .iter()
+                .filter(|chat| seen.insert(chat.account.clone()))
+                .map(|chat| chat.account.clone())
+                .collect()
+        };
+        let mut entries: Vec<ThreadInboxEntry> = Vec::new();
+        for account in accounts {
+            let summaries = self.store.unread_thread_summaries(&account).await?;
+            for summary in summaries {
+                let chat_name = self
+                    .state
+                    .chats
+                    .iter()
+                    .find(|chat| chat.account == summary.account && chat.id == summary.chat_id)
+                    .map(|chat| chat.name.to_string())
+                    .unwrap_or_else(|| short_id(&summary.chat_id));
+                let preview = summary
+                    .root_preview
+                    .as_deref()
+                    .map(message_list::slack_emoji_shortcodes_to_display)
+                    .unwrap_or_else(|| "(no preview)".to_owned());
+                entries.push(ThreadInboxEntry {
+                    account: summary.account,
+                    chat_id: summary.chat_id,
+                    root_id: summary.root_id,
+                    chat_name,
+                    preview,
+                    unread_reply_count: summary.unread_reply_count,
+                    reply_count: summary.reply_count,
+                    last_reply_at: summary.last_reply_at,
+                });
+            }
+        }
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.last_reply_at));
+        let unread_threads = entries.len();
+        self.state.action_menu = None;
+        self.state.reaction_picker = None;
+        self.state.account_switcher = None;
+        self.state.threads_inbox = Some(ThreadsInbox {
+            entries,
+            selected: 0,
+        });
+        self.state.status = if unread_threads == 0 {
+            "Threads: all caught up".to_owned()
+        } else if unread_threads == 1 {
+            "Threads: 1 thread with new replies".to_owned()
+        } else {
+            format!("Threads: {unread_threads} threads with new replies")
+        };
+        Ok(())
+    }
+
+    /// Handle keys while the Threads inbox overlay is open. Reuses the same
+    /// navigation as the rest of the app: arrows move, Enter opens the selected
+    /// thread, Esc closes. Returns whether a navigation load should be
+    /// scheduled.
+    async fn handle_threads_inbox_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(inbox) = self.state.threads_inbox.as_mut() else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.state.threads_inbox = None;
+                self.state.status = "Threads closed".to_owned();
+                Ok(false)
+            }
+            KeyCode::Down => {
+                if !inbox.entries.is_empty() {
+                    inbox.selected = (inbox.selected + 1).min(inbox.entries.len() - 1);
+                }
+                Ok(false)
+            }
+            KeyCode::Up => {
+                inbox.selected = inbox.selected.saturating_sub(1);
+                Ok(false)
+            }
+            KeyCode::Home => {
+                inbox.selected = 0;
+                Ok(false)
+            }
+            KeyCode::End => {
+                if !inbox.entries.is_empty() {
+                    inbox.selected = inbox.entries.len() - 1;
+                }
+                Ok(false)
+            }
+            KeyCode::Enter => Ok(self.activate_thread_inbox_entry()),
+            _ => Ok(false),
+        }
+    }
+
+    /// Open the thread for the currently selected Threads-inbox entry. Selects
+    /// the parent chat (scheduling its message load when needed) and queues the
+    /// thread to open once messages are available. Returns whether a navigation
+    /// load should be scheduled.
+    fn activate_thread_inbox_entry(&mut self) -> bool {
+        let Some(inbox) = self.state.threads_inbox.take() else {
+            return false;
+        };
+        let Some(entry) = inbox.entries.get(inbox.selected).cloned() else {
+            return false;
+        };
+        let Some(chat_index) = self
+            .state
+            .chats
+            .iter()
+            .position(|chat| chat.account == entry.account && chat.id == entry.chat_id)
+        else {
+            self.state.status = "thread's chat is no longer available".to_owned();
+            return false;
+        };
+        let changed = self.activate_chat_index(chat_index);
+        self.state.pending_thread_open = Some(entry.root_id);
+        // When the chat was already loaded, open the thread immediately;
+        // otherwise the message-load drain will open it once messages arrive.
+        let opened_now = self.try_open_pending_thread();
+        changed && !opened_now
+    }
+
+    /// Open a queued thread if its root message is already loaded in the
+    /// current chat. No-op when nothing is queued or the message is not yet
+    /// available. Returns whether a thread was opened.
+    fn try_open_pending_thread(&mut self) -> bool {
+        let Some(root_id) = self.state.pending_thread_open.clone() else {
+            return false;
+        };
+        if self.message_by_id(&root_id).is_none() {
+            return false;
+        }
+        self.state.pending_thread_open = None;
+        self.open_thread(root_id);
+        true
+    }
+
     fn unread_message_ids_for_chat(&self, unread_count: u32) -> HashSet<Arc<str>> {
         self.state
             .messages
@@ -8459,7 +9652,7 @@ impl App {
         self.state.discovery_results.clear();
         self.state.filtered_messages.clear();
         self.pending_discovery_query = None;
-        self.message_layout_cache.clear();
+        self.clear_message_layout_cache();
         let selection_changed = self.apply_filter();
         self.state.status = "filter cleared".to_owned();
         selection_changed
@@ -8641,6 +9834,91 @@ impl App {
         Ok(())
     }
 
+    async fn mark_slack_live_message_unread_if_needed(&mut self, message: &Message) -> Result<()> {
+        if message.account.is_empty()
+            || message.chat_id.is_empty()
+            || message.is_from_me
+            || message.platform_data.slack.is_none()
+            || self.is_chat_currently_attended(&message.account, &message.chat_id)
+        {
+            return Ok(());
+        }
+
+        let Some(chat) = self
+            .state
+            .chats
+            .iter_mut()
+            .find(|chat| chat.account == message.account && chat.id == message.chat_id)
+        else {
+            return Ok(());
+        };
+
+        chat.unread_count = chat.unread_count.saturating_add(1);
+        let updated = chat.clone();
+        self.store.upsert_chat(&updated).await?;
+        self.sort_chats_preserving_selection();
+        self.apply_filter();
+        Ok(())
+    }
+
+    fn is_chat_currently_attended(&self, account: &ProviderId, chat_id: &ChatId) -> bool {
+        matches!(
+            self.state.focus,
+            FocusPane::Messages | FocusPane::Compose | FocusPane::Details
+        ) && self
+            .state
+            .selected_chat()
+            .is_some_and(|chat| chat.account == *account && chat.id == *chat_id)
+    }
+
+    /// True when the user currently has the thread pane open on this thread, in
+    /// which case live replies should not be counted as unread.
+    fn is_thread_currently_attended(&self, thread_root: &MessageId) -> bool {
+        self.state.focus == FocusPane::Details
+            && self.state.thread_root.as_ref() == Some(thread_root)
+    }
+
+    /// Increment the per-thread unread counter for a live (non-historical)
+    /// thread reply, unless the reply is the user's own or the thread is already
+    /// open. Mirrors `mark_slack_live_message_unread_if_needed` but tracks the
+    /// thread separately so the sidebar, summary line, and Threads inbox can
+    /// surface unread replies distinctly from channel activity.
+    async fn mark_live_thread_reply_unread_if_needed(&mut self, message: &Message) -> Result<()> {
+        if message.is_from_me {
+            return Ok(());
+        }
+        let Some(root) = thread_root_of(message) else {
+            return Ok(());
+        };
+        if self.is_thread_currently_attended(&root) {
+            return Ok(());
+        }
+        let unread = self
+            .store
+            .bump_thread_unread(&message.account, &root)
+            .await?;
+        self.log_perf_marker(
+            "thread.unread.bump",
+            format!(
+                "account={} chat={} thread={} unread={}",
+                message.account, message.chat_id, root, unread
+            ),
+        );
+        if self
+            .state
+            .selected_chat()
+            .is_some_and(|chat| chat.account == message.account && chat.id == message.chat_id)
+        {
+            self.state.thread_unread.insert(root, unread);
+        }
+        *self
+            .state
+            .thread_unread_by_chat
+            .entry(message.chat_id.clone())
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
     fn append_historical_message_to_current_chat(&mut self, message: Message) {
         if let Some(existing) = self
             .state
@@ -8654,7 +9932,7 @@ impl App {
         }
         self.state.messages.sort_by_key(|message| message.timestamp);
         self.apply_message_filter();
-        self.message_layout_cache.clear();
+        self.clear_message_layout_cache();
         self.clamp_message_scroll();
     }
 
@@ -9148,8 +10426,30 @@ impl App {
 
     fn open_thread(&mut self, message_id: MessageId) {
         let reply_count = self.thread_reply_count(&message_id);
+        // Queue clearing this thread's unread counter; the async flush runs
+        // after event handling so this sync path stays responsive.
+        if let Some(account) = self
+            .state
+            .selected_chat()
+            .map(|chat| chat.account.clone())
+            .or_else(|| {
+                self.message_by_id(&message_id)
+                    .map(|message| message.account.clone())
+            })
+        {
+            self.state.pending_thread_read = Some((account, message_id.clone()));
+        }
+        self.state.thread_open_unread = self
+            .state
+            .thread_unread
+            .get(&message_id)
+            .copied()
+            .unwrap_or(0);
         self.state.thread_root = Some(message_id);
         self.state.focus = FocusPane::Details;
+        // Land on the newest replies (native thread behaviour); the draw path
+        // clamps this to the real maximum once the pane is measured.
+        self.state.details_scroll = usize::MAX;
         self.state.status = if reply_count == 0 {
             "thread opened; no replies yet".to_owned()
         } else if reply_count == 1 {
@@ -9157,6 +10457,35 @@ impl App {
         } else {
             format!("thread opened with {reply_count} replies")
         };
+    }
+
+    /// Clear the unread counter for a thread that was just opened. No-op when
+    /// nothing is pending. Mirrors how chat unread is cleared on read.
+    async fn flush_pending_thread_read(&mut self) -> Result<()> {
+        let Some((account, thread_root)) = self.state.pending_thread_read.take() else {
+            return Ok(());
+        };
+        let last_reply_id = self
+            .thread_replies(&thread_root)
+            .last()
+            .map(|message| message.id.clone());
+        self.store
+            .mark_thread_read(
+                &account,
+                &thread_root,
+                last_reply_id.as_ref(),
+                Some(Utc::now()),
+            )
+            .await?;
+        self.log_perf_marker(
+            "thread.unread.clear",
+            format!("account={account} thread={thread_root}"),
+        );
+        self.state.thread_unread.remove(&thread_root);
+        // Recompute the sidebar aggregate from storage so it always matches the
+        // authoritative per-thread counters after a read.
+        self.refresh_thread_unread_by_chat().await?;
+        Ok(())
     }
 
     fn open_forward_picker(&mut self, message_id: MessageId) {
@@ -9406,7 +10735,7 @@ impl App {
             });
         }
         let updated = message.clone();
-        self.message_layout_cache.clear();
+        self.clear_message_layout_cache();
         self.store.upsert_message(&updated).await?;
         self.state.status = "poll vote submitted".to_owned();
         Ok(())
@@ -9442,7 +10771,7 @@ impl App {
             add_reaction(message, emoji, Arc::from(LOCAL_REACTION_SENDER));
         }
         let updated = message.clone();
-        self.message_layout_cache.clear();
+        self.clear_message_layout_cache();
         self.store.upsert_message(&updated).await?;
         self.state.status = if had_reaction {
             format!("removed reaction {emoji}")
@@ -9760,10 +11089,17 @@ impl App {
     fn open_slack_setup_for_account(&mut self, account: &Account, status: Option<String>) {
         let workspace_label = slack_setup_workspace_seed(&account.display_name);
         let mut overlay = SlackSetupOverlay::new(account.id.clone(), workspace_label);
-        overlay.bundled_oauth_app = self
+        let (bundled_oauth_app, configured_realtime) = self
             .provider_for_id(&account.id)
-            .map(|provider| provider.has_bundled_oauth_app())
-            .unwrap_or(false);
+            .map(|provider| {
+                (
+                    provider.has_bundled_oauth_app(),
+                    provider.has_configured_realtime(),
+                )
+            })
+            .unwrap_or((false, false));
+        overlay.bundled_oauth_app = bundled_oauth_app;
+        overlay.configured_realtime = configured_realtime;
         if let Some(status) = status {
             overlay.phase = SlackSetupPhase::Failed;
             overlay.status = Some(status);
@@ -9783,19 +11119,35 @@ impl App {
             .map(|account| slack_setup_workspace_seed(&account.display_name))
             .unwrap_or_else(|| provider_id.to_string());
         let mut overlay = SlackSetupOverlay::new(provider_id.clone(), workspace_label);
-        overlay.bundled_oauth_app = self
+        let (bundled_oauth_app, configured_realtime) = self
             .provider_for_id(provider_id)
-            .map(|provider| provider.has_bundled_oauth_app())
-            .unwrap_or(false);
+            .map(|provider| {
+                (
+                    provider.has_bundled_oauth_app(),
+                    provider.has_configured_realtime(),
+                )
+            })
+            .unwrap_or((false, false));
+        overlay.bundled_oauth_app = bundled_oauth_app;
+        overlay.configured_realtime = configured_realtime;
         if let Some(challenge) = challenge {
             match challenge {
                 AuthChallenge::OAuthUrl(url) => {
                     overlay.phase = SlackSetupPhase::OAuthPrompt;
-                    overlay.oauth_url = Some(url.to_string());
-                    overlay.status = Some(
-                        "Create the Slack app, then enter Client ID and Client Secret here; chat-cli opens your browser to finish sign-in automatically.".to_owned(),
-                    );
-                    open_and_copy_slack_oauth_url(url.as_ref());
+                    if overlay.bundled_oauth_app {
+                        overlay.selected_mode = 0; // Automatic (built-in Slack app).
+                        overlay.oauth_url = None;
+                        overlay.status = Some(
+                            "Press Enter to open Slack and sign in with the built-in chat-cli app."
+                                .to_owned(),
+                        );
+                    } else {
+                        overlay.oauth_url = Some(url.to_string());
+                        overlay.status = Some(
+                            "Create the Slack app, then enter Client ID and Client Secret here; chat-cli opens your browser to finish sign-in automatically.".to_owned(),
+                        );
+                        open_and_copy_slack_oauth_url(url.as_ref());
+                    }
                 }
                 AuthChallenge::Waiting => {
                     overlay.phase = SlackSetupPhase::EnterCredentials;
@@ -10781,13 +12133,12 @@ impl App {
                         .thread_root
                         .as_ref()
                         .is_some_and(|root| root.as_ref() == message.id.as_ref());
-                    thread_message_card_lines(
+                    thread_message_card_line_count(
                         message,
-                        self.theme,
                         is_root,
                         self.state.pane_areas.details.width,
+                        &self.link_metadata_cache,
                     )
-                    .len()
                 })
                 .sum::<usize>();
         }
@@ -10829,13 +12180,12 @@ impl App {
         let root_rows = self
             .message_by_id(thread_root)
             .map(|message| {
-                thread_message_card_lines(
+                thread_message_card_line_count(
                     message,
-                    self.theme,
                     true,
                     self.state.pane_areas.details.width,
+                    &self.link_metadata_cache,
                 )
-                .len()
             })
             .unwrap_or(2);
         let replies = self.thread_replies(thread_root);
@@ -10845,13 +12195,12 @@ impl App {
             replies
                 .iter()
                 .map(|message| {
-                    thread_message_card_lines(
+                    thread_message_card_line_count(
                         message,
-                        self.theme,
                         false,
                         self.state.pane_areas.details.width,
+                        &self.link_metadata_cache,
                     )
-                    .len()
                 })
                 .sum()
         };
@@ -10898,7 +12247,7 @@ impl App {
             Vec::new()
         };
         self.ensure_filtered_message_selection();
-        self.message_layout_cache.clear();
+        self.clear_message_layout_cache();
     }
 
     fn apply_filter(&mut self) -> bool {
@@ -10973,6 +12322,59 @@ impl App {
             }
             true
         })
+    }
+
+    fn queue_loaded_chat_avatar_previews(&mut self) {
+        let mut seen_accounts = HashSet::new();
+        let mut keys = self
+            .state
+            .visible_chat_indices
+            .iter()
+            .filter_map(|chat_index| {
+                self.state
+                    .chats
+                    .get(*chat_index)
+                    .and_then(|chat| chat.avatar.as_deref())
+                    .map(|path| AvatarPreviewKey {
+                        path: path.to_path_buf(),
+                        width: chat_list::CHAT_AVATAR_WIDTH,
+                        rows: chat_list::CHAT_AVATAR_ROWS,
+                        source: AvatarPreviewSource::Avatar,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let account_ids = self
+            .state
+            .visible_chat_indices
+            .iter()
+            .filter_map(|chat_index| self.state.chats.get(*chat_index))
+            .map(|chat| chat.account.clone())
+            .filter(|provider_id| seen_accounts.insert(provider_id.clone()))
+            .collect::<Vec<_>>();
+        for provider_id in account_ids {
+            let Some(account) = self.account_for_provider(&provider_id) else {
+                continue;
+            };
+            let Some(path) = self.account_badge_avatar_path(&provider_id, &account) else {
+                continue;
+            };
+            keys.push(AvatarPreviewKey {
+                path,
+                width: chat_list::ACCOUNT_BADGE_WIDTH,
+                rows: chat_list::ACCOUNT_BADGE_ROWS,
+                source: AvatarPreviewSource::AccountBadge,
+            });
+        }
+        let queued = keys.len();
+        self.queue_avatar_preview_loads(keys);
+        self.log_perf_marker(
+            "avatar_preview.prewarm",
+            format!(
+                "requested={queued} visible_chats={} accounts={}",
+                self.state.visible_chat_indices.len(),
+                seen_accounts.len()
+            ),
+        );
     }
 
     fn clamp_message_scroll(&mut self) {
@@ -11193,6 +12595,7 @@ impl App {
             self.state.selected_chat = self.state.chats.len().saturating_sub(1);
         }
         self.apply_filter();
+        self.queue_loaded_chat_avatar_previews();
         self.log_slow_perf_duration(
             "chats.reload",
             reload_started,
@@ -11457,12 +12860,12 @@ impl App {
                 .get_messages_for_chat(&chat.account, &chat.id, None, SELECTED_CHAT_MESSAGE_LIMIT)
                 .await?;
             self.apply_message_filter();
-            self.message_layout_cache.clear();
+            self.clear_message_layout_cache();
             self.apply_cached_member_names_to_selected_messages();
         } else {
             self.state.messages.clear();
             self.state.filtered_messages.clear();
-            self.message_layout_cache.clear();
+            self.clear_message_layout_cache();
         }
         self.clamp_message_scroll();
         self.schedule_older_history_prefetch_if_needed();
@@ -11763,7 +13166,7 @@ impl App {
         older.sort_by_key(|message| message.timestamp);
         self.state.messages = older;
         self.apply_message_filter();
-        self.message_layout_cache.clear();
+        self.clear_message_layout_cache();
 
         let new_line_count = self.cached_message_line_count();
         let added_lines = new_line_count.saturating_sub(previous_line_count);
@@ -11970,6 +13373,7 @@ fn build_terminal_image_protocol(
     picker: &Picker,
     path: &Path,
     size: Size,
+    resize_mode: TerminalImageResizeMode,
 ) -> std::result::Result<Protocol, String> {
     if size.width == 0 || size.height == 0 {
         return Err("image area is too small".to_owned());
@@ -11980,9 +13384,34 @@ fn build_terminal_image_protocol(
         .map_err(|error| format!("detecting {}: {error}", path.display()))?
         .decode()
         .map_err(|error| format!("decoding {}: {error}", path.display()))?;
+    let resize = match resize_mode {
+        TerminalImageResizeMode::Fit => Resize::Fit(Some(FilterType::Triangle)),
+        TerminalImageResizeMode::Scale => Resize::Scale(Some(FilterType::Triangle)),
+    };
+    picker
+        .new_protocol(image, size, resize)
+        .map_err(|error| format!("rendering {}: {error}", path.display()))
+}
+
+fn stable_bytes_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn build_terminal_image_protocol_from_bytes(
+    picker: &Picker,
+    bytes: &[u8],
+    size: Size,
+) -> std::result::Result<Protocol, String> {
+    if size.width == 0 || size.height == 0 {
+        return Err("image area is too small".to_owned());
+    }
+    let image =
+        image::load_from_memory(bytes).map_err(|error| format!("decoding image bytes: {error}"))?;
     picker
         .new_protocol(image, size, Resize::Fit(Some(FilterType::Triangle)))
-        .map_err(|error| format!("rendering {}: {error}", path.display()))
+        .map_err(|error| format!("rendering image bytes: {error}"))
 }
 
 async fn run_app_loop(
@@ -11993,7 +13422,6 @@ async fn run_app_loop(
     let mut loop_started = Instant::now();
 
     while !app.state.should_quit() {
-        let iteration_started = Instant::now();
         if needs_draw {
             let draw_started = Instant::now();
             terminal.draw(|frame| app.draw(frame))?;
@@ -12046,7 +13474,6 @@ async fn run_app_loop(
                 needs_draw = true;
             }
         }
-        app.log_slow_perf_duration("event_loop.iteration", iteration_started, "");
         app.log_event_loop_stall(loop_started.elapsed(), "after=idle");
         loop_started = Instant::now();
     }
@@ -12624,6 +14051,19 @@ fn inner_area(area: Rect) -> Rect {
     Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
 }
 
+fn format_relative_time(timestamp: Timestamp) -> String {
+    let duration = Utc::now().signed_duration_since(timestamp);
+    if duration.num_days() >= 1 {
+        format!("{}d", duration.num_days())
+    } else if duration.num_hours() >= 1 {
+        format!("{}h", duration.num_hours())
+    } else if duration.num_minutes() >= 1 {
+        format!("{}m", duration.num_minutes())
+    } else {
+        "now".to_owned()
+    }
+}
+
 fn centered_fixed_rect(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.max(1).min(area.width);
     let height = height.max(1).min(area.height);
@@ -12915,11 +14355,32 @@ fn is_slack_thread_reply(message: &Message) -> bool {
     })
 }
 
+/// The thread root id a reply belongs to, or `None` when the message is not a
+/// thread reply. Prefers the explicit `thread_id`, falling back to `reply_to`.
+fn thread_root_of(message: &Message) -> Option<ThreadId> {
+    if !is_slack_thread_reply(message) {
+        return None;
+    }
+    message
+        .thread_id
+        .clone()
+        .or_else(|| message.reply_to.clone())
+        .filter(|root| root.as_ref() != message.id.as_ref())
+}
+
 fn reply_count_label(count: usize) -> String {
     if count == 1 {
         "1 reply".to_owned()
     } else {
         format!("{count} replies")
+    }
+}
+
+fn new_replies_label(count: usize) -> String {
+    if count == 1 {
+        "1 new reply".to_owned()
+    } else {
+        format!("{count} new replies")
     }
 }
 
@@ -12936,7 +14397,9 @@ fn thread_message_card_lines(
     theme: Theme,
     is_root: bool,
     width: u16,
-) -> Vec<Line<'static>> {
+    media_cache: &mut message_list::MediaPreviewCache,
+    link_metadata: &message_list::LinkMetadataCache,
+) -> message_list::ThreadMessageCardRender {
     let sender_style = if is_root {
         message_list::sender_style(theme, message.is_from_me).add_modifier(Modifier::BOLD)
     } else {
@@ -12960,18 +14423,24 @@ fn thread_message_card_lines(
         Span::raw(" "),
     ])];
 
-    let content = content_copy_text(&message.content);
-    if content.trim().is_empty() {
+    let body_width = width.saturating_sub(UnicodeWidthStr::width(body_gutter) as u16);
+    let rendered = message_list::build_thread_message_card_lines(
+        message,
+        body_width,
+        media_cache,
+        link_metadata,
+        theme,
+    );
+    if rendered.lines.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(body_gutter.to_owned(), theme.muted()),
             Span::styled("attachment", theme.muted()),
         ]));
     } else {
-        for line in content.lines() {
-            lines.push(Line::from(vec![
-                Span::styled(body_gutter.to_owned(), theme.muted()),
-                Span::raw(line.to_owned()),
-            ]));
+        for mut line in rendered.lines {
+            let mut spans = vec![Span::styled(body_gutter.to_owned(), theme.muted())];
+            spans.append(&mut line.spans);
+            lines.push(Line::from(spans));
         }
     }
 
@@ -12994,7 +14463,24 @@ fn thread_message_card_lines(
         ]));
     }
     lines.push(Line::from(""));
-    lines
+    message_list::ThreadMessageCardRender {
+        lines,
+        link_preview_requests: rendered.link_preview_requests,
+        media_preview_requests: rendered.media_preview_requests,
+    }
+}
+
+fn thread_message_card_line_count(
+    message: &Message,
+    is_root: bool,
+    width: u16,
+    link_metadata: &message_list::LinkMetadataCache,
+) -> usize {
+    let body_gutter = if is_root { "│   " } else { "    " };
+    let body_width = width.saturating_sub(UnicodeWidthStr::width(body_gutter) as u16);
+    1 + message_list::thread_message_card_content_line_count(message, body_width, link_metadata)
+        + usize::from(!message.reactions.is_empty())
+        + 1
 }
 
 fn action_menu_items_for_message(
@@ -13282,6 +14768,12 @@ fn visible_media_caption(media: &Media) -> Option<&str> {
         .filter(|caption| !caption.eq_ignore_ascii_case(EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER))
 }
 
+fn is_whatsapp_status_chat(chat: &Chat) -> bool {
+    chat.platform == Platform::WhatsApp
+        && (chat.id.as_ref() == "whatsapp:status@broadcast"
+            || (chat.name.eq_ignore_ascii_case("status") && chat.id.contains("status")))
+}
+
 fn static_account_icon_path(provider_id: &ProviderId, platform: Platform) -> PathBuf {
     let prefix = match platform {
         Platform::Slack => "slack",
@@ -13303,6 +14795,126 @@ fn static_account_icon_path(provider_id: &ProviderId, platform: Platform) -> Pat
         .join(format!("{prefix}-embedded-v3-{safe_id}.png"))
 }
 
+fn avatar_thumbnail_cache_key(key: &AvatarPreviewKey) -> String {
+    let source = match key.source {
+        AvatarPreviewSource::Avatar => "avatar",
+        AvatarPreviewSource::AccountBadge => "account_badge",
+    };
+    format!(
+        "v{}:{source}:{}:{}x{}",
+        AVATAR_THUMBNAIL_CACHE_VERSION,
+        key.path.to_string_lossy(),
+        key.width,
+        key.rows
+    )
+}
+
+fn avatar_thumbnail_source_kind(key: &AvatarPreviewKey) -> &'static str {
+    match key.source {
+        AvatarPreviewSource::Avatar => "chat_avatar",
+        AvatarPreviewSource::AccountBadge => "account_badge",
+    }
+}
+
+fn avatar_source_metadata(path: &Path) -> (Option<i64>, Option<i64>) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return (None, None);
+    };
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64);
+    let size = i64::try_from(metadata.len()).ok();
+    (modified, size)
+}
+
+fn avatar_thumbnail_record_is_stale(
+    key: &AvatarPreviewKey,
+    record: &AvatarThumbnailCacheRecord,
+) -> bool {
+    let (source_mtime, source_size) = avatar_source_metadata(&key.path);
+    record.cache_version != AVATAR_THUMBNAIL_CACHE_VERSION
+        || record.source_kind != avatar_thumbnail_source_kind(key)
+        || record.source_path != key.path
+        || record.source_mtime != source_mtime
+        || record.source_size != source_size
+}
+
+fn avatar_thumbnail_record_to_rows(
+    key: &AvatarPreviewKey,
+    record: AvatarThumbnailCacheRecord,
+) -> Result<AvatarPreviewData, String> {
+    if record.image_format != "png" {
+        return Err(format!(
+            "unsupported cached avatar thumbnail format {}",
+            record.image_format
+        ));
+    }
+    let rows =
+        message_list::image_preview_rows_from_bytes(&record.image_blob, key.width, key.rows)?;
+    Ok(AvatarPreviewData {
+        rows,
+        thumbnail: Some(Arc::from(record.image_blob.into_boxed_slice())),
+    })
+}
+
+fn decode_avatar_preview_with_thumbnail(
+    key: &AvatarPreviewKey,
+) -> Result<(AvatarPreviewData, AvatarThumbnailCacheUpsert), String> {
+    let thumbnail = generate_avatar_thumbnail_png(&key.path)?;
+    let rows = message_list::image_preview_rows_from_rgba(&thumbnail.image, key.width, key.rows);
+    let (source_mtime, source_size) = avatar_source_metadata(&key.path);
+    let thumbnail_bytes = thumbnail.png.clone();
+    let data = AvatarPreviewData {
+        rows,
+        thumbnail: Some(Arc::from(thumbnail.png.into_boxed_slice())),
+    };
+    let upsert = AvatarThumbnailCacheUpsert {
+        cache_key: avatar_thumbnail_cache_key(key),
+        source_kind: avatar_thumbnail_source_kind(key).to_owned(),
+        source_path: key.path.clone(),
+        source_mtime,
+        source_size,
+        image_format: "png".to_owned(),
+        image_blob: thumbnail_bytes,
+        cache_version: AVATAR_THUMBNAIL_CACHE_VERSION,
+    };
+    Ok((data, upsert))
+}
+
+struct GeneratedAvatarThumbnail {
+    image: image::RgbaImage,
+    png: Vec<u8>,
+}
+
+fn generate_avatar_thumbnail_png(path: &Path) -> Result<GeneratedAvatarThumbnail, String> {
+    let image = image::open(path)
+        .map_err(|error| format!("decoding avatar image {}: {error}", path.display()))?;
+    let mut thumbnail = resize_avatar_cover(image, AVATAR_THUMBNAIL_SIZE).to_rgba8();
+    message_list::apply_rounded_thumbnail_mask(&mut thumbnail);
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(thumbnail.clone())
+        .write_to(&mut io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| format!("encoding avatar thumbnail {}: {error}", path.display()))?;
+    Ok(GeneratedAvatarThumbnail {
+        image: thumbnail,
+        png,
+    })
+}
+
+fn resize_avatar_cover(image: image::DynamicImage, size: u32) -> image::DynamicImage {
+    let width = image.width().max(1);
+    let height = image.height().max(1);
+    let crop_size = width.min(height);
+    let crop_x = width.saturating_sub(crop_size) / 2;
+    let crop_y = height.saturating_sub(crop_size) / 2;
+    image
+        .crop_imm(crop_x, crop_y, crop_size, crop_size)
+        .resize_exact(size, size, image::imageops::FilterType::Triangle)
+}
+
+#[cfg(test)]
 fn account_badge_image_rows(path: &Path) -> Result<chat_list::AvatarRows, String> {
     let image = image::open(path)
         .map_err(|error| format!("decoding account badge image {}: {error}", path.display()))?
@@ -13323,6 +14935,7 @@ fn account_badge_image_rows(path: &Path) -> Result<chat_list::AvatarRows, String
     ]])
 }
 
+#[cfg(test)]
 fn sample_image_region(
     image: &image::RgbaImage,
     x_start: u32,
@@ -14075,6 +15688,423 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_polled_live_message_marks_background_channel_unread() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let active_chat = Chat {
+            id: Arc::from("C-active"),
+            account: account_id.clone(),
+            platform: Platform::Slack,
+            name: Arc::from("active"),
+            avatar: None,
+            is_group: true,
+            kind: ChatKind::Group,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            last_message_at: None,
+            last_message_preview: None,
+            thread_id: None,
+        };
+        let background_chat = Chat {
+            id: Arc::from("C-background"),
+            account: account_id.clone(),
+            platform: Platform::Slack,
+            name: Arc::from("background"),
+            avatar: None,
+            is_group: true,
+            kind: ChatKind::Group,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            last_message_at: None,
+            last_message_preview: None,
+            thread_id: None,
+        };
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        assert_eq!(app.state().selected_chat().unwrap().id.as_ref(), "C-active");
+
+        let mut message = test_incoming_message(
+            &background_chat,
+            "slack:msg:background-live",
+            "Maya",
+            "new message from polling",
+        );
+        message.platform_data.slack = Some(chat_core::SlackData {
+            ts: Arc::from("1710000000.000100"),
+            thread_ts: None,
+            channel: background_chat.id.clone(),
+        });
+
+        app.handle_event(AppEvent::Provider(
+            account_id,
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        let unread_chat = app
+            .state()
+            .chats()
+            .iter()
+            .find(|chat| chat.id.as_ref() == "C-background")
+            .unwrap();
+        assert_eq!(unread_chat.unread_count, 1);
+        let stored = app.store.get_all_chats().await?;
+        let stored_chat = stored
+            .iter()
+            .find(|chat| chat.id.as_ref() == "C-background")
+            .unwrap();
+        assert_eq!(stored_chat.unread_count, 1);
+        assert_eq!(app.state().selected_chat().unwrap().id.as_ref(), "C-active");
+
+        Ok(())
+    }
+
+    /// Build a Slack thread-reply message that lands in `chat`, parented to
+    /// `root`. Used by the thread-surfacing tests below.
+    fn slack_thread_reply(
+        chat: &Chat,
+        id: &str,
+        sender: &str,
+        text: &str,
+        root: &MessageId,
+        ts: &str,
+        thread_ts: &str,
+    ) -> Message {
+        let mut message = test_incoming_message(chat, id, sender, text);
+        message.thread_id = Some(root.clone());
+        message.reply_to = Some(root.clone());
+        message.platform_data.slack = Some(chat_core::SlackData {
+            ts: Arc::from(ts),
+            thread_ts: Some(Arc::from(thread_ts)),
+            channel: chat.id.clone(),
+        });
+        message
+    }
+
+    fn slack_thread_test_chats(account_id: &ProviderId) -> (Chat, Chat) {
+        let make = |id: &str, name: &str| Chat {
+            id: Arc::from(id),
+            account: account_id.clone(),
+            platform: Platform::Slack,
+            name: Arc::from(name),
+            avatar: None,
+            is_group: true,
+            kind: ChatKind::Group,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            last_message_at: None,
+            last_message_preview: None,
+            thread_id: None,
+        };
+        (
+            make("C-active", "active"),
+            make("C-background", "background"),
+        )
+    }
+
+    #[tokio::test]
+    async fn live_thread_reply_marks_thread_unread_and_clears_on_open() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let root: MessageId = Arc::from("slack:msg:root");
+        // Seed the thread root so the reply has a parent to open later.
+        let mut root_message = test_incoming_message(
+            &background_chat,
+            "slack:msg:root",
+            "Priya",
+            "can we finalise the token names?",
+        );
+        root_message.platform_data.slack = Some(chat_core::SlackData {
+            ts: Arc::from("1710000000.000100"),
+            thread_ts: None,
+            channel: background_chat.id.clone(),
+        });
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            vec![root_message],
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        assert_eq!(app.state().selected_chat().unwrap().id.as_ref(), "C-active");
+
+        let reply = slack_thread_reply(
+            &background_chat,
+            "slack:msg:reply-1",
+            "Maya",
+            "shipping it",
+            &root,
+            "1710000000.000200",
+            "1710000000.000100",
+        );
+
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message: reply,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        // The per-thread unread is tracked in storage and surfaced in the
+        // sidebar aggregate, distinct from channel unread.
+        assert_eq!(app.store.thread_unread_count(&account_id, &root).await?, 1);
+        assert_eq!(
+            app.state
+                .thread_unread_by_chat
+                .get(&background_chat.id)
+                .copied(),
+            Some(1)
+        );
+
+        // Selecting the chat and opening the thread clears the unread counter.
+        let background_index = app
+            .state
+            .chats
+            .iter()
+            .position(|chat| chat.id.as_ref() == "C-background")
+            .unwrap();
+        app.activate_chat_index(background_index);
+        drain_async_app_work(&mut app).await?;
+        app.open_thread(root.clone());
+        // Opening focuses the thread compose so the user can reply immediately.
+        assert_eq!(app.state.focus, FocusPane::Details);
+        app.flush_pending_thread_read().await?;
+
+        assert_eq!(app.store.thread_unread_count(&account_id, &root).await?, 0);
+        assert!(
+            app.state
+                .thread_unread_by_chat
+                .get(&background_chat.id)
+                .is_none()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_thread_reply_notification_says_replied_to_a_thread() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let root: MessageId = Arc::from("slack:msg:root");
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        let capture = capture_desktop_notifications(&mut app);
+
+        let reply = slack_thread_reply(
+            &background_chat,
+            "slack:msg:reply-1",
+            "Maya",
+            "shipping it",
+            &root,
+            "1710000000.000200",
+            "1710000000.000100",
+        );
+
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message: reply,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+        // Force the queued notification to deliver on the next tick.
+        assert_eq!(app.state().pending_notification_count(), 1);
+        app.state.pending_notifications[0].deliver_at = Instant::now();
+        app.handle_event(AppEvent::Tick).await?;
+
+        let sent = capture.lock().unwrap();
+        assert!(
+            sent.iter()
+                .any(|notification| notification.sender_name.contains("replied to a thread")),
+            "expected a thread-aware desktop notification, got {sent:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_thread_reply_replay_does_not_bump_unread() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let root: MessageId = Arc::from("slack:msg:root");
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+
+        let reply = slack_thread_reply(
+            &background_chat,
+            "slack:msg:reply-1",
+            "Maya",
+            "shipping it",
+            &root,
+            "1710000000.000200",
+            "1710000000.000100",
+        );
+
+        // Replaying the same reply as historical catch-up must store it without
+        // ever inflating the per-thread unread counter (idempotent replay).
+        for _ in 0..3 {
+            app.handle_event(AppEvent::Provider(
+                account_id.clone(),
+                Box::new(ProviderEvent::Message {
+                    message: reply.clone(),
+                    is_historical: true,
+                }),
+            ))
+            .await?;
+        }
+        drain_async_app_work(&mut app).await?;
+
+        assert_eq!(app.store.thread_unread_count(&account_id, &root).await?, 0);
+        assert!(app.state.thread_unread_by_chat.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn threads_inbox_lists_unread_thread_and_opens_it() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let root: MessageId = Arc::from("slack:msg:root");
+        let mut root_message = test_incoming_message(
+            &background_chat,
+            "slack:msg:root",
+            "Priya",
+            "can we finalise the token names?",
+        );
+        root_message.platform_data.slack = Some(chat_core::SlackData {
+            ts: Arc::from("1710000000.000100"),
+            thread_ts: None,
+            channel: background_chat.id.clone(),
+        });
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            vec![root_message.clone()],
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+
+        // Deliver the root through the event path so it is reliably persisted
+        // (and therefore loadable into the thread pane) regardless of history
+        // sync timing.
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message: root_message,
+                is_historical: true,
+            }),
+        ))
+        .await?;
+
+        let reply = slack_thread_reply(
+            &background_chat,
+            "slack:msg:reply-1",
+            "Maya",
+            "shipping it",
+            &root,
+            "1710000000.000200",
+            "1710000000.000100",
+        );
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message: reply,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        // The Threads inbox aggregates threads with new replies, newest first.
+        app.open_threads_inbox().await?;
+        let inbox = app
+            .state
+            .threads_inbox
+            .as_ref()
+            .expect("threads inbox should be open");
+        assert_eq!(inbox.entries.len(), 1);
+        assert_eq!(inbox.entries[0].root_id.as_ref(), root.as_ref());
+        assert_eq!(inbox.entries[0].unread_reply_count, 1);
+
+        // Activating the entry selects its chat and opens the thread pane via
+        // the same navigation the rest of the app uses (no new shortcut):
+        // Enter on the selected inbox row.
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(
+            app.state.thread_root.as_ref().map(|id| id.as_ref()),
+            Some(root.as_ref())
+        );
+        assert_eq!(app.state.focus, FocusPane::Details);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_account_switcher_filters_chats_by_account_and_returns_to_all() -> Result<()> {
         let mock = MockProvider::new();
         let second = StaticTestProvider::from_mock(
@@ -14349,6 +16379,114 @@ mod tests {
         assert!(submission.client_secret.is_none());
         assert!(submission.user_token.is_none());
         assert_eq!(submission.mode, Some(AuthSubmissionMode::UserOAuth));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_bundled_oauth_auth_challenge_does_not_open_manual_manifest() -> Result<()> {
+        let provider = StaticTestProvider::slack_setup("slack:bundled-auth", "Bundled Slack")
+            .with_bundled_oauth_app();
+        let provider_id = provider.id().clone();
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        let manual_manifest_url =
+            Arc::<str>::from("https://api.slack.com/apps?new_app=1&manifest_yaml=manual-template");
+
+        app.open_slack_setup_for_provider(
+            &provider_id,
+            Some(&AuthChallenge::OAuthUrl(manual_manifest_url)),
+            None,
+        );
+
+        let setup = app.state.slack_setup.as_ref().expect("slack setup overlay");
+        assert!(setup.bundled_oauth_app);
+        assert_eq!(setup.phase, SlackSetupPhase::OAuthPrompt);
+        assert_eq!(setup.selected_mode(), SlackSetupMode::Automatic);
+        assert!(
+            setup.oauth_url.is_none(),
+            "startup manual manifest URL must not be stored for bundled app flow"
+        );
+        assert!(
+            setup
+                .status
+                .as_deref()
+                .unwrap_or_default()
+                .contains("built-in chat-cli app")
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("built-in Slack app"));
+        assert!(content.contains("no app creation or Client ID/Secret needed"));
+        assert!(!content.contains("api.slack.com/apps?new_app=1"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_bundled_oauth_with_configured_realtime_hides_app_token_field() -> Result<()> {
+        let provider = StaticTestProvider::slack_setup("slack:bundled-realtime", "Bundled Slack")
+            .with_bundled_oauth_app()
+            .with_configured_realtime();
+        let provider_id = provider.id().clone();
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+
+        app.open_slack_setup_for_provider(
+            &provider_id,
+            Some(&AuthChallenge::OAuthUrl(Arc::from(
+                "https://api.slack.com/apps?new_app=1&manifest_yaml=manual-template",
+            ))),
+            None,
+        );
+
+        let setup = app.state.slack_setup.as_ref().expect("slack setup overlay");
+        assert!(setup.bundled_oauth_app);
+        assert!(setup.configured_realtime);
+        assert_eq!(setup.selected_mode(), SlackSetupMode::Automatic);
+        assert!(setup.credential_fields().is_empty());
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Realtime is already configured from startup settings"));
+        assert!(!content.contains("Optional realtime field"));
+        assert!(!content.contains("App token:"));
+        assert!(!content.contains("xapp- App-Level Token"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_bundled_oauth_advanced_user_oauth_still_shows_manual_setup() -> Result<()> {
+        let provider = StaticTestProvider::slack_setup("slack:bundled-advanced", "Bundled Slack")
+            .with_bundled_oauth_app();
+        let provider_id = provider.id().clone();
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        let manual_manifest_url =
+            Arc::<str>::from("https://api.slack.com/apps?new_app=1&manifest_yaml=manual-template");
+
+        app.open_slack_setup_for_provider(
+            &provider_id,
+            Some(&AuthChallenge::OAuthUrl(manual_manifest_url)),
+            None,
+        );
+        {
+            let setup = app.state.slack_setup.as_mut().expect("slack setup overlay");
+            assert_eq!(setup.selected_mode(), SlackSetupMode::Automatic);
+            setup.selected_mode = 1; // Advanced User OAuth with a self-managed Slack app.
+            setup.oauth_url = Some(
+                "https://api.slack.com/apps?new_app=1&manifest_yaml=manual-template".to_owned(),
+            );
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("User OAuth"));
+        assert!(content.contains("Slack app creation URL"));
+        assert!(content.contains("api.slack.com/apps?new_app=1"));
+        assert!(!content.contains("Primary action: press Enter to open Slack"));
 
         Ok(())
     }
@@ -16728,6 +18866,80 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn app_ignores_stale_message_click_hits_after_history_prepend() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(140, 40))?;
+        terminal.draw(|frame| app.draw(frame))?;
+
+        assert!(!app.state.message_hits.is_empty());
+        let stale_hit_count = app.state.message_hits.len();
+        let content_area = inner_area(app.state.pane_areas.messages);
+        let hit = app
+            .state
+            .message_hits
+            .iter()
+            .find_map(|hit| {
+                hit.line_hits
+                    .first()
+                    .map(|line_hit| (hit.message_id.clone(), line_hit.clone()))
+            })
+            .expect("draw should produce a message click hit");
+        let click_row = content_area
+            .y
+            .saturating_add(app.state.message_top_padding as u16)
+            .saturating_add(hit.1.line.saturating_sub(app.state.message_scroll) as u16);
+        let click_column = content_area.x.saturating_add(hit.1.start_col);
+
+        let selected_chat = app
+            .state
+            .selected_chat()
+            .expect("test app should have a selected chat")
+            .clone();
+        let mut older = test_incoming_message(
+            &selected_chat,
+            "mock:msg:older:prepend",
+            "Alice Chen",
+            "Older history page inserted before the visible messages",
+        );
+        older.timestamp = app
+            .state
+            .messages
+            .first()
+            .expect("test app should have loaded messages")
+            .timestamp
+            - ChronoDuration::minutes(1);
+
+        app.merge_older_messages_into_current_chat(
+            vec![older],
+            selected_chat.name.as_ref(),
+            false,
+            selected_chat.platform,
+        );
+
+        assert_eq!(app.state.message_hits.len(), 0);
+        assert_eq!(app.state.media_hits.len(), 0);
+        assert_ne!(stale_hit_count, 0);
+        assert!(app.state.selected_message_id() != Some(&hit.0));
+
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            click_column,
+            click_row,
+        )))
+        .await?;
+
+        assert_eq!(app.state().selected_message_id(), None);
+        assert!(!app.state().action_menu_open());
+        assert_eq!(app.state().status(), "messages focused");
+
+        terminal.draw(|frame| app.draw(frame))?;
+        assert!(!app.state.message_hits.is_empty());
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn app_copy_action_reports_clipboard_success_or_friendly_fallback() -> Result<()> {
         let mut app = test_app().await?;
@@ -17029,6 +19241,7 @@ mod tests {
             200,
             None,
             &HashSet::new(),
+            &HashMap::new(),
             &mut app.media_preview_cache,
             &app.link_metadata_cache,
             app.theme,
@@ -17222,6 +19435,87 @@ mod tests {
     }
 
     #[test]
+    fn avatar_thumbnail_generation_crops_and_persists_32px_png() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("wide-avatar.png");
+        let mut image = image::RgbaImage::new(64, 32);
+        for y in 0..32 {
+            for x in 0..64 {
+                let pixel = if x < 16 {
+                    image::Rgba([255, 0, 0, 255])
+                } else if x < 48 {
+                    image::Rgba([0, 255, 0, 255])
+                } else {
+                    image::Rgba([0, 0, 255, 255])
+                };
+                image.put_pixel(x, y, pixel);
+            }
+        }
+        image.save(&path)?;
+
+        let key = AvatarPreviewKey {
+            path,
+            width: chat_list::CHAT_AVATAR_WIDTH,
+            rows: chat_list::CHAT_AVATAR_ROWS,
+            source: AvatarPreviewSource::Avatar,
+        };
+        let (rows, upsert) =
+            decode_avatar_preview_with_thumbnail(&key).map_err(anyhow::Error::msg)?;
+        let thumbnail = image::load_from_memory(&upsert.image_blob)?.to_rgba8();
+
+        assert_eq!(
+            thumbnail.dimensions(),
+            (AVATAR_THUMBNAIL_SIZE, AVATAR_THUMBNAIL_SIZE)
+        );
+        assert_eq!(thumbnail.get_pixel(0, 0).0, [0, 255, 0, 0]);
+        assert_eq!(thumbnail.get_pixel(16, 16).0, [0, 255, 0, 255]);
+        assert_eq!(upsert.image_format, "png");
+        assert_eq!(upsert.cache_version, AVATAR_THUMBNAIL_CACHE_VERSION);
+        assert_eq!(upsert.source_kind, "chat_avatar");
+        assert_eq!(rows.rows.len(), usize::from(chat_list::CHAT_AVATAR_ROWS));
+        Ok(())
+    }
+
+    #[test]
+    fn avatar_thumbnail_sqlite_record_hydrates_rows_and_detects_stale_source() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("avatar.png");
+        let original = image::RgbaImage::from_pixel(32, 32, image::Rgba([12, 34, 56, 255]));
+        original.save(&path)?;
+        let key = AvatarPreviewKey {
+            path: path.clone(),
+            width: chat_list::CHAT_AVATAR_WIDTH,
+            rows: chat_list::CHAT_AVATAR_ROWS,
+            source: AvatarPreviewSource::Avatar,
+        };
+        let (_, upsert) = decode_avatar_preview_with_thumbnail(&key).map_err(anyhow::Error::msg)?;
+        let fresh_record = AvatarThumbnailCacheRecord {
+            cache_key: upsert.cache_key.clone(),
+            source_kind: upsert.source_kind.clone(),
+            source_path: upsert.source_path.clone(),
+            source_mtime: upsert.source_mtime,
+            source_size: upsert.source_size,
+            image_format: upsert.image_format.clone(),
+            image_blob: upsert.image_blob.clone(),
+            cache_version: upsert.cache_version,
+            updated_at: 1,
+        };
+
+        let hydrated = avatar_thumbnail_record_to_rows(&key, fresh_record.clone())
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            hydrated.rows.len(),
+            usize::from(chat_list::CHAT_AVATAR_ROWS)
+        );
+        assert!(!avatar_thumbnail_record_is_stale(&key, &fresh_record));
+
+        let changed = image::RgbaImage::from_pixel(64, 64, image::Rgba([90, 80, 70, 255]));
+        changed.save(&path)?;
+        assert!(avatar_thumbnail_record_is_stale(&key, &fresh_record));
+        Ok(())
+    }
+
+    #[test]
     fn image_response_detection_uses_content_type_or_url_extension() {
         assert!(is_image_response(
             "https://cdn.example.com/photo",
@@ -17362,6 +19656,7 @@ mod tests {
         outbound_capabilities: OutboundCapabilities,
         require_auth_until_submit: bool,
         bundled_oauth_app: bool,
+        configured_realtime: bool,
     }
 
     impl StaticTestProvider {
@@ -17410,6 +19705,7 @@ mod tests {
                 outbound_capabilities,
                 require_auth_until_submit: false,
                 bundled_oauth_app: false,
+                configured_realtime: false,
             }
         }
 
@@ -17466,6 +19762,7 @@ mod tests {
                 outbound_capabilities: OutboundCapabilities::all(),
                 require_auth_until_submit: false,
                 bundled_oauth_app: false,
+                configured_realtime: false,
             })
         }
 
@@ -17481,6 +19778,11 @@ mod tests {
 
         fn with_bundled_oauth_app(mut self) -> Self {
             self.bundled_oauth_app = true;
+            self
+        }
+
+        fn with_configured_realtime(mut self) -> Self {
+            self.configured_realtime = true;
             self
         }
 
@@ -17606,6 +19908,10 @@ mod tests {
 
         fn has_bundled_oauth_app(&self) -> bool {
             self.bundled_oauth_app
+        }
+
+        fn has_configured_realtime(&self) -> bool {
+            self.configured_realtime
         }
 
         async fn search(&self, query: &str, limit: usize) -> Result<Vec<Message>> {

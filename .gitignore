@@ -7,3 +7,6 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Local secrets (sourced by test.sh)
+.env

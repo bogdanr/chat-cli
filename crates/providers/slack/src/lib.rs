@@ -41,14 +41,16 @@ const PROVIDER_ID: &str = "slack:setup";
 const PROVIDER_ID_PREFIX: &str = "slack";
 const SLACK_CONVERSATION_TYPES: &str = "public_channel,private_channel,mpim,im";
 const SLACK_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
-// Loopback OAuth callback. Slack matches redirect URIs exactly against the
-// app's registered `redirect_urls`, so the port is fixed (not ephemeral) and
-// the same value is baked into the generated app manifest.
+// Slack OAuth advertises the HTTPS relay URL by default because Slack matches
+// redirect URIs exactly and distributed apps cannot register insecure loopback
+// redirects. The relay forwards the browser to the fixed local listener port
+// below, which is where chat-cli receives the OAuth code.
 const SLACK_OAUTH_REDIRECT_PORT: u16 = 41419;
-const SLACK_OAUTH_REDIRECT_URI: &str = "http://localhost:41419/slack/oauth/callback";
+const SLACK_OAUTH_REDIRECT_URI: &str = "https://chat-cli.vpn.cafe/slack/oauth/callback";
 // How long the loopback listener waits for the browser to complete the OAuth
 // redirect before giving up.
 const SLACK_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+const SLACK_SOCKET_MODE_IDLE_DIAGNOSTIC_AFTER: Duration = Duration::from_secs(60);
 const SLACK_HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(20);
 // Fetch a small window (not just the single newest message) per conversation
 // each poll so a burst of messages arriving between polls is not collapsed to
@@ -99,7 +101,7 @@ pub fn official_slack_app() -> Option<OfficialSlackApp> {
 
 /// Pure resolution of official app credentials from already-resolved values.
 /// Requires both a client ID and secret; the redirect URI defaults to the
-/// loopback callback when not explicitly configured. Kept separate from env
+/// HTTPS relay callback when not explicitly configured. Kept separate from env
 /// reads so the precedence and required-field rules are unit-testable.
 fn resolve_official_slack_app(
     client_id: Option<String>,
@@ -527,6 +529,20 @@ where
     Ok(messages)
 }
 
+fn deserialize_optional_slack_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(value)) => non_empty_string(value),
+        Some(serde_json::Value::Number(value)) => Some(value.to_string()),
+        Some(serde_json::Value::Bool(value)) => Some(value.to_string()),
+        Some(serde_json::Value::Null) | None => None,
+        Some(other) => Some(other.to_string()),
+    })
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 struct SlackMessageIconsResponse {
     image_36: Option<String>,
@@ -564,6 +580,7 @@ struct SlackAttachmentResponse {
     author_name: Option<String>,
     author_link: Option<String>,
     footer: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_slack_string")]
     ts: Option<String>,
     fields: Option<Vec<SlackAttachmentFieldResponse>>,
 }
@@ -2041,6 +2058,7 @@ pub struct SlackOAuthLoginFlow {
     authorize_url: String,
     listener: TcpListener,
     state: String,
+    redirect_uri: String,
 }
 
 impl SlackOAuthLoginFlow {
@@ -2049,10 +2067,13 @@ impl SlackOAuthLoginFlow {
         &self.authorize_url
     }
 
-    /// The loopback redirect URI Slack will call back. Matches the value baked
-    /// into the generated app manifest's `redirect_urls`.
+    /// The redirect URI advertised to Slack in the authorize request. Slack
+    /// matches this value exactly during the `oauth.v2.access` exchange, so the
+    /// same value must be reused there. For distributed apps this is an HTTPS
+    /// relay URL that 302-redirects the browser back to the local loopback
+    /// listener; for single-workspace/dev use it defaults to the loopback URL.
     pub fn redirect_uri(&self) -> &str {
-        SLACK_OAUTH_REDIRECT_URI
+        &self.redirect_uri
     }
 
     /// Wait for Slack to redirect to the loopback listener, validate the CSRF
@@ -2084,8 +2105,15 @@ impl SlackOAuthLoginFlow {
 /// Begin a browser-based Slack OAuth login: bind the loopback callback listener
 /// and build the authorize URL with a fresh CSRF `state`. The listener is bound
 /// before returning so the browser can be opened without racing the redirect.
+///
+/// `redirect_uri` is the value advertised to Slack. Slack requires distributed
+/// apps to use an HTTPS redirect, so production builds pass an HTTPS relay URL
+/// that forwards the browser back to the local loopback listener; the listener
+/// itself always binds the fixed loopback port regardless of this value. When
+/// `redirect_uri` is empty the loopback URL is used (single-workspace/dev).
 pub fn begin_slack_oauth_login(
     client_id: &str,
+    redirect_uri: &str,
     bot_scopes: &str,
     user_scopes: &str,
 ) -> Result<SlackOAuthLoginFlow> {
@@ -2093,21 +2121,38 @@ pub fn begin_slack_oauth_login(
     if client_id.is_empty() {
         bail!("Slack OAuth requires a client ID to start the browser login");
     }
+    let redirect_uri = non_empty_string(redirect_uri.to_owned())
+        .unwrap_or_else(|| SLACK_OAUTH_REDIRECT_URI.to_owned());
     let listener = bind_oauth_callback_listener()?;
     let state = slack_oauth_state();
-    let authorize_url = format!(
-        "https://slack.com/oauth/v2/authorize?client_id={}&scope={}&user_scope={}&redirect_uri={}&state={}",
-        url_component(client_id),
-        url_component(bot_scopes),
-        url_component(user_scopes),
-        url_component(SLACK_OAUTH_REDIRECT_URI),
-        url_component(&state),
-    );
+    let authorize_url =
+        slack_authorize_url(client_id, &redirect_uri, bot_scopes, user_scopes, &state);
     Ok(SlackOAuthLoginFlow {
         authorize_url,
         listener,
         state,
+        redirect_uri,
     })
+}
+
+/// Build the Slack `oauth/v2/authorize` URL. Pure (no socket binding) so the
+/// URL/redirect construction is unit-testable without racing the fixed loopback
+/// port. `redirect_uri` is assumed already normalized to a non-empty value.
+fn slack_authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    bot_scopes: &str,
+    user_scopes: &str,
+    state: &str,
+) -> String {
+    format!(
+        "https://slack.com/oauth/v2/authorize?client_id={}&scope={}&user_scope={}&redirect_uri={}&state={}",
+        url_component(client_id.trim()),
+        url_component(bot_scopes),
+        url_component(user_scopes),
+        url_component(redirect_uri),
+        url_component(state),
+    )
 }
 
 async fn open_socket_mode(app_token: SlackCredential) -> Result<SlackSocketModeConnection> {
@@ -2458,7 +2503,9 @@ impl SlackProvider {
                 self.events.send(ProviderEvent::SyncComplete);
                 if validated.capabilities.can_realtime {
                     self.start_realtime();
-                } else if validated.capabilities.can_read_history && supports_realtime {
+                } else if validated.capabilities.can_read_history {
+                    self.start_history_polling();
+                } else if supports_realtime {
                     self.start_history_polling_with_realtime_notice();
                 }
                 Ok(validated.capabilities)
@@ -2606,7 +2653,25 @@ impl SlackProvider {
             return Ok(submission);
         }
 
-        let flow = begin_slack_oauth_login(&client_id, mode.bot_scopes(), mode.user_scopes())?;
+        // Resolve the redirect URI to advertise to Slack. Slack requires HTTPS
+        // for distributed apps, so a distributor-configured HTTPS relay (via
+        // `redirect_uri`) takes precedence; otherwise this falls back to the
+        // loopback URL for single-workspace/dev use. The same value is reused in
+        // the token exchange because Slack matches `redirect_uri` exactly.
+        let advertised_redirect_uri = submission
+            .redirect_uri
+            .clone()
+            .or_else(|| options.redirect_uri.clone())
+            .or_else(|| official.as_ref().map(|app| app.redirect_uri.clone()))
+            .and_then(non_empty_string)
+            .unwrap_or_else(|| SLACK_OAUTH_REDIRECT_URI.to_owned());
+
+        let flow = begin_slack_oauth_login(
+            &client_id,
+            &advertised_redirect_uri,
+            mode.bot_scopes(),
+            mode.user_scopes(),
+        )?;
         let redirect_uri = flow.redirect_uri().to_owned();
         slack_diagnostic_log(
             "slack.oauth.browser_login.start",
@@ -2712,18 +2777,28 @@ impl SlackProvider {
 
     fn oauth_setup_url(&self) -> String {
         let options = self.options();
-        match (
-            options.client_id.as_deref(),
-            options.redirect_uri.as_deref(),
-        ) {
-            (Some(client_id), Some(redirect_uri)) if !client_id.is_empty() => format!(
+        let official = official_slack_app();
+        let client_id = options
+            .client_id
+            .as_deref()
+            .and_then(|value| non_empty_string(value.to_owned()))
+            .or_else(|| official.as_ref().map(|app| app.client_id.clone()));
+        let redirect_uri = options
+            .redirect_uri
+            .as_deref()
+            .and_then(|value| non_empty_string(value.to_owned()))
+            .or_else(|| official.as_ref().map(|app| app.redirect_uri.clone()))
+            .unwrap_or_else(|| SLACK_OAUTH_REDIRECT_URI.to_owned());
+
+        match client_id {
+            Some(client_id) => format!(
                 "https://slack.com/oauth/v2/authorize?client_id={}&scope={}&user_scope={}&redirect_uri={}",
-                url_component(client_id),
+                url_component(&client_id),
                 url_component(options.auth_mode.bot_scopes()),
                 url_component(options.auth_mode.user_scopes()),
-                url_component(redirect_uri)
+                url_component(&redirect_uri)
             ),
-            _ => slack_app_manifest_url(&options.auth_mode),
+            None => slack_app_manifest_url(&options.auth_mode),
         }
     }
 
@@ -3161,7 +3236,6 @@ impl SlackProvider {
     }
 
     fn start_realtime(&self) {
-        self.stop_history_polling();
         let app_token = read_lock(&self.connection).app_token.clone();
         let Some(app_token) = app_token else {
             slack_diagnostic_log(
@@ -3236,6 +3310,7 @@ impl SlackProvider {
                 credential,
                 current_user_id,
                 users,
+                Utc::now(),
             )
             .await;
         });
@@ -3697,11 +3772,9 @@ impl Provider for SlackProvider {
                 if capabilities.can_realtime {
                     self.start_realtime();
                 } else if capabilities.can_read_history {
-                    if options.auth_mode.supports_realtime() && capabilities.has_non_realtime() {
-                        self.start_history_polling_with_realtime_notice();
-                    } else {
-                        self.start_history_polling();
-                    }
+                    self.start_history_polling();
+                } else if options.auth_mode.supports_realtime() && capabilities.has_non_realtime() {
+                    self.start_history_polling_with_realtime_notice();
                 }
                 Ok(())
             }
@@ -3895,6 +3968,13 @@ impl Provider for SlackProvider {
 
     fn has_bundled_oauth_app(&self) -> bool {
         official_slack_app_is_configured()
+    }
+
+    fn has_configured_realtime(&self) -> bool {
+        self.options()
+            .app_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
     }
 
     async fn search(&self, _query: &str, _limit: usize) -> Result<Vec<Message>> {
@@ -4215,15 +4295,18 @@ async fn run_history_poll_loop(
     credential: SlackCredential,
     current_user_id: Option<String>,
     users: Arc<RwLock<HashMap<String, SlackUser>>>,
+    started_at: Timestamp,
 ) {
     // History polling is a fallback for missing realtime, so it must only
-    // surface messages that genuinely arrive *after* polling begins. Gating on
-    // a "first poll" flag alone is unsafe: if the baseline history fetch fails
-    // (for example a transient decode error), those old messages are not
-    // recorded and would later look brand new, notifying the user about
-    // long-past conversations. Anchoring to a startup timestamp makes the
-    // baseline robust against such failures.
-    let started_at = Utc::now();
+    // surface messages that genuinely arrive *after* the relevant fallback
+    // baseline. Gating on a "first poll" flag alone is unsafe: if the baseline
+    // history fetch fails (for example a transient decode error), those old
+    // messages are not recorded and would later look brand new, notifying the
+    // user about long-past conversations. Anchoring to an explicit timestamp
+    // makes the baseline robust against such failures. When polling starts
+    // after a connected-but-idle realtime socket, callers pass the realtime
+    // connection timestamp so messages sent during the idle window are still
+    // eligible for delivery.
     let mut seen_message_ids = HashSet::new();
     loop {
         match api_client.list_conversations(credential.clone()).await {
@@ -4391,6 +4474,7 @@ async fn run_socket_mode_loop(
             user_id.clone(),
             app_token.clone(),
             Arc::clone(&users),
+            fallback_credential.clone(),
         )
         .await;
         match &result {
@@ -4435,6 +4519,7 @@ async fn run_socket_mode_loop(
                             credential,
                             history_user_id,
                             users,
+                            Utc::now(),
                         )
                         .await;
                     }
@@ -4488,6 +4573,7 @@ async fn run_socket_mode_once(
     user_id: Option<String>,
     app_token: String,
     users: Arc<RwLock<HashMap<String, SlackUser>>>,
+    fallback_credential: Option<SlackCredential>,
 ) -> Result<()> {
     events.send(ProviderEvent::NetworkActivity {
         direction: NetworkActivityDirection::Tx,
@@ -4519,7 +4605,61 @@ async fn run_socket_mode_once(
         format!("account={account}"),
     );
 
-    while let Some(message) = socket.next().await {
+    let realtime_started_at = Utc::now();
+    let connected_at = tokio::time::Instant::now();
+    let mut saw_event_callback = false;
+    let mut logged_idle_no_events = false;
+    let mut started_idle_history_fallback = false;
+    loop {
+        if !saw_event_callback
+            && !logged_idle_no_events
+            && connected_at.elapsed() >= SLACK_SOCKET_MODE_IDLE_DIAGNOSTIC_AFTER
+        {
+            logged_idle_no_events = true;
+            slack_diagnostic_log(
+                "slack.realtime.idle_no_events",
+                format!(
+                    "account={account} connected_s={} history_fallback={} hint=socket_connected_but_no_events_api_payloads_check_event_subscriptions_and_reinstall_app",
+                    connected_at.elapsed().as_secs(),
+                    fallback_credential.is_some()
+                ),
+            );
+            events.send(ProviderEvent::AccountNotice {
+                title: arc_str("Slack realtime has no events"),
+                body: arc_str(
+                    "Slack Socket Mode is connected, but Slack has not delivered any event payloads. Check Event Subscriptions, message events, and reinstall the Slack app. Starting periodic history checks while the socket stays connected.",
+                ),
+                severity: AccountNoticeSeverity::SystemAlert,
+            });
+            if let Some(credential) = fallback_credential.clone()
+                && !started_idle_history_fallback
+            {
+                started_idle_history_fallback = true;
+                slack_diagnostic_log(
+                    "slack.realtime.idle_history_fallback.start",
+                    format!("account={account}"),
+                );
+                tokio::spawn(run_history_poll_loop(
+                    Arc::clone(&api_client),
+                    events.clone(),
+                    account.clone(),
+                    credential,
+                    user_id.clone(),
+                    Arc::clone(&users),
+                    realtime_started_at,
+                ));
+            }
+        }
+
+        let timed_message =
+            tokio::time::timeout(SLACK_SOCKET_MODE_IDLE_DIAGNOSTIC_AFTER, socket.next()).await;
+        let Some(message) = (match timed_message {
+            Ok(Some(message)) => Some(message),
+            Ok(None) => None,
+            Err(_) => continue,
+        }) else {
+            break;
+        };
         let message = message.context("reading Slack Socket Mode frame")?;
         match message {
             WebSocketMessage::Text(text) => {
@@ -4527,13 +4667,16 @@ async fn run_socket_mode_once(
                     direction: NetworkActivityDirection::Rx,
                     kind: NetworkActivityKind::Realtime,
                 });
-                if let Some(ack) = handle_socket_mode_text(
+                let handled = handle_socket_mode_text(
                     &events,
                     &account,
                     user_id.as_deref(),
                     text.as_ref(),
                     &users,
-                )? {
+                    fallback_credential.as_ref(),
+                )?;
+                saw_event_callback |= handled.received_event_callback;
+                if let Some(ack) = handled.ack {
                     socket
                         .send(WebSocketMessage::Text(ack.into()))
                         .await
@@ -4562,13 +4705,19 @@ async fn run_socket_mode_once(
     Ok(())
 }
 
+struct SlackSocketModeHandleResult {
+    ack: Option<String>,
+    received_event_callback: bool,
+}
+
 fn handle_socket_mode_text(
     events: &EventBus,
     account: &ProviderId,
     current_user_id: Option<&str>,
     text: &str,
     users: &Arc<RwLock<HashMap<String, SlackUser>>>,
-) -> Result<Option<String>> {
+    web_api_credential: Option<&SlackCredential>,
+) -> Result<SlackSocketModeHandleResult> {
     let envelope: SlackSocketEnvelope =
         serde_json::from_str(text).context("decoding Slack Socket Mode envelope")?;
     let ack = envelope
@@ -4589,29 +4738,60 @@ fn handle_socket_mode_text(
         ),
     );
 
-    if envelope.envelope_type.as_deref() == Some("events_api")
+    let received_event_callback = envelope.envelope_type.as_deref() == Some("events_api")
         && envelope
             .payload
             .as_ref()
             .and_then(|payload| payload.event_type.as_deref())
-            == Some("event_callback")
+            == Some("event_callback");
+
+    if received_event_callback
         && let Some(event) = envelope.payload.and_then(|payload| payload.event)
     {
-        emit_realtime_event(events, account, current_user_id, event, users);
+        let events = events.clone();
+        let account = account.clone();
+        let current_user_id = current_user_id.map(str::to_owned);
+        let users = Arc::clone(users);
+        let web_api_credential = web_api_credential.cloned();
+        tokio::spawn(async move {
+            emit_realtime_event(
+                &events,
+                &account,
+                current_user_id.as_deref(),
+                event,
+                &users,
+                web_api_credential.as_ref(),
+            )
+            .await;
+        });
     }
 
-    Ok(ack)
+    Ok(SlackSocketModeHandleResult {
+        ack,
+        received_event_callback,
+    })
 }
 
-fn emit_realtime_event(
+async fn emit_realtime_event(
     events: &EventBus,
     account: &ProviderId,
     current_user_id: Option<&str>,
     event: SlackRealtimeEvent,
     users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+    web_api_credential: Option<&SlackCredential>,
 ) {
     match event.event_type.as_str() {
-        "message" => emit_realtime_message(events, account, current_user_id, event, users),
+        "message" => {
+            emit_realtime_message(
+                events,
+                account,
+                current_user_id,
+                event,
+                users,
+                web_api_credential,
+            )
+            .await
+        }
         "reaction_added" | "reaction_removed" => emit_realtime_reaction(events, event),
         other => slack_diagnostic_log(
             "slack.realtime.event.unhandled",
@@ -4621,18 +4801,16 @@ fn emit_realtime_event(
 }
 
 fn is_ignored_slack_message_subtype(subtype: Option<&str>) -> bool {
-    matches!(
-        subtype,
-        Some("channel_join" | "channel_leave" | "message_deleted" | "message_changed")
-    )
+    matches!(subtype, Some("message_deleted" | "message_changed"))
 }
 
-fn emit_realtime_message(
+async fn emit_realtime_message(
     events: &EventBus,
     account: &ProviderId,
     current_user_id: Option<&str>,
     event: SlackRealtimeEvent,
     users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+    web_api_credential: Option<&SlackCredential>,
 ) {
     let subtype = event.subtype.as_deref();
     if event.hidden.unwrap_or(false) || matches!(subtype, Some("message_deleted")) {
@@ -4665,9 +4843,11 @@ fn emit_realtime_message(
                 Vec::new(),
                 Some(users),
                 false,
-                None,
+                web_api_credential.map(SlackCredential::value),
             )
         }) {
+            let mut message = message;
+            resolve_realtime_message_users(&mut message, users, events, web_api_credential).await;
             events.send(ProviderEvent::MessageEdited { message });
         }
         return;
@@ -4685,7 +4865,7 @@ fn emit_realtime_message(
     }
 
     let channel = event.channel.clone();
-    if let Some(message) = slack_message_from_parts(
+    if let Some(mut message) = slack_message_from_parts(
         account,
         current_user_id,
         event.channel,
@@ -4700,8 +4880,9 @@ fn emit_realtime_message(
         Vec::new(),
         Some(users),
         false,
-        None,
+        web_api_credential.map(SlackCredential::value),
     ) {
+        resolve_realtime_message_users(&mut message, users, events, web_api_credential).await;
         slack_diagnostic_log(
             "slack.realtime.message.emit",
             format!(
@@ -4726,6 +4907,49 @@ fn emit_realtime_message(
             ),
         );
     }
+}
+
+async fn resolve_realtime_message_users(
+    message: &mut Message,
+    users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+    events: &EventBus,
+    credential: Option<&SlackCredential>,
+) {
+    let unresolved = unresolved_slack_user_ids(std::slice::from_ref(message));
+    if !unresolved.is_empty()
+        && let Some(credential) = credential
+    {
+        for user_id in unresolved {
+            if read_lock(users).contains_key(&user_id) {
+                continue;
+            }
+            events.send(ProviderEvent::NetworkActivity {
+                direction: NetworkActivityDirection::Tx,
+                kind: NetworkActivityKind::Other,
+            });
+            let fetched = match get_web_api_user_info(credential.clone(), &user_id).await {
+                Ok(fetched) => {
+                    events.send(ProviderEvent::NetworkActivity {
+                        direction: NetworkActivityDirection::Rx,
+                        kind: NetworkActivityKind::Other,
+                    });
+                    fetched
+                }
+                Err(error) => {
+                    slack_diagnostic_log(
+                        "slack.realtime.user_info_failed",
+                        sanitize_slack_error(&error),
+                    );
+                    None
+                }
+            }
+            .or_else(|| fallback_slack_user(&user_id));
+            if let Some(user) = fetched {
+                write_lock(users).insert(user.id.clone(), user);
+            }
+        }
+    }
+    apply_cached_user_to_message(users, message);
 }
 
 fn emit_realtime_reaction(events: &EventBus, event: SlackRealtimeEvent) {
@@ -5683,15 +5907,6 @@ fn slack_cached_media_path(url: &str, subdir: &str, auth_token: Option<&str>) ->
     let path = cache_dir.join(format!("{:016x}.{extension}", hasher.finish()));
 
     if path.exists() {
-        slack_diagnostic_log(
-            "slack.provider.media_path",
-            format!(
-                "subdir={} url={} path={} status=cached",
-                subdir,
-                url,
-                path.display()
-            ),
-        );
         return Some(path);
     }
     if fs::create_dir_all(&cache_dir).is_err() {
@@ -5908,7 +6123,7 @@ fn slack_app_manifest_url(auth_mode: &SlackAuthMode) -> String {
     let event_subscriptions_section = manifest_event_subscriptions_section(auth_mode);
     let redirect_urls_section = manifest_redirect_urls_section(auth_mode);
     let manifest = format!(
-        "_metadata:\n  major_version: 2\n  minor_version: 1\ndisplay_information:\n  name: {}\n  description: Terminal chat client Slack integration\n{}oauth_config:\n{}  scopes:\n{}{}{}settings:\n  org_deploy_enabled: false\n  socket_mode_enabled: true\n  token_rotation_enabled: false\n",
+        "_metadata:\n  major_version: 2\n  minor_version: 1\ndisplay_information:\n  name: {}\n  description: Terminal chat client Slack integration\n{}oauth_config:\n{}  scopes:\n{}{}settings:\n  org_deploy_enabled: false\n  socket_mode_enabled: true\n{}  token_rotation_enabled: false\n",
         manifest_yaml_string("chat-cli"),
         bot_user_section,
         redirect_urls_section,
@@ -5927,7 +6142,21 @@ fn manifest_redirect_urls_section(auth_mode: &SlackAuthMode) -> String {
         return String::new();
     }
 
-    format!("  redirect_urls:\n    - {SLACK_OAUTH_REDIRECT_URI}\n")
+    format!(
+        "  redirect_urls:\n    - {}\n",
+        default_advertised_oauth_redirect_uri()
+    )
+}
+
+/// The redirect URI a freshly generated app manifest should register, and the
+/// default advertised to Slack when no per-submission/options override exists.
+/// A distributor-configured official app takes precedence; otherwise this is
+/// the HTTPS relay URL that Slack accepts for the default app flow.
+fn default_advertised_oauth_redirect_uri() -> String {
+    official_slack_app()
+        .map(|app| app.redirect_uri)
+        .and_then(non_empty_string)
+        .unwrap_or_else(|| SLACK_OAUTH_REDIRECT_URI.to_owned())
 }
 
 fn manifest_event_subscriptions_section(auth_mode: &SlackAuthMode) -> String {
@@ -5943,15 +6172,32 @@ fn manifest_event_subscriptions_section(auth_mode: &SlackAuthMode) -> String {
         "reaction_added",
         "reaction_removed",
     ];
-    let bot_events = if auth_mode.bot_scopes().is_empty() {
-        Vec::new()
-    } else {
+    let bot_events = if bot_scopes_support_realtime_events(auth_mode.bot_scopes()) {
         user_events.to_vec()
+    } else {
+        Vec::new()
     };
-    let user_events_section = manifest_event_list_section("user_events", &user_events, 2);
-    let bot_events_section = manifest_event_list_section("bot_events", &bot_events, 2);
+    let user_events_section = manifest_event_list_section("user_events", &user_events, 4);
+    let bot_events_section = manifest_event_list_section("bot_events", &bot_events, 4);
 
-    format!("event_subscriptions:\n{user_events_section}{bot_events_section}")
+    format!("  event_subscriptions:\n{user_events_section}{bot_events_section}")
+}
+
+fn bot_scopes_support_realtime_events(bot_scopes: &str) -> bool {
+    let scopes = bot_scopes
+        .split(',')
+        .map(str::trim)
+        .collect::<std::collections::HashSet<_>>();
+
+    [
+        "channels:history",
+        "groups:history",
+        "im:history",
+        "mpim:history",
+        "reactions:read",
+    ]
+    .into_iter()
+    .all(|scope| scopes.contains(scope))
 }
 
 fn manifest_event_list_section(label: &str, events: &[&str], indent: usize) -> String {
@@ -6526,26 +6772,33 @@ mod tests {
     }
 
     #[test]
-    fn history_response_keeps_valid_messages_when_one_message_is_undecodable() {
-        // The second message carries an attachment `ts` as an integer, which
-        // does not match our `Option<String>` model. Strict decoding would fail
-        // the entire response and drop every message in the conversation — so a
-        // genuine message (for example one sent to yourself) would never reach
-        // the sidebar or notifications. Lenient per-message decoding must skip
-        // only the offending entry and keep the valid one.
+    fn history_response_decodes_integer_attachment_timestamp() {
+        // Slack sometimes returns attachment `ts` as an integer. Treat that as a
+        // string rather than skipping the whole message; otherwise history poll
+        // can miss valid messages entirely.
         let raw = r#"{
             "ok": true,
             "messages": [
                 {"type": "message", "user": "U123", "ts": "1700000000.000100", "text": "hello self"},
-                {"type": "message", "user": "U123", "ts": "1700000001.000200", "text": "broken", "attachments": [{"ts": 1700000001}]}
+                {"type": "message", "user": "U123", "ts": "1700000001.000200", "text": "with attachment", "attachments": [{"ts": 1700000001}]}
             ]
         }"#;
         let response: SlackConversationsHistoryResponse =
-            serde_json::from_str(raw).expect("response decodes leniently");
+            serde_json::from_str(raw).expect("response decodes integer attachment ts");
 
         assert!(response.ok);
-        assert_eq!(response.messages.len(), 1);
+        assert_eq!(response.messages.len(), 2);
         assert_eq!(response.messages[0].text.as_deref(), Some("hello self"));
+        assert_eq!(
+            response.messages[1].text.as_deref(),
+            Some("with attachment")
+        );
+        assert_eq!(
+            response.messages[1].attachments.as_ref().unwrap()[0]
+                .ts
+                .as_deref(),
+            Some("1700000001")
+        );
     }
 
     #[test]
@@ -6573,8 +6826,8 @@ mod tests {
 
         assert!(manifest.contains("team:read"));
         assert!(manifest.contains("socket_mode_enabled: true"));
-        assert!(manifest.contains("event_subscriptions:"));
-        assert!(manifest.contains("message.channels"));
+        assert!(manifest.contains("  event_subscriptions:\n    user_events:"));
+        assert!(manifest.contains("    - message.channels"));
         // Self-DM realtime relies on the im message event, and the history
         // fallback relies on the *:history scopes. A manifest missing either
         // reproduces the realtime/missing_scope failures, so lock them in.
@@ -6598,13 +6851,15 @@ mod tests {
             .replace("%3A", ":");
 
         assert!(manifest.contains("socket_mode_enabled: true"));
-        assert!(manifest.contains("message.im"));
+        assert!(manifest.contains("  event_subscriptions:\n    user_events:"));
+        assert!(manifest.contains("    - message.im"));
+        assert!(!manifest.contains("bot_events:"));
         assert!(manifest.contains("im:history"));
         assert!(manifest.contains("team:read"));
     }
 
     #[test]
-    fn slack_user_oauth_manifest_registers_loopback_redirect_url() {
+    fn slack_user_oauth_manifest_registers_advertised_redirect_url() {
         let url = slack_app_manifest_url(&SlackAuthMode::UserOAuth);
         let manifest = url
             .split("manifest_yaml=")
@@ -6612,12 +6867,13 @@ mod tests {
             .expect("manifest query is present")
             .replace("%0A", "\n")
             .replace("%20", " ")
+            .replace("%2F", "/")
             .replace("%3A", ":");
-        // Slack matches redirect URIs exactly, so the loopback callback the
-        // local listener binds must be pre-registered in the app manifest or
-        // the browser OAuth exchange fails with a redirect mismatch.
+        // Slack matches redirect URIs exactly, so the redirect URI advertised
+        // during browser OAuth must be pre-registered in the app manifest or
+        // the exchange fails with a redirect mismatch.
         assert!(manifest.contains("redirect_urls:"));
-        assert!(manifest.contains("41419"));
+        assert!(manifest.contains(&default_advertised_oauth_redirect_uri()));
 
         // Bot-token apps use a pasted token, not the loopback browser login, so
         // they must not advertise a redirect URL.
@@ -6672,7 +6928,7 @@ mod tests {
     }
 
     #[test]
-    fn official_slack_app_defaults_redirect_to_loopback_callback() {
+    fn official_slack_app_defaults_redirect_to_https_relay_callback() {
         let app = resolve_official_slack_app(
             Some("client-id".to_owned()),
             Some("client-secret".to_owned()),
@@ -6695,12 +6951,51 @@ mod tests {
         assert_eq!(app.redirect_uri, "https://chat.example/callback");
     }
 
+    #[test]
+    fn slack_authorize_url_advertises_https_relay_redirect_for_distribution() {
+        // Slack requires distributed apps to use an HTTPS redirect. The relay
+        // URL must be advertised exactly (percent-encoded) in the authorize URL
+        // so it matches the registered redirect and the later token exchange.
+        let relay = "https://relay.example/slack/oauth/callback";
+        let url = slack_authorize_url(
+            "client-123",
+            relay,
+            "team:read",
+            "channels:history",
+            "abc123",
+        );
+        assert!(url.starts_with("https://slack.com/oauth/v2/authorize?"));
+        assert!(url.contains("client_id=client-123"));
+        assert!(url.contains(&format!("redirect_uri={}", url_component(relay))));
+        // The insecure loopback URL must not leak into a distribution authorize URL.
+        assert!(!url.contains("localhost"));
+        assert!(url.contains("state=abc123"));
+    }
+
+    #[test]
+    fn official_app_keeps_https_relay_redirect_for_distribution() {
+        // With an explicit HTTPS relay redirect configured, the resolved official
+        // app must keep that exact URL so Slack accepts the distributed app and
+        // the authorize/exchange/manifest all advertise the same value.
+        let relay = "https://relay.example/slack/oauth/callback".to_owned();
+        let resolved = resolve_official_slack_app(
+            Some("client-id".to_owned()),
+            Some("client-secret".to_owned()),
+            Some(relay.clone()),
+        )
+        .expect("client id + secret configure an official app");
+        assert_eq!(resolved.redirect_uri, relay);
+    }
+
     #[tokio::test]
-    async fn slack_oauth_loopback_flow_returns_authorization_code() -> Result<()> {
-        let flow = begin_slack_oauth_login("client-123", "team:read", "channels:history")?;
+    async fn slack_oauth_relay_flow_returns_authorization_code() -> Result<()> {
+        // An empty redirect falls back to the default advertised HTTPS relay,
+        // while the callback listener still binds locally for the relay target.
+        let flow = begin_slack_oauth_login("client-123", "", "team:read", "channels:history")?;
         let authorize_url = flow.authorize_url().to_owned();
         assert!(authorize_url.contains("client_id=client-123"));
         assert!(authorize_url.contains("redirect_uri="));
+        assert_eq!(flow.redirect_uri(), SLACK_OAUTH_REDIRECT_URI);
         let state = authorize_url
             .split("state=")
             .nth(1)
@@ -6794,8 +7089,9 @@ mod tests {
     fn slack_history_poll_limit_catches_more_than_one_message_per_cycle() {
         // A limit of 1 only fetches the newest message per conversation each
         // cycle, dropping every earlier message in a burst between polls.
+        let limit = SLACK_HISTORY_POLL_LIMIT;
         assert!(
-            SLACK_HISTORY_POLL_LIMIT > 1,
+            limit > 1,
             "history fallback must fetch a window, not just the newest message"
         );
     }
@@ -6862,7 +7158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_alerts_before_history_fallback_when_realtime_is_unavailable() -> Result<()> {
+    async fn connect_uses_history_polling_without_alert_when_history_is_available() -> Result<()> {
         let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
         options.user_token = Some("xoxp-user".to_owned());
         let client = Arc::new(FakeSlackApiClient::default());
@@ -6870,41 +7166,29 @@ mod tests {
         let mut events = provider.events();
 
         provider.connect().await?;
-
-        let mut saw_notice_before_history_poll = false;
         for _ in 0..20 {
-            match events.try_recv() {
-                Ok(ProviderEvent::AccountNotice {
-                    title,
-                    body,
-                    severity,
-                }) => {
-                    assert_eq!(title.as_ref(), "Slack realtime unavailable");
-                    assert!(body.contains("Using periodic Slack history checks"));
-                    assert!(body.contains("app-level xapp token"));
-                    assert_eq!(severity, AccountNoticeSeverity::SystemAlert);
-                    saw_notice_before_history_poll =
-                        client.history_calls.lock().unwrap().is_empty();
-                    break;
-                }
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
-                    tokio::task::yield_now().await;
-                }
-                Err(error) => panic!("unexpected provider event error: {error}"),
+            if !client.listed_conversations.lock().unwrap().is_empty() {
+                break;
             }
+            tokio::task::yield_now().await;
         }
         provider.disconnect().await?;
 
         assert!(
-            saw_notice_before_history_poll,
-            "Slack realtime fallback must alert before starting history polling"
+            !client.listed_conversations.lock().unwrap().is_empty(),
+            "OAuth history polling is the primary inbound path when history scopes are available"
         );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, ProviderEvent::AccountNotice { .. }),
+                "history-capable OAuth should not warn about realtime before using polling"
+            );
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn connect_starts_realtime_when_app_token_is_available() -> Result<()> {
+    async fn connect_prefers_realtime_when_app_token_is_available() -> Result<()> {
         let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
         options.user_token = Some("xoxp-user".to_owned());
         options.app_token = Some("xapp-realtime".to_owned());
@@ -6920,6 +7204,7 @@ mod tests {
         }
         provider.disconnect().await?;
 
+        assert!(provider.capabilities().can_read_history);
         assert!(provider.capabilities().can_realtime);
         assert_eq!(
             *client.validated_tokens.lock().unwrap(),
@@ -6930,7 +7215,12 @@ mod tests {
         );
         assert_eq!(
             *client.opened_socket_modes.lock().unwrap(),
-            vec![SlackCredentialKind::AppToken]
+            vec![SlackCredentialKind::AppToken],
+            "Socket Mode is the primary interactive chat path when an app token is configured"
+        );
+        assert!(
+            client.listed_conversations.lock().unwrap().is_empty(),
+            "history polling should not start immediately when realtime is available"
         );
         Ok(())
     }
@@ -7640,8 +7930,46 @@ mod tests {
         assert_eq!(content_text(&message.content), "deployed 🟢");
     }
 
-    #[test]
-    fn realtime_slack_bot_message_subtype_emits_live_message() {
+    #[tokio::test]
+    async fn socket_mode_handler_marks_event_callbacks_for_idle_diagnostics() {
+        let events = EventBus::new();
+        let account = arc_str("slack:test");
+        let users = Arc::new(RwLock::new(HashMap::new()));
+        let handled = handle_socket_mode_text(
+            &events,
+            &account,
+            Some("U123"),
+            r#"{"envelope_id":"env-1","type":"events_api","payload":{"type":"event_callback","event":{"type":"message","channel":"C123","user":"U999","ts":"1710000005.000200","text":"hello"}}}"#,
+            &users,
+            None,
+        )
+        .expect("socket envelope parses");
+
+        assert_eq!(handled.ack.as_deref(), Some(r#"{"envelope_id":"env-1"}"#));
+        assert!(handled.received_event_callback);
+    }
+
+    #[tokio::test]
+    async fn socket_mode_handler_does_not_mark_hello_as_event_callback() {
+        let events = EventBus::new();
+        let account = arc_str("slack:test");
+        let users = Arc::new(RwLock::new(HashMap::new()));
+        let handled = handle_socket_mode_text(
+            &events,
+            &account,
+            Some("U123"),
+            r#"{"type":"hello"}"#,
+            &users,
+            None,
+        )
+        .expect("hello envelope parses");
+
+        assert!(handled.ack.is_none());
+        assert!(!handled.received_event_callback);
+    }
+
+    #[tokio::test]
+    async fn realtime_slack_bot_message_subtype_emits_live_message() {
         let events = EventBus::new();
         let mut receiver = events.subscribe();
         let account = arc_str("slack:test");
@@ -7674,7 +8002,9 @@ mod tests {
                 item_user: None,
             },
             &users,
-        );
+            None,
+        )
+        .await;
 
         let event = receiver.try_recv().expect("live message event");
         let ProviderEvent::Message {
@@ -7760,6 +8090,33 @@ mod tests {
         );
     }
 
+    // With a token, private Slack files get an authenticated lazy cache path so
+    // history-loaded and realtime official-app uploads render the same way.
+    #[test]
+    fn slack_file_image_media_uses_authenticated_cache_path_when_token_available() {
+        let file = SlackFileResponse {
+            id: Some("F1".to_owned()),
+            name: Some("image.png".to_owned()),
+            title: Some("image".to_owned()),
+            mimetype: Some("image/png".to_owned()),
+            filetype: Some("png".to_owned()),
+            size: Some(1234),
+            url_private: Some("https://files.slack.com/image.png".to_owned()),
+            url_private_download: None,
+            thumb_360: None,
+            thumb_720: None,
+            thumb_1024: None,
+            permalink: Some("https://slack.com/files/image".to_owned()),
+            mode: Some("hosted".to_owned()),
+        };
+
+        let media = slack_file_image_media(&file, Some("xoxb-test-token"))
+            .expect("image file should become media");
+
+        assert_eq!(media.mime_type.as_ref(), "image/png");
+        assert!(media.local_path.is_some());
+    }
+
     #[test]
     fn historical_slack_message_renders_image_files_as_media_cards_with_caption() {
         let message = slack_history_message(
@@ -7834,6 +8191,14 @@ mod tests {
                 .map(|image| image.mime_type.as_ref()),
             Some("image/png")
         );
+    }
+
+    #[test]
+    fn slack_channel_join_messages_are_kept_for_resolved_sidebar_previews() {
+        assert!(!is_ignored_slack_message_subtype(Some("channel_join")));
+        assert!(!is_ignored_slack_message_subtype(Some("channel_leave")));
+        assert!(is_ignored_slack_message_subtype(Some("message_deleted")));
+        assert!(is_ignored_slack_message_subtype(Some("message_changed")));
     }
 
     #[test]

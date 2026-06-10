@@ -22,6 +22,7 @@
 
 ## Implementation Safety Rules
 
+- Before committing, always inspect the current CI workflow/configuration and run the same required validation checks locally so CI does not fail for preventable reasons. For this repository, check `.github/workflows/ci.yml` and mirror its required `cargo check`, `cargo test`, `cargo clippy`, and release-build commands as applicable.
 - Prefer small, targeted changes with validation after each performance fix.
 - Do not remove failing tests to make a change pass. Update tests only when behavior intentionally changes.
 - Avoid adding synchronous work to helpers called from `handle_event`, `draw`, or completion drains unless the work is demonstrably bounded and instrumented.

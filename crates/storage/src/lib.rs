@@ -4,10 +4,10 @@ use anyhow::{Context, Result, anyhow};
 use chat_core::*;
 use chrono::{TimeZone, Utc};
 use directories::ProjectDirs;
-use rusqlite::{Connection, OptionalExtension, ToSql, params};
+use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -44,6 +44,14 @@ pub enum ConversationPresentationSetting {
     #[default]
     WhatsApp,
     Slack,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePreviewMode {
+    #[default]
+    Matrix,
+    Hd,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -91,6 +99,7 @@ pub struct AppSettings {
     pub chat_inbox_style: ChatInboxStyle,
     pub ui_theme: UiThemePreset,
     pub conversation_presentation: ConversationPresentationSetting,
+    pub image_preview_mode: ImagePreviewMode,
     pub network_activity: NetworkActivityDisplay,
     pub show_muted_chats: bool,
     pub show_browse_channels: bool,
@@ -133,6 +142,37 @@ pub struct ChatLatestMessage {
     pub message: Message,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvatarThumbnailCacheRecord {
+    pub cache_key: String,
+    pub source_kind: String,
+    pub source_path: PathBuf,
+    pub source_mtime: Option<i64>,
+    pub source_size: Option<i64>,
+    pub image_format: String,
+    pub image_blob: Vec<u8>,
+    pub cache_version: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AvatarThumbnailCacheUpsert {
+    pub cache_key: String,
+    pub source_kind: String,
+    pub source_path: PathBuf,
+    pub source_mtime: Option<i64>,
+    pub source_size: Option<i64>,
+    pub image_format: String,
+    pub image_blob: Vec<u8>,
+    pub cache_version: i64,
+}
+
+impl AvatarThumbnailCacheUpsert {
+    pub fn blob_bytes(&self) -> i64 {
+        self.image_blob.len() as i64
+    }
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -142,6 +182,7 @@ impl Default for AppSettings {
             chat_inbox_style: ChatInboxStyle::ActivityFirst,
             ui_theme: UiThemePreset::DefaultDark,
             conversation_presentation: ConversationPresentationSetting::WhatsApp,
+            image_preview_mode: ImagePreviewMode::Matrix,
             network_activity: NetworkActivityDisplay::CombinedLights,
             show_muted_chats: true,
             show_browse_channels: false,
@@ -166,6 +207,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             chat_inbox_style: ChatInboxStyle,
             ui_theme: UiThemePreset,
             conversation_presentation: ConversationPresentationSetting,
+            image_preview_mode: ImagePreviewMode,
             network_activity: NetworkActivityDisplay,
             show_muted_chats: bool,
             show_browse_channels: bool,
@@ -184,6 +226,7 @@ impl<'de> Deserialize<'de> for AppSettings {
                     chat_inbox_style: defaults.chat_inbox_style,
                     ui_theme: defaults.ui_theme,
                     conversation_presentation: defaults.conversation_presentation,
+                    image_preview_mode: defaults.image_preview_mode,
                     network_activity: defaults.network_activity,
                     show_muted_chats: defaults.show_muted_chats,
                     show_browse_channels: defaults.show_browse_channels,
@@ -210,6 +253,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             chat_inbox_style: compat.chat_inbox_style,
             ui_theme: compat.ui_theme,
             conversation_presentation: compat.conversation_presentation,
+            image_preview_mode: compat.image_preview_mode,
             network_activity: compat.network_activity,
             show_muted_chats: compat.show_muted_chats,
             show_browse_channels: compat.show_browse_channels,
@@ -369,6 +413,95 @@ impl Store {
             paused_until: Some(paused_until),
         })
         .await
+    }
+
+    pub async fn avatar_thumbnail_cache_entries(
+        &self,
+        cache_keys: &[String],
+    ) -> Result<Vec<AvatarThumbnailCacheRecord>> {
+        if cache_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let now = Utc::now().timestamp_millis();
+        let mut conn = self.conn.lock().await;
+        let placeholders = std::iter::repeat_n("?", cache_keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "SELECT cache_key, source_kind, source_path, source_mtime, source_size,
+                    image_format, image_blob, cache_version, updated_at
+             FROM avatar_thumbnail_cache
+             WHERE cache_key IN ({placeholders})"
+        );
+        let records = {
+            let mut stmt = conn.prepare(&query)?;
+            let rows = stmt.query_map(params_from_iter(cache_keys.iter()), |row| {
+                Ok(AvatarThumbnailCacheRecord {
+                    cache_key: row.get(0)?,
+                    source_kind: row.get(1)?,
+                    source_path: PathBuf::from(row.get::<_, String>(2)?),
+                    source_mtime: row.get(3)?,
+                    source_size: row.get(4)?,
+                    image_format: row.get(5)?,
+                    image_blob: row.get(6)?,
+                    cache_version: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let tx = conn.transaction()?;
+        for cache_key in records.iter().map(|record| &record.cache_key) {
+            tx.execute(
+                "UPDATE avatar_thumbnail_cache SET last_accessed_at = ?2 WHERE cache_key = ?1",
+                params![cache_key, now],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(records)
+    }
+
+    pub async fn upsert_avatar_thumbnail_cache(
+        &self,
+        entry: &AvatarThumbnailCacheUpsert,
+    ) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO avatar_thumbnail_cache (
+                cache_key, source_kind, source_path, source_mtime, source_size,
+                image_format, image_blob, blob_bytes, cache_version,
+                created_at, updated_at, last_accessed_at, error_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, NULL)
+             ON CONFLICT(cache_key) DO UPDATE SET
+                source_kind = excluded.source_kind,
+                source_path = excluded.source_path,
+                source_mtime = excluded.source_mtime,
+                source_size = excluded.source_size,
+                image_format = excluded.image_format,
+                image_blob = excluded.image_blob,
+                blob_bytes = excluded.blob_bytes,
+                cache_version = excluded.cache_version,
+                updated_at = excluded.updated_at,
+                last_accessed_at = excluded.last_accessed_at,
+                error_json = NULL",
+            params![
+                entry.cache_key,
+                entry.source_kind,
+                entry.source_path.to_string_lossy().as_ref(),
+                entry.source_mtime,
+                entry.source_size,
+                entry.image_format,
+                entry.image_blob,
+                entry.blob_bytes(),
+                entry.cache_version,
+                now,
+            ],
+        )?;
+        Ok(())
     }
 
     pub async fn resume_notifications(&self) -> Result<()> {
@@ -696,6 +829,110 @@ impl Store {
             hydrate_reactions_and_receipts(&conn, msg)?;
         }
         Ok(messages)
+    }
+
+    /// Return all messages belonging to a single thread (root + replies),
+    /// oldest first. Uses the `idx_messages_thread` index.
+    pub async fn get_messages_for_thread(
+        &self,
+        account_id: &ProviderId,
+        thread_id: &ThreadId,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().await;
+        let limit = usize_to_i64(limit)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
+                    content_type, content_text, content_caption, media_id, media_filename, media_mime,
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+             FROM messages WHERE account_id = ?1 AND thread_id = ?2 ORDER BY timestamp ASC LIMIT ?3",
+        )?;
+        let mut messages = stmt
+            .query_map(
+                params![account_id.as_ref(), thread_id.as_ref(), limit],
+                message_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for msg in &mut messages {
+            hydrate_reactions_and_receipts(&conn, msg)?;
+        }
+        Ok(messages)
+    }
+
+    /// Aggregate thread summaries for a single chat (reply counts, participants,
+    /// last reply time, unread replies), ordered by most recent reply first.
+    pub async fn thread_summaries_for_chat(
+        &self,
+        account_id: &ProviderId,
+        chat_id: &ChatId,
+    ) -> Result<Vec<ThreadSummary>> {
+        let conn = self.conn.lock().await;
+        thread_summaries_on_conn(&conn, account_id, Some(chat_id))
+    }
+
+    /// Aggregate thread summaries across all chats for an account that currently
+    /// have unread replies, ordered by most recent reply first. Backs the
+    /// Threads inbox view.
+    pub async fn unread_thread_summaries(
+        &self,
+        account_id: &ProviderId,
+    ) -> Result<Vec<ThreadSummary>> {
+        let conn = self.conn.lock().await;
+        let mut summaries = thread_summaries_on_conn(&conn, account_id, None)?;
+        summaries.retain(|summary| summary.unread_reply_count > 0);
+        Ok(summaries)
+    }
+
+    /// Current unread reply count for a single thread (0 when untracked).
+    pub async fn thread_unread_count(
+        &self,
+        account_id: &ProviderId,
+        thread_id: &ThreadId,
+    ) -> Result<u32> {
+        let conn = self.conn.lock().await;
+        thread_unread_count_on_conn(&conn, account_id, thread_id)
+    }
+
+    /// Increment the unread reply counter for a thread by one. Intended for the
+    /// live (non-historical) arrival path only, mirroring how chat-level unread
+    /// is bumped, so historical replay never inflates unread counts.
+    pub async fn bump_thread_unread(
+        &self,
+        account_id: &ProviderId,
+        thread_id: &ThreadId,
+    ) -> Result<u32> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO thread_reads (account_id, thread_id, unread_count)
+             VALUES (?1, ?2, 1)
+             ON CONFLICT(account_id, thread_id) DO UPDATE SET unread_count = unread_count + 1",
+            params![account_id.as_ref(), thread_id.as_ref()],
+        )?;
+        thread_unread_count_on_conn(&conn, account_id, thread_id)
+    }
+
+    /// Mark a thread as read, clearing its unread reply counter and recording
+    /// the read watermark. Safe to call repeatedly.
+    pub async fn mark_thread_read(
+        &self,
+        account_id: &ProviderId,
+        thread_id: &ThreadId,
+        last_read_message_id: Option<&MessageId>,
+        at: Option<Timestamp>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let at_millis = at.map(|t| t.timestamp_millis());
+        let last_read = last_read_message_id.map(|id| id.as_ref());
+        conn.execute(
+            "INSERT INTO thread_reads (account_id, thread_id, unread_count, last_read_at, last_read_message_id)
+             VALUES (?1, ?2, 0, ?3, ?4)
+             ON CONFLICT(account_id, thread_id) DO UPDATE SET
+                unread_count = 0,
+                last_read_at = excluded.last_read_at,
+                last_read_message_id = excluded.last_read_message_id",
+            params![account_id.as_ref(), thread_id.as_ref(), at_millis, last_read],
+        )?;
+        Ok(())
     }
 
     pub async fn upsert_person(&self, person: &Person) -> Result<()> {
@@ -1674,10 +1911,215 @@ fn usize_to_i64(value: usize) -> Result<i64> {
     i64::try_from(value).context("limit does not fit into i64")
 }
 
+fn thread_unread_count_on_conn(
+    conn: &Connection,
+    account_id: &ProviderId,
+    thread_id: &ThreadId,
+) -> Result<u32> {
+    let count: Option<i64> = conn
+        .query_row(
+            "SELECT unread_count FROM thread_reads WHERE account_id = ?1 AND thread_id = ?2",
+            params![account_id.as_ref(), thread_id.as_ref()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(u32::try_from(count.unwrap_or(0).max(0)).unwrap_or(0))
+}
+
+/// Short preview text for a message row given its stored content columns.
+fn row_preview(kind: &str, text: Option<String>, caption: Option<String>) -> Option<Arc<str>> {
+    if let Some(text) = text.filter(|t| !t.is_empty()) {
+        return Some(arc_str(text));
+    }
+    if let Some(caption) = caption.filter(|c| !c.is_empty()) {
+        return Some(arc_str(caption));
+    }
+    match kind {
+        "text" | "" => None,
+        "image" => Some(arc_str("Photo".to_owned())),
+        "video" => Some(arc_str("Video".to_owned())),
+        "audio" => Some(arc_str("Audio".to_owned())),
+        "file" => Some(arc_str("File".to_owned())),
+        "sticker" => Some(arc_str("Sticker".to_owned())),
+        "poll" => Some(arc_str("Poll".to_owned())),
+        other => Some(arc_str(other.to_owned())),
+    }
+}
+
+struct ThreadAgg {
+    chat_id: Arc<str>,
+    root_preview: Option<Arc<str>>,
+    reply_count: u32,
+    last_reply_at: Option<i64>,
+    participants: Vec<Arc<str>>,
+}
+
+/// Build [`ThreadSummary`] aggregates for an account, optionally scoped to a
+/// single chat. Threads with no replies (root-only) are omitted. Results are
+/// ordered by most recent reply first.
+fn thread_summaries_on_conn(
+    conn: &Connection,
+    account_id: &ProviderId,
+    chat_id: Option<&ChatId>,
+) -> Result<Vec<ThreadSummary>> {
+    let mut unread_map: HashMap<Arc<str>, u32> = HashMap::new();
+    {
+        let mut stmt =
+            conn.prepare("SELECT thread_id, unread_count FROM thread_reads WHERE account_id = ?1")?;
+        let rows = stmt.query_map(params![account_id.as_ref()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (thread_id, count) = row?;
+            unread_map.insert(arc_str(thread_id), u32::try_from(count.max(0)).unwrap_or(0));
+        }
+    }
+
+    let mut order: Vec<Arc<str>> = Vec::new();
+    let mut aggs: HashMap<Arc<str>, ThreadAgg> = HashMap::new();
+
+    let select = "SELECT id, chat_id, thread_id, sender_name, timestamp, is_from_me, content_type, content_text, content_caption
+                  FROM messages
+                  WHERE account_id = ?1 AND thread_id IS NOT NULL AND thread_id != ''";
+    let mut handle_row = |id: String,
+                          row_chat: String,
+                          thread_id: String,
+                          sender: String,
+                          timestamp: i64,
+                          content_type: String,
+                          content_text: Option<String>,
+                          content_caption: Option<String>| {
+        let thread_id = arc_str(thread_id);
+        let agg = aggs.entry(thread_id.clone()).or_insert_with(|| {
+            order.push(thread_id.clone());
+            ThreadAgg {
+                chat_id: arc_str(row_chat),
+                root_preview: None,
+                reply_count: 0,
+                last_reply_at: None,
+                participants: Vec::new(),
+            }
+        });
+        let is_root = id == thread_id.as_ref();
+        if is_root {
+            agg.root_preview = row_preview(&content_type, content_text, content_caption);
+        } else {
+            agg.reply_count = agg.reply_count.saturating_add(1);
+            agg.last_reply_at = Some(match agg.last_reply_at {
+                Some(existing) => existing.max(timestamp),
+                None => timestamp,
+            });
+            let sender = arc_str(sender);
+            if !agg.participants.contains(&sender) {
+                agg.participants.push(sender);
+            }
+        }
+    };
+
+    if let Some(chat_id) = chat_id {
+        let mut stmt =
+            conn.prepare(&format!("{select} AND chat_id = ?2 ORDER BY timestamp ASC"))?;
+        let rows = stmt.query_map(params![account_id.as_ref(), chat_id.as_ref()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, c, t, s, ts, ct, txt, cap) = row?;
+            handle_row(id, c, t, s, ts, ct, txt, cap);
+        }
+    } else {
+        let mut stmt = conn.prepare(&format!("{select} ORDER BY timestamp ASC"))?;
+        let rows = stmt.query_map(params![account_id.as_ref()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, c, t, s, ts, ct, txt, cap) = row?;
+            handle_row(id, c, t, s, ts, ct, txt, cap);
+        }
+    }
+
+    let mut summaries: Vec<ThreadSummary> = order
+        .into_iter()
+        .filter_map(|thread_id| {
+            let agg = aggs.remove(&thread_id)?;
+            if agg.reply_count == 0 {
+                return None;
+            }
+            let unread = unread_map
+                .get(&thread_id)
+                .copied()
+                .unwrap_or(0)
+                .min(agg.reply_count);
+            Some(ThreadSummary {
+                account: account_id.clone(),
+                chat_id: agg.chat_id,
+                root_id: thread_id.clone(),
+                thread_id,
+                root_preview: agg.root_preview,
+                reply_count: agg.reply_count,
+                unread_reply_count: unread,
+                last_reply_at: millis_to_timestamp(agg.last_reply_at),
+                participants: agg.participants,
+            })
+        })
+        .collect();
+
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_reply_at));
+    Ok(summaries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn avatar_thumbnail_cache_roundtrips_blob_metadata() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let entry = AvatarThumbnailCacheUpsert {
+            cache_key: "avatar:v1:path:4x2".to_owned(),
+            source_kind: "chat_avatar".to_owned(),
+            source_path: PathBuf::from("/tmp/avatar.png"),
+            source_mtime: Some(123),
+            source_size: Some(456),
+            image_format: "png".to_owned(),
+            image_blob: vec![1, 2, 3, 4],
+            cache_version: 1,
+        };
+
+        store.upsert_avatar_thumbnail_cache(&entry).await?;
+        let loaded = store
+            .avatar_thumbnail_cache_entries(&[entry.cache_key.clone(), "missing".to_owned()])
+            .await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cache_key, entry.cache_key);
+        assert_eq!(loaded[0].source_kind, entry.source_kind);
+        assert_eq!(loaded[0].source_path, entry.source_path);
+        assert_eq!(loaded[0].source_mtime, entry.source_mtime);
+        assert_eq!(loaded[0].source_size, entry.source_size);
+        assert_eq!(loaded[0].image_format, entry.image_format);
+        assert_eq!(loaded[0].image_blob, entry.image_blob);
+        assert_eq!(loaded[0].cache_version, entry.cache_version);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn app_settings_roundtrip_includes_ui_preferences() -> Result<()> {
@@ -2226,6 +2668,130 @@ mod tests {
         assert_eq!(deleted, 1);
         assert_eq!(chats.len(), 1);
         assert_eq!(chats[0].id.as_ref(), "CJOINED");
+        Ok(())
+    }
+
+    fn thread_message(
+        id: &str,
+        chat_id: &ChatId,
+        account: &ProviderId,
+        sender: &str,
+        text: &str,
+        thread_id: &str,
+        reply_to: Option<&str>,
+        ts: Timestamp,
+    ) -> Message {
+        Message {
+            id: arc_str(id.to_owned()),
+            chat_id: chat_id.clone(),
+            account: account.clone(),
+            sender: Sender {
+                platform_id: arc_str(sender.to_owned()),
+                display_name: arc_str(sender.to_owned()),
+                avatar: None,
+            },
+            timestamp: ts,
+            edited_at: None,
+            content: Content::Text(arc_str(text.to_owned())),
+            reply_to: reply_to.map(|r| arc_str(r.to_owned())),
+            thread_id: Some(arc_str(thread_id.to_owned())),
+            reactions: Vec::new(),
+            receipts: Vec::new(),
+            is_from_me: false,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_summaries_and_unread_lifecycle() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account = arc_str("acct".to_owned());
+        let chat_id = arc_str("chat".to_owned());
+        let thread = "root-1";
+        let base = Utc.timestamp_millis_opt(1_000_000).single().unwrap();
+
+        // Root message + two replies from different senders.
+        store
+            .upsert_message(&thread_message(
+                thread,
+                &chat_id,
+                &account,
+                "Priya",
+                "token names?",
+                thread,
+                None,
+                base,
+            ))
+            .await?;
+        store
+            .upsert_message(&thread_message(
+                "r1",
+                &chat_id,
+                &account,
+                "Lee",
+                "semantic names",
+                thread,
+                Some(thread),
+                base + chrono::Duration::seconds(10),
+            ))
+            .await?;
+        store
+            .upsert_message(&thread_message(
+                "r2",
+                &chat_id,
+                &account,
+                "Sam",
+                "shipping it",
+                thread,
+                Some(thread),
+                base + chrono::Duration::seconds(20),
+            ))
+            .await?;
+
+        let summaries = store.thread_summaries_for_chat(&account, &chat_id).await?;
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.thread_id.as_ref(), thread);
+        assert_eq!(summary.reply_count, 2);
+        assert_eq!(
+            summary.unread_reply_count, 0,
+            "untracked thread starts read"
+        );
+        assert_eq!(summary.root_preview.as_deref(), Some("token names?"));
+        assert_eq!(summary.participants.len(), 2);
+
+        // get_messages_for_thread returns root + replies oldest first.
+        let thread_msgs = store
+            .get_messages_for_thread(&account, &arc_str(thread.to_owned()), 50)
+            .await?;
+        assert_eq!(thread_msgs.len(), 3);
+        assert_eq!(thread_msgs[0].id.as_ref(), thread);
+
+        // A live reply bumps unread; it then appears in the unread inbox.
+        store
+            .bump_thread_unread(&account, &arc_str(thread.to_owned()))
+            .await?;
+        let unread = store.unread_thread_summaries(&account).await?;
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].unread_reply_count, 1);
+
+        // Marking read clears unread and removes it from the inbox.
+        store
+            .mark_thread_read(
+                &account,
+                &arc_str(thread.to_owned()),
+                Some(&arc_str("r2".to_owned())),
+                Some(base + chrono::Duration::seconds(20)),
+            )
+            .await?;
+        assert_eq!(
+            store
+                .thread_unread_count(&account, &arc_str(thread.to_owned()))
+                .await?,
+            0
+        );
+        assert!(store.unread_thread_summaries(&account).await?.is_empty());
         Ok(())
     }
 }

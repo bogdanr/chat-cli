@@ -84,6 +84,11 @@ chat-cli --whatsapp    # WhatsApp only
 
 Most people never need a flag — the in-app account screen handles setup.
 
+The quickest way to authorize Slack is the official app — click below to install
+it into your workspace, then finish signing in from the account screen:
+
+<a href="https://slack.com/oauth/v2/authorize?client_id=4614087544.11325148183808&scope=&user_scope=team:read,channels:history,channels:read,chat:write,files:read,files:write,groups:history,groups:read,im:history,im:read,mpim:history,mpim:read,reactions:read,reactions:write,search:read,users.profile:read,users:read"><img alt="Add to Slack" height="40" width="139" src="https://platform.slack-edge.com/img/add_to_slack.png" srcSet="https://platform.slack-edge.com/img/add_to_slack.png 1x, https://platform.slack-edge.com/img/add_to_slack@2x.png 2x" /></a>
+
 ---
 
 ## Getting around

@@ -1214,6 +1214,17 @@ func contactDisplayNameForJID(c *client, ctx context.Context, jid types.JID) (st
 			return name, true
 		}
 	}
+	if jid.Server == types.DefaultUserServer && c.wa != nil {
+		if info, err := c.wa.IsOnWhatsApp(ctx, []string{jid.User}); err == nil {
+			for _, item := range info {
+				if item.JID == jid && item.VerifiedName != nil {
+					if name := strings.TrimSpace(item.VerifiedName.Details.GetVerifiedName()); name != "" {
+						return name, true
+					}
+				}
+			}
+		}
+	}
 	return "", false
 }
 

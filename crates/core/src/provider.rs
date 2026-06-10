@@ -238,6 +238,14 @@ pub trait Provider: Send + Sync + 'static {
         false
     }
 
+    /// Whether this provider already has realtime delivery credentials configured
+    /// outside the setup UI (for example via launch environment variables or a
+    /// bundled/distributor configuration). Setup screens use this to avoid
+    /// asking the user to paste redundant realtime-only credentials.
+    fn has_configured_realtime(&self) -> bool {
+        false
+    }
+
     /// Search messages across this provider.
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Message>>;
 
