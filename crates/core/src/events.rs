@@ -49,6 +49,13 @@ pub enum ProviderEvent {
         sender: PlatformId,
     },
     ChatUpdated(Chat),
+    /// The chat was marked read (locally acknowledged or read on another
+    /// client of the same account). Carries no activity metadata so it can
+    /// never regress sidebar ordering; consumers should only clear unread
+    /// state.
+    ChatMarkedRead {
+        chat_id: ChatId,
+    },
     ChatMerged {
         from_chat_id: ChatId,
         to_chat_id: ChatId,

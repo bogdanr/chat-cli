@@ -10,6 +10,47 @@ pub type PersonId = Uuid;
 pub type PlatformId = Arc<str>;
 pub type Timestamp = DateTime<Utc>;
 
+/// Media at or below this size may be downloaded automatically by providers
+/// when a message referencing it is rendered. Larger media must be fetched on
+/// demand (for example via [`crate::Provider::download_media`]) after an
+/// explicit user action, such as activating a "Retrieve media" card.
+pub const MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// How the authenticated user relates to a conversation thread. Computed
+/// locally from stored messages: the user is a participant when they authored
+/// the thread root, replied inside the thread, or were mentioned by any
+/// message in it. Ordered by strength so the strongest applicable
+/// classification wins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ThreadParticipation {
+    /// The user authored the thread's root message.
+    Author,
+    /// The user wrote at least one reply in the thread.
+    Replied,
+    /// The user was @-mentioned (or broadcast-pinged) in the thread.
+    Mentioned,
+    /// The thread happens around the user without involving them.
+    #[default]
+    None,
+}
+
+impl ThreadParticipation {
+    /// Whether the user is part of the thread in any capacity.
+    pub fn is_participant(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Short human-readable label for UI badges; empty for `None`.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Self::Author => "you started",
+            Self::Replied => "you replied",
+            Self::Mentioned => "mentioned you",
+            Self::None => "",
+        }
+    }
+}
+
 /// Aggregated view of a single conversation thread, used to surface thread
 /// activity (reply counts, unread replies, participants) in the sidebar, the
 /// timeline summary line, and the dedicated Threads inbox view.
@@ -33,6 +74,8 @@ pub struct ThreadSummary {
     pub last_reply_at: Option<Timestamp>,
     /// Distinct display names of reply authors, ordered by first appearance.
     pub participants: Vec<Arc<str>>,
+    /// How the authenticated user relates to this thread.
+    pub participation: ThreadParticipation,
 }
 
 impl ThreadSummary {

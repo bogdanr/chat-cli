@@ -87,6 +87,23 @@ pub enum NotificationScope {
     DirectAndMentions,
 }
 
+/// Which thread-activity markers the sidebar shows. Applies to the `⤷N`
+/// marker rendered under a chat's name; the underlying per-thread unread
+/// counters are always tracked so changing this setting is retroactive.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadMarkerScope {
+    /// Count only threads the user participates in (authored the root,
+    /// replied, or was mentioned). Other thread activity renders as a dim
+    /// glyph without a count.
+    #[default]
+    Participating,
+    /// Count every unread thread reply, regardless of participation.
+    All,
+    /// Hide thread markers entirely.
+    None,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AppSettings {
     pub notifications: NotificationMode,
@@ -104,6 +121,8 @@ pub struct AppSettings {
     pub show_muted_chats: bool,
     pub show_browse_channels: bool,
     pub show_empty_chats: bool,
+    /// Scope of the sidebar `⤷N` unread-thread marker.
+    pub thread_marker_scope: ThreadMarkerScope,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,6 +159,13 @@ pub struct ChatLatestMessage {
     pub account_id: ProviderId,
     pub chat_id: ChatId,
     pub message: Message,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatAvatarHint {
+    pub account_id: ProviderId,
+    pub chat_id: ChatId,
+    pub avatar: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +213,7 @@ impl Default for AppSettings {
             show_muted_chats: true,
             show_browse_channels: false,
             show_empty_chats: true,
+            thread_marker_scope: ThreadMarkerScope::Participating,
         }
     }
 }
@@ -212,6 +239,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             show_muted_chats: bool,
             show_browse_channels: bool,
             show_empty_chats: bool,
+            thread_marker_scope: ThreadMarkerScope,
         }
 
         impl Default for AppSettingsCompat {
@@ -231,6 +259,7 @@ impl<'de> Deserialize<'de> for AppSettings {
                     show_muted_chats: defaults.show_muted_chats,
                     show_browse_channels: defaults.show_browse_channels,
                     show_empty_chats: defaults.show_empty_chats,
+                    thread_marker_scope: defaults.thread_marker_scope,
                 }
             }
         }
@@ -258,6 +287,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             show_muted_chats: compat.show_muted_chats,
             show_browse_channels: compat.show_browse_channels,
             show_empty_chats: compat.show_empty_chats,
+            thread_marker_scope: compat.thread_marker_scope,
         })
     }
 }
@@ -288,6 +318,7 @@ impl Store {
         conn.execute_batch(schema::V1)
             .context("running storage migrations")?;
         ensure_chat_metadata_columns(&conn).context("adding chat metadata columns")?;
+        ensure_message_metadata_columns(&conn).context("adding message metadata columns")?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -582,7 +613,8 @@ impl Store {
             "SELECT m.id, m.chat_id, m.account_id, m.sender_id, m.sender_name, m.sender_avatar,
                     m.timestamp, m.edited_at, m.content_type, m.content_text, m.content_caption,
                     m.media_id, m.media_filename, m.media_mime, m.media_size, m.media_local,
-                    m.media_thumbnail, m.reply_to_id, m.thread_id, m.is_from_me, m.platform_json
+                    m.media_thumbnail, m.reply_to_id, m.thread_id, m.is_from_me, m.platform_json,
+                    m.mentions_me
              FROM messages m
              JOIN (
                  SELECT account_id, chat_id, MAX(timestamp) AS timestamp
@@ -613,6 +645,59 @@ impl Store {
             });
         }
         Ok(latest_messages)
+    }
+
+    pub async fn latest_sender_avatar_for_each_chat(&self) -> Result<Vec<ChatAvatarHint>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT m.account_id, m.chat_id, m.sender_avatar
+             FROM messages m
+             JOIN chats c
+               ON c.account_id = m.account_id
+              AND c.id = m.chat_id
+             WHERE c.platform = ?1
+               AND c.kind = ?2
+               AND c.avatar_path IS NULL
+               AND c.id != 'whatsapp:status@broadcast'
+               AND NOT (LOWER(c.name) = 'status' AND instr(c.id, 'status') > 0)
+               AND m.sender_avatar IS NOT NULL
+               AND m.sender_avatar != ''
+               AND m.timestamp = (
+                   SELECT MAX(m2.timestamp)
+                   FROM messages m2
+                   WHERE m2.account_id = m.account_id
+                     AND m2.chat_id = m.chat_id
+                     AND m2.sender_avatar IS NOT NULL
+                     AND m2.sender_avatar != ''
+               )
+               AND m.id = (
+                   SELECT m3.id
+                   FROM messages m3
+                   WHERE m3.account_id = m.account_id
+                     AND m3.chat_id = m.chat_id
+                     AND m3.sender_avatar IS NOT NULL
+                     AND m3.sender_avatar != ''
+                     AND m3.timestamp = m.timestamp
+                   ORDER BY m3.id DESC
+                   LIMIT 1
+               )",
+        )?;
+        let hints = stmt
+            .query_map(
+                params![
+                    platform_to_str(&Platform::WhatsApp),
+                    chat_kind_to_str(ChatKind::Direct)
+                ],
+                |row| {
+                    Ok(ChatAvatarHint {
+                        account_id: arc_str(row.get::<_, String>(0)?),
+                        chat_id: arc_str(row.get::<_, String>(1)?),
+                        avatar: PathBuf::from(row.get::<_, String>(2)?),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(hints)
     }
 
     pub async fn set_chat_activity(
@@ -763,7 +848,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                         content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
                  FROM messages WHERE account_id = ?1 AND chat_id = ?2 AND timestamp < ?3 ORDER BY timestamp DESC LIMIT ?4",
             )?;
             stmt.query_map(
@@ -775,7 +860,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                         content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
                  FROM messages WHERE chat_id = ?1 AND timestamp < ?2 ORDER BY timestamp DESC LIMIT ?3",
             )?;
             stmt.query_map(params![chat_id.as_ref(), before, limit], message_from_row)?
@@ -797,7 +882,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                     content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
              FROM messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY timestamp ASC LIMIT 1",
         )?;
         let mut message = stmt
@@ -819,7 +904,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                     content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
              FROM messages WHERE content_text LIKE ?1 ORDER BY timestamp DESC LIMIT ?2",
         )?;
         let mut messages = stmt
@@ -844,7 +929,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                     content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
              FROM messages WHERE account_id = ?1 AND thread_id = ?2 ORDER BY timestamp ASC LIMIT ?3",
         )?;
         let mut messages = stmt
@@ -891,6 +976,42 @@ impl Store {
     ) -> Result<u32> {
         let conn = self.conn.lock().await;
         thread_unread_count_on_conn(&conn, account_id, thread_id)
+    }
+
+    /// How the authenticated user relates to a single thread, derived from
+    /// stored messages (authored root / replied / mentioned). Bounded by the
+    /// `idx_messages_thread` index, so it is safe to call from live event
+    /// drains off the draw path.
+    pub async fn thread_participation(
+        &self,
+        account_id: &ProviderId,
+        thread_id: &ThreadId,
+    ) -> Result<ThreadParticipation> {
+        let conn = self.conn.lock().await;
+        let (authored_root, replied, mentioned): (bool, bool, bool) = conn.query_row(
+            "SELECT
+                COALESCE(MAX(CASE WHEN id = thread_id AND is_from_me THEN 1 ELSE 0 END), 0),
+                COALESCE(MAX(CASE WHEN id != thread_id AND is_from_me THEN 1 ELSE 0 END), 0),
+                COALESCE(MAX(CASE WHEN mentions_me THEN 1 ELSE 0 END), 0)
+             FROM messages WHERE account_id = ?1 AND thread_id = ?2",
+            params![account_id.as_ref(), thread_id.as_ref()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? != 0,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )?;
+        Ok(if authored_root {
+            ThreadParticipation::Author
+        } else if replied {
+            ThreadParticipation::Replied
+        } else if mentioned {
+            ThreadParticipation::Mentioned
+        } else {
+            ThreadParticipation::None
+        })
     }
 
     /// Increment the unread reply counter for a thread by one. Intended for the
@@ -993,7 +1114,7 @@ fn upsert_chat_on_conn(conn: &Connection, chat: &Chat) -> Result<()> {
          ON CONFLICT(id, account_id) DO UPDATE SET
            platform = excluded.platform,
            name = excluded.name,
-           avatar_path = excluded.avatar_path,
+           avatar_path = COALESCE(excluded.avatar_path, chats.avatar_path),
            is_group = excluded.is_group,
            kind = excluded.kind,
            membership = excluded.membership,
@@ -1439,6 +1560,27 @@ fn ensure_chat_metadata_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Adds message columns introduced after the initial schema. `mentions_me`
+/// backs mention-based thread participation; pre-migration rows default to 0,
+/// so mention participation only applies to messages stored after the
+/// migration (authored-by-me participation works retroactively via
+/// `is_from_me`).
+fn ensure_message_metadata_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+
+    if !columns.contains("mentions_me") {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN mentions_me INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    Ok(())
+}
+
 fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
     Ok(Chat {
         id: arc_str(row.get::<_, String>(0)?),
@@ -1491,7 +1633,7 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         reactions: Vec::new(),
         receipts: Vec::new(),
         is_from_me: row.get(19)?,
-        mentions_me: false,
+        mentions_me: row.get::<_, Option<bool>>(21)?.unwrap_or(false),
         platform_data: platform_data_from_json(platform_json.as_deref()),
     })
 }
@@ -1834,13 +1976,14 @@ fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
         "INSERT INTO messages (
                 id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                 content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json,
+                mentions_me
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
              ON CONFLICT(id, account_id) DO UPDATE SET
                 chat_id = excluded.chat_id,
                 sender_id = excluded.sender_id,
                 sender_name = excluded.sender_name,
-                sender_avatar = excluded.sender_avatar,
+                sender_avatar = COALESCE(excluded.sender_avatar, messages.sender_avatar),
                 edited_at = excluded.edited_at,
                 content_type = excluded.content_type,
                 content_text = excluded.content_text,
@@ -1854,7 +1997,8 @@ fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
                 reply_to_id = excluded.reply_to_id,
                 thread_id = excluded.thread_id,
                 is_from_me = excluded.is_from_me,
-                platform_json = excluded.platform_json",
+                platform_json = excluded.platform_json,
+                mentions_me = excluded.mentions_me",
         params![
             msg.id.as_ref(),
             msg.chat_id.as_ref(),
@@ -1877,6 +2021,7 @@ fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
             msg.thread_id.as_deref(),
             msg.is_from_me,
             platform_json,
+            msg.mentions_me,
         ],
     )?;
 
@@ -1952,6 +2097,23 @@ struct ThreadAgg {
     reply_count: u32,
     last_reply_at: Option<i64>,
     participants: Vec<Arc<str>>,
+    authored_root: bool,
+    replied_by_me: bool,
+    mentioned_me: bool,
+}
+
+impl ThreadAgg {
+    fn participation(&self) -> ThreadParticipation {
+        if self.authored_root {
+            ThreadParticipation::Author
+        } else if self.replied_by_me {
+            ThreadParticipation::Replied
+        } else if self.mentioned_me {
+            ThreadParticipation::Mentioned
+        } else {
+            ThreadParticipation::None
+        }
+    }
 }
 
 /// Build [`ThreadSummary`] aggregates for an account, optionally scoped to a
@@ -1978,7 +2140,7 @@ fn thread_summaries_on_conn(
     let mut order: Vec<Arc<str>> = Vec::new();
     let mut aggs: HashMap<Arc<str>, ThreadAgg> = HashMap::new();
 
-    let select = "SELECT id, chat_id, thread_id, sender_name, timestamp, is_from_me, content_type, content_text, content_caption
+    let select = "SELECT id, chat_id, thread_id, sender_name, timestamp, is_from_me, content_type, content_text, content_caption, mentions_me
                   FROM messages
                   WHERE account_id = ?1 AND thread_id IS NOT NULL AND thread_id != ''";
     let mut handle_row = |id: String,
@@ -1986,9 +2148,11 @@ fn thread_summaries_on_conn(
                           thread_id: String,
                           sender: String,
                           timestamp: i64,
+                          is_from_me: bool,
                           content_type: String,
                           content_text: Option<String>,
-                          content_caption: Option<String>| {
+                          content_caption: Option<String>,
+                          mentions_me: bool| {
         let thread_id = arc_str(thread_id);
         let agg = aggs.entry(thread_id.clone()).or_insert_with(|| {
             order.push(thread_id.clone());
@@ -1998,13 +2162,25 @@ fn thread_summaries_on_conn(
                 reply_count: 0,
                 last_reply_at: None,
                 participants: Vec::new(),
+                authored_root: false,
+                replied_by_me: false,
+                mentioned_me: false,
             }
         });
+        if mentions_me {
+            agg.mentioned_me = true;
+        }
         let is_root = id == thread_id.as_ref();
         if is_root {
             agg.root_preview = row_preview(&content_type, content_text, content_caption);
+            if is_from_me {
+                agg.authored_root = true;
+            }
         } else {
             agg.reply_count = agg.reply_count.saturating_add(1);
+            if is_from_me {
+                agg.replied_by_me = true;
+            }
             agg.last_reply_at = Some(match agg.last_reply_at {
                 Some(existing) => existing.max(timestamp),
                 None => timestamp,
@@ -2026,14 +2202,16 @@ fn thread_summaries_on_conn(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, bool>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<bool>>(9)?.unwrap_or(false),
             ))
         })?;
         for row in rows {
-            let (id, c, t, s, ts, ct, txt, cap) = row?;
-            handle_row(id, c, t, s, ts, ct, txt, cap);
+            let (id, c, t, s, ts, mine, ct, txt, cap, mentioned) = row?;
+            handle_row(id, c, t, s, ts, mine, ct, txt, cap, mentioned);
         }
     } else {
         let mut stmt = conn.prepare(&format!("{select} ORDER BY timestamp ASC"))?;
@@ -2044,14 +2222,16 @@ fn thread_summaries_on_conn(
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, bool>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<bool>>(9)?.unwrap_or(false),
             ))
         })?;
         for row in rows {
-            let (id, c, t, s, ts, ct, txt, cap) = row?;
-            handle_row(id, c, t, s, ts, ct, txt, cap);
+            let (id, c, t, s, ts, mine, ct, txt, cap, mentioned) = row?;
+            handle_row(id, c, t, s, ts, mine, ct, txt, cap, mentioned);
         }
     }
 
@@ -2067,6 +2247,7 @@ fn thread_summaries_on_conn(
                 .copied()
                 .unwrap_or(0)
                 .min(agg.reply_count);
+            let participation = agg.participation();
             Some(ThreadSummary {
                 account: account_id.clone(),
                 chat_id: agg.chat_id,
@@ -2077,6 +2258,7 @@ fn thread_summaries_on_conn(
                 unread_reply_count: unread,
                 last_reply_at: millis_to_timestamp(agg.last_reply_at),
                 participants: agg.participants,
+                participation,
             })
         })
         .collect();
@@ -2196,8 +2378,10 @@ mod tests {
 
         // An explicitly stored restricted scope survives a serialize/deserialize
         // round-trip.
-        let mut settings = AppSettings::default();
-        settings.notification_scope = NotificationScope::DirectAndMentions;
+        let settings = AppSettings {
+            notification_scope: NotificationScope::DirectAndMentions,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&settings)?;
         let restored = serde_json::from_str::<AppSettings>(&json)?;
         assert_eq!(
@@ -2221,8 +2405,10 @@ mod tests {
 
         // An explicit stored value still survives a serialize/deserialize
         // round-trip for compatibility with existing config files.
-        let mut settings = AppSettings::default();
-        settings.notify_self_messages = false;
+        let settings = AppSettings {
+            notify_self_messages: false,
+            ..Default::default()
+        };
         let json = serde_json::to_string(&settings)?;
         let restored = serde_json::from_str::<AppSettings>(&json)?;
         assert!(!restored.notify_self_messages);
@@ -2452,6 +2638,229 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_upsert_preserves_cached_avatar_when_provider_snapshot_omits_it() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account_id = arc_str("whatsapp:avatar-preserve".to_owned());
+        let chat_id = arc_str("whatsapp:123@s.whatsapp.net".to_owned());
+        store
+            .upsert_account(
+                &Account {
+                    id: account_id.clone(),
+                    platform: Platform::WhatsApp,
+                    display_name: arc_str("WhatsApp".to_owned()),
+                    avatar: None,
+                },
+                "{}",
+            )
+            .await?;
+
+        let mut chat = Chat {
+            id: chat_id.clone(),
+            account: account_id.clone(),
+            platform: Platform::WhatsApp,
+            name: arc_str("Ada Lovelace".to_owned()),
+            avatar: Some(PathBuf::from("/tmp/ada-avatar.jpg")),
+            is_group: false,
+            kind: ChatKind::Direct,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            last_message_at: None,
+            last_message_preview: None,
+            thread_id: None,
+        };
+        store.upsert_chat(&chat).await?;
+
+        chat.avatar = None;
+        chat.last_message_preview = Some(arc_str("fresh provider metadata".to_owned()));
+        store.upsert_chat(&chat).await?;
+
+        let chat = store.get_chats(&account_id).await?.remove(0);
+        assert_eq!(
+            chat.avatar.as_deref(),
+            Some(Path::new("/tmp/ada-avatar.jpg"))
+        );
+        assert_eq!(
+            chat.last_message_preview.as_deref(),
+            Some("fresh provider metadata")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_sender_avatar_hints_return_whatsapp_direct_chats_missing_avatars() -> Result<()>
+    {
+        let store = Store::open_memory().await?;
+        let account_id = arc_str("whatsapp:avatar-hints".to_owned());
+        let direct_chat_id = arc_str("whatsapp:123@s.whatsapp.net".to_owned());
+        let group_chat_id = arc_str("whatsapp:group@g.us".to_owned());
+        let status_chat_id = arc_str("whatsapp:status@broadcast".to_owned());
+        let slack_chat_id = arc_str("C123".to_owned());
+        let base = Utc
+            .with_ymd_and_hms(2026, 6, 7, 9, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        store
+            .upsert_account(
+                &Account {
+                    id: account_id.clone(),
+                    platform: Platform::WhatsApp,
+                    display_name: arc_str("WhatsApp".to_owned()),
+                    avatar: None,
+                },
+                "{}",
+            )
+            .await?;
+        store
+            .upsert_account(
+                &Account {
+                    id: arc_str("slack:avatar-hints".to_owned()),
+                    platform: Platform::Slack,
+                    display_name: arc_str("Slack".to_owned()),
+                    avatar: None,
+                },
+                "{}",
+            )
+            .await?;
+
+        for chat in [
+            Chat {
+                id: direct_chat_id.clone(),
+                account: account_id.clone(),
+                platform: Platform::WhatsApp,
+                name: arc_str("Ada Lovelace".to_owned()),
+                avatar: None,
+                is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: None,
+                last_message_preview: None,
+                thread_id: None,
+            },
+            Chat {
+                id: group_chat_id.clone(),
+                account: account_id.clone(),
+                platform: Platform::WhatsApp,
+                name: arc_str("Family".to_owned()),
+                avatar: None,
+                is_group: true,
+                kind: ChatKind::Group,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: None,
+                last_message_preview: None,
+                thread_id: None,
+            },
+            Chat {
+                id: status_chat_id.clone(),
+                account: account_id.clone(),
+                platform: Platform::WhatsApp,
+                name: arc_str("Status".to_owned()),
+                avatar: None,
+                is_group: false,
+                kind: ChatKind::Direct,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: None,
+                last_message_preview: None,
+                thread_id: None,
+            },
+            Chat {
+                id: slack_chat_id.clone(),
+                account: arc_str("slack:avatar-hints".to_owned()),
+                platform: Platform::Slack,
+                name: arc_str("#general".to_owned()),
+                avatar: None,
+                is_group: true,
+                kind: ChatKind::PublicChannel,
+                membership: ChatMembership::Joined,
+                is_shared: false,
+                unread_count: 0,
+                muted: false,
+                pinned: false,
+                last_message_at: None,
+                last_message_preview: None,
+                thread_id: None,
+            },
+        ] {
+            store.upsert_chat(&chat).await?;
+        }
+
+        for (chat_id, sender_avatar, minute) in [
+            (
+                direct_chat_id.clone(),
+                Some(PathBuf::from("/tmp/ada-old.jpg")),
+                1,
+            ),
+            (
+                direct_chat_id.clone(),
+                Some(PathBuf::from("/tmp/ada-new.jpg")),
+                2,
+            ),
+            (
+                group_chat_id.clone(),
+                Some(PathBuf::from("/tmp/group-sender.jpg")),
+                3,
+            ),
+            (
+                status_chat_id.clone(),
+                Some(PathBuf::from("/tmp/status-sender.jpg")),
+                4,
+            ),
+            (
+                slack_chat_id.clone(),
+                Some(PathBuf::from("/tmp/slack-sender.jpg")),
+                5,
+            ),
+        ] {
+            store
+                .upsert_message(&Message {
+                    id: arc_str(format!("msg-{minute}")),
+                    chat_id,
+                    account: if minute == 5 {
+                        arc_str("slack:avatar-hints".to_owned())
+                    } else {
+                        account_id.clone()
+                    },
+                    sender: Sender {
+                        platform_id: arc_str("sender".to_owned()),
+                        display_name: arc_str("Sender".to_owned()),
+                        avatar: sender_avatar,
+                    },
+                    timestamp: base + chrono::Duration::minutes(minute),
+                    edited_at: None,
+                    content: Content::Text(arc_str("hello".to_owned())),
+                    reply_to: None,
+                    thread_id: None,
+                    reactions: Vec::new(),
+                    receipts: Vec::new(),
+                    is_from_me: false,
+                    mentions_me: false,
+                    platform_data: PlatformData::default(),
+                })
+                .await?;
+        }
+
+        let hints = store.latest_sender_avatar_for_each_chat().await?;
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].account_id, account_id);
+        assert_eq!(hints[0].chat_id, direct_chat_id);
+        assert_eq!(hints[0].avatar, PathBuf::from("/tmp/ada-new.jpg"));
+        Ok(())
+    }
+    #[tokio::test]
     async fn messages_are_returned_chronologically_after_out_of_order_upserts() -> Result<()> {
         let store = Store::open_memory().await?;
         let account_id = arc_str("mock:local".to_owned());
@@ -2671,7 +3080,8 @@ mod tests {
         Ok(())
     }
 
-    fn thread_message(
+    #[allow(clippy::too_many_arguments)]
+    fn thread_message_with_flags(
         id: &str,
         chat_id: &ChatId,
         account: &ProviderId,
@@ -2680,6 +3090,8 @@ mod tests {
         thread_id: &str,
         reply_to: Option<&str>,
         ts: Timestamp,
+        is_from_me: bool,
+        mentions_me: bool,
     ) -> Message {
         Message {
             id: arc_str(id.to_owned()),
@@ -2697,10 +3109,125 @@ mod tests {
             thread_id: Some(arc_str(thread_id.to_owned())),
             reactions: Vec::new(),
             receipts: Vec::new(),
-            is_from_me: false,
-            mentions_me: false,
+            is_from_me,
+            mentions_me,
             platform_data: PlatformData::default(),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn thread_message(
+        id: &str,
+        chat_id: &ChatId,
+        account: &ProviderId,
+        sender: &str,
+        text: &str,
+        thread_id: &str,
+        reply_to: Option<&str>,
+        ts: Timestamp,
+    ) -> Message {
+        thread_message_with_flags(
+            id, chat_id, account, sender, text, thread_id, reply_to, ts, false, false,
+        )
+    }
+
+    #[tokio::test]
+    async fn thread_participation_classifies_author_reply_mention_and_none() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account = arc_str("acct-participation".to_owned());
+        let chat_id = arc_str("chat-participation".to_owned());
+        let base = Utc.timestamp_millis_opt(2_000_000).single().unwrap();
+
+        for (thread, root_from_me, reply_from_me, mention_me, expected) in [
+            (
+                "thread-author",
+                true,
+                false,
+                true,
+                ThreadParticipation::Author,
+            ),
+            (
+                "thread-replied",
+                false,
+                true,
+                true,
+                ThreadParticipation::Replied,
+            ),
+            (
+                "thread-mentioned",
+                false,
+                false,
+                true,
+                ThreadParticipation::Mentioned,
+            ),
+            (
+                "thread-other",
+                false,
+                false,
+                false,
+                ThreadParticipation::None,
+            ),
+        ] {
+            store
+                .upsert_message(&thread_message_with_flags(
+                    thread,
+                    &chat_id,
+                    &account,
+                    "Root",
+                    "root message",
+                    thread,
+                    None,
+                    base,
+                    root_from_me,
+                    false,
+                ))
+                .await?;
+            store
+                .upsert_message(&thread_message_with_flags(
+                    &format!("{thread}-reply"),
+                    &chat_id,
+                    &account,
+                    "Reply",
+                    "reply message",
+                    thread,
+                    Some(thread),
+                    base + chrono::Duration::seconds(1),
+                    reply_from_me,
+                    mention_me,
+                ))
+                .await?;
+
+            assert_eq!(
+                store
+                    .thread_participation(&account, &arc_str(thread.to_owned()))
+                    .await?,
+                expected
+            );
+        }
+
+        let summaries = store.thread_summaries_for_chat(&account, &chat_id).await?;
+        let participation_by_thread = summaries
+            .into_iter()
+            .map(|summary| (summary.thread_id.to_string(), summary.participation))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            participation_by_thread.get("thread-author"),
+            Some(&ThreadParticipation::Author)
+        );
+        assert_eq!(
+            participation_by_thread.get("thread-replied"),
+            Some(&ThreadParticipation::Replied)
+        );
+        assert_eq!(
+            participation_by_thread.get("thread-mentioned"),
+            Some(&ThreadParticipation::Mentioned)
+        );
+        assert_eq!(
+            participation_by_thread.get("thread-other"),
+            Some(&ThreadParticipation::None)
+        );
+        Ok(())
     }
 
     #[tokio::test]

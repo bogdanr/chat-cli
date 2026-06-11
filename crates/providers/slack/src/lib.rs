@@ -26,13 +26,13 @@ use std::{
     hash::{Hash, Hasher},
     io::{Read, Write},
     net::TcpListener,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{sync::broadcast, task::JoinHandle};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WebSocketMessage};
@@ -41,6 +41,18 @@ const PROVIDER_ID: &str = "slack:setup";
 const PROVIDER_ID_PREFIX: &str = "slack";
 const SLACK_CONVERSATION_TYPES: &str = "public_channel,private_channel,mpim,im";
 const SLACK_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+// Files at or below this size are cached eagerly in the background when a
+// message referencing them is rendered. Larger uploads are only fetched when
+// the user explicitly retrieves them from the media card, so a single huge
+// attachment cannot saturate bandwidth or blow up the cache unprompted.
+const SLACK_MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES: u64 = chat_core::MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES;
+// Safety ceiling for explicit on-demand downloads so a malformed response
+// cannot fill the disk; generous enough for any realistic chat attachment.
+const SLACK_MEDIA_ON_DEMAND_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+// After a background media download fails, do not re-queue the same URL until
+// this cooldown elapses. Prevents render-driven retry storms for URLs that
+// fail deterministically. Explicit on-demand retrieval bypasses the cooldown.
+const SLACK_MEDIA_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_secs(300);
 // Slack OAuth advertises the HTTPS relay URL by default because Slack matches
 // redirect URIs exactly and distributed apps cannot register insecure loopback
 // redirects. The relay forwards the browser to the fixed local listener port
@@ -3042,6 +3054,15 @@ impl SlackProvider {
         if let Some(user) = read_lock(&self.users).get(user_id).cloned() {
             return Ok(Some(user));
         }
+        // `users.info` only resolves user ids (U.../W...); bot ids (B...) make
+        // it fail with `user_not_found` on every call. Bot display names arrive
+        // through message `bot_profile` metadata instead, so synthesize a
+        // placeholder rather than burning a doomed API round trip.
+        if is_slack_bot_id(user_id) {
+            let user = fallback_slack_bot_user(user_id);
+            write_lock(&self.users).insert(user.id.clone(), user.clone());
+            return Ok(Some(user));
+        }
 
         let user = self
             .call_api(
@@ -3311,6 +3332,7 @@ impl SlackProvider {
                 current_user_id,
                 users,
                 Utc::now(),
+                None,
             )
             .await;
         });
@@ -3885,12 +3907,60 @@ impl Provider for SlackProvider {
         }
     }
 
-    async fn download_media(&self, _media: &Media) -> Result<PathBuf> {
-        if self.capabilities().can_download_files {
-            Err(anyhow!("Slack file download is not implemented yet"))
-        } else {
-            Err(self.unsupported("file download"))
+    async fn download_media(&self, media: &Media) -> Result<PathBuf> {
+        if !self.capabilities().can_download_files {
+            return Err(self.unsupported("file download"));
         }
+        let url = media.id.trim().to_owned();
+        if !url.starts_with("https://") {
+            bail!("Slack media id is not a downloadable URL");
+        }
+        let path = slack_media_cache_file_path(&url, "files")
+            .ok_or_else(|| anyhow!("cannot determine Slack media cache path"))?;
+        if path.exists() {
+            return Ok(path);
+        }
+        let connection = read_lock(&self.connection).clone();
+        let token = connection
+            .read_credential()
+            .ok_or_else(|| self.unsupported("file download"))?
+            .value;
+
+        // User-initiated retrieval retries through the failure cooldown, but
+        // never races an in-flight download for the same URL.
+        if !slack_begin_media_download(&url, true) {
+            bail!("this file is already being downloaded");
+        }
+        let download_path = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let result = slack_download_media_to_path(
+                &url,
+                Some(&token),
+                &download_path,
+                SLACK_MEDIA_ON_DEMAND_LIMIT_BYTES,
+            );
+            slack_finish_media_download(&url, result.is_ok());
+            match &result {
+                Ok(()) => slack_diagnostic_log(
+                    "slack.provider.media_retrieved",
+                    format!("url={} path={}", url, download_path.display()),
+                ),
+                Err(error) => slack_diagnostic_log(
+                    "slack.provider.media_retrieve_failed",
+                    format!(
+                        "url={} path={} error={:#}",
+                        url,
+                        download_path.display(),
+                        error
+                    ),
+                ),
+            }
+            result
+        })
+        .await
+        .context("joining Slack media download task")?;
+        result.map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
+        Ok(path)
     }
 
     async fn mark_read(&self, _chat_id: &ChatId, _up_to: &MessageId) -> Result<()> {
@@ -4239,10 +4309,15 @@ fn conversation_display_name(conversation: &SlackConversation) -> String {
             .unwrap_or_else(|| format!("DM {}", conversation.id));
     }
 
+    if conversation.is_mpim {
+        return conversation
+            .name
+            .as_deref()
+            .and_then(slack_mpim_display_name)
+            .unwrap_or_else(|| format!("Group DM {}", conversation.id));
+    }
+
     if let Some(name) = conversation.name.as_deref() {
-        if conversation.is_mpim {
-            return format!("mpdm-{name}");
-        }
         if conversation.is_channel && !name.starts_with('#') {
             return format!("#{name}");
         }
@@ -4254,6 +4329,55 @@ fn conversation_display_name(conversation: &SlackConversation) -> String {
     }
 
     conversation.id.clone()
+}
+
+fn slack_mpim_display_name(name: &str) -> Option<String> {
+    let mut cleaned = name.trim().trim_start_matches('#').trim();
+    while cleaned
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("mpdm-"))
+    {
+        cleaned = cleaned[5..].trim_start_matches('-').trim();
+    }
+
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let raw_parts: Vec<&str> = cleaned.split("--").collect();
+    let last_index = raw_parts.len().saturating_sub(1);
+    let parts = raw_parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            let part = part.trim_matches('-').trim();
+            let part = if index == last_index {
+                strip_slack_mpim_collision_suffix(part)
+            } else {
+                part
+            };
+            (!part.is_empty()).then(|| part.to_owned())
+        })
+        .collect::<Vec<_>>();
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn strip_slack_mpim_collision_suffix(value: &str) -> &str {
+    let value = value.trim();
+    let Some((head, tail)) = value.rsplit_once('-') else {
+        return value;
+    };
+
+    if !head.is_empty() && !tail.is_empty() && tail.chars().all(|ch| ch.is_ascii_digit()) {
+        head.trim()
+    } else {
+        value
+    }
 }
 
 fn chat_from_slack_conversation(
@@ -4296,6 +4420,7 @@ async fn run_history_poll_loop(
     current_user_id: Option<String>,
     users: Arc<RwLock<HashMap<String, SlackUser>>>,
     started_at: Timestamp,
+    realtime_events_seen: Option<Arc<AtomicBool>>,
 ) {
     // History polling is a fallback for missing realtime, so it must only
     // surface messages that genuinely arrive *after* the relevant fallback
@@ -4307,81 +4432,158 @@ async fn run_history_poll_loop(
     // after a connected-but-idle realtime socket, callers pass the realtime
     // connection timestamp so messages sent during the idle window are still
     // eligible for delivery.
+    //
+    // `realtime_events_seen` is Some only when this loop runs as the safety
+    // net behind a connected-but-silent realtime socket. In that mode the
+    // loop shuts itself down once realtime proves it delivers events, and it
+    // alerts the user only on hard evidence of missed realtime messages (see
+    // `should_alert_undelivered_realtime_messages`).
     let mut seen_message_ids = HashSet::new();
+    let mut alerted_missing_realtime = false;
     loop {
-        match api_client.list_conversations(credential.clone()).await {
-            Ok(conversations) => {
-                events.send(ProviderEvent::NetworkActivity {
-                    direction: NetworkActivityDirection::Rx,
-                    kind: NetworkActivityKind::History,
-                });
-                for conversation in conversations
-                    .into_iter()
-                    .filter(|conversation| include_conversation_in_sidebar(conversation))
-                {
-                    let Some(mut chat) = chat_from_slack_conversation(&account, &conversation)
-                    else {
-                        continue;
-                    };
-                    // Realtime is unavailable here, so the `load_chats`
-                    // name-resolution path never runs for these chats. Resolve
-                    // direct-message names inline (cached after the first
-                    // lookup) so DMs do not stay labelled with the raw Slack
-                    // user id, for example "DM U01ABC".
-                    resolve_slack_dm_chat_name(
-                        &api_client,
-                        &credential,
-                        &users,
-                        &events,
-                        &mut chat,
-                    )
-                    .await;
-                    events.send(ProviderEvent::ChatUpdated(chat));
-                    match api_client
-                        .history(
-                            credential.clone(),
-                            &account,
-                            current_user_id.as_deref(),
-                            &arc_str(&conversation.id),
-                            None,
-                            SLACK_HISTORY_POLL_LIMIT,
-                            Some(Arc::clone(&users)),
-                        )
-                        .await
-                    {
-                        Ok(messages) => {
-                            for message in messages {
-                                let first_seen = seen_message_ids
-                                    .insert(format!("{}:{}", message.chat_id, message.id));
-                                // Only notify for messages first observed by
-                                // this loop AND newer than when polling began,
-                                // so historical backlog never triggers alerts.
-                                if history_poll_message_is_live(
-                                    started_at,
-                                    message.timestamp,
-                                    first_seen,
-                                ) {
-                                    events.send(ProviderEvent::Message {
-                                        message,
-                                        is_historical: false,
-                                    });
-                                }
-                            }
-                        }
-                        Err(error) => slack_diagnostic_log(
-                            "slack.history_poll.history_failed",
-                            sanitize_slack_error(&error),
-                        ),
-                    }
-                }
-            }
-            Err(error) => slack_diagnostic_log(
-                "slack.history_poll.conversations_failed",
-                sanitize_slack_error(&error),
-            ),
+        if let Some(flag) = &realtime_events_seen
+            && flag.load(Ordering::Acquire)
+        {
+            slack_diagnostic_log(
+                "slack.realtime.idle_history_fallback.stop",
+                format!("account={account} reason=realtime_events_active"),
+            );
+            return;
         }
+
+        let delivered_live_message = run_history_poll_pass(
+            &api_client,
+            &events,
+            &account,
+            &credential,
+            current_user_id.as_deref(),
+            &users,
+            started_at,
+            &mut seen_message_ids,
+        )
+        .await;
+
+        if should_alert_undelivered_realtime_messages(
+            delivered_live_message,
+            realtime_events_seen
+                .as_ref()
+                .map(|flag| flag.load(Ordering::Acquire)),
+            alerted_missing_realtime,
+        ) {
+            alerted_missing_realtime = true;
+            slack_diagnostic_log(
+                "slack.realtime.idle_fallback_missed_messages",
+                format!("account={account}"),
+            );
+            events.send(ProviderEvent::AccountNotice {
+                title: arc_str("Slack realtime is not delivering messages"),
+                body: arc_str(
+                    "A new Slack message arrived via periodic history checks, but the open realtime connection never delivered it. Check the Slack app's Event Subscriptions (message events) and reinstall the app to the workspace. Messages keep arriving through history checks in the meantime.",
+                ),
+                severity: AccountNoticeSeverity::SystemAlert,
+            });
+        }
+
         tokio::time::sleep(SLACK_HISTORY_POLL_INTERVAL).await;
     }
+}
+
+/// Decides whether the idle history-poll safety net should alert the user
+/// that realtime is not delivering messages.
+///
+/// A silent socket alone is ambiguous: broken Event Subscriptions and a
+/// simply quiet workspace look identical, and alerting on silence confuses
+/// users whose setup is perfectly fine. The alert therefore requires hard
+/// evidence — a live message surfaced by polling (`delivered_live_message`)
+/// while the connected realtime socket has still delivered no events at all
+/// (`realtime_events_seen == Some(false)`). Plain polling modes without a
+/// realtime socket (`None`) never alert, and the alert fires at most once.
+fn should_alert_undelivered_realtime_messages(
+    delivered_live_message: bool,
+    realtime_events_seen: Option<bool>,
+    already_alerted: bool,
+) -> bool {
+    delivered_live_message && realtime_events_seen == Some(false) && !already_alerted
+}
+
+/// One full poll over every sidebar conversation. Returns whether at least one
+/// live (notify-worthy) message was delivered during this pass.
+async fn run_history_poll_pass(
+    api_client: &Arc<dyn SlackApiClient>,
+    events: &EventBus,
+    account: &ProviderId,
+    credential: &SlackCredential,
+    current_user_id: Option<&str>,
+    users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+    started_at: Timestamp,
+    seen_message_ids: &mut HashSet<String>,
+) -> bool {
+    let mut delivered_live_message = false;
+    match api_client.list_conversations(credential.clone()).await {
+        Ok(conversations) => {
+            events.send(ProviderEvent::NetworkActivity {
+                direction: NetworkActivityDirection::Rx,
+                kind: NetworkActivityKind::History,
+            });
+            for conversation in conversations
+                .into_iter()
+                .filter(|conversation| include_conversation_in_sidebar(conversation))
+            {
+                let Some(mut chat) = chat_from_slack_conversation(account, &conversation) else {
+                    continue;
+                };
+                // Realtime is unavailable here, so the `load_chats`
+                // name-resolution path never runs for these chats. Resolve
+                // direct-message names inline (cached after the first
+                // lookup) so DMs do not stay labelled with the raw Slack
+                // user id, for example "DM U01ABC".
+                resolve_slack_dm_chat_name(api_client, credential, users, events, &mut chat).await;
+                events.send(ProviderEvent::ChatUpdated(chat));
+                match api_client
+                    .history(
+                        credential.clone(),
+                        account,
+                        current_user_id,
+                        &arc_str(&conversation.id),
+                        None,
+                        SLACK_HISTORY_POLL_LIMIT,
+                        Some(Arc::clone(users)),
+                    )
+                    .await
+                {
+                    Ok(messages) => {
+                        for message in messages {
+                            let first_seen = seen_message_ids
+                                .insert(format!("{}:{}", message.chat_id, message.id));
+                            // Only notify for messages first observed by
+                            // this loop AND newer than when polling began,
+                            // so historical backlog never triggers alerts.
+                            if history_poll_message_is_live(
+                                started_at,
+                                message.timestamp,
+                                first_seen,
+                            ) {
+                                delivered_live_message = true;
+                                events.send(ProviderEvent::Message {
+                                    message,
+                                    is_historical: false,
+                                });
+                            }
+                        }
+                    }
+                    Err(error) => slack_diagnostic_log(
+                        "slack.history_poll.history_failed",
+                        sanitize_slack_error(&error),
+                    ),
+                }
+            }
+        }
+        Err(error) => slack_diagnostic_log(
+            "slack.history_poll.conversations_failed",
+            sanitize_slack_error(&error),
+        ),
+    }
+    delivered_live_message
 }
 
 /// Resolves a direct-message chat's display name from the user cache, fetching
@@ -4466,6 +4668,15 @@ async fn run_socket_mode_loop(
     history_user_id: Option<String>,
 ) {
     let mut transient_alerted = false;
+    // Shared across reconnects of this realtime loop:
+    // - `saw_event_callback` records whether Slack has ever delivered an
+    //   Events API payload on this account's socket, so the idle safety-net
+    //   poller can distinguish "quiet workspace" from "events not flowing"
+    //   and shut itself down once realtime is proven to work.
+    // - `idle_fallback_started` guarantees at most one safety-net poller per
+    //   realtime loop even when the socket reconnects and goes idle again.
+    let saw_event_callback = Arc::new(AtomicBool::new(false));
+    let idle_fallback_started = Arc::new(AtomicBool::new(false));
     loop {
         let result = run_socket_mode_once(
             api_client.clone(),
@@ -4475,6 +4686,8 @@ async fn run_socket_mode_loop(
             app_token.clone(),
             Arc::clone(&users),
             fallback_credential.clone(),
+            Arc::clone(&saw_event_callback),
+            Arc::clone(&idle_fallback_started),
         )
         .await;
         match &result {
@@ -4520,6 +4733,7 @@ async fn run_socket_mode_loop(
                             history_user_id,
                             users,
                             Utc::now(),
+                            None,
                         )
                         .await;
                     }
@@ -4574,6 +4788,8 @@ async fn run_socket_mode_once(
     app_token: String,
     users: Arc<RwLock<HashMap<String, SlackUser>>>,
     fallback_credential: Option<SlackCredential>,
+    saw_event_callback: Arc<AtomicBool>,
+    idle_fallback_started: Arc<AtomicBool>,
 ) -> Result<()> {
     events.send(ProviderEvent::NetworkActivity {
         direction: NetworkActivityDirection::Tx,
@@ -4607,34 +4823,32 @@ async fn run_socket_mode_once(
 
     let realtime_started_at = Utc::now();
     let connected_at = tokio::time::Instant::now();
-    let mut saw_event_callback = false;
     let mut logged_idle_no_events = false;
-    let mut started_idle_history_fallback = false;
     loop {
-        if !saw_event_callback
+        if !saw_event_callback.load(Ordering::Acquire)
             && !logged_idle_no_events
             && connected_at.elapsed() >= SLACK_SOCKET_MODE_IDLE_DIAGNOSTIC_AFTER
         {
             logged_idle_no_events = true;
+            // A connected-but-silent socket is ambiguous: broken Event
+            // Subscriptions and a simply quiet workspace look identical from
+            // here, so alarming the user on silence alone would be a false
+            // positive for perfectly healthy setups. Log a diagnostic and
+            // quietly start a history-poll safety net instead; that poller
+            // alerts only on hard evidence (a message it delivered that
+            // realtime missed) and stops itself once realtime delivers its
+            // first event.
             slack_diagnostic_log(
                 "slack.realtime.idle_no_events",
                 format!(
-                    "account={account} connected_s={} history_fallback={} hint=socket_connected_but_no_events_api_payloads_check_event_subscriptions_and_reinstall_app",
+                    "account={account} connected_s={} history_fallback={} hint=quiet_workspace_or_missing_event_subscriptions",
                     connected_at.elapsed().as_secs(),
                     fallback_credential.is_some()
                 ),
             );
-            events.send(ProviderEvent::AccountNotice {
-                title: arc_str("Slack realtime has no events"),
-                body: arc_str(
-                    "Slack Socket Mode is connected, but Slack has not delivered any event payloads. Check Event Subscriptions, message events, and reinstall the Slack app. Starting periodic history checks while the socket stays connected.",
-                ),
-                severity: AccountNoticeSeverity::SystemAlert,
-            });
             if let Some(credential) = fallback_credential.clone()
-                && !started_idle_history_fallback
+                && !idle_fallback_started.swap(true, Ordering::AcqRel)
             {
-                started_idle_history_fallback = true;
                 slack_diagnostic_log(
                     "slack.realtime.idle_history_fallback.start",
                     format!("account={account}"),
@@ -4647,6 +4861,7 @@ async fn run_socket_mode_once(
                     user_id.clone(),
                     Arc::clone(&users),
                     realtime_started_at,
+                    Some(Arc::clone(&saw_event_callback)),
                 ));
             }
         }
@@ -4675,7 +4890,9 @@ async fn run_socket_mode_once(
                     &users,
                     fallback_credential.as_ref(),
                 )?;
-                saw_event_callback |= handled.received_event_callback;
+                if handled.received_event_callback {
+                    saw_event_callback.store(true, Ordering::Release);
+                }
                 if let Some(ack) = handled.ack {
                     socket
                         .send(WebSocketMessage::Text(ack.into()))
@@ -5418,7 +5635,17 @@ fn slack_file_image_media(file: &SlackFileResponse, token: Option<&str>) -> Opti
         mime_type: arc_str(mime_type),
         size_bytes: file.size,
         caption: None,
-        local_path: slack_cached_media_path(&url, "files", token),
+        // Large uploads are not fetched eagerly: only the deterministic cache
+        // path is reserved so the UI can offer on-demand retrieval (see
+        // `download_media`) and detect when the bytes have arrived.
+        local_path: if file
+            .size
+            .is_some_and(|size| size > SLACK_MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES)
+        {
+            slack_media_cache_file_path(&url, "files")
+        } else {
+            slack_cached_media_path(&url, "files", token)
+        },
         thumbnail: None,
     })
 }
@@ -5877,40 +6104,20 @@ fn slack_avatar_path(url: &str) -> Option<PathBuf> {
 /// background thread if not already cached. When `auth_token` is provided the
 /// download includes a `Bearer` header, which is required for authenticated
 /// file uploads (`url_private`). Public CDN assets (avatars) pass `None`.
+///
+/// Background fetches are bounded by [`SLACK_MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES`]
+/// and deduplicated: a URL that is already downloading, or that failed within
+/// [`SLACK_MEDIA_FAILURE_RETRY_COOLDOWN`], is not queued again.
 fn slack_cached_media_path(url: &str, subdir: &str, auth_token: Option<&str>) -> Option<PathBuf> {
     let url = url.trim();
-    if url.is_empty() {
-        return None;
-    }
-
-    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("chat-cli")
-        .join("slack")
-        .join(subdir);
-    let extension = url
-        .split('?')
-        .next()
-        .and_then(|path| path.rsplit('.').next())
-        .filter(|extension| {
-            !extension.is_empty()
-                && extension.len() <= 5
-                && extension
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric())
-        })
-        .unwrap_or("img");
-    let mut hasher = DefaultHasher::new();
-    url.hash(&mut hasher);
-    let path = cache_dir.join(format!("{:016x}.{extension}", hasher.finish()));
-
+    let path = slack_media_cache_file_path(url, subdir)?;
     if path.exists() {
         return Some(path);
     }
-    if fs::create_dir_all(&cache_dir).is_err() {
-        return None;
+    if !slack_begin_media_download(url, false) {
+        // Already in flight or in failure cooldown; the reserved path is still
+        // the right answer for callers, the bytes just are not there (yet).
+        return Some(path);
     }
 
     let url = url.to_owned();
@@ -5927,19 +6134,13 @@ fn slack_cached_media_path(url: &str, subdir: &str, auth_token: Option<&str>) ->
     );
     let path_for_download = path.clone();
     std::thread::spawn(move || {
-        let result = (|| -> Result<()> {
-            let mut request = slack_http_agent().get(&url);
-            if let Some(token) = auth_token.as_deref() {
-                request = request.header("Authorization", &format!("Bearer {token}"));
-            }
-            let mut response = request.call().context("downloading Slack media")?;
-            let bytes = response
-                .body_mut()
-                .read_to_vec()
-                .context("reading Slack media body")?;
-            fs::write(&path_for_download, bytes).context("writing Slack media cache")?;
-            Ok(())
-        })();
+        let result = slack_download_media_to_path(
+            &url,
+            auth_token.as_deref(),
+            &path_for_download,
+            SLACK_MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES,
+        );
+        slack_finish_media_download(&url, result.is_ok());
         match result {
             Ok(()) => slack_diagnostic_log(
                 "slack.provider.media_cached",
@@ -5966,6 +6167,122 @@ fn slack_cached_media_path(url: &str, subdir: &str, auth_token: Option<&str>) ->
     Some(path)
 }
 
+/// Computes the deterministic cache path for a Slack media URL without
+/// downloading anything. Used both to reserve a destination for on-demand
+/// (user-initiated) downloads of large files and by the eager cache path.
+fn slack_media_cache_file_path(url: &str, subdir: &str) -> Option<PathBuf> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+
+    let cache_dir = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("chat-cli")
+        .join("slack")
+        .join(subdir);
+    let extension = url
+        .split('?')
+        .next()
+        .and_then(|path| path.rsplit('.').next())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 5
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .unwrap_or("img");
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    Some(cache_dir.join(format!("{:016x}.{extension}", hasher.finish())))
+}
+
+#[derive(Default)]
+struct SlackMediaDownloadRegistry {
+    in_flight: HashSet<String>,
+    failed_at: HashMap<String, Instant>,
+}
+
+fn slack_media_download_registry() -> &'static Mutex<SlackMediaDownloadRegistry> {
+    static REGISTRY: OnceLock<Mutex<SlackMediaDownloadRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(Mutex::default)
+}
+
+/// Registers `url` as downloading. Returns `false` (caller must not download)
+/// when the URL is already in flight, or when it failed recently and `force`
+/// is not set. `force` is used by explicit user-initiated retrieval, which may
+/// retry through the failure cooldown but never alongside an active download.
+fn slack_begin_media_download(url: &str, force: bool) -> bool {
+    let mut registry = slack_media_download_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registry.in_flight.contains(url) {
+        return false;
+    }
+    if !force
+        && registry
+            .failed_at
+            .get(url)
+            .is_some_and(|failed_at| failed_at.elapsed() < SLACK_MEDIA_FAILURE_RETRY_COOLDOWN)
+    {
+        return false;
+    }
+    registry.in_flight.insert(url.to_owned());
+    true
+}
+
+fn slack_finish_media_download(url: &str, success: bool) {
+    let mut registry = slack_media_download_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.in_flight.remove(url);
+    if success {
+        registry.failed_at.remove(url);
+    } else {
+        registry.failed_at.insert(url.to_owned(), Instant::now());
+    }
+}
+
+/// Downloads a Slack media URL to `path`, streaming the body to a temporary
+/// sibling file and renaming it into place so `path.exists()` never observes a
+/// partially written cache entry. `limit_bytes` bounds the body size
+/// explicitly (ureq otherwise rejects bodies above 10 MiB).
+fn slack_download_media_to_path(
+    url: &str,
+    auth_token: Option<&str>,
+    path: &Path,
+    limit_bytes: u64,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Slack media cache path has no parent directory"))?;
+    fs::create_dir_all(parent).context("creating Slack media cache directory")?;
+
+    let mut request = slack_http_agent().get(url);
+    if let Some(token) = auth_token {
+        request = request.header("Authorization", &format!("Bearer {token}"));
+    }
+    let mut response = request.call().context("downloading Slack media")?;
+    let mut reader = response.body_mut().with_config().limit(limit_bytes).reader();
+
+    let temp_path = path.with_extension("part");
+    let result = (|| -> Result<()> {
+        let mut file = fs::File::create(&temp_path).context("creating Slack media cache file")?;
+        std::io::copy(&mut reader, &mut file).context("reading Slack media body")?;
+        file.flush().context("flushing Slack media cache file")?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    fs::rename(&temp_path, path).context("storing Slack media cache file")?;
+    Ok(())
+}
+
 fn fallback_slack_user(user_id: &str) -> Option<SlackUser> {
     is_slack_user_id(user_id).then(|| SlackUser {
         id: user_id.to_owned(),
@@ -5978,9 +6295,31 @@ fn fallback_slack_user(user_id: &str) -> Option<SlackUser> {
     })
 }
 
+/// Placeholder for bot senders (`B...` ids), which `users.info` cannot
+/// resolve. The id doubles as the display name until richer `bot_profile`
+/// metadata supplies a real one.
+fn fallback_slack_bot_user(bot_id: &str) -> SlackUser {
+    SlackUser {
+        id: bot_id.to_owned(),
+        name: Some(bot_id.to_owned()),
+        real_name: None,
+        display_name: Some(bot_id.to_owned()),
+        avatar: None,
+        is_bot: true,
+        deleted: false,
+    }
+}
+
 fn is_slack_user_id(value: &str) -> bool {
     let mut chars = value.chars();
     matches!(chars.next(), Some('U' | 'W'))
+        && chars.all(|character| character.is_ascii_alphanumeric())
+}
+
+fn is_slack_bot_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some('B'))
+        && chars.clone().next().is_some()
         && chars.all(|character| character.is_ascii_alphanumeric())
 }
 
@@ -6279,6 +6618,7 @@ mod tests {
         listed_conversations: Mutex<Vec<SlackCredentialKind>>,
         conversations: Mutex<Vec<SlackConversation>>,
         users: Mutex<HashMap<String, SlackUser>>,
+        user_info_calls: Mutex<Vec<String>>,
         conversation_members: Mutex<HashMap<String, Vec<String>>>,
         added_reactions: Mutex<Vec<(String, String, String)>>,
         removed_reactions: Mutex<Vec<(String, String, String)>>,
@@ -6425,6 +6765,7 @@ mod tests {
             _credential: SlackCredential,
             user_id: &str,
         ) -> Result<Option<SlackUser>> {
+            self.user_info_calls.lock().unwrap().push(user_id.to_owned());
             Ok(self.users.lock().unwrap().get(user_id).cloned())
         }
 
@@ -6603,6 +6944,66 @@ mod tests {
         }
     }
 
+    fn mpim_conversation(id: &str, name: Option<&str>, updated: i64) -> SlackConversation {
+        SlackConversation {
+            id: id.to_owned(),
+            name: name.map(ToOwned::to_owned),
+            user: None,
+            is_channel: false,
+            is_group: false,
+            is_im: false,
+            is_mpim: true,
+            is_member: Some(true),
+            is_private: true,
+            is_archived: false,
+            is_ext_shared: false,
+            is_muted: false,
+            is_pinned: false,
+            unread_count: 0,
+            updated: Some(updated),
+            topic: None,
+            purpose: None,
+            num_members: None,
+        }
+    }
+
+    #[test]
+    fn slack_mpim_display_name_removes_provider_prefixes_and_suffix() {
+        assert_eq!(
+            slack_mpim_display_name("mpdm-mpdm-bogdan--mihai--ana-1").as_deref(),
+            Some("bogdan, mihai, ana")
+        );
+        assert_eq!(
+            slack_mpim_display_name("#mpdm-bogdan--mihai").as_deref(),
+            Some("bogdan, mihai")
+        );
+        assert_eq!(
+            slack_mpim_display_name("bogdan--mihai-adamut").as_deref(),
+            Some("bogdan, mihai-adamut")
+        );
+    }
+
+    #[test]
+    fn slack_mpim_chat_uses_readable_group_dm_name() {
+        let conversation = mpim_conversation("G123", Some("mpdm-bogdan--mihai--ana-1"), 123);
+        let chat = chat_from_slack_conversation(&arc_str("slack:test"), &conversation)
+            .expect("mpim conversation should produce chat");
+
+        assert_eq!(chat.kind, ChatKind::GroupDirectMessage);
+        assert!(chat.is_group);
+        assert_eq!(chat.name.as_ref(), "bogdan, mihai, ana");
+    }
+
+    #[test]
+    fn slack_mpim_chat_falls_back_to_group_dm_id_without_name() {
+        let conversation = mpim_conversation("G123", None, 123);
+        let chat = chat_from_slack_conversation(&arc_str("slack:test"), &conversation)
+            .expect("mpim conversation should produce chat");
+
+        assert_eq!(chat.kind, ChatKind::GroupDirectMessage);
+        assert_eq!(chat.name.as_ref(), "Group DM G123");
+    }
+
     #[test]
     fn setup_options_are_ordered_by_robustness() {
         let modes = SlackProvider::setup_options_in_robustness_order()
@@ -6755,6 +7156,141 @@ mod tests {
         // A message exactly at the startup instant is treated as backlog, not
         // new, so it is not re-announced on startup.
         assert!(!history_poll_message_is_live(started_at, started_at, true));
+    }
+
+    #[test]
+    fn idle_fallback_alerts_only_with_evidence_of_missed_realtime_messages() {
+        // A quiet workspace (no live messages found by polling) must never
+        // alert: silence is indistinguishable from a healthy-but-idle setup,
+        // and alarming the user about it was pure confusion.
+        assert!(!should_alert_undelivered_realtime_messages(
+            false,
+            Some(false),
+            false
+        ));
+
+        // Hard evidence — polling delivered a live message while the open
+        // realtime socket has still seen no events — is the only alert case.
+        assert!(should_alert_undelivered_realtime_messages(
+            true,
+            Some(false),
+            false
+        ));
+
+        // Once realtime has proven it delivers events, polling finding a
+        // message is normal overlap, not a failure.
+        assert!(!should_alert_undelivered_realtime_messages(
+            true,
+            Some(true),
+            false
+        ));
+
+        // The alert fires at most once per fallback loop.
+        assert!(!should_alert_undelivered_realtime_messages(
+            true,
+            Some(false),
+            true
+        ));
+
+        // Plain history polling without a realtime socket never alerts.
+        assert!(!should_alert_undelivered_realtime_messages(
+            true, None, false
+        ));
+    }
+
+    fn poll_history_message(chat_id: &str, id: &str, timestamp: Timestamp) -> Message {
+        Message {
+            id: arc_str(id),
+            chat_id: arc_str(chat_id),
+            account: arc_str("slack:test"),
+            sender: Sender {
+                platform_id: arc_str("U999"),
+                display_name: arc_str("Teammate"),
+                avatar: None,
+            },
+            timestamp,
+            edited_at: None,
+            content: Content::Text(arc_str("hello")),
+            reply_to: None,
+            thread_id: None,
+            reactions: Vec::new(),
+            receipts: Vec::new(),
+            is_from_me: false,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn history_poll_pass_reports_live_deliveries_and_dedupes_repeats() {
+        let client = Arc::new(FakeSlackApiClient::default());
+        client
+            .conversations
+            .lock()
+            .unwrap()
+            .push(channel_conversation("C123", "general", 1_710_000_000));
+        let started_at = Utc::now();
+        let backlog = started_at - chrono::Duration::hours(2);
+        let live = started_at + chrono::Duration::seconds(5);
+        client.history_messages.lock().unwrap().push(
+            poll_history_message("C123", "1710000001.000100", backlog),
+        );
+
+        let api_client: Arc<dyn SlackApiClient> = client.clone();
+        let events = EventBus::new();
+        let account = arc_str("slack:test");
+        let credential =
+            SlackCredential::new(SlackCredentialKind::UserToken, "xoxp-test".to_owned());
+        let users = Arc::new(RwLock::new(HashMap::new()));
+        let mut seen_message_ids = HashSet::new();
+
+        // Backlog-only pass: nothing is delivered live, so the idle fallback
+        // has no evidence of missed realtime messages and must not alert.
+        assert!(
+            !run_history_poll_pass(
+                &api_client,
+                &events,
+                &account,
+                &credential,
+                Some("U123"),
+                &users,
+                started_at,
+                &mut seen_message_ids,
+            )
+            .await
+        );
+
+        // A genuinely new message is reported as a live delivery exactly
+        // once; re-observing it on the next pass is not new evidence.
+        client.history_messages.lock().unwrap().push(
+            poll_history_message("C123", "1710000010.000200", live),
+        );
+        assert!(
+            run_history_poll_pass(
+                &api_client,
+                &events,
+                &account,
+                &credential,
+                Some("U123"),
+                &users,
+                started_at,
+                &mut seen_message_ids,
+            )
+            .await
+        );
+        assert!(
+            !run_history_poll_pass(
+                &api_client,
+                &events,
+                &account,
+                &credential,
+                Some("U123"),
+                &users,
+                started_at,
+                &mut seen_message_ids,
+            )
+            .await
+        );
     }
 
     #[test]
@@ -8115,6 +8651,115 @@ mod tests {
 
         assert_eq!(media.mime_type.as_ref(), "image/png");
         assert!(media.local_path.is_some());
+    }
+
+    // Files above the auto-download limit must still reserve their cache path
+    // (so the UI can offer on-demand retrieval and detect arrival), but no
+    // background download may be queued for them.
+    #[test]
+    fn oversized_slack_file_reserves_cache_path_without_eager_download() {
+        let url = "https://files.slack.com/oversized-eager-download-test.png";
+        let file = SlackFileResponse {
+            id: Some("F9".to_owned()),
+            name: Some("huge.png".to_owned()),
+            title: Some("huge".to_owned()),
+            mimetype: Some("image/png".to_owned()),
+            filetype: Some("png".to_owned()),
+            size: Some(SLACK_MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES + 1),
+            url_private: Some(url.to_owned()),
+            url_private_download: None,
+            thumb_360: None,
+            thumb_720: None,
+            thumb_1024: None,
+            permalink: None,
+            mode: Some("hosted".to_owned()),
+        };
+
+        let media = slack_file_image_media(&file, Some("xoxb-test-token"))
+            .expect("oversized image file should still become media");
+
+        assert_eq!(
+            media.size_bytes,
+            Some(SLACK_MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES + 1)
+        );
+        let reserved = slack_media_cache_file_path(url, "files").expect("cache path");
+        assert_eq!(media.local_path.as_deref(), Some(reserved.as_path()));
+        assert!(!reserved.exists());
+        // The URL was never registered with the download registry: claiming it
+        // now succeeds, proving no eager background download was spawned.
+        assert!(
+            slack_begin_media_download(url, false),
+            "oversized files must not enqueue a background download"
+        );
+        slack_finish_media_download(url, true);
+    }
+
+    #[test]
+    fn media_download_registry_dedups_in_flight_and_applies_failure_cooldown() {
+        let url = "https://files.slack.com/registry-dedup-cooldown-test.png";
+
+        assert!(slack_begin_media_download(url, false));
+        // Already in flight: neither background nor forced (user-initiated)
+        // retrieval may start a concurrent download of the same URL.
+        assert!(!slack_begin_media_download(url, false));
+        assert!(!slack_begin_media_download(url, true));
+
+        // A failure puts the URL into cooldown for background retries...
+        slack_finish_media_download(url, false);
+        assert!(!slack_begin_media_download(url, false));
+        // ...but explicit user-initiated retrieval may retry through it.
+        assert!(slack_begin_media_download(url, true));
+
+        // Success clears both the in-flight entry and the failure marker.
+        slack_finish_media_download(url, true);
+        assert!(slack_begin_media_download(url, false));
+        slack_finish_media_download(url, true);
+    }
+
+    #[test]
+    fn bot_sender_ids_get_placeholder_users_instead_of_user_fallback() {
+        assert!(is_slack_bot_id("B0N6Y87V0"));
+        assert!(!is_slack_bot_id("U123"));
+        assert!(!is_slack_bot_id("W123"));
+        assert!(!is_slack_bot_id("B"));
+        assert!(!is_slack_bot_id(""));
+
+        // The user fallback keeps rejecting bot ids; the bot placeholder
+        // carries the id as its display name and is flagged as a bot.
+        assert!(fallback_slack_user("B0N6Y87V0").is_none());
+        let bot = fallback_slack_bot_user("B0N6Y87V0");
+        assert!(bot.is_bot);
+        assert_eq!(bot.display_name.as_deref(), Some("B0N6Y87V0"));
+    }
+
+    #[tokio::test]
+    async fn resolve_user_synthesizes_bot_placeholder_without_users_info_call() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client.clone())?;
+        provider.connect().await?;
+        let credential = SlackCredential::new(SlackCredentialKind::UserToken, "xoxp-user");
+
+        let bot = provider
+            .resolve_user(&credential, "B0N6Y87V0")
+            .await?
+            .expect("bot sender should resolve to a placeholder");
+
+        assert!(bot.is_bot);
+        assert_eq!(bot.display_name.as_deref(), Some("B0N6Y87V0"));
+        assert!(
+            client.user_info_calls.lock().unwrap().is_empty(),
+            "bot ids must not be sent to users.info"
+        );
+
+        // Regular user ids still go through users.info.
+        provider.resolve_user(&credential, "U123").await?;
+        assert_eq!(
+            *client.user_info_calls.lock().unwrap(),
+            vec!["U123".to_owned()]
+        );
+        Ok(())
     }
 
     #[test]

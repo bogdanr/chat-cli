@@ -2,8 +2,12 @@ package main
 
 import (
 	"testing"
+	"time"
 
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestChooseCanonicalJIDPrefersPhoneNumberJID(t *testing.T) {
@@ -57,5 +61,90 @@ func TestDisplayNameForContactKeepsBareJIDFallbackForSearch(t *testing.T) {
 	named := types.ContactInfo{Found: true, FirstName: "Bogdan"}
 	if name := displayNameForContact(named, phone); name != "Bogdan" {
 		t.Fatalf("expected real name to win over bare JID, got %q", name)
+	}
+}
+
+func TestAddressBookContactNameOnlyAcceptsSavedNames(t *testing.T) {
+	// Push names alone must not surface a contact as a sidebar chat: they
+	// belong to people who merely messaged the user, not saved contacts.
+	pushOnly := types.ContactInfo{Found: true, PushName: "Sorin"}
+	if name := addressBookContactName(pushOnly); name != "" {
+		t.Fatalf("expected push-name-only contact to be skipped, got %q", name)
+	}
+
+	saved := types.ContactInfo{Found: true, FullName: "Ada Lovelace", PushName: "ada"}
+	if name := addressBookContactName(saved); name != "Ada Lovelace" {
+		t.Fatalf("expected saved full name, got %q", name)
+	}
+
+	firstNameOnly := types.ContactInfo{Found: true, FirstName: " Grace "}
+	if name := addressBookContactName(firstNameOnly); name != "Grace" {
+		t.Fatalf("expected trimmed first name, got %q", name)
+	}
+
+	business := types.ContactInfo{Found: true, BusinessName: "Hopper Computing"}
+	if name := addressBookContactName(business); name != "Hopper Computing" {
+		t.Fatalf("expected business name, got %q", name)
+	}
+}
+
+func historyTestMessage(ts time.Time, message *waProto.Message) *events.Message {
+	return &events.Message{
+		Info:    types.MessageInfo{MessageSource: types.MessageSource{}, Timestamp: ts},
+		Message: message,
+	}
+}
+
+func TestConversationActivityUsesNewestPayloadMessage(t *testing.T) {
+	older := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 6, 9, 18, 30, 0, 0, time.UTC)
+	messages := []*events.Message{
+		historyTestMessage(older, &waProto.Message{Conversation: proto.String("first")}),
+		historyTestMessage(newer, &waProto.Message{Conversation: proto.String("latest")}),
+	}
+
+	gotTs, gotPreview := conversationActivity(messages, 0)
+	if !gotTs.Equal(newer) {
+		t.Fatalf("expected newest message timestamp %s, got %s", newer, gotTs)
+	}
+	if gotPreview != "latest" {
+		t.Fatalf("expected preview of newest message, got %q", gotPreview)
+	}
+}
+
+func TestConversationActivityFallsBackToConversationTimestamp(t *testing.T) {
+	// INITIAL_BOOTSTRAP conversations often arrive with metadata only; the
+	// conversation's last-message timestamp must still mark the chat as
+	// recently active so it is not shown as never contacted.
+	last := time.Date(2026, 6, 8, 9, 0, 0, 0, time.UTC)
+	gotTs, gotPreview := conversationActivity(nil, uint64(last.Unix()))
+	if !gotTs.Equal(last) {
+		t.Fatalf("expected fallback timestamp %s, got %s", last, gotTs)
+	}
+	if gotPreview != "" {
+		t.Fatalf("expected no preview for metadata-only fallback, got %q", gotPreview)
+	}
+
+	gotTs, _ = conversationActivity(nil, 0)
+	if !gotTs.IsZero() {
+		t.Fatalf("expected zero time when no activity is known, got %s", gotTs)
+	}
+}
+
+func TestConversationActivitySkipsNonDisplayableMessages(t *testing.T) {
+	older := time.Date(2026, 6, 1, 10, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 6, 9, 18, 30, 0, 0, time.UTC)
+	reaction := &waProto.Message{ReactionMessage: &waProto.ReactionMessage{Text: proto.String("👍")}}
+	messages := []*events.Message{
+		historyTestMessage(older, &waProto.Message{Conversation: proto.String("real text")}),
+		historyTestMessage(newer, reaction),
+	}
+
+	gotTs, gotPreview := conversationActivity(messages, 0)
+	if !gotTs.Equal(older) {
+		t.Fatalf("expected reaction to be skipped in favour of %s, got %s", older, gotTs)
+	}
+	if gotPreview != "real text" {
+		t.Fatalf("expected preview from displayable message, got %q", gotPreview)
 	}
 }

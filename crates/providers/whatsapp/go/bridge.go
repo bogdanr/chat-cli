@@ -84,6 +84,9 @@ type bridgeEvent struct {
 	Muted        *bool  `json:"muted,omitempty"`
 	Progress     uint8  `json:"progress,omitempty"`
 
+	LastMessageAt      string `json:"last_message_at,omitempty"`
+	LastMessagePreview string `json:"last_message_preview,omitempty"`
+
 	ContentType           string           `json:"content_type,omitempty"`
 	MediaID               string           `json:"media_id,omitempty"`
 	MediaFileName         string           `json:"media_file_name,omitempty"`
@@ -209,6 +212,7 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 		go c.fetchAndEmitProfile(context.Background(), *wa.Store.ID, "WhatsApp", false)
 		go c.syncChatMuteSettings(context.Background())
 		go c.emitJoinedGroups(context.Background())
+		go c.emitContacts(context.Background())
 	}
 	emit(bridgeEvent{Type: "sync", Progress: 100})
 	return 1
@@ -648,6 +652,75 @@ func C_SearchContacts(clientID C.uint64_t, query *C.char, limit C.int) *C.char {
 	return cJSON(bridgeEvent{Type: "contact_search", Contacts: contacts})
 }
 
+type markReadEntry struct {
+	ID        string `json:"id"`
+	SenderJID string `json:"sender_jid"`
+}
+
+//export C_MarkRead
+func C_MarkRead(clientID C.uint64_t, chatJID *C.char, messagesJSON *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "unknown WhatsApp bridge client"})
+	}
+
+	chatRaw := C.GoString(chatJID)
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{Type: "read", ChatJID: chatRaw})
+	}
+	if c.wa == nil || !c.wa.IsConnected() {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	chat, err := types.ParseJID(chatRaw)
+	if err != nil || chat.IsEmpty() {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
+	}
+	var entries []markReadEntry
+	if err := json.Unmarshal([]byte(C.GoString(messagesJSON)), &entries); err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp mark-read payload: %v", err)})
+	}
+
+	// Group receipts by sender: group chats require one receipt per
+	// participant, while DMs use the chat JID itself.
+	bySender := map[string][]types.MessageID{}
+	senderOrder := []string{}
+	for _, entry := range entries {
+		if entry.ID == "" {
+			continue
+		}
+		if _, seen := bySender[entry.SenderJID]; !seen {
+			senderOrder = append(senderOrder, entry.SenderJID)
+		}
+		bySender[entry.SenderJID] = append(bySender[entry.SenderJID], types.MessageID(entry.ID))
+	}
+	if len(senderOrder) == 0 {
+		return cJSON(bridgeEvent{Type: "read", ChatJID: chat.String()})
+	}
+
+	now := time.Now()
+	marked := 0
+	for _, senderRaw := range senderOrder {
+		sender := chat
+		if senderRaw != "" {
+			if parsed, err := types.ParseJID(senderRaw); err == nil && !parsed.IsEmpty() {
+				sender = parsed
+			}
+		}
+		ids := bySender[senderRaw]
+		if err := c.wa.MarkRead(context.Background(), ids, now, chat, sender); err != nil {
+			c.log("mark WhatsApp chat read failed chat=%s sender=%s count=%d: %v", chat.String(), sender.String(), len(ids), err)
+			return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("mark WhatsApp chat read: %v", err)})
+		}
+		marked += len(ids)
+	}
+	canonicalChat := canonicalJID(c, context.Background(), chat)
+	c.log("marked WhatsApp chat read chat=%s messages=%d", chat.String(), marked)
+	return cJSON(bridgeEvent{Type: "read", ChatJID: canonicalChat.String()})
+}
+
 //export C_FireSyntheticMessage
 func C_FireSyntheticMessage(message *C.char) C.uint8_t {
 	text := C.GoString(message)
@@ -775,8 +848,21 @@ func (c *client) syncChatMuteSettings(ctx context.Context) {
 }
 
 func emitProfileEvent(c *client, ctx context.Context, jid types.JID, name string, avatarPath string, isGroup bool, muted *bool) {
+	emitProfileEventWithActivity(c, ctx, jid, name, avatarPath, isGroup, muted, time.Time{}, "")
+}
+
+// emitProfileEventWithActivity emits a profile event optionally carrying
+// chat-level last-message activity. The activity always describes an actual
+// message (timestamp of the conversation's newest message, plus its preview
+// text when the message payload is available), never synthetic conversation
+// metadata, so the Rust side can use it for sidebar ordering.
+func emitProfileEventWithActivity(c *client, ctx context.Context, jid types.JID, name string, avatarPath string, isGroup bool, muted *bool, lastMessageAt time.Time, lastMessagePreview string) {
 	alias := canonicalJIDAlias(c, ctx, jid)
 	event := bridgeEvent{Type: "profile", JID: alias.canonical.String(), SenderName: name, AvatarPath: avatarPath, IsGroup: isGroup, Muted: muted}
+	if !lastMessageAt.IsZero() {
+		event.LastMessageAt = lastMessageAt.UTC().Format(time.RFC3339Nano)
+		event.LastMessagePreview = lastMessagePreview
+	}
 	if !alias.alternate.IsEmpty() && alias.alternate != alias.canonical {
 		event.CanonicalJID = alias.canonical.String()
 		event.AltJID = alias.alternate.String()
@@ -799,6 +885,35 @@ func emitMuteEvent(c *client, evt *events.Mute) {
 		muted = chatMuted(c, context.Background(), evt.JID)
 	}
 	emitProfileEvent(c, context.Background(), evt.JID, "", "", evt.JID.Server == types.GroupServer, &muted)
+}
+
+// emitSelfReadReceipt forwards read receipts produced by the user's other
+// WhatsApp clients so this client can clear the chat's unread state. Receipts
+// from other people reading our messages are ignored here.
+func emitSelfReadReceipt(c *client, evt *events.Receipt) {
+	if evt == nil || evt.Chat.IsEmpty() {
+		return
+	}
+	isSelfRead := evt.Type == types.ReceiptTypeReadSelf ||
+		(evt.Type == types.ReceiptTypeRead && evt.IsFromMe)
+	if !isSelfRead {
+		return
+	}
+	emitChatReadEvent(c, evt.Chat)
+}
+
+// emitMarkChatAsRead forwards app-state "chat marked read" actions performed
+// on the user's other WhatsApp clients.
+func emitMarkChatAsRead(c *client, evt *events.MarkChatAsRead) {
+	if evt == nil || evt.JID.IsEmpty() || evt.Action == nil || !evt.Action.GetRead() {
+		return
+	}
+	emitChatReadEvent(c, evt.JID)
+}
+
+func emitChatReadEvent(c *client, chatJID types.JID) {
+	canonical := canonicalJID(c, context.Background(), chatJID)
+	emit(bridgeEvent{Type: "read", ChatJID: canonical.String()})
 }
 
 func handleWhatsAppEvent(c *client, evt interface{}) {
@@ -824,6 +939,10 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 			muted := chatMuted(c, context.Background(), v.JID)
 			emitProfileEvent(c, context.Background(), v.JID, v.Name.Name, "", true, &muted)
 		}
+	case *events.Receipt:
+		emitSelfReadReceipt(c, v)
+	case *events.MarkChatAsRead:
+		emitMarkChatAsRead(c, v)
 	case *events.Connected:
 		emit(bridgeEvent{Type: "connected"})
 	case *events.LoggedOut:
@@ -869,9 +988,8 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 		isGroup := chatJID.Server == types.GroupServer
 		chatName := conversationName(c, ctx, chatJID, firstNonEmpty(conv.GetDisplayName(), conv.GetName()))
 		chatMuted := chatMuted(c, ctx, chatJID)
-		emitProfileEvent(c, ctx, chatJID, chatName, "", isGroup, &chatMuted)
-		go c.fetchAndEmitProfile(ctx, chatJID, chatName, isGroup)
 
+		parsedMessages := make([]*events.Message, 0, len(conv.GetMessages()))
 		for _, historyMsg := range conv.GetMessages() {
 			webMessage := historyMsg.GetMessage()
 			if webMessage == nil {
@@ -881,6 +999,17 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 			if err != nil {
 				continue
 			}
+			parsedMessages = append(parsedMessages, message)
+		}
+
+		// Carry the conversation's real last-message activity even when the
+		// sync scope skips replaying the messages themselves, so recently
+		// contacted chats never show up as "No messages yet".
+		lastMessageAt, lastMessagePreview := conversationActivity(parsedMessages, conv.GetLastMsgTimestamp())
+		emitProfileEventWithActivity(c, ctx, chatJID, chatName, "", isGroup, &chatMuted, lastMessageAt, lastMessagePreview)
+		go c.fetchAndEmitProfile(ctx, chatJID, chatName, isGroup)
+
+		for _, message := range parsedMessages {
 			if !isOnDemand && c.shouldSkipHistoryMessage(message.Info.Timestamp) {
 				continue
 			}
@@ -1248,6 +1377,49 @@ func displayNameForContact(contact types.ContactInfo, jid types.JID) string {
 		return name
 	}
 	return jid.User
+}
+
+// addressBookContactName returns the saved address-book name for a contact.
+// Push names are deliberately excluded so only contacts the user actually
+// saved are surfaced as sidebar chats; push-name-only senders already get
+// chats through the messages they send.
+func addressBookContactName(contact types.ContactInfo) string {
+	for _, name := range []string{contact.FullName, contact.FirstName, contact.BusinessName} {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+// emitContacts surfaces every saved address-book contact as a chat (via the
+// existing "profile" event) so the sidebar's older-chats fold also lists
+// people the user never exchanged a message with.
+func (c *client) emitContacts(ctx context.Context) {
+	if c == nil || c.wa == nil || strings.HasPrefix(c.dbPath, "test:") {
+		return
+	}
+	if c.wa.Store == nil || c.wa.Store.Contacts == nil {
+		return
+	}
+	storedContacts, err := c.wa.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		c.log("fetch WhatsApp contacts failed: %v", err)
+		return
+	}
+	emitted := 0
+	for jid, contact := range storedContacts {
+		if jid.IsEmpty() || (jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer) {
+			continue
+		}
+		name := addressBookContactName(contact)
+		if name == "" {
+			continue
+		}
+		emitProfileEvent(c, ctx, jid, name, "", false, nil)
+		emitted++
+	}
+	c.log("emitted WhatsApp contacts count=%d stored=%d", emitted, len(storedContacts))
 }
 
 func (c *client) searchContacts(ctx context.Context, query string, limit int) ([]bridgeContact, error) {
@@ -1903,6 +2075,45 @@ func messageMentionsUser(message *waProto.Message, ownJID string) bool {
 		}
 	}
 	return false
+}
+
+// conversationActivity derives last-message activity for a history-synced
+// conversation from the actual messages included in the payload (newest
+// displayable message wins). When the payload carries no usable message —
+// common for INITIAL_BOOTSTRAP conversations whose messages fall outside the
+// sync scope window — it falls back to the conversation's own last-message
+// timestamp, which still describes a real message even though its body is
+// unavailable. Returns a zero time when no activity is known.
+func conversationActivity(messages []*events.Message, lastMsgTimestamp uint64) (time.Time, string) {
+	var newest time.Time
+	preview := ""
+	for _, message := range messages {
+		if message == nil || message.Message == nil {
+			continue
+		}
+		if message.Message.GetReactionMessage() != nil ||
+			message.Message.GetEncReactionMessage() != nil ||
+			message.Message.GetPollUpdateMessage() != nil ||
+			message.Message.GetProtocolMessage() != nil {
+			continue
+		}
+		if !message.Info.Timestamp.After(newest) {
+			continue
+		}
+		text := messageText(message.Message)
+		if text == "[unsupported WhatsApp message]" {
+			continue
+		}
+		if text == "" && message.Message.GetImageMessage() != nil {
+			text = "[image]"
+		}
+		newest = message.Info.Timestamp
+		preview = text
+	}
+	if newest.IsZero() && lastMsgTimestamp > 0 {
+		newest = time.Unix(int64(lastMsgTimestamp), 0).UTC()
+	}
+	return newest, preview
 }
 
 func messageText(message *waProto.Message) string {

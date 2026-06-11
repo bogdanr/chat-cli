@@ -3,7 +3,7 @@ use chat_core::{
     Account, Chat, ChatId, ChatKind, ChatMembership, DiscoveryAction, DiscoveryResult,
     DiscoveryResultKind, Platform, ProviderId,
 };
-use chrono::{Local, NaiveDateTime};
+use chrono::{Local, NaiveDateTime, Utc};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -12,13 +12,14 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState},
 };
 use std::collections::{HashMap, HashSet};
-use storage::ChatInboxStyle;
+use storage::{ChatInboxStyle, ThreadMarkerScope};
 use unicode_width::UnicodeWidthStr;
 
 const CHAT_ROW_HEIGHT: u16 = 2;
 const CHAT_META_WIDTH: usize = 6;
 const CHAT_RIGHT_PADDING: usize = 1;
 const SELECTED_CHAT_BG: Color = Color::Rgb(0, 48, 48);
+const OLDER_CHAT_DAYS: i64 = 365;
 pub const CHAT_AVATAR_WIDTH: u16 = 4;
 pub const CHAT_AVATAR_ROWS: u16 = CHAT_ROW_HEIGHT;
 pub const ACCOUNT_BADGE_WIDTH: u16 = 2;
@@ -29,6 +30,24 @@ pub type AvatarRows = Vec<Vec<Span<'static>>>;
 pub enum ChatListRow {
     Chat { chat_index: usize },
     Section { title: String },
+    OlderChats { count: usize, expanded: bool },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OlderChatsFold {
+    pub enabled: bool,
+    pub expanded: bool,
+    pub selected: bool,
+}
+
+impl OlderChatsFold {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            expanded: false,
+            selected: false,
+        }
+    }
 }
 
 pub struct ChatListProps<'a> {
@@ -48,6 +67,10 @@ pub struct ChatListProps<'a> {
     /// Aggregated unread thread-reply counts per chat id, used to render the
     /// `⤷N` thread-activity marker distinct from the channel unread badge.
     pub thread_unread_by_chat: &'a HashMap<ChatId, u32>,
+    /// Aggregated unread thread-reply counts for threads the user is not part of.
+    pub thread_unread_other_by_chat: &'a HashMap<ChatId, u32>,
+    pub thread_marker_scope: ThreadMarkerScope,
+    pub older_chats: OlderChatsFold,
     pub theme: Theme,
 }
 
@@ -65,7 +88,7 @@ impl ChatListLayout {
             .iter()
             .filter_map(|row| match row {
                 ChatListRow::Chat { chat_index } => Some(*chat_index),
-                ChatListRow::Section { .. } => None,
+                ChatListRow::Section { .. } | ChatListRow::OlderChats { .. } => None,
             })
             .collect()
     }
@@ -90,11 +113,24 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
                     .get(&props.chats[*chat_index].id)
                     .copied()
                     .unwrap_or(0),
+                props
+                    .thread_unread_other_by_chat
+                    .get(&props.chats[*chat_index].id)
+                    .copied()
+                    .unwrap_or(0),
+                props.thread_marker_scope,
                 props.theme,
                 inner_width,
-                *chat_index == props.selected_chat_index,
+                *chat_index == props.selected_chat_index && !props.older_chats.selected,
             ),
             ChatListRow::Section { title } => section_item(title),
+            ChatListRow::OlderChats { count, expanded } => older_chats_item(
+                *count,
+                *expanded,
+                props.older_chats.selected,
+                props.theme,
+                inner_width,
+            ),
         })
         .collect::<Vec<_>>();
     if items.is_empty() {
@@ -111,7 +147,7 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
     }
     let mut state = ListState::default();
     state.select(
-        selected_row_position(rows, props.selected_chat_index)
+        selected_row_position_with_older_chats(rows, props.selected_chat_index, props.older_chats)
             .or_else(|| (!items.is_empty()).then_some(0)),
     );
 
@@ -156,7 +192,31 @@ pub fn build_layout(
     list_area: Rect,
     inbox_style: ChatInboxStyle,
 ) -> ChatListLayout {
-    let rows = build_rows(chats, visible_chat_indices, inbox_style);
+    build_layout_with_older_chats(
+        chats,
+        visible_chat_indices,
+        selected_chat_index,
+        list_area,
+        inbox_style,
+        OlderChatsFold::disabled(),
+    )
+}
+
+pub fn build_layout_with_older_chats(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    list_area: Rect,
+    inbox_style: ChatInboxStyle,
+    older_chats: OlderChatsFold,
+) -> ChatListLayout {
+    let rows = build_rows_with_older_chats(
+        chats,
+        visible_chat_indices,
+        inbox_style,
+        selected_chat_index,
+        older_chats,
+    );
     let content_height = rows.iter().map(|row| row_height(row) as usize).sum();
     let inner = inner_area(list_area);
     if inner.height == 0 {
@@ -168,7 +228,8 @@ pub fn build_layout(
         };
     }
 
-    let selected_row = selected_row_position(&rows, selected_chat_index);
+    let selected_row =
+        selected_row_position_with_older_chats(&rows, selected_chat_index, older_chats);
     let offset = scroll_offset(&rows, selected_row, inner.height as usize);
     let scroll_position = rows
         .iter()
@@ -208,19 +269,44 @@ pub fn build_rows(
     visible_chat_indices: &[usize],
     inbox_style: ChatInboxStyle,
 ) -> Vec<ChatListRow> {
+    build_rows_with_older_chats(
+        chats,
+        visible_chat_indices,
+        inbox_style,
+        usize::MAX,
+        OlderChatsFold::disabled(),
+    )
+}
+
+pub fn build_rows_with_older_chats(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+    selected_chat_index: usize,
+    older_chats: OlderChatsFold,
+) -> Vec<ChatListRow> {
+    let (active_chat_indices, older_chat_indices) = split_older_chat_indices(
+        chats,
+        visible_chat_indices,
+        selected_chat_index,
+        older_chats,
+    );
+    let active_chat_indices = active_chat_indices.as_slice();
+    let older_count = older_chat_indices.len();
     if inbox_style == ChatInboxStyle::RecentFlat {
-        return visible_chat_indices
+        let mut rows = active_chat_indices
             .iter()
             .copied()
             .map(|chat_index| ChatListRow::Chat { chat_index })
-            .collect();
+            .collect::<Vec<_>>();
+        append_older_chat_rows(&mut rows, &older_chat_indices, older_count, older_chats);
+        return rows;
     }
 
-    let use_recent_fallback =
-        use_recent_activity_fallback(chats, visible_chat_indices, inbox_style);
-    let ordered_indices = ordered_chat_indices(chats, visible_chat_indices, inbox_style);
+    let use_recent_fallback = use_recent_activity_fallback(chats, active_chat_indices, inbox_style);
+    let ordered_indices = ordered_visible_chat_indices(chats, active_chat_indices, inbox_style);
     let mut seen_sections = HashSet::new();
-    let mut rows = Vec::with_capacity(ordered_indices.len() + 8);
+    let mut rows = Vec::with_capacity(ordered_indices.len() + older_count + 9);
 
     for chat_index in ordered_indices {
         let section = chat_section(&chats[chat_index], inbox_style, use_recent_fallback);
@@ -232,10 +318,130 @@ pub fn build_rows(
         rows.push(ChatListRow::Chat { chat_index });
     }
 
+    append_older_chat_rows(&mut rows, &older_chat_indices, older_count, older_chats);
+
     rows
 }
 
+fn append_older_chat_rows(
+    rows: &mut Vec<ChatListRow>,
+    older_chat_indices: &[usize],
+    older_count: usize,
+    older_chats: OlderChatsFold,
+) {
+    if !older_chats.enabled || older_count == 0 {
+        return;
+    }
+    rows.push(ChatListRow::OlderChats {
+        count: older_count,
+        expanded: older_chats.expanded,
+    });
+    if older_chats.expanded {
+        rows.extend(
+            older_chat_indices
+                .iter()
+                .copied()
+                .map(|chat_index| ChatListRow::Chat { chat_index }),
+        );
+    }
+}
+
+fn split_older_chat_indices(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    older_chats: OlderChatsFold,
+) -> (Vec<usize>, Vec<usize>) {
+    if !older_chats.enabled {
+        return (visible_chat_indices.to_vec(), Vec::new());
+    }
+
+    visible_chat_indices
+        .iter()
+        .copied()
+        .partition(|chat_index| {
+            chats.get(*chat_index).is_none_or(|chat| {
+                !should_fold_as_older_chat(chat, *chat_index, selected_chat_index, older_chats)
+            })
+        })
+}
+
+fn should_fold_as_older_chat(
+    chat: &Chat,
+    chat_index: usize,
+    selected_chat_index: usize,
+    older_chats: OlderChatsFold,
+) -> bool {
+    // While the fold is collapsed the selected chat must stay visible in the
+    // active list. Once the fold is expanded the selected chat is already
+    // visible inside it, so it must keep its position there; pulling it out
+    // would make the selection jump back to the top of the sidebar while
+    // navigating through the expanded fold.
+    (older_chats.expanded || chat_index != selected_chat_index)
+        && !chat.pinned
+        && chat.unread_count == 0
+        && is_older_chat(chat)
+}
+
+pub fn is_older_chat(chat: &Chat) -> bool {
+    match chat.last_message_at {
+        Some(last_message_at) => {
+            Utc::now().signed_duration_since(last_message_at).num_days() > OLDER_CHAT_DAYS
+        }
+        // Contacts that were never messaged have no recorded activity at all.
+        // They belong in the older-chats fold instead of the active sidebar.
+        None => is_direct_chat(chat) && chat.last_message_preview.is_none(),
+    }
+}
+
+/// Placeholder preview text for chats without a cached message preview. Chats
+/// with known last-message activity (e.g. history-synced conversations whose
+/// message bodies were outside the sync scope) are real conversations, so
+/// labelling them "No messages yet" would be misleading.
+fn sidebar_preview_placeholder(chat: &Chat) -> &'static str {
+    if chat.last_message_at.is_some() {
+        "Messages not synced"
+    } else {
+        "No messages yet"
+    }
+}
+
 pub fn ordered_chat_indices(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+) -> Vec<usize> {
+    ordered_chat_indices_with_older_chats(
+        chats,
+        visible_chat_indices,
+        inbox_style,
+        usize::MAX,
+        OlderChatsFold::disabled(),
+    )
+}
+
+pub fn ordered_chat_indices_with_older_chats(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    inbox_style: ChatInboxStyle,
+    selected_chat_index: usize,
+    older_chats: OlderChatsFold,
+) -> Vec<usize> {
+    let (active_chat_indices, older_chat_indices) = split_older_chat_indices(
+        chats,
+        visible_chat_indices,
+        selected_chat_index,
+        older_chats,
+    );
+    let mut ordered_indices =
+        ordered_visible_chat_indices(chats, &active_chat_indices, inbox_style);
+    if older_chats.enabled && older_chats.expanded {
+        ordered_indices.extend(older_chat_indices);
+    }
+    ordered_indices
+}
+
+fn ordered_visible_chat_indices(
     chats: &[Chat],
     visible_chat_indices: &[usize],
     inbox_style: ChatInboxStyle,
@@ -303,7 +509,22 @@ fn first_visible_row_offset(
     selected_chat_index: usize,
     list_height: usize,
 ) -> usize {
-    let selected_row = selected_row_position(rows, selected_chat_index);
+    first_visible_row_offset_with_older_chats(
+        rows,
+        selected_chat_index,
+        list_height,
+        OlderChatsFold::disabled(),
+    )
+}
+
+fn first_visible_row_offset_with_older_chats(
+    rows: &[ChatListRow],
+    selected_chat_index: usize,
+    list_height: usize,
+    older_chats: OlderChatsFold,
+) -> usize {
+    let selected_row =
+        selected_row_position_with_older_chats(rows, selected_chat_index, older_chats);
     scroll_offset(rows, selected_row, list_height)
 }
 
@@ -325,13 +546,47 @@ pub fn row_at(
     row: u16,
     inbox_style: ChatInboxStyle,
 ) -> Option<ChatListRow> {
+    row_at_with_older_chats(
+        chats,
+        visible_chat_indices,
+        selected_chat_index,
+        list_area,
+        column,
+        row,
+        inbox_style,
+        OlderChatsFold::disabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn row_at_with_older_chats(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    list_area: Rect,
+    column: u16,
+    row: u16,
+    inbox_style: ChatInboxStyle,
+    older_chats: OlderChatsFold,
+) -> Option<ChatListRow> {
     let inner = inner_area(list_area);
     if !contains(inner, column, row) {
         return None;
     }
 
-    let rows = build_rows(chats, visible_chat_indices, inbox_style);
-    let offset = first_visible_row_offset(&rows, selected_chat_index, inner.height as usize);
+    let rows = build_rows_with_older_chats(
+        chats,
+        visible_chat_indices,
+        inbox_style,
+        selected_chat_index,
+        older_chats,
+    );
+    let offset = first_visible_row_offset_with_older_chats(
+        &rows,
+        selected_chat_index,
+        inner.height as usize,
+        older_chats,
+    );
     let relative_row = row.saturating_sub(inner.y);
     let mut y = 0;
 
@@ -358,7 +613,7 @@ pub fn chat_at(
     row: u16,
     inbox_style: ChatInboxStyle,
 ) -> Option<usize> {
-    match row_at(
+    chat_at_with_older_chats(
         chats,
         visible_chat_indices,
         selected_chat_index,
@@ -366,6 +621,30 @@ pub fn chat_at(
         column,
         row,
         inbox_style,
+        OlderChatsFold::disabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn chat_at_with_older_chats(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    list_area: Rect,
+    column: u16,
+    row: u16,
+    inbox_style: ChatInboxStyle,
+    older_chats: OlderChatsFold,
+) -> Option<usize> {
+    match row_at_with_older_chats(
+        chats,
+        visible_chat_indices,
+        selected_chat_index,
+        list_area,
+        column,
+        row,
+        inbox_style,
+        older_chats,
     ) {
         Some(ChatListRow::Chat { chat_index }) => Some(chat_index),
         _ => None,
@@ -442,7 +721,7 @@ pub fn rendered_chat_indices(
         .into_iter()
         .filter_map(|row| match row {
             ChatListRow::Chat { chat_index } => Some(chat_index),
-            ChatListRow::Section { .. } => None,
+            ChatListRow::Section { .. } | ChatListRow::OlderChats { .. } => None,
         })
         .collect()
 }
@@ -453,12 +732,47 @@ pub fn selected_visible_position(
     selected_chat_index: usize,
     inbox_style: ChatInboxStyle,
 ) -> Option<usize> {
-    ordered_chat_indices(chats, visible_chat_indices, inbox_style)
-        .iter()
-        .position(|index| *index == selected_chat_index)
+    selected_visible_position_with_older_chats(
+        chats,
+        visible_chat_indices,
+        selected_chat_index,
+        inbox_style,
+        OlderChatsFold::disabled(),
+    )
+}
+
+pub fn selected_visible_position_with_older_chats(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    inbox_style: ChatInboxStyle,
+    older_chats: OlderChatsFold,
+) -> Option<usize> {
+    ordered_chat_indices_with_older_chats(
+        chats,
+        visible_chat_indices,
+        inbox_style,
+        selected_chat_index,
+        older_chats,
+    )
+    .iter()
+    .position(|index| *index == selected_chat_index)
 }
 
 pub fn selected_row_position(rows: &[ChatListRow], selected_chat_index: usize) -> Option<usize> {
+    selected_row_position_with_older_chats(rows, selected_chat_index, OlderChatsFold::disabled())
+}
+
+pub fn selected_row_position_with_older_chats(
+    rows: &[ChatListRow],
+    selected_chat_index: usize,
+    older_chats: OlderChatsFold,
+) -> Option<usize> {
+    if older_chats.enabled && older_chats.selected {
+        return rows
+            .iter()
+            .position(|row| matches!(row, ChatListRow::OlderChats { .. }));
+    }
     rows.iter().position(|row| {
         matches!(
             row,
@@ -487,6 +801,102 @@ fn unread_marker(unread_count: u32) -> String {
     }
 }
 
+fn thread_marker_text(
+    thread_unread: u32,
+    thread_unread_other: u32,
+    thread_marker_scope: ThreadMarkerScope,
+) -> String {
+    match thread_marker_scope {
+        ThreadMarkerScope::None => String::new(),
+        ThreadMarkerScope::All => {
+            let total = thread_unread.saturating_add(thread_unread_other);
+            if total > 0 {
+                format!("\u{2937}{} ", total.min(99))
+            } else {
+                String::new()
+            }
+        }
+        ThreadMarkerScope::Participating => {
+            if thread_unread > 0 {
+                format!("\u{2937}{} ", thread_unread.min(99))
+            } else if thread_unread_other > 0 {
+                "\u{2937} ".to_owned()
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn thread_marker_chat_at(
+    chats: &[Chat],
+    visible_chat_indices: &[usize],
+    selected_chat_index: usize,
+    list_area: Rect,
+    column: u16,
+    row: u16,
+    inbox_style: ChatInboxStyle,
+    older_chats: OlderChatsFold,
+    thread_unread_by_chat: &HashMap<ChatId, u32>,
+    thread_unread_other_by_chat: &HashMap<ChatId, u32>,
+    thread_marker_scope: ThreadMarkerScope,
+) -> Option<usize> {
+    let inner = inner_area(list_area);
+    if !contains(inner, column, row) {
+        return None;
+    }
+
+    let rows = build_rows_with_older_chats(
+        chats,
+        visible_chat_indices,
+        inbox_style,
+        selected_chat_index,
+        older_chats,
+    );
+    let offset = first_visible_row_offset_with_older_chats(
+        &rows,
+        selected_chat_index,
+        inner.height as usize,
+        older_chats,
+    );
+    let relative_row = row.saturating_sub(inner.y);
+    let mut y = 0;
+
+    for chat_row in rows.iter().skip(offset) {
+        let height = row_height(chat_row);
+        if relative_row < y + height {
+            let ChatListRow::Chat { chat_index } = chat_row else {
+                return None;
+            };
+            if relative_row != y.saturating_add(1) {
+                return None;
+            }
+            let chat = chats.get(*chat_index)?;
+            let marker = thread_marker_text(
+                thread_unread_by_chat.get(&chat.id).copied().unwrap_or(0),
+                thread_unread_other_by_chat
+                    .get(&chat.id)
+                    .copied()
+                    .unwrap_or(0),
+                thread_marker_scope,
+            );
+            if marker.is_empty() {
+                return None;
+            }
+            let start = inner.x.saturating_add(CHAT_AVATAR_WIDTH).saturating_add(1);
+            let end = start.saturating_add(UnicodeWidthStr::width(marker.as_str()) as u16);
+            return (column >= start && column < end).then_some(*chat_index);
+        }
+        y += height;
+        if y >= inner.height {
+            break;
+        }
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chat_item(
     chat: &Chat,
@@ -494,6 +904,8 @@ fn chat_item(
     account_badge_rows: Option<&[Vec<Span<'static>>]>,
     typing_preview: Option<&str>,
     thread_unread: u32,
+    thread_unread_other: u32,
+    thread_marker_scope: ThreadMarkerScope,
     theme: Theme,
     row_width: usize,
     selected: bool,
@@ -507,7 +919,7 @@ fn chat_item(
     } else {
         Style::default()
     };
-    let fallback_avatar = avatar_placeholder(chat, theme);
+    let fallback_avatar = avatar_placeholder(chat, theme, selected.then_some(SELECTED_CHAT_BG));
     let first_avatar_line = avatar_rows
         .and_then(|rows| rows.first().cloned())
         .unwrap_or_else(|| fallback_avatar[0].clone());
@@ -553,13 +965,12 @@ fn chat_item(
                 .as_deref()
                 .map(message_list::slack_emoji_shortcodes_to_display)
         })
-        .unwrap_or_else(|| "No messages yet".to_owned());
+        .unwrap_or_else(|| sidebar_preview_placeholder(chat).to_owned());
     let second_prefix_width = CHAT_AVATAR_WIDTH as usize + 1;
-    let thread_marker = if thread_unread > 0 {
-        format!("\u{2937}{} ", thread_unread.min(99))
-    } else {
-        String::new()
-    };
+    let thread_marker = thread_marker_text(thread_unread, thread_unread_other, thread_marker_scope);
+    let thread_marker_dim = thread_marker_scope == ThreadMarkerScope::Participating
+        && thread_unread == 0
+        && thread_unread_other > 0;
     let thread_marker_width = UnicodeWidthStr::width(thread_marker.as_str());
     let preview_budget = content_width
         .saturating_sub(second_prefix_width)
@@ -596,9 +1007,14 @@ fn chat_item(
             let mut spans = second_avatar_line;
             spans.extend([styled_raw(" ", selected_bg)]);
             if !thread_marker.is_empty() {
+                let marker_style = if thread_marker_dim {
+                    Style::default().fg(theme.muted)
+                } else {
+                    theme.unread()
+                };
                 spans.push(Span::styled(
                     thread_marker,
-                    style_with_optional_bg(theme.unread(), selected_bg),
+                    style_with_optional_bg(marker_style, selected_bg),
                 ));
             }
             spans.extend([
@@ -617,6 +1033,25 @@ fn section_item(title: &str) -> ListItem<'static> {
         format!("── {title} ──"),
         Style::default().fg(Color::DarkGray),
     )))
+}
+
+fn older_chats_item(
+    count: usize,
+    expanded: bool,
+    selected: bool,
+    theme: Theme,
+    row_width: usize,
+) -> ListItem<'static> {
+    let indicator = if expanded { "▾" } else { "▸" };
+    let label = format!("{indicator} Older chats · {count}");
+    let effective_width = row_width.saturating_sub(CHAT_RIGHT_PADDING);
+    let label = truncate_to_width(&label, effective_width);
+    let bg = selected.then_some(SELECTED_CHAT_BG);
+    let style = style_with_optional_bg(Style::default().fg(theme.accent), bg);
+    ListItem::new(Line::from(vec![
+        Span::styled(label, style),
+        styled_raw(" ".repeat(CHAT_RIGHT_PADDING), bg),
+    ]))
 }
 
 const ACTIVITY_FIRST_SECTION_ORDER: [&str; 9] = [
@@ -1015,7 +1450,17 @@ fn stable_badge_color(id: &str, display_name: &str) -> Color {
     PALETTE[(hash as usize) % PALETTE.len()]
 }
 
-fn avatar_placeholder(chat: &Chat, theme: Theme) -> [Vec<Span<'static>>; 2] {
+fn avatar_placeholder(chat: &Chat, theme: Theme, bg: Option<Color>) -> [Vec<Span<'static>>; 2] {
+    if is_slack_channel(chat) {
+        return slack_channel_avatar_placeholder(chat, bg);
+    }
+    if is_slack_group_direct_message(chat) {
+        return slack_group_dm_avatar_placeholder(chat, bg);
+    }
+    if is_transparent_initials_placeholder(chat) {
+        return transparent_initials_avatar_placeholder(chat, bg);
+    }
+
     let label = avatar_label(chat);
     let tile_style = Style::default().fg(theme.foreground).bg(avatar_color(chat));
 
@@ -1025,10 +1470,101 @@ fn avatar_placeholder(chat: &Chat, theme: Theme) -> [Vec<Span<'static>>; 2] {
     ]
 }
 
+fn is_transparent_initials_placeholder(chat: &Chat) -> bool {
+    matches!(chat.platform, Platform::WhatsApp | Platform::Slack)
+}
+
+fn transparent_initials_avatar_placeholder(
+    chat: &Chat,
+    bg: Option<Color>,
+) -> [Vec<Span<'static>>; 2] {
+    let blank_style = style_with_optional_bg(Style::default(), bg);
+    let label_style = style_with_optional_bg(Style::default().fg(avatar_color(chat)), bg);
+    let label = avatar_label(chat);
+
+    [
+        vec![Span::styled("    ", blank_style)],
+        vec![
+            Span::styled(" ", blank_style),
+            Span::styled(format!("{label:<2}"), label_style),
+            Span::styled(" ", blank_style),
+        ],
+    ]
+}
+
+fn is_slack_channel(chat: &Chat) -> bool {
+    chat.platform == Platform::Slack
+        && matches!(
+            chat.kind,
+            ChatKind::PublicChannel | ChatKind::PrivateChannel
+        )
+}
+
+fn is_slack_group_direct_message(chat: &Chat) -> bool {
+    chat.platform == Platform::Slack && matches!(chat.kind, ChatKind::GroupDirectMessage)
+}
+
+fn slack_channel_avatar_placeholder(chat: &Chat, bg: Option<Color>) -> [Vec<Span<'static>>; 2] {
+    let blank_style = style_with_optional_bg(Style::default(), bg);
+    let hashtag_style = style_with_optional_bg(
+        Style::default().fg(slack_channel_workspace_tint(&chat.account)),
+        bg,
+    );
+
+    [
+        vec![Span::styled("    ", blank_style)],
+        vec![
+            Span::styled(" ", blank_style),
+            Span::styled("#", hashtag_style),
+            Span::styled("  ", blank_style),
+        ],
+    ]
+}
+
+fn slack_group_dm_avatar_placeholder(chat: &Chat, bg: Option<Color>) -> [Vec<Span<'static>>; 2] {
+    let blank_style = style_with_optional_bg(Style::default(), bg);
+    let marker_style = style_with_optional_bg(
+        Style::default().fg(slack_channel_workspace_tint(&chat.account)),
+        bg,
+    );
+
+    [
+        vec![
+            Span::styled(" ", blank_style),
+            Span::styled("••", marker_style),
+            Span::styled(" ", blank_style),
+        ],
+        vec![
+            Span::styled(" ", blank_style),
+            Span::styled("•", marker_style),
+            Span::styled("  ", blank_style),
+        ],
+    ]
+}
+
+fn slack_channel_workspace_tint(account: &ProviderId) -> Color {
+    const PALETTE: [Color; 8] = [
+        Color::Rgb(95, 125, 116),
+        Color::Rgb(87, 116, 140),
+        Color::Rgb(126, 106, 76),
+        Color::Rgb(122, 88, 108),
+        Color::Rgb(88, 118, 96),
+        Color::Rgb(112, 98, 132),
+        Color::Rgb(126, 92, 82),
+        Color::Rgb(82, 112, 122),
+    ];
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in account.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    PALETTE[(hash as usize) % PALETTE.len()]
+}
+
 fn avatar_color(chat: &Chat) -> Color {
     match chat.platform {
         Platform::WhatsApp => Color::Rgb(18, 140, 126),
-        Platform::Slack => Color::Magenta,
+        Platform::Slack => slack_channel_workspace_tint(&chat.account),
         Platform::Discord => Color::Blue,
         Platform::Unknown(_) => Color::DarkGray,
     }
@@ -1116,7 +1652,7 @@ fn inbox_style_title(inbox_style: ChatInboxStyle) -> &'static str {
 
 fn formatted_time(chat: &Chat) -> String {
     chat.last_message_at
-        .map(|timestamp| timestamp.with_timezone(&Local).format("%H:%M").to_string())
+        .map(message_list::format_timestamp_compact)
         .unwrap_or_else(|| "--:--".to_owned())
 }
 
@@ -1163,7 +1699,7 @@ fn scroll_offset(rows: &[ChatListRow], selected_row: Option<usize>, list_height:
 fn row_height(row: &ChatListRow) -> u16 {
     match row {
         ChatListRow::Chat { .. } => CHAT_ROW_HEIGHT,
-        ChatListRow::Section { .. } => 1,
+        ChatListRow::Section { .. } | ChatListRow::OlderChats { .. } => 1,
     }
 }
 
@@ -1442,6 +1978,289 @@ mod tests {
     }
 
     #[test]
+    fn older_chats_are_collapsed_into_single_header_by_default() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(10));
+        chats[0].unread_count = 0;
+        chats[0].pinned = false;
+        chats[1].last_message_at = Some(now - Duration::days(400));
+        chats[2].last_message_at = Some(now - Duration::days(500));
+        chats[2].unread_count = 0;
+        chats[2].muted = false;
+        chats[3].last_message_at = Some(now - Duration::days(4));
+        chats[4].last_message_at = Some(now - Duration::days(700));
+        let older = OlderChatsFold {
+            enabled: true,
+            expanded: false,
+            selected: false,
+        };
+
+        let rows = build_rows_with_older_chats(
+            &chats,
+            &[0, 1, 2, 3, 4],
+            ChatInboxStyle::RecentFlat,
+            0,
+            older,
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::OlderChats {
+                    count: 3,
+                    expanded: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn older_chats_expand_below_header() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(10));
+        chats[0].unread_count = 0;
+        chats[0].pinned = false;
+        chats[1].last_message_at = Some(now - Duration::days(400));
+        chats[3].last_message_at = Some(now - Duration::days(4));
+        chats[4].last_message_at = Some(now - Duration::days(700));
+        let older = OlderChatsFold {
+            enabled: true,
+            expanded: true,
+            selected: false,
+        };
+
+        let rows = build_rows_with_older_chats(
+            &chats,
+            &[0, 1, 3, 4],
+            ChatInboxStyle::RecentFlat,
+            0,
+            older,
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::OlderChats {
+                    count: 2,
+                    expanded: true
+                },
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Chat { chat_index: 4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn expanded_older_fold_keeps_selected_older_chat_in_place() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(10));
+        chats[0].unread_count = 0;
+        chats[0].pinned = false;
+        chats[1].last_message_at = Some(now - Duration::days(400));
+        chats[3].last_message_at = Some(now - Duration::days(500));
+        chats[4].last_message_at = Some(now - Duration::days(700));
+        let older = OlderChatsFold {
+            enabled: true,
+            expanded: true,
+            selected: false,
+        };
+
+        // Chat 3 is selected while browsing the expanded fold; it must keep
+        // its position inside the fold instead of being promoted into the
+        // active list, which made the selection jump back to the top.
+        let rows = build_rows_with_older_chats(
+            &chats,
+            &[0, 1, 3, 4],
+            ChatInboxStyle::RecentFlat,
+            3,
+            older,
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::OlderChats {
+                    count: 3,
+                    expanded: true
+                },
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::Chat { chat_index: 4 },
+            ]
+        );
+        assert_eq!(
+            selected_row_position_with_older_chats(&rows, 3, older),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn collapsed_older_fold_still_keeps_selected_older_chat_visible() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(10));
+        chats[0].unread_count = 0;
+        chats[0].pinned = false;
+        chats[1].last_message_at = Some(now - Duration::days(400));
+        chats[3].last_message_at = Some(now - Duration::days(500));
+        let older = OlderChatsFold {
+            enabled: true,
+            expanded: false,
+            selected: false,
+        };
+
+        let rows =
+            build_rows_with_older_chats(&chats, &[0, 1, 3], ChatInboxStyle::RecentFlat, 3, older);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::OlderChats {
+                    count: 1,
+                    expanded: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn never_contacted_contacts_fold_into_older_chats() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(2));
+        chats[0].unread_count = 0;
+        chats[0].pinned = false;
+        // Saved contact that was never messaged: no recorded activity at all.
+        chats[3].last_message_at = None;
+        chats[3].last_message_preview = None;
+        // A group/channel without recorded activity stays in the active list.
+        chats[4].last_message_at = None;
+        chats[4].last_message_preview = None;
+        let older = OlderChatsFold {
+            enabled: true,
+            expanded: false,
+            selected: false,
+        };
+
+        let rows =
+            build_rows_with_older_chats(&chats, &[0, 3, 4], ChatInboxStyle::RecentFlat, 0, older);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Chat { chat_index: 4 },
+                ChatListRow::OlderChats {
+                    count: 1,
+                    expanded: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn older_chat_fold_exempts_unread_pinned_and_selected_chats() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        for chat in &mut chats {
+            chat.last_message_at = Some(now - Duration::days(400));
+            chat.unread_count = 0;
+            chat.pinned = false;
+            chat.muted = false;
+        }
+        chats[1].unread_count = 2;
+        chats[2].pinned = true;
+        let older = OlderChatsFold {
+            enabled: true,
+            expanded: false,
+            selected: false,
+        };
+
+        let rows = build_rows_with_older_chats(
+            &chats,
+            &[0, 1, 2, 3],
+            ChatInboxStyle::RecentFlat,
+            3,
+            older,
+        );
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Chat { chat_index: 2 },
+                ChatListRow::Chat { chat_index: 3 },
+                ChatListRow::OlderChats {
+                    count: 1,
+                    expanded: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_older_fold_keeps_search_matches_visible() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[1].last_message_at = Some(now - Duration::days(400));
+        chats[1].unread_count = 0;
+        chats[1].pinned = false;
+        let matches = filter_chat_indices(&chats, "project");
+        let older = OlderChatsFold {
+            enabled: false,
+            expanded: false,
+            selected: false,
+        };
+
+        let rows =
+            build_rows_with_older_chats(&chats, &matches, ChatInboxStyle::RecentFlat, 0, older);
+
+        assert_eq!(rows, vec![ChatListRow::Chat { chat_index: 1 }]);
+    }
+
+    #[test]
+    fn row_at_can_hit_test_older_chats_header() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].last_message_at = Some(now - Duration::days(10));
+        chats[0].unread_count = 0;
+        chats[0].pinned = false;
+        chats[1].last_message_at = Some(now - Duration::days(400));
+        let area = Rect::new(0, 0, 40, 8);
+        let older = OlderChatsFold {
+            enabled: true,
+            expanded: false,
+            selected: false,
+        };
+
+        assert_eq!(
+            row_at_with_older_chats(
+                &chats,
+                &[0, 1],
+                0,
+                area,
+                2,
+                3,
+                ChatInboxStyle::RecentFlat,
+                older
+            ),
+            Some(ChatListRow::OlderChats {
+                count: 1,
+                expanded: false
+            })
+        );
+    }
+    #[test]
     fn unread_marker_shows_right_side_badge_text() {
         assert_eq!(unread_marker(0), "");
         assert_eq!(unread_marker(2), "2");
@@ -1463,7 +2282,60 @@ mod tests {
     #[test]
     fn avatar_placeholder_uses_consistent_two_line_tile() {
         let chats = sample_chats();
-        let placeholder = avatar_placeholder(&chats[0], Theme::default());
+        let placeholder = avatar_placeholder(&chats[3], Theme::default(), None);
+
+        assert_eq!(placeholder.len(), CHAT_AVATAR_ROWS as usize);
+        assert_eq!(
+            placeholder[0]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    "
+        );
+        assert_eq!(
+            placeholder[1]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " DE "
+        );
+    }
+
+    #[test]
+    fn slack_direct_avatar_placeholder_uses_transparent_workspace_tinted_initials() {
+        let chats = sample_chats();
+        let placeholder = avatar_placeholder(&chats[3], Theme::default(), None);
+
+        assert_eq!(placeholder.len(), CHAT_AVATAR_ROWS as usize);
+        assert_eq!(
+            placeholder[0]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    "
+        );
+        assert_eq!(
+            placeholder[1]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " DE "
+        );
+        assert_eq!(placeholder[0][0].style.bg, None);
+        assert_eq!(placeholder[1][0].style.bg, None);
+        assert_eq!(placeholder[1][1].style.bg, None);
+        assert_eq!(placeholder[1][2].style.bg, None);
+        assert_eq!(
+            placeholder[1][1].style.fg,
+            Some(slack_channel_workspace_tint(&chats[3].account))
+        );
+        assert_ne!(placeholder[1][1].style.fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn whatsapp_avatar_placeholder_uses_transparent_green_initials() {
+        let chats = sample_chats();
+        let placeholder = avatar_placeholder(&chats[0], Theme::default(), None);
 
         assert_eq!(placeholder.len(), CHAT_AVATAR_ROWS as usize);
         assert_eq!(
@@ -1480,6 +2352,135 @@ mod tests {
                 .collect::<String>(),
             " AE "
         );
+        assert_eq!(placeholder[0][0].style.bg, None);
+        assert_eq!(placeholder[1][0].style.bg, None);
+        assert_eq!(placeholder[1][1].style.bg, None);
+        assert_eq!(placeholder[1][2].style.bg, None);
+        assert_eq!(placeholder[1][1].style.fg, Some(avatar_color(&chats[0])));
+    }
+
+    #[test]
+    fn whatsapp_avatar_placeholder_inherits_selected_row_background() {
+        let chats = sample_chats();
+        let placeholder = avatar_placeholder(&chats[0], Theme::default(), Some(SELECTED_CHAT_BG));
+
+        assert_eq!(placeholder[0][0].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][0].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][1].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][2].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][1].style.fg, Some(avatar_color(&chats[0])));
+    }
+
+    #[test]
+    fn slack_channel_avatar_placeholder_uses_subtle_workspace_tinted_hashtag() {
+        let chats = sample_chats();
+        let placeholder = avatar_placeholder(&chats[1], Theme::default(), None);
+
+        assert_eq!(placeholder.len(), CHAT_AVATAR_ROWS as usize);
+        assert_eq!(
+            placeholder[0]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "    "
+        );
+        assert_eq!(
+            placeholder[1]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " #  "
+        );
+        assert_eq!(placeholder[0][0].style.bg, None);
+        assert_eq!(placeholder[1][1].style.bg, None);
+        assert_eq!(
+            placeholder[1][1].style.fg,
+            Some(slack_channel_workspace_tint(&chats[1].account))
+        );
+        assert_ne!(placeholder[1][1].style.fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn slack_channel_avatar_placeholder_inherits_selected_row_background() {
+        let chats = sample_chats();
+        let placeholder = avatar_placeholder(&chats[1], Theme::default(), Some(SELECTED_CHAT_BG));
+
+        assert_eq!(placeholder[0][0].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][0].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][1].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][2].style.bg, Some(SELECTED_CHAT_BG));
+    }
+
+    #[test]
+    fn slack_group_dm_avatar_placeholder_uses_workspace_tinted_people_marker() {
+        let chats = sample_chats();
+        let mut chat = chats[3].clone();
+        chat.is_group = true;
+        chat.kind = ChatKind::GroupDirectMessage;
+        chat.name = arc_str("bogdan, mihai, ana");
+
+        let placeholder = avatar_placeholder(&chat, Theme::default(), None);
+
+        assert_eq!(placeholder.len(), CHAT_AVATAR_ROWS as usize);
+        assert_eq!(
+            placeholder[0]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " •• "
+        );
+        assert_eq!(
+            placeholder[1]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " •  "
+        );
+        assert_eq!(placeholder[0][1].style.bg, None);
+        assert_eq!(placeholder[1][1].style.bg, None);
+        assert_eq!(
+            placeholder[0][1].style.fg,
+            Some(slack_channel_workspace_tint(&chat.account))
+        );
+        assert_eq!(
+            placeholder[1][1].style.fg,
+            Some(slack_channel_workspace_tint(&chat.account))
+        );
+        assert_ne!(placeholder[0][1].style.fg, Some(Color::Magenta));
+    }
+
+    #[test]
+    fn slack_group_dm_avatar_placeholder_inherits_selected_row_background() {
+        let chats = sample_chats();
+        let mut chat = chats[3].clone();
+        chat.is_group = true;
+        chat.kind = ChatKind::GroupDirectMessage;
+
+        let placeholder = avatar_placeholder(&chat, Theme::default(), Some(SELECTED_CHAT_BG));
+
+        assert_eq!(placeholder[0][0].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[0][1].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[0][2].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][0].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][1].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[1][2].style.bg, Some(SELECTED_CHAT_BG));
+    }
+
+    #[test]
+    fn slack_direct_avatar_placeholder_keeps_initials_without_square_tile() {
+        let chats = sample_chats();
+        let placeholder = avatar_placeholder(&chats[3], Theme::default(), None);
+
+        assert_eq!(
+            placeholder[1]
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            " DE "
+        );
+        assert_eq!(placeholder[1][0].style.bg, None);
+        assert_eq!(placeholder[1][1].style.bg, None);
+        assert_eq!(placeholder[1][1].style.fg, Some(avatar_color(&chats[3])));
     }
 
     #[test]
@@ -1714,6 +2715,38 @@ mod tests {
         assert_eq!(rows[0][0].style.bg, Some(Color::Rgb(54, 197, 240)));
         assert_eq!(rows[0][1].style.fg, Some(Color::Rgb(236, 178, 46)));
         assert_eq!(rows[0][1].style.bg, Some(Color::Rgb(224, 30, 90)));
+    }
+
+    #[test]
+    fn preview_placeholder_distinguishes_unsynced_history_from_empty_chats() {
+        let mut chat = sample_chats().remove(0);
+        chat.last_message_preview = None;
+
+        // Real conversations whose history bodies were outside the sync scope
+        // still carry a last-message timestamp; they must not claim there are
+        // no messages.
+        chat.last_message_at = Some(Utc::now());
+        assert_eq!(sidebar_preview_placeholder(&chat), "Messages not synced");
+
+        chat.last_message_at = None;
+        assert_eq!(sidebar_preview_placeholder(&chat), "No messages yet");
+    }
+
+    #[test]
+    fn recently_active_chats_without_synced_messages_stay_out_of_older_fold() {
+        let mut chat = sample_chats().remove(0);
+        chat.pinned = false;
+        chat.unread_count = 0;
+        chat.last_message_preview = None;
+
+        // History-synced activity keeps recently contacted chats in the
+        // active sidebar even when no message bodies were replayed.
+        chat.last_message_at = Some(Utc::now() - Duration::days(1));
+        assert!(!is_older_chat(&chat));
+
+        // Without any recorded activity the direct chat still folds away.
+        chat.last_message_at = None;
+        assert!(is_older_chat(&chat));
     }
 
     fn sample_chats() -> Vec<Chat> {

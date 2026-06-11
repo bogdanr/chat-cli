@@ -47,6 +47,11 @@ unsafe extern "C" {
         message_id: *const c_char,
         selected_options_json: *const c_char,
     ) -> *mut c_char;
+    fn C_MarkRead(
+        client_id: u64,
+        chat_jid: *const c_char,
+        messages_json: *const c_char,
+    ) -> *mut c_char;
     fn C_SearchContacts(client_id: u64, query: *const c_char, limit: i32) -> *mut c_char;
     fn C_FireSyntheticMessage(message: *const c_char) -> u8;
     fn C_FreeString(value: *mut c_char);
@@ -200,6 +205,20 @@ pub fn search_contacts(handle: ClientHandle, query: &str, limit: usize) -> anyho
     let query = CString::new(query)?;
     let limit = limit.min(i32::MAX as usize) as i32;
     let response = unsafe { C_SearchContacts(handle, query.as_ptr(), limit) };
+    take_c_string(response)
+}
+
+/// Sends read receipts for the given messages. `messages_json` is a JSON
+/// array of `{"id": ..., "sender_jid": ...}` objects describing inbound
+/// messages of the chat that should be acknowledged.
+pub fn mark_read(
+    handle: ClientHandle,
+    chat_jid: &str,
+    messages_json: &str,
+) -> anyhow::Result<String> {
+    let chat_jid = CString::new(chat_jid)?;
+    let messages_json = CString::new(messages_json)?;
+    let response = unsafe { C_MarkRead(handle, chat_jid.as_ptr(), messages_json.as_ptr()) };
     take_c_string(response)
 }
 

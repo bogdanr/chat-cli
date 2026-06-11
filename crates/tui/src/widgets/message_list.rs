@@ -1,6 +1,6 @@
 use crate::theme::Theme;
 use chat_core::{Content, Message, MessageId, ReceiptKind, Sender, Timestamp};
-use chrono::Local;
+use chrono::{DateTime, Datelike, Local};
 use image::imageops::FilterType;
 use ratatui::{
     Frame,
@@ -82,6 +82,46 @@ pub struct MediaHit {
     pub preview_path: PathBuf,
     pub title: String,
     pub caption: Option<String>,
+    /// When set, the media bytes are not cached locally and must be fetched
+    /// on demand: activating the hit should trigger a provider download of
+    /// this media instead of opening the (missing) file.
+    pub retrieve: Option<chat_core::Media>,
+}
+
+/// True when this media is too large for automatic caching and its bytes are
+/// not available locally yet, i.e. the card should offer on-demand retrieval.
+/// Requires a reserved `local_path` (the provider's download destination) so
+/// media that cannot be downloaded at all never advertises retrieval.
+pub fn media_awaits_retrieve(media: &chat_core::Media) -> bool {
+    media
+        .size_bytes
+        .is_some_and(|size| size > chat_core::MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES)
+        && media.local_path.as_ref().is_some_and(|path| !path.exists())
+        && media.thumbnail.as_ref().is_none_or(|path| !path.exists())
+}
+
+/// Resolves the open/preview paths and the optional retrieve payload for a
+/// media hit. Returns `None` when the media is neither previewable nor
+/// awaiting on-demand retrieval, in which case no hit should be registered.
+fn media_hit_paths(
+    media: &chat_core::Media,
+    source: &Option<PathBuf>,
+    error: &Option<String>,
+) -> Option<(PathBuf, PathBuf, Option<chat_core::Media>)> {
+    let preview = match (source, error) {
+        (Some(path), None) => Some(path.clone()),
+        _ => None,
+    };
+    let retrieve = media_awaits_retrieve(media).then(|| media.clone());
+    if preview.is_none() && retrieve.is_none() {
+        return None;
+    }
+    let anchor = preview
+        .clone()
+        .or_else(|| media.local_path.clone())
+        .unwrap_or_default();
+    let path = media_open_source(media).unwrap_or_else(|| anchor.clone());
+    Some((path, anchor, retrieve))
 }
 
 #[derive(Clone, Debug)]
@@ -764,6 +804,25 @@ pub fn cached_message_line_count(
     cache: &mut MessageLayoutCache,
     presentation: ConversationPresentation,
 ) -> usize {
+    ensure_layout_cache(
+        messages,
+        content_width,
+        link_metadata,
+        link_metadata_revision,
+        cache,
+        presentation,
+    );
+    cache.total_lines
+}
+
+fn ensure_layout_cache(
+    messages: &[Message],
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+    link_metadata_revision: u64,
+    cache: &mut MessageLayoutCache,
+    presentation: ConversationPresentation,
+) {
     let key = MessageLayoutKey {
         content_width,
         presentation,
@@ -780,7 +839,66 @@ pub fn cached_message_line_count(
             presentation,
         );
     }
-    cache.total_lines
+}
+
+/// Returns the message id rendered at the absolute layout line `line` plus the
+/// line offset inside that message. Used to anchor the viewport on a stable
+/// message while history merges mutate the timeline above or below it.
+#[allow(clippy::too_many_arguments)]
+pub fn cached_message_anchor_at_line(
+    messages: &[Message],
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+    link_metadata_revision: u64,
+    cache: &mut MessageLayoutCache,
+    presentation: ConversationPresentation,
+    line: usize,
+) -> Option<(MessageId, usize)> {
+    ensure_layout_cache(
+        messages,
+        content_width,
+        link_metadata,
+        link_metadata_revision,
+        cache,
+        presentation,
+    );
+    let index = cache
+        .entries
+        .partition_point(|entry| entry.start_line.saturating_add(entry.line_count) <= line);
+    let entry = cache.entries.get(index)?;
+    let message = messages.get(entry.message_index)?;
+    Some((
+        message.id.clone(),
+        line.saturating_sub(entry.start_line),
+    ))
+}
+
+/// Returns the first layout line of the message with `message_id`, or `None`
+/// when the message is not part of the rendered timeline.
+#[allow(clippy::too_many_arguments)]
+pub fn cached_message_start_line(
+    messages: &[Message],
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+    link_metadata_revision: u64,
+    cache: &mut MessageLayoutCache,
+    presentation: ConversationPresentation,
+    message_id: &str,
+) -> Option<usize> {
+    ensure_layout_cache(
+        messages,
+        content_width,
+        link_metadata,
+        link_metadata_revision,
+        cache,
+        presentation,
+    );
+    cache.entries.iter().find_map(|entry| {
+        messages
+            .get(entry.message_index)
+            .filter(|message| message.id.as_ref() == message_id)
+            .map(|_| entry.start_line)
+    })
 }
 
 fn message_line_hits(
@@ -1102,8 +1220,43 @@ pub fn sender_style(theme: Theme, is_from_me: bool) -> Style {
     }
 }
 
+/// Age-aware message timestamp. Messages from today or yesterday keep the
+/// bare clock time (the surrounding ordering and the sidebar's Yesterday
+/// section make the day obvious); older messages carry the date so the
+/// reader is never tricked into thinking an old message is recent. Full date
+/// and time (with seconds) for detail views comes from
+/// [`format_message_datetime`].
 pub fn format_message_time(timestamp: chat_core::Timestamp) -> String {
-    timestamp.with_timezone(&Local).format("%H:%M").to_string()
+    format_message_time_at(timestamp, Local::now())
+}
+
+fn format_message_time_at(timestamp: chat_core::Timestamp, now: DateTime<Local>) -> String {
+    let local = timestamp.with_timezone(&Local);
+    match local_days_ago(local, now) {
+        ..=1 => local.format("%H:%M").to_string(),
+        _ if local.year() == now.year() => local.format("%d %b %H:%M").to_string(),
+        _ => local.format("%d %b %Y %H:%M").to_string(),
+    }
+}
+
+/// Compact age-aware stamp for narrow, fixed-width columns (chat sidebar
+/// meta column, Slack-style gutter). Always at most 5 cells wide.
+pub fn format_timestamp_compact(timestamp: chat_core::Timestamp) -> String {
+    format_timestamp_compact_at(timestamp, Local::now())
+}
+
+fn format_timestamp_compact_at(timestamp: chat_core::Timestamp, now: DateTime<Local>) -> String {
+    let local = timestamp.with_timezone(&Local);
+    match local_days_ago(local, now) {
+        ..=1 => local.format("%H:%M").to_string(),
+        2..=6 => local.format("%a").to_string(),
+        _ if local.year() == now.year() => local.format("%d/%m").to_string(),
+        _ => local.format("%Y").to_string(),
+    }
+}
+
+fn local_days_ago(timestamp: DateTime<Local>, now: DateTime<Local>) -> i64 {
+    (now.date_naive() - timestamp.date_naive()).num_days()
 }
 
 pub fn format_message_datetime(timestamp: chat_core::Timestamp) -> String {
@@ -1450,9 +1603,11 @@ fn slack_grouped_prefix_spans(message: &Message, theme: Theme) -> Vec<Span<'stat
 }
 
 fn slack_timestamp_spans(message: &Message, theme: Theme) -> Vec<Span<'static>> {
+    let stamp = format_timestamp_compact(message.timestamp);
+    let padding = SLACK_TIMESTAMP_WIDTH.saturating_sub(UnicodeWidthStr::width(stamp.as_str()));
     vec![
-        Span::styled(format_message_time(message.timestamp), theme.muted()),
-        Span::raw(" ".repeat(SLACK_GUTTER_GAP)),
+        Span::styled(stamp, theme.muted()),
+        Span::raw(" ".repeat(padding + SLACK_GUTTER_GAP)),
     ]
 }
 
@@ -1862,7 +2017,9 @@ fn inline_image_grid_lines(
                 LINK_PREVIEW_THUMBNAIL_ROWS,
                 preview_color,
             );
-            if let (Some(preview_path), None) = (&source, &error) {
+            if let Some((path, preview_path, retrieve)) =
+                media_hit_paths(image, &source, &error)
+            {
                 let start_col = column_index * (column_width as usize + gap);
                 context.media_hits.push(MediaHit {
                     start_line: row_base,
@@ -1871,14 +2028,15 @@ fn inline_image_grid_lines(
                     end_col: (start_col + column_width as usize) as u16,
                     preview_start_col: start_col as u16,
                     preview_end_col: (start_col + column_width as usize) as u16,
-                    path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
-                    preview_path: preview_path.clone(),
+                    path,
+                    preview_path,
                     title: card
                         .title
                         .as_deref()
                         .unwrap_or(image.file_name.as_ref())
                         .to_owned(),
                     caption: card.body.as_deref().map(str::to_owned),
+                    retrieve,
                 });
             }
             column_rows.push(preview_rows);
@@ -1948,7 +2106,7 @@ fn flat_card_lines(
             LINK_PREVIEW_THUMBNAIL_ROWS,
             accent.fg.unwrap_or(Color::DarkGray),
         );
-        if let (Some(preview_path), None) = (&source, &error) {
+        if let Some((path, preview_path, retrieve)) = media_hit_paths(image, &source, &error) {
             context.media_hits.push(MediaHit {
                 start_line: start_line + lines.len(),
                 end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
@@ -1968,14 +2126,15 @@ fn flat_card_lines(
                     0
                 },
                 preview_end_col: context.content_width,
-                path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
-                preview_path: preview_path.clone(),
+                path,
+                preview_path,
                 title: card
                     .title
                     .as_deref()
                     .unwrap_or(image.file_name.as_ref())
                     .to_owned(),
                 caption: card.body.as_deref().map(str::to_owned),
+                retrieve,
             });
         }
         lines.extend(
@@ -2072,7 +2231,7 @@ fn generic_card_lines(
             LINK_PREVIEW_THUMBNAIL_ROWS,
             accent.fg.unwrap_or(Color::DarkGray),
         );
-        if let (Some(preview_path), None) = (&source, &error) {
+        if let Some((path, preview_path, retrieve)) = media_hit_paths(image, &source, &error) {
             let hit_width = card_width.saturating_add(4).min(context.content_width);
             let start_col = if is_from_me {
                 context.content_width.saturating_sub(hit_width)
@@ -2086,14 +2245,15 @@ fn generic_card_lines(
                 end_col: start_col.saturating_add(hit_width),
                 preview_start_col: start_col.saturating_add(2),
                 preview_end_col: start_col.saturating_add(2).saturating_add(card_width),
-                path: media_open_source(image).unwrap_or_else(|| preview_path.clone()),
-                preview_path: preview_path.clone(),
+                path,
+                preview_path,
                 title: card
                     .title
                     .as_deref()
                     .unwrap_or(image.file_name.as_ref())
                     .to_owned(),
                 caption: card.body.as_deref().map(str::to_owned),
+                retrieve,
             });
         }
         lines.extend(
@@ -2265,6 +2425,7 @@ fn link_preview_card_lines(
                 title: clean_link_preview_text(link.title.as_deref())
                     .unwrap_or_else(|| "Link preview image".to_owned()),
                 caption: clean_link_preview_text(link.description.as_deref()),
+                retrieve: None,
             });
         }
 
@@ -2335,6 +2496,7 @@ fn flat_link_preview_card_lines(
                 title: clean_link_preview_text(link.title.as_deref())
                     .unwrap_or_else(|| "Link preview image".to_owned()),
                 caption: clean_link_preview_text(link.description.as_deref()),
+                retrieve: None,
             });
         }
 
@@ -2524,6 +2686,7 @@ fn link_image_card_lines(
         preview_path,
         title: media.file_name.to_string(),
         caption: media.caption.as_deref().map(str::to_owned),
+        retrieve: None,
     });
 
     lines.extend(
@@ -2609,7 +2772,7 @@ fn media_card_lines(
         ));
     }
 
-    if let (Some(preview_path), None) = (&source, &error) {
+    if let Some((path, preview_path, retrieve)) = media_hit_paths(media, &source, &error) {
         let hit_width = card_width.saturating_add(4).min(context.content_width);
         let start_col = if is_from_me {
             context.content_width.saturating_sub(hit_width)
@@ -2623,10 +2786,11 @@ fn media_card_lines(
             end_col: start_col.saturating_add(hit_width),
             preview_start_col: start_col.saturating_add(2),
             preview_end_col: start_col.saturating_add(2).saturating_add(card_width),
-            path: media_open_source(media).unwrap_or_else(|| preview_path.clone()),
-            preview_path: preview_path.clone(),
+            path,
+            preview_path,
             title: media.file_name.to_string(),
             caption: caption.map(str::to_owned),
+            retrieve,
         });
     }
 
@@ -2646,16 +2810,25 @@ fn media_card_lines(
     }
 
     if error.is_some() || source.is_none() {
-        lines.push(card_text_line(
-            accent,
-            "Preview unavailable",
-            card_width,
-            Style::default().fg(if error.is_some() {
-                Color::Red
-            } else {
-                Color::DarkGray
-            }),
-        ));
+        if error.is_none() && media_awaits_retrieve(media) {
+            lines.push(card_text_line(
+                accent,
+                &format!("Retrieve media{}", format_media_size(media)),
+                card_width,
+                accent.add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            lines.push(card_text_line(
+                accent,
+                "Preview unavailable",
+                card_width,
+                Style::default().fg(if error.is_some() {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ));
+        }
     }
 
     if let Some(caption) = caption {
@@ -2734,7 +2907,7 @@ fn flat_media_card_lines(
         Style::default().add_modifier(Modifier::BOLD),
     )];
 
-    if let (Some(preview_path), None) = (&source, &error) {
+    if let Some((path, preview_path, retrieve)) = media_hit_paths(media, &source, &error) {
         context.media_hits.push(MediaHit {
             start_line: start_line + lines.len(),
             end_line: start_line + lines.len() + preview_rows.len().saturating_sub(1),
@@ -2742,10 +2915,11 @@ fn flat_media_card_lines(
             end_col: card_width,
             preview_start_col: 0,
             preview_end_col: card_width,
-            path: media_open_source(media).unwrap_or_else(|| preview_path.clone()),
-            preview_path: preview_path.clone(),
+            path,
+            preview_path,
             title: media.file_name.to_string(),
             caption: visible_media_caption(media).map(str::to_owned),
+            retrieve,
         });
     }
 
@@ -2756,16 +2930,25 @@ fn flat_media_card_lines(
     );
 
     if error.is_some() || source.is_none() {
-        lines.push(flat_card_text_line(
-            accent,
-            "Preview unavailable",
-            card_width,
-            Style::default().fg(if error.is_some() {
-                Color::Red
-            } else {
-                Color::DarkGray
-            }),
-        ));
+        if error.is_none() && media_awaits_retrieve(media) {
+            lines.push(flat_card_text_line(
+                accent,
+                &format!("Retrieve media{}", format_media_size(media)),
+                card_width,
+                accent.add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            lines.push(flat_card_text_line(
+                accent,
+                "Preview unavailable",
+                card_width,
+                Style::default().fg(if error.is_some() {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
+            ));
+        }
     }
 
     if let Some(caption) = visible_media_caption(media) {
@@ -2790,8 +2973,13 @@ fn media_preview_rows(
     bool,
 ) {
     let Some(source) = media_preview_source(media) else {
+        let label = if media_awaits_retrieve(media) {
+            "not downloaded"
+        } else {
+            "no local image"
+        };
         return (
-            fallback_preview_rows(width, rows, accent, "no local image"),
+            fallback_preview_rows(width, rows, accent, label),
             None,
             None,
             false,
@@ -4351,6 +4539,71 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use std::path::PathBuf;
 
+    fn local_timestamp(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+    ) -> chat_core::Timestamp {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .expect("valid local timestamp")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn message_timestamps_gain_dates_as_they_age() {
+        // 2026-06-11 is a Thursday.
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 11, 12, 0, 0)
+            .single()
+            .expect("valid now");
+
+        assert_eq!(
+            format_message_time_at(local_timestamp(2026, 6, 11, 9, 5), now),
+            "09:05"
+        );
+        assert_eq!(
+            format_message_time_at(local_timestamp(2026, 6, 10, 22, 48), now),
+            "22:48"
+        );
+        assert_eq!(
+            format_message_time_at(local_timestamp(2026, 6, 7, 8, 30), now),
+            "07 Jun 08:30"
+        );
+        assert_eq!(
+            format_message_time_at(local_timestamp(2025, 12, 31, 23, 59), now),
+            "31 Dec 2025 23:59"
+        );
+    }
+
+    #[test]
+    fn compact_timestamps_fit_narrow_columns() {
+        // 2026-06-11 is a Thursday, so 2026-06-08 is a Monday.
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 11, 12, 0, 0)
+            .single()
+            .expect("valid now");
+        let cases = [
+            (local_timestamp(2026, 6, 11, 9, 5), "09:05"),
+            (local_timestamp(2026, 6, 10, 22, 48), "22:48"),
+            (local_timestamp(2026, 6, 8, 8, 0), "Mon"),
+            (local_timestamp(2026, 6, 1, 8, 0), "01/06"),
+            (local_timestamp(2025, 6, 1, 8, 0), "2025"),
+        ];
+
+        for (timestamp, expected) in cases {
+            let stamp = format_timestamp_compact_at(timestamp, now);
+            assert_eq!(stamp, expected);
+            assert!(
+                UnicodeWidthStr::width(stamp.as_str()) <= SLACK_TIMESTAMP_WIDTH,
+                "compact stamp {stamp:?} exceeds the fixed gutter width"
+            );
+        }
+    }
+
     #[test]
     fn halfblock_span_preserves_transparent_halves() {
         assert_eq!(halfblock_span([1, 2, 3, 0], [4, 5, 6, 0]).content, " ");
@@ -5623,7 +5876,7 @@ mod tests {
             .find(|line| line.contains("Incoming flat message"))
             .expect("incoming Slack-style row");
 
-        let expected_time = format_message_time(
+        let expected_time = format_timestamp_compact(
             Utc.with_ymd_and_hms(2026, 6, 5, 9, 30, 0)
                 .single()
                 .expect("valid timestamp"),
@@ -5710,6 +5963,71 @@ mod tests {
         assert!(!rendered.contains('╰'));
     }
 
+    // Media above the auto-download limit whose bytes are not cached must show
+    // a "Retrieve media" action and register a clickable hit carrying the
+    // media payload, instead of pretending a preview exists.
+    #[test]
+    fn oversized_media_without_local_bytes_offers_retrieve_hit() {
+        let media = chat_core::Media {
+            id: arc_str("https://files.slack.com/huge.png"),
+            file_name: arc_str("huge.png"),
+            mime_type: arc_str("image/png"),
+            size_bytes: Some(chat_core::MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES + 1),
+            caption: None,
+            local_path: Some(PathBuf::from("/nonexistent/chat-cli-tests/huge.png")),
+            thumbnail: None,
+        };
+        assert!(media_awaits_retrieve(&media));
+        // Small media keeps the automatic pipeline; media without a reserved
+        // download destination cannot advertise retrieval at all.
+        assert!(!media_awaits_retrieve(&chat_core::Media {
+            size_bytes: Some(1024),
+            ..media.clone()
+        }));
+        assert!(!media_awaits_retrieve(&chat_core::Media {
+            local_path: None,
+            ..media.clone()
+        }));
+
+        let mut cache = MediaPreviewCache::default();
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = MessageRenderContext {
+            content_width: 90,
+            media_cache: &mut cache,
+            media_hits: &mut media_hits,
+            link_metadata: &link_metadata,
+            link_preview_requests: &mut link_preview_requests,
+            media_preview_requests: &mut media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation: ConversationPresentation::Bubbles,
+            reply_previews: &reply_previews,
+            thread_summaries: &thread_summaries,
+            thread_unread: &thread_unread,
+        };
+
+        let lines = media_card_lines("image", &media, Style::default(), &mut context, 0, false, true);
+        let rendered = rendered_lines(&lines).join("\n");
+
+        assert!(
+            rendered.contains("Retrieve media (10.5 MB)"),
+            "card should offer on-demand retrieval with the size: {rendered}"
+        );
+        assert!(!rendered.contains("Preview unavailable"));
+        assert_eq!(media_hits.len(), 1);
+        let retrieve = media_hits[0]
+            .retrieve
+            .as_ref()
+            .expect("hit should carry the retrieve payload");
+        assert_eq!(retrieve.id, media.id);
+    }
+
     fn image_preview_card(title: &str, caption: Option<&str>) -> Card {
         Card {
             kind: CardKind::MediaPreview,
@@ -5735,6 +6053,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn flat_render_context<'a>(
         cache: &'a mut MediaPreviewCache,
         media_hits: &'a mut Vec<MediaHit>,
@@ -6027,9 +6346,9 @@ mod tests {
             .expect("grouped message content line");
 
         assert!(second_line.contains("Second flat message"));
-        assert!(second_line.starts_with(&format_message_time(messages[1].timestamp)));
+        assert!(second_line.starts_with(&format_timestamp_compact(messages[1].timestamp)));
         assert!(
-            second_line.find(&format_message_time(messages[1].timestamp))
+            second_line.find(&format_timestamp_compact(messages[1].timestamp))
                 < second_line.find("Second flat message"),
             "timestamp should be at the left of grouped Slack content: {second_line}"
         );

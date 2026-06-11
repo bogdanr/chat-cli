@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to_id     TEXT,
     thread_id       TEXT,
     is_from_me      INTEGER NOT NULL DEFAULT 0,
+    mentions_me     INTEGER NOT NULL DEFAULT 0,
     platform_json   TEXT,
     PRIMARY KEY (id, account_id)
 );
