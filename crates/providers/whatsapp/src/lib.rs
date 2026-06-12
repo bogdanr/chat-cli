@@ -565,9 +565,7 @@ impl Provider for WhatsAppProvider {
                 .iter()
                 .rev()
                 .filter(|message| message.chat_id == *chat_id && !message.is_from_me)
-                .filter(|message| {
-                    up_to_timestamp.is_none_or(|up_to| message.timestamp <= up_to)
-                })
+                .filter(|message| up_to_timestamp.is_none_or(|up_to| message.timestamp <= up_to))
                 .take(limit)
                 .map(|message| MarkReadEntry {
                     id: message.id.to_string(),
@@ -2142,7 +2140,9 @@ fn forward_profile_event(
 /// from real messages during history sync). Never downgrades newer existing
 /// activity; only fills the preview at an equal timestamp when it is missing.
 fn apply_profile_activity(chat: &mut Chat, timestamp: Timestamp, preview: Option<Arc<str>>) {
-    let is_newer = chat.last_message_at.is_none_or(|current| timestamp > current);
+    let is_newer = chat
+        .last_message_at
+        .is_none_or(|current| timestamp > current);
     if is_newer {
         chat.last_message_at = Some(timestamp);
         if preview.is_some() {
@@ -2639,7 +2639,10 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(chat.last_message_at, Some(expected_at));
-        assert_eq!(chat.last_message_preview.as_deref(), Some("see you tomorrow"));
+        assert_eq!(
+            chat.last_message_preview.as_deref(),
+            Some("see you tomorrow")
+        );
 
         // A staler activity snapshot must never downgrade the chat.
         assert!(bridge::fire_synthetic_message(
@@ -2656,7 +2659,10 @@ mod tests {
             }
         };
         assert_eq!(chat.last_message_at, Some(expected_at));
-        assert_eq!(chat.last_message_preview.as_deref(), Some("see you tomorrow"));
+        assert_eq!(
+            chat.last_message_preview.as_deref(),
+            Some("see you tomorrow")
+        );
 
         // Newer metadata-only activity (no preview available) bumps the
         // timestamp but keeps the last known preview text.
@@ -2677,7 +2683,10 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(chat.last_message_at, Some(newer_at));
-        assert_eq!(chat.last_message_preview.as_deref(), Some("see you tomorrow"));
+        assert_eq!(
+            chat.last_message_preview.as_deref(),
+            Some("see you tomorrow")
+        );
 
         provider.disconnect().await?;
         Ok(())

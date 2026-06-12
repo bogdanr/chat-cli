@@ -11,11 +11,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
-    CardColor, CardField, CardKind, CardSource, Chat, ChatId, ChatKind, ChatMembership, Content,
-    DiscoveryAction, DiscoveryCapabilities, DiscoveryResult, DiscoveryResultKind, EventBus, Media,
-    Message, MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities,
-    Platform, PlatformData, PlatformId, Provider, ProviderEvent, ProviderId, Reaction, Sender,
-    SlackData, Timestamp,
+    CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatId, ChatKind,
+    ChatMembership, Content, DiscoveryAction, DiscoveryCapabilities, DiscoveryResult,
+    DiscoveryResultKind, EventBus, Media, Message, MessageId, NetworkActivityDirection,
+    NetworkActivityKind, OutboundCapabilities, Platform, PlatformData, PlatformId, Provider,
+    ProviderEvent, ProviderId, Reaction, Sender, SlackData, Timestamp,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -492,6 +492,7 @@ struct SlackHistoryMessageResponse {
     thread_ts: Option<String>,
     reply_count: Option<u32>,
     text: Option<String>,
+    blocks: Option<Vec<serde_json::Value>>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
     files: Option<Vec<SlackFileResponse>>,
     hidden: Option<bool>,
@@ -602,6 +603,32 @@ struct SlackAttachmentFieldResponse {
     title: Option<String>,
     value: Option<String>,
     short: Option<bool>,
+}
+
+/// A single Block Kit layout block from a message's `blocks` array. Every
+/// field is optional so unfamiliar block shapes still decode; blocks whose
+/// `type` we do not model are skipped (and logged) during card conversion.
+/// Free-form parts (`elements`, `accessory`) stay as raw JSON values because
+/// their shape varies per block type.
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SlackBlockResponse {
+    #[serde(rename = "type")]
+    block_type: Option<String>,
+    text: Option<SlackBlockTextResponse>,
+    fields: Option<Vec<SlackBlockTextResponse>>,
+    elements: Option<Vec<serde_json::Value>>,
+    accessory: Option<serde_json::Value>,
+    image_url: Option<String>,
+    alt_text: Option<String>,
+    title: Option<SlackBlockTextResponse>,
+}
+
+/// A Block Kit text object (`mrkdwn` or `plain_text`).
+#[derive(Clone, Debug, Default, Deserialize)]
+struct SlackBlockTextResponse {
+    #[serde(rename = "type")]
+    text_type: Option<String>,
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -977,6 +1004,7 @@ struct SlackRealtimeEvent {
     event_ts: Option<String>,
     thread_ts: Option<String>,
     text: Option<String>,
+    blocks: Option<Vec<serde_json::Value>>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
     files: Option<Vec<SlackFileResponse>>,
     subtype: Option<String>,
@@ -999,6 +1027,7 @@ struct SlackRealtimeInnerMessage {
     ts: Option<String>,
     thread_ts: Option<String>,
     text: Option<String>,
+    blocks: Option<Vec<serde_json::Value>>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
     files: Option<Vec<SlackFileResponse>>,
 }
@@ -5055,6 +5084,7 @@ async fn emit_realtime_message(
                 message.ts,
                 message.thread_ts,
                 message.text,
+                message.blocks,
                 message.attachments,
                 message.files,
                 Vec::new(),
@@ -5092,6 +5122,7 @@ async fn emit_realtime_message(
         event.ts.or(event.event_ts),
         event.thread_ts,
         event.text,
+        event.blocks,
         event.attachments,
         event.files,
         Vec::new(),
@@ -5220,6 +5251,7 @@ fn slack_history_message(
         message.ts,
         message.thread_ts,
         message.text,
+        message.blocks,
         message.attachments,
         message.files,
         slack_reactions(message.reactions),
@@ -5239,6 +5271,7 @@ fn slack_message_from_parts(
     ts: Option<String>,
     thread_ts: Option<String>,
     text: Option<String>,
+    blocks: Option<Vec<serde_json::Value>>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
     files: Option<Vec<SlackFileResponse>>,
     reactions: Vec<Reaction>,
@@ -5253,13 +5286,26 @@ fn slack_message_from_parts(
         .unwrap_or_else(|| "slack".to_owned());
     let attachments = attachments.unwrap_or_default();
     let files = files.unwrap_or_default();
-    let text = slack_message_text(text, &attachments);
+    let own_text = slack_message_own_text(text);
+    let text = slack_message_text(Some(own_text.as_str()), &attachments);
+    // Block Kit messages carry their real layout in `blocks`; the top-level
+    // `text` is only a notification fallback there, so prefer the structured
+    // cards and drop the (duplicate, flattened) fallback text.
+    let block_cards = slack_block_cards(&slack_block_responses(blocks.unwrap_or_default()));
+    let has_block_cards = !block_cards.is_empty();
     let mut cards = slack_attachment_cards(&attachments);
     let mut file_cards = slack_file_cards(&files, web_api_token);
+    if has_block_cards {
+        let mut merged = block_cards;
+        merged.append(&mut cards);
+        cards = merged;
+    } else if !own_text.trim().is_empty() && !cards.is_empty() {
+        cards.insert(0, slack_message_text_card(&own_text));
+    }
     // Preserve the message's own text as a caption on the first file card when
-    // there are no attachment cards (attachment cards already fold in their
-    // text). Otherwise a message like "<text> + 2 images" would render the
-    // images but silently drop the text once content becomes `Cards`.
+    // there are no attachment cards. Otherwise a message like "<text> + 2 images"
+    // would render the images but silently drop the text once content becomes
+    // `Cards`.
     if cards.is_empty()
         && let Some(first) = file_cards.first_mut()
         && first.body.is_none()
@@ -5271,7 +5317,19 @@ fn slack_message_from_parts(
     // Detect self-mentions from the raw text while `<@U123>`/`<!here>` tokens
     // are still present (mention substitution happens later, in
     // `apply_cached_user_to_message`). Used by the notification scope filter.
-    let mentions_me = slack_text_mentions_user(&text, current_user_id);
+    // Block messages may only carry the mention inside their blocks, so scan
+    // the converted card text as well.
+    let mention_text = if has_block_cards {
+        let card_text = cards
+            .iter()
+            .map(slack_card_fallback_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{text}\n{card_text}")
+    } else {
+        text.clone()
+    };
+    let mentions_me = slack_text_mentions_user(&mention_text, current_user_id);
     let timestamp = slack_ts_to_timestamp(&ts).unwrap_or_else(Utc::now);
     let thread_id = non_empty_option(&thread_ts)
         .filter(|thread_ts| thread_ts != &ts)
@@ -5317,17 +5375,40 @@ fn slack_message_from_parts(
     })
 }
 
-fn slack_message_text(text: Option<String>, attachments: &[SlackAttachmentResponse]) -> String {
+fn slack_message_own_text(text: Option<String>) -> String {
+    text.and_then(non_empty_string)
+        .map(|text| replace_slack_emoji_codes(&slack_mrkdwn_styles_to_markdown(&text)))
+        .unwrap_or_default()
+}
+
+fn slack_message_text(text: Option<&str>, attachments: &[SlackAttachmentResponse]) -> String {
     let mut parts = Vec::new();
-    if let Some(text) = text.and_then(non_empty_string) {
-        parts.push(text);
+    if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+        parts.push(text.to_owned());
     }
 
     for attachment in attachments {
         parts.extend(slack_attachment_text_parts(attachment));
     }
 
-    replace_slack_emoji_codes(&parts.join("\n"))
+    parts.join("\n")
+}
+
+fn slack_message_text_card(text: &str) -> Card {
+    Card {
+        kind: CardKind::BotMessage,
+        source: CardSource::Slack,
+        title: None,
+        subtitle: None,
+        body: Some(arc_str(text)),
+        footer: None,
+        url: None,
+        accent_color: None,
+        thumbnail: None,
+        image: None,
+        fields: Vec::new(),
+        actions: Vec::new(),
+    }
 }
 
 fn slack_attachment_text_parts(attachment: &SlackAttachmentResponse) -> Vec<String> {
@@ -5506,9 +5587,510 @@ fn slack_card_media(kind: &str, url: &str) -> Media {
         mime_type: arc_str("image/*"),
         size_bytes: None,
         caption: None,
-        local_path: None,
+        // Attachment/block images are public CDN URLs (no Bearer auth), so
+        // reserve a deterministic cache path and fetch the bytes eagerly on a
+        // background thread. Without a local path the preview pipeline can
+        // never render these images.
+        local_path: slack_cached_media_path(url, "cards", None),
         thumbnail: None,
     }
+}
+
+/// Decodes a message's raw `blocks` array one entry at a time, skipping (and
+/// logging) entries that fail to decode so a single unfamiliar block can never
+/// drop the whole message.
+fn slack_block_responses(values: Vec<serde_json::Value>) -> Vec<SlackBlockResponse> {
+    values
+        .into_iter()
+        .filter_map(|value| match serde_json::from_value::<SlackBlockResponse>(value) {
+            Ok(block) => Some(block),
+            Err(error) => {
+                slack_diagnostic_log("slack.blocks.decode_skipped", error.to_string());
+                None
+            }
+        })
+        .collect()
+}
+
+/// Accumulates consecutive Block Kit blocks into one provider-neutral card so
+/// related blocks (status line, linked title, buttons, context footer) render
+/// as a single visual group, mirroring Slack's own layout.
+#[derive(Default)]
+struct SlackBlockCardBuilder {
+    title: Option<String>,
+    body: Vec<String>,
+    footer: Vec<String>,
+    fields: Vec<CardField>,
+    actions: Vec<CardAction>,
+    thumbnail: Option<Media>,
+}
+
+impl SlackBlockCardBuilder {
+    fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.body.is_empty()
+            && self.footer.is_empty()
+            && self.fields.is_empty()
+            && self.actions.is_empty()
+            && self.thumbnail.is_none()
+    }
+
+    fn flush(&mut self, cards: &mut Vec<Card>) {
+        if self.is_empty() {
+            return;
+        }
+        let builder = std::mem::take(self);
+        cards.push(Card {
+            kind: CardKind::BotMessage,
+            source: CardSource::Slack,
+            title: builder.title.and_then(non_empty_string).map(arc_str),
+            subtitle: None,
+            body: non_empty_string(builder.body.join("\n")).map(arc_str),
+            footer: non_empty_string(builder.footer.join(" ")).map(arc_str),
+            url: None,
+            accent_color: None,
+            thumbnail: builder.thumbnail,
+            image: None,
+            fields: builder.fields,
+            actions: builder.actions,
+        });
+    }
+}
+
+/// Converts a message's Block Kit blocks into renderable cards. `header`
+/// blocks start a new card, `section`/`rich_text` text accumulates into the
+/// card body, `actions` buttons attach to the current group and close it,
+/// `context` becomes the footer, `image` blocks become standalone media
+/// preview cards, and `divider` flushes the group. Unknown block types are
+/// skipped (logged) so they degrade to the fallback text path when nothing
+/// else parses.
+fn slack_block_cards(blocks: &[SlackBlockResponse]) -> Vec<Card> {
+    let mut cards = Vec::new();
+    let mut builder = SlackBlockCardBuilder::default();
+    for block in blocks {
+        match block.block_type.as_deref() {
+            Some("header") => {
+                builder.flush(&mut cards);
+                builder.title = block.text.as_ref().and_then(slack_block_text);
+            }
+            Some("section") => {
+                if let Some(text) = block.text.as_ref().and_then(slack_block_text) {
+                    builder.body.push(text);
+                }
+                for field in block.fields.as_deref().unwrap_or_default() {
+                    if let Some(text) = slack_block_text(field) {
+                        builder.fields.push(CardField {
+                            title: None,
+                            value: arc_str(text),
+                            short: true,
+                        });
+                    }
+                }
+                if let Some(accessory) = block.accessory.as_ref() {
+                    if let Some(action) = slack_block_button_action(accessory) {
+                        builder.actions.push(action);
+                    } else if builder.thumbnail.is_none() {
+                        builder.thumbnail = slack_block_accessory_image(accessory);
+                    }
+                }
+            }
+            Some("rich_text") => {
+                if let Some(text) = non_empty_string(slack_rich_text_elements_text(
+                    block.elements.as_deref().unwrap_or_default(),
+                )) {
+                    builder.body.push(text);
+                }
+            }
+            Some("image") => {
+                builder.flush(&mut cards);
+                let Some(url) = block.image_url.clone().and_then(non_empty_string) else {
+                    continue;
+                };
+                cards.push(Card {
+                    kind: CardKind::MediaPreview,
+                    source: CardSource::Slack,
+                    // Kept for the details pane; media preview cards hide the
+                    // title in the transcript.
+                    title: block
+                        .title
+                        .as_ref()
+                        .and_then(slack_block_text)
+                        .or_else(|| block.alt_text.clone().and_then(non_empty_string))
+                        .map(arc_str),
+                    subtitle: None,
+                    body: None,
+                    footer: None,
+                    url: None,
+                    accent_color: None,
+                    thumbnail: None,
+                    image: Some(slack_card_media("image", &url)),
+                    fields: Vec::new(),
+                    actions: Vec::new(),
+                });
+            }
+            Some("actions") => {
+                builder.actions.extend(
+                    block
+                        .elements
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(slack_block_button_action),
+                );
+                // Buttons visually close a group in Slack's layout.
+                builder.flush(&mut cards);
+            }
+            Some("context") => {
+                if let Some(text) = non_empty_string(slack_context_elements_text(
+                    block.elements.as_deref().unwrap_or_default(),
+                )) {
+                    builder.footer.push(text);
+                }
+            }
+            Some("divider") => builder.flush(&mut cards),
+            other => slack_diagnostic_log(
+                "slack.blocks.unsupported_type",
+                format!("type={}", other.unwrap_or("<none>")),
+            ),
+        }
+    }
+    builder.flush(&mut cards);
+
+    // Alert bots lead with a colored-square severity emoji; surface it as the
+    // card accent so themed presentations can color the card chrome.
+    if let Some(first) = cards.first_mut()
+        && first.accent_color.is_none()
+    {
+        first.accent_color = first
+            .title
+            .as_deref()
+            .or(first.body.as_deref())
+            .and_then(slack_severity_accent_color);
+    }
+    cards
+}
+
+/// Renders a Block Kit text object into the renderer's markdown dialect with
+/// emoji shortcodes resolved. `plain_text` is taken verbatim; `mrkdwn` goes
+/// through the dialect translation.
+fn slack_block_text(text: &SlackBlockTextResponse) -> Option<String> {
+    let raw = text.text.clone().and_then(non_empty_string)?;
+    let converted = if text.text_type.as_deref() == Some("plain_text") {
+        raw
+    } else {
+        slack_mrkdwn_to_markdown(&raw)
+    };
+    non_empty_string(replace_slack_emoji_codes(&converted))
+}
+
+/// Extracts a `button` element as a card action. Interactive buttons without
+/// a `url` still surface as (inert) labels so the message reads like Slack's
+/// layout instead of the "Acknowledge button" fallback prose.
+fn slack_block_button_action(value: &serde_json::Value) -> Option<CardAction> {
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("button") {
+        return None;
+    }
+    let label = value
+        .get("text")
+        .and_then(|text| text.get("text"))
+        .and_then(|text| text.as_str())?;
+    let label = non_empty_string(replace_slack_emoji_codes(label.trim()))?;
+    Some(CardAction {
+        label: arc_str(label),
+        url: value
+            .get("url")
+            .and_then(|url| url.as_str())
+            .map(str::to_owned)
+            .and_then(non_empty_string)
+            .map(arc_str),
+    })
+}
+
+fn slack_block_accessory_image(value: &serde_json::Value) -> Option<Media> {
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("image") {
+        return None;
+    }
+    let url = value
+        .get("image_url")
+        .and_then(|url| url.as_str())
+        .map(str::to_owned)
+        .and_then(non_empty_string)?;
+    Some(slack_card_media("image", &url))
+}
+
+/// Joins the text elements of a `context` block. Context image elements (tiny
+/// icons) carry no useful transcript text and are skipped.
+fn slack_context_elements_text(elements: &[serde_json::Value]) -> String {
+    elements
+        .iter()
+        .filter_map(|element| {
+            let element_type = element.get("type").and_then(|kind| kind.as_str())?;
+            let text = element.get("text").and_then(|text| text.as_str())?;
+            let converted = match element_type {
+                "plain_text" => text.to_owned(),
+                "mrkdwn" => slack_mrkdwn_to_markdown(text),
+                _ => return None,
+            };
+            non_empty_string(replace_slack_emoji_codes(&converted))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Flattens a `rich_text` block's element tree to plain text, one line per
+/// top-level section and one bulleted line per list item. A lossy but safe
+/// degradation path: unknown leaves are recursed into for any nested text.
+fn slack_rich_text_elements_text(elements: &[serde_json::Value]) -> String {
+    let mut parts = Vec::new();
+    for element in elements {
+        let element_type = element
+            .get("type")
+            .and_then(|kind| kind.as_str())
+            .unwrap_or_default();
+        let children = element
+            .get("elements")
+            .and_then(|elements| elements.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if element_type == "rich_text_list" {
+            for item in children {
+                let mut line = String::from("• ");
+                slack_rich_text_leaf_text(item, &mut line);
+                if line.trim() != "•" {
+                    parts.push(line);
+                }
+            }
+        } else {
+            let mut text = String::new();
+            for child in children {
+                slack_rich_text_leaf_text(child, &mut text);
+            }
+            if !text.trim().is_empty() {
+                parts.push(text);
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn slack_rich_text_leaf_text(element: &serde_json::Value, output: &mut String) {
+    let element_type = element
+        .get("type")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or_default();
+    match element_type {
+        "text" => {
+            if let Some(text) = element.get("text").and_then(|text| text.as_str()) {
+                output.push_str(text);
+            }
+        }
+        "link" => {
+            if let Some(label) = element
+                .get("text")
+                .and_then(|text| text.as_str())
+                .or_else(|| element.get("url").and_then(|url| url.as_str()))
+            {
+                output.push_str(label);
+            }
+        }
+        "emoji" => {
+            if let Some(name) = element.get("name").and_then(|name| name.as_str()) {
+                output.push_str(&slack_emoji_display(name));
+            }
+        }
+        // Emit the raw mention token so the existing user-mention substitution
+        // (`replace_slack_mentions_in_cards`) resolves it to a display name.
+        "user" => {
+            if let Some(id) = element.get("user_id").and_then(|id| id.as_str()) {
+                output.push_str("<@");
+                output.push_str(id);
+                output.push('>');
+            }
+        }
+        "broadcast" => {
+            if let Some(range) = element.get("range").and_then(|range| range.as_str()) {
+                output.push('@');
+                output.push_str(range);
+            }
+        }
+        "channel" => {
+            if let Some(id) = element.get("channel_id").and_then(|id| id.as_str()) {
+                output.push('#');
+                output.push_str(id);
+            }
+        }
+        _ => {
+            for child in element
+                .get("elements")
+                .and_then(|elements| elements.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                slack_rich_text_leaf_text(child, output);
+            }
+        }
+    }
+}
+
+/// Maps a leading severity emoji (as emitted by alerting bots like NewRelic)
+/// to a named card accent color.
+fn slack_severity_accent_color(text: &str) -> Option<CardColor> {
+    let trimmed = text.trim_start_matches(['*', '_', '~', '`', ' ']);
+    let named = if trimmed.starts_with('🟥') || trimmed.starts_with('🔴') {
+        "danger"
+    } else if trimmed.starts_with('🟧')
+        || trimmed.starts_with('🟠')
+        || trimmed.starts_with('🟨')
+        || trimmed.starts_with('🟡')
+    {
+        "warning"
+    } else if trimmed.starts_with('🟩') || trimmed.starts_with('🟢') {
+        "good"
+    } else if trimmed.starts_with('🟦') || trimmed.starts_with('🔵') {
+        "primary"
+    } else {
+        return None;
+    };
+    Some(CardColor::Named(arc_str(named)))
+}
+
+/// Translates Slack mrkdwn into the renderer's markdown dialect: `*bold*` →
+/// `**bold**`, `~strike~` → `~~strike~~`, `<url|label>` → `label`, and
+/// `<#C123|name>` → `#name`. Mention tokens (`<@U…>`, `<!here>`) pass through
+/// untouched for the later user-substitution pass, and code spans are copied
+/// verbatim.
+fn slack_mrkdwn_to_markdown(text: &str) -> String {
+    map_outside_code_spans(text, |segment| {
+        convert_mrkdwn_delimiters(&convert_slack_angle_tokens(segment))
+    })
+}
+
+/// Style-only mrkdwn translation (`*bold*`, `~strike~`) for plain message
+/// text, where angle-bracket link tokens must survive for link-preview and
+/// mention handling.
+fn slack_mrkdwn_styles_to_markdown(text: &str) -> String {
+    map_outside_code_spans(text, |segment| convert_mrkdwn_delimiters(segment))
+}
+
+/// Applies `transform` to the parts of `text` outside backtick code spans
+/// (inline and fenced), copying the code spans verbatim.
+fn map_outside_code_spans(text: &str, transform: impl Fn(&str) -> String) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        output.push_str(&transform(&rest[..start]));
+        let code = &rest[start..];
+        let fence = if code.starts_with("```") { "```" } else { "`" };
+        match code[fence.len()..].find(fence) {
+            Some(end) => {
+                let code_end = fence.len() + end + fence.len();
+                output.push_str(&code[..code_end]);
+                rest = &code[code_end..];
+            }
+            None => {
+                output.push_str(code);
+                return output;
+            }
+        }
+    }
+    output.push_str(&transform(rest));
+    output
+}
+
+fn convert_mrkdwn_delimiters(text: &str) -> String {
+    let text = convert_mrkdwn_delimiter(text, '*', "**");
+    convert_mrkdwn_delimiter(&text, '~', "~~")
+}
+
+fn convert_mrkdwn_delimiter(text: &str, delimiter: char, replacement: &str) -> String {
+    text.split('\n')
+        .map(|line| convert_mrkdwn_delimiter_line(line, delimiter, replacement))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rewrites single-character mrkdwn delimiter pairs on one line into the
+/// renderer's doubled markers. A pair only converts when it follows mrkdwn's
+/// own rules (opens before non-space, closes after non-space, word-boundary
+/// adjacent), so literal asterisks/tildes in prose survive.
+fn convert_mrkdwn_delimiter_line(line: &str, delimiter: char, replacement: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut output = String::with_capacity(line.len() + 8);
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == delimiter
+            && mrkdwn_delimiter_opens(&chars, index, delimiter)
+            && let Some(close) = mrkdwn_delimiter_close(&chars, index, delimiter)
+        {
+            output.push_str(replacement);
+            output.extend(&chars[index + 1..close]);
+            output.push_str(replacement);
+            index = close + 1;
+        } else {
+            output.push(chars[index]);
+            index += 1;
+        }
+    }
+    output
+}
+
+fn mrkdwn_delimiter_opens(chars: &[char], index: usize, delimiter: char) -> bool {
+    let preceded_ok = index == 0
+        || (!chars[index - 1].is_alphanumeric() && chars[index - 1] != delimiter);
+    let next = chars.get(index + 1);
+    preceded_ok && next.is_some_and(|next| !next.is_whitespace() && *next != delimiter)
+}
+
+fn mrkdwn_delimiter_close(chars: &[char], open: usize, delimiter: char) -> Option<usize> {
+    (open + 2..chars.len()).find(|&index| {
+        chars[index] == delimiter
+            && !chars[index - 1].is_whitespace()
+            && chars[index - 1] != delimiter
+            && chars
+                .get(index + 1)
+                .is_none_or(|next| !next.is_alphanumeric() && *next != delimiter)
+    })
+}
+
+/// Rewrites Slack angle-bracket tokens: `<url|label>` → `label`, bare `<url>`
+/// → `url`, `<#C123|name>` → `#name`. Mention tokens (`<@…>`, `<!…>`) are
+/// preserved for the later mention-substitution pass.
+fn convert_slack_angle_tokens(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('>') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let token = &after[..end];
+        if token.starts_with('@') || token.starts_with('!') {
+            output.push('<');
+            output.push_str(token);
+            output.push('>');
+        } else if let Some(channel) = token.strip_prefix('#') {
+            let label = channel
+                .split_once('|')
+                .map(|(_, label)| label)
+                .unwrap_or(channel);
+            output.push('#');
+            output.push_str(label);
+        } else if token.contains("://") || token.starts_with("mailto:") {
+            match token.split_once('|') {
+                Some((_, label)) if !label.trim().is_empty() => output.push_str(label),
+                _ => output.push_str(token.split_once('|').map_or(token, |(url, _)| url)),
+            }
+        } else {
+            output.push('<');
+            output.push_str(token);
+            output.push('>');
+        }
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    output
 }
 
 /// Builds attachment cards for the `files` array of a Slack message. Image
@@ -6266,7 +6848,11 @@ fn slack_download_media_to_path(
         request = request.header("Authorization", &format!("Bearer {token}"));
     }
     let mut response = request.call().context("downloading Slack media")?;
-    let mut reader = response.body_mut().with_config().limit(limit_bytes).reader();
+    let mut reader = response
+        .body_mut()
+        .with_config()
+        .limit(limit_bytes)
+        .reader();
 
     let temp_path = path.with_extension("part");
     let result = (|| -> Result<()> {
@@ -6765,7 +7351,10 @@ mod tests {
             _credential: SlackCredential,
             user_id: &str,
         ) -> Result<Option<SlackUser>> {
-            self.user_info_calls.lock().unwrap().push(user_id.to_owned());
+            self.user_info_calls
+                .lock()
+                .unwrap()
+                .push(user_id.to_owned());
             Ok(self.users.lock().unwrap().get(user_id).cloned())
         }
 
@@ -7232,9 +7821,11 @@ mod tests {
         let started_at = Utc::now();
         let backlog = started_at - chrono::Duration::hours(2);
         let live = started_at + chrono::Duration::seconds(5);
-        client.history_messages.lock().unwrap().push(
-            poll_history_message("C123", "1710000001.000100", backlog),
-        );
+        client
+            .history_messages
+            .lock()
+            .unwrap()
+            .push(poll_history_message("C123", "1710000001.000100", backlog));
 
         let api_client: Arc<dyn SlackApiClient> = client.clone();
         let events = EventBus::new();
@@ -7262,9 +7853,11 @@ mod tests {
 
         // A genuinely new message is reported as a live delivery exactly
         // once; re-observing it on the next pass is not new evidence.
-        client.history_messages.lock().unwrap().push(
-            poll_history_message("C123", "1710000010.000200", live),
-        );
+        client
+            .history_messages
+            .lock()
+            .unwrap()
+            .push(poll_history_message("C123", "1710000010.000200", live));
         assert!(
             run_history_poll_pass(
                 &api_client,
@@ -8349,6 +8942,7 @@ mod tests {
             Some("hello".to_owned()),
             None,
             None,
+            None,
             Vec::new(),
             None,
             false,
@@ -8450,6 +9044,7 @@ mod tests {
                 thread_ts: None,
                 reply_count: None,
                 text: Some("deployed :large_green_circle:".to_owned()),
+                blocks: None,
                 attachments: None,
                 files: None,
                 hidden: None,
@@ -8527,6 +9122,7 @@ mod tests {
                 event_ts: None,
                 thread_ts: None,
                 text: Some("deployment finished".to_owned()),
+                blocks: None,
                 attachments: None,
                 subtype: Some("bot_message".to_owned()),
                 files: None,
@@ -8576,6 +9172,7 @@ mod tests {
                 thread_ts: None,
                 reply_count: None,
                 text: None,
+                blocks: None,
                 attachments: Some(vec![SlackAttachmentResponse {
                     pretext: None,
                     title: Some("Partition maintenance successful on deploy".to_owned()),
@@ -8624,6 +9221,239 @@ mod tests {
             content_text(&message.content),
             "Partition maintenance successful on deploy\nScript: /var/www/wap/partition_maintenance.sh, Elapsed time: 415 seconds"
         );
+    }
+
+    // A Block Kit bot message (NewRelic alert shape) must render as structured
+    // cards: status/title group with action buttons, standalone chart image
+    // card with a reserved cache path, detail sections, and a context footer
+    // with link labels instead of raw `<url|label>` tokens. The top-level
+    // `text` is only Slack's notification fallback ("... Acknowledge button
+    // ...") and must not leak into the content.
+    #[test]
+    fn historical_slack_message_with_blocks_renders_structured_cards() {
+        let blocks = vec![
+            serde_json::json!({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": ":large_red_square: *Critical priority issue is active*"
+                }
+            }),
+            serde_json::json!({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "<https://radar-api.service.newrelic.com/accounts/20424/issues/abc?notifier=SLACK|*Metric query deviated from the baseline for at least 5 minutes on 'WaP Web Shop Production - Error rate'*>"
+                }
+            }),
+            serde_json::json!({
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": ":toolbox: Acknowledge", "emoji": true },
+                        "value": "ack"
+                    },
+                    {
+                        "type": "button",
+                        "text": { "type": "plain_text", "text": ":heavy_check_mark: Close", "emoji": true },
+                        "value": "close"
+                    }
+                ]
+            }),
+            serde_json::json!({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*1 alert event* · Metric query deviated from the baseline"
+                }
+            }),
+            serde_json::json!({
+                "type": "image",
+                "image_url": "https://chart-embed.example.invalid/charts/violation.png",
+                "alt_text": "Violation chart",
+                "title": { "type": "plain_text", "text": "UTC TIME (10 kB)", "emoji": true }
+            }),
+            serde_json::json!({
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": "*1 policy* · Webshop" }
+            }),
+            serde_json::json!({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": "This notification was sent via the \"Policy: 3630765 - Webshop\" workflow. <https://radar-api.service.newrelic.com/accounts/20424/workflows/abc?notifier=SLACK|⚙️ Edit workflow>"
+                }]
+            }),
+        ];
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: Some("bot_message".to_owned()),
+                user: None,
+                bot_id: Some("BNEWRELIC".to_owned()),
+                username: Some("New Relic".to_owned()),
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000004.000300".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: Some(
+                    "Critical priority issue is active :toolbox: Acknowledge button :heavy_check_mark: Close button"
+                        .to_owned(),
+                ),
+                blocks: Some(blocks),
+                attachments: None,
+                files: None,
+                hidden: None,
+                reactions: None,
+            },
+            None,
+            None,
+        )
+        .expect("message should parse");
+
+        let Content::Cards(cards) = &message.content else {
+            panic!("Block Kit message should render as cards");
+        };
+        assert_eq!(cards.len(), 4, "status+buttons, alert event, image, details");
+
+        // Group 1: status line + linked title + buttons.
+        let lead = &cards[0];
+        assert_eq!(lead.kind, CardKind::BotMessage);
+        let lead_body = lead.body.as_deref().expect("lead card has a body");
+        assert!(lead_body.contains("🟥 **Critical priority issue is active**"));
+        assert!(
+            lead_body.contains(
+                "**Metric query deviated from the baseline for at least 5 minutes on 'WaP Web Shop Production - Error rate'**"
+            ),
+            "title link must render its (bold) label: {lead_body}"
+        );
+        assert!(
+            !lead_body.contains("<https://"),
+            "raw angle-bracket URL tokens must not leak: {lead_body}"
+        );
+        assert_eq!(lead.accent_color, Some(CardColor::Named(arc_str("danger"))));
+        let labels = lead
+            .actions
+            .iter()
+            .map(|action| action.label.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["🧰 Acknowledge", "✔️ Close"]);
+        assert!(lead.actions.iter().all(|action| action.url.is_none()));
+
+        // Group 2: the "1 alert event" section renders above the chart, in
+        // block order.
+        assert!(
+            cards[1]
+                .body
+                .as_deref()
+                .unwrap()
+                .contains("**1 alert event**")
+        );
+
+        // Group 3: chart image with a reserved local cache path so the preview
+        // pipeline can render it (or show retrieve/placeholder states).
+        let chart = &cards[2];
+        assert_eq!(chart.kind, CardKind::MediaPreview);
+        assert_eq!(chart.title.as_deref(), Some("UTC TIME (10 kB)"));
+        let image = chart.image.as_ref().expect("image block becomes media");
+        assert!(image.local_path.is_some());
+
+        // Group 4: detail sections + context footer with link label.
+        let details = &cards[3];
+        assert!(details.body.as_deref().unwrap().contains("**1 policy** · Webshop"));
+        let footer = details.footer.as_deref().expect("context becomes footer");
+        assert!(footer.contains("⚙️ Edit workflow"));
+        assert!(!footer.contains("<https://"));
+
+        // The notification fallback must not appear anywhere in the content.
+        assert!(!content_text(&message.content).contains("Acknowledge button"));
+    }
+
+    // A message whose blocks are all unmodeled must keep today's behavior and
+    // fall back to the plain `text`, never dropping the message.
+    #[test]
+    fn unknown_block_types_degrade_to_fallback_text() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: Some("bot_message".to_owned()),
+                user: None,
+                bot_id: Some("BBOT".to_owned()),
+                username: Some("bot".to_owned()),
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000005.000400".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: Some("fallback text".to_owned()),
+                blocks: Some(vec![
+                    serde_json::json!({ "type": "fancy_new_block", "payload": { "x": 1 } }),
+                    serde_json::json!({ "type": ["not", "a", "string"] }),
+                ]),
+                attachments: None,
+                files: None,
+                hidden: None,
+                reactions: None,
+            },
+            None,
+            None,
+        )
+        .expect("message should parse despite unknown blocks");
+
+        let Content::Text(text) = &message.content else {
+            panic!("unparseable blocks should fall back to text content");
+        };
+        assert_eq!(text.as_ref(), "fallback text");
+    }
+
+    // mrkdwn -> renderer-markdown dialect translation: Slack single-character
+    // delimiters become the renderer's doubled markers, link tokens render
+    // their labels, and code spans plus literal characters pass through.
+    #[test]
+    fn slack_mrkdwn_translation_converts_styles_links_and_preserves_code() {
+        assert_eq!(
+            slack_mrkdwn_to_markdown("*1 alert event* and ~old~"),
+            "**1 alert event** and ~~old~~"
+        );
+        assert_eq!(
+            slack_mrkdwn_to_markdown("<https://example.com/a|Edit workflow> done"),
+            "Edit workflow done"
+        );
+        assert_eq!(
+            slack_mrkdwn_to_markdown("see <https://example.com/bare>"),
+            "see https://example.com/bare"
+        );
+        assert_eq!(slack_mrkdwn_to_markdown("<#C123|general>"), "#general");
+        // Mention tokens survive for the later user-substitution pass.
+        assert_eq!(
+            slack_mrkdwn_to_markdown("<@U123> and <!here>"),
+            "<@U123> and <!here>"
+        );
+        // Code spans are verbatim; literal asterisks in prose stay literal.
+        assert_eq!(
+            slack_mrkdwn_to_markdown("`*not bold*` and 2*3*4"),
+            "`*not bold*` and 2*3*4"
+        );
+    }
+
+    // Attachment `image_url`/`thumb_url` images are public CDN assets; they
+    // must reserve a local cache path so the preview pipeline can render them
+    // instead of dead-ending on `local_path: None`.
+    #[test]
+    fn slack_attachment_image_card_reserves_local_cache_path() {
+        let media = slack_card_media(
+            "image",
+            "https://attachment-image.example.invalid/chart.png",
+        );
+        assert!(media.local_path.is_some());
     }
 
     // With a token, private Slack files get an authenticated lazy cache path so
@@ -8763,6 +9593,69 @@ mod tests {
     }
 
     #[test]
+    fn historical_slack_message_preserves_text_before_link_attachment_card() {
+        let message = slack_history_message(
+            arc_str("slack:test"),
+            Some("U123"),
+            "C123".to_owned(),
+            SlackHistoryMessageResponse {
+                message_type: Some("message".to_owned()),
+                subtype: None,
+                user: Some("U234".to_owned()),
+                bot_id: None,
+                username: None,
+                icons: None,
+                bot_profile: None,
+                ts: Some("1710000006.000200".to_owned()),
+                thread_ts: None,
+                reply_count: None,
+                text: Some("Comentariu înainte de link :white_check_mark:".to_owned()),
+                blocks: None,
+                attachments: Some(vec![SlackAttachmentResponse {
+                    pretext: None,
+                    title: Some("How to debug invisible text".to_owned()),
+                    title_link: Some("https://example.com/debug".to_owned()),
+                    color: None,
+                    image_url: None,
+                    thumb_url: None,
+                    author_name: None,
+                    author_link: None,
+                    footer: None,
+                    ts: None,
+                    text: Some("Preview description".to_owned()),
+                    fallback: Some("fallback should not replace visible text".to_owned()),
+                    fields: None,
+                }]),
+                files: None,
+                hidden: None,
+                reactions: None,
+            },
+            None,
+            None,
+        )
+        .expect("message should parse");
+
+        let Content::Cards(cards) = &message.content else {
+            panic!("message with text and a link attachment should render as cards");
+        };
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].kind, CardKind::BotMessage);
+        assert_eq!(
+            cards[0].body.as_deref(),
+            Some("Comentariu înainte de link ✅")
+        );
+        assert_eq!(cards[1].kind, CardKind::ProviderAttachment);
+        assert_eq!(
+            cards[1].title.as_deref(),
+            Some("How to debug invisible text")
+        );
+        assert_eq!(
+            content_text(&message.content),
+            "Comentariu înainte de link ✅\nHow to debug invisible text\nPreview description\nhttps://example.com/debug"
+        );
+    }
+
+    #[test]
     fn historical_slack_message_renders_image_files_as_media_cards_with_caption() {
         let message = slack_history_message(
             arc_str("slack:test"),
@@ -8780,6 +9673,7 @@ mod tests {
                 thread_ts: None,
                 reply_count: None,
                 text: Some("Cica vecini gospodari".to_owned()),
+                blocks: None,
                 attachments: None,
                 files: Some(vec![
                     SlackFileResponse {
@@ -8969,6 +9863,7 @@ mod tests {
                 event_ts: None,
                 thread_ts: None,
                 text: None,
+                blocks: None,
                 attachments: None,
                 subtype: None,
                 files: None,
@@ -9020,6 +9915,7 @@ mod tests {
                 thread_ts: None,
                 reply_count: None,
                 text: Some("done :white_check_mark: custom :party-parrot:".to_owned()),
+                blocks: None,
                 attachments: None,
                 files: None,
                 hidden: None,
@@ -9066,6 +9962,7 @@ mod tests {
                 thread_ts: Some("1710000000.000100".to_owned()),
                 reply_count: None,
                 text: Some("thread reply".to_owned()),
+                blocks: None,
                 attachments: None,
                 files: None,
                 hidden: None,
@@ -9106,6 +10003,7 @@ mod tests {
                 thread_ts: Some("1710000000.000100".to_owned()),
                 reply_count: Some(2),
                 text: Some("thread root".to_owned()),
+                blocks: None,
                 attachments: None,
                 files: None,
                 hidden: None,
@@ -9139,6 +10037,7 @@ mod tests {
                 thread_ts: None,
                 reply_count: None,
                 text: Some("plain message".to_owned()),
+                blocks: None,
                 attachments: None,
                 files: None,
                 hidden: None,

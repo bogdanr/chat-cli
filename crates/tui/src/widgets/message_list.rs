@@ -867,10 +867,7 @@ pub fn cached_message_anchor_at_line(
         .partition_point(|entry| entry.start_line.saturating_add(entry.line_count) <= line);
     let entry = cache.entries.get(index)?;
     let message = messages.get(entry.message_index)?;
-    Some((
-        message.id.clone(),
-        line.saturating_sub(entry.start_line),
-    ))
+    Some((message.id.clone(), line.saturating_sub(entry.start_line)))
 }
 
 /// Returns the first layout line of the message with `message_id`, or `None`
@@ -2017,9 +2014,7 @@ fn inline_image_grid_lines(
                 LINK_PREVIEW_THUMBNAIL_ROWS,
                 preview_color,
             );
-            if let Some((path, preview_path, retrieve)) =
-                media_hit_paths(image, &source, &error)
-            {
+            if let Some((path, preview_path, retrieve)) = media_hit_paths(image, &source, &error) {
                 let start_col = column_index * (column_width as usize + gap);
                 context.media_hits.push(MediaHit {
                     start_line: row_base,
@@ -2179,6 +2174,12 @@ fn flat_card_lines(
             Style::default().fg(Color::Gray),
         ));
     }
+    if !card.actions.is_empty() {
+        lines.push(flat_card_spans_line(
+            accent,
+            card_action_spans(&card.actions),
+        ));
+    }
     if let Some(footer) = card.footer.as_deref() {
         lines.push(flat_card_text_line(
             accent,
@@ -2297,6 +2298,13 @@ fn generic_card_lines(
             Style::default().fg(Color::Gray),
         ));
     }
+    if !card.actions.is_empty() {
+        lines.push(card_spans_line(
+            accent,
+            card_action_spans(&card.actions),
+            card_width,
+        ));
+    }
     if let Some(footer) = card.footer.as_deref() {
         lines.push(card_text_line(
             accent,
@@ -2319,6 +2327,29 @@ fn generic_card_lines(
     }
     lines.push(card_border_line('╰', '─', '╯', card_width, accent));
     lines
+}
+
+/// Renders card actions (Block Kit buttons) as a row of button-styled pills,
+/// e.g. `[ 🧰 Acknowledge ]  [ ✔ Close ]`. Actions carrying a URL are styled
+/// like links (openable via the message "open link" action); interactive-only
+/// buttons render as inert labels since Slack interactivity round-trips are
+/// not supported.
+fn card_action_spans(actions: &[chat_core::CardAction]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for action in actions {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+        }
+        let style = Style::default().add_modifier(Modifier::BOLD).fg(
+            if action.url.is_some() {
+                Color::Cyan
+            } else {
+                Color::Gray
+            },
+        );
+        spans.push(Span::styled(format!("[ {} ]", action.label), style));
+    }
+    spans
 }
 
 fn card_accent_style(color: Option<&chat_core::CardColor>, fallback: Style) -> Style {
@@ -4443,6 +4474,7 @@ fn generic_card_line_count(
         + usize::from(counts_title)
         + body_lines
         + card.fields.len()
+        + usize::from(!card.actions.is_empty())
         + usize::from(card.footer.is_some())
         + usize::from(counts_url)
         + usize::from(
@@ -4452,6 +4484,7 @@ fn generic_card_line_count(
                 && card.footer.is_none()
                 && !counts_url
                 && card.fields.is_empty()
+                && card.actions.is_empty()
                 && card.image.is_none()
                 && card.thumbnail.is_none(),
         );
@@ -5963,6 +5996,71 @@ mod tests {
         assert!(!rendered.contains('╰'));
     }
 
+    // Block Kit action buttons render as a row of button pills (not the
+    // "Acknowledge button" fallback prose), and the layout line-count mirror
+    // must agree with the rendered line count.
+    #[test]
+    fn card_actions_render_as_button_pills_with_matching_line_count() {
+        let card = Card {
+            kind: CardKind::BotMessage,
+            source: CardSource::Slack,
+            title: None,
+            subtitle: None,
+            body: Some(arc_str("🟥 **Critical priority issue is active**")),
+            footer: Some(arc_str("This notification was sent via a workflow.")),
+            url: None,
+            accent_color: Some(CardColor::Named(arc_str("danger"))),
+            thumbnail: None,
+            image: None,
+            fields: Vec::new(),
+            actions: vec![
+                chat_core::CardAction {
+                    label: arc_str("🧰 Acknowledge"),
+                    url: None,
+                },
+                chat_core::CardAction {
+                    label: arc_str("✔️ Close"),
+                    url: Some(arc_str("https://example.com/close")),
+                },
+            ],
+        };
+        let mut cache = MediaPreviewCache::default();
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = MessageRenderContext {
+            content_width: 90,
+            media_cache: &mut cache,
+            media_hits: &mut media_hits,
+            link_metadata: &link_metadata,
+            link_preview_requests: &mut link_preview_requests,
+            media_preview_requests: &mut media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation: ConversationPresentation::Flat,
+            reply_previews: &reply_previews,
+            thread_summaries: &thread_summaries,
+            thread_unread: &thread_unread,
+        };
+
+        let cards = vec![card];
+        let lines = card_collection_lines(&cards, Style::default(), &mut context, 0, false);
+        let rendered = rendered_lines(&lines).join("\n");
+
+        assert!(rendered.contains("[ 🧰 Acknowledge ]"));
+        assert!(rendered.contains("[ ✔️ Close ]"));
+        assert!(!rendered.contains("button"));
+        assert_eq!(
+            lines.len(),
+            card_collection_line_count(&cards, 90, ConversationPresentation::Flat),
+            "line-count mirror must include the actions row"
+        );
+    }
+
     // Media above the auto-download limit whose bytes are not cached must show
     // a "Retrieve media" action and register a clickable hit carrying the
     // media payload, instead of pretending a preview exists.
@@ -6012,7 +6110,15 @@ mod tests {
             thread_unread: &thread_unread,
         };
 
-        let lines = media_card_lines("image", &media, Style::default(), &mut context, 0, false, true);
+        let lines = media_card_lines(
+            "image",
+            &media,
+            Style::default(),
+            &mut context,
+            0,
+            false,
+            true,
+        );
         let rendered = rendered_lines(&lines).join("\n");
 
         assert!(

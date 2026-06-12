@@ -1252,6 +1252,12 @@ struct StoredCard {
     accent_color: Option<String>,
     fields: Vec<StoredCardField>,
     actions: Vec<StoredCardAction>,
+    // Optional with defaults so card rows persisted before media support
+    // still rehydrate (as image-less cards).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<StoredCardMedia>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thumbnail: Option<StoredCardMedia>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -1265,6 +1271,56 @@ struct StoredCardField {
 struct StoredCardAction {
     label: String,
     url: Option<String>,
+}
+
+/// Persisted form of a card's `image`/`thumbnail` media so previews (and the
+/// on-demand retrieve affordance) survive a restart instead of being dropped
+/// on rehydration.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredCardMedia {
+    id: String,
+    file_name: String,
+    mime_type: String,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    local_path: Option<String>,
+    #[serde(default)]
+    thumbnail: Option<String>,
+}
+
+impl StoredCardMedia {
+    fn from_media(media: &Media) -> Self {
+        Self {
+            id: media.id.to_string(),
+            file_name: media.file_name.to_string(),
+            mime_type: media.mime_type.to_string(),
+            size_bytes: media.size_bytes,
+            caption: media.caption.as_ref().map(ToString::to_string),
+            local_path: media
+                .local_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            thumbnail: media
+                .thumbnail
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn into_media(self) -> Media {
+        Media {
+            id: arc_str(self.id),
+            file_name: arc_str(self.file_name),
+            mime_type: arc_str(self.mime_type),
+            size_bytes: self.size_bytes,
+            caption: self.caption.map(arc_str),
+            local_path: self.local_path.map(PathBuf::from),
+            thumbnail: self.thumbnail.map(PathBuf::from),
+        }
+    }
 }
 
 impl StoredCards {
@@ -1307,6 +1363,8 @@ impl StoredCard {
                     url: action.url.as_ref().map(ToString::to_string),
                 })
                 .collect(),
+            image: card.image.as_ref().map(StoredCardMedia::from_media),
+            thumbnail: card.thumbnail.as_ref().map(StoredCardMedia::from_media),
         }
     }
 
@@ -1320,8 +1378,8 @@ impl StoredCard {
             footer: self.footer.map(arc_str),
             url: self.url.map(arc_str),
             accent_color: self.accent_color.map(card_color_from_str),
-            thumbnail: None,
-            image: None,
+            thumbnail: self.thumbnail.map(StoredCardMedia::into_media),
+            image: self.image.map(StoredCardMedia::into_media),
             fields: self
                 .fields
                 .into_iter()

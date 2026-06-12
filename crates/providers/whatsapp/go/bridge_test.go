@@ -148,3 +148,44 @@ func TestConversationActivitySkipsNonDisplayableMessages(t *testing.T) {
 		t.Fatalf("expected preview from displayable message, got %q", gotPreview)
 	}
 }
+
+func TestDisplayableMessageUnwrapsEphemeralText(t *testing.T) {
+	message := &waProto.Message{
+		EphemeralMessage: &waProto.FutureProofMessage{
+			Message: &waProto.Message{
+				ExtendedTextMessage: &waProto.ExtendedTextMessage{Text: proto.String("visible text")},
+			},
+		},
+	}
+
+	if text := messageText(message); text != "visible text" {
+		t.Fatalf("expected wrapped text to be visible, got %q", text)
+	}
+}
+
+func TestDisplayableMessageUnwrapsViewOncePhoto(t *testing.T) {
+	message := &waProto.Message{
+		ViewOnceMessageV2: &waProto.FutureProofMessage{
+			Message: &waProto.Message{
+				ImageMessage: &waProto.ImageMessage{
+					Mimetype:   proto.String("image/jpeg"),
+					Caption:    proto.String("photo caption"),
+					DirectPath: proto.String("/v/t62/photo.enc"),
+				},
+			},
+		},
+	}
+	event := bridgeEvent{Text: messageText(message)}
+
+	applyMedia(nil, "photo-1", message, &event)
+
+	if event.ContentType != "image" {
+		t.Fatalf("expected wrapped photo content type, got %q", event.ContentType)
+	}
+	if event.Text != "photo caption" {
+		t.Fatalf("expected wrapped photo caption, got %q", event.Text)
+	}
+	if event.MediaID == "" {
+		t.Fatal("expected wrapped photo to receive a media id")
+	}
+}

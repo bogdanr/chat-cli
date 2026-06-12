@@ -10,12 +10,15 @@ members = [
     "crates/mcp",
     "crates/notify",
 ]
+# The crates.io publish stub shares the `chat-cli` package name and must not be
+# part of the workspace build/test graph.
+exclude = ["packaging/crates-io"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 license = "GPL-3.0-only"
-repository = ""
+repository = "https://github.com/bogdanr/chat-cli"
 
 [workspace.dependencies]
 anyhow = "1"

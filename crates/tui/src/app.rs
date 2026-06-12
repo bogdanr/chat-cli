@@ -1720,7 +1720,8 @@ impl SettingsItem {
                 false
             }
             Self::ThreadMarkers => {
-                settings.thread_marker_scope = next_thread_marker_scope(settings.thread_marker_scope);
+                settings.thread_marker_scope =
+                    next_thread_marker_scope(settings.thread_marker_scope);
                 false
             }
             Self::ShowMutedChats => {
@@ -10221,7 +10222,11 @@ impl App {
             .flatten();
         let selected = selected_root
             .as_ref()
-            .and_then(|root| summaries.iter().position(|summary| summary.root_id == *root))
+            .and_then(|root| {
+                summaries
+                    .iter()
+                    .position(|summary| summary.root_id == *root)
+            })
             .map(|index| (index + 1) % summaries.len())
             .unwrap_or(0);
         let entry = ThreadInboxEntry {
@@ -10804,7 +10809,10 @@ impl App {
                 message.account, message.chat_id, root, unread
             ),
         );
-        let participation = self.store.thread_participation(&message.account, &root).await?;
+        let participation = self
+            .store
+            .thread_participation(&message.account, &root)
+            .await?;
         if self
             .state
             .selected_chat()
@@ -17775,7 +17783,10 @@ mod tests {
         }
         drain_async_app_work(&mut app).await?;
 
-        assert_eq!(app.store.thread_unread_count(&account_id, &my_root).await?, 1);
+        assert_eq!(
+            app.store.thread_unread_count(&account_id, &my_root).await?,
+            1
+        );
         assert_eq!(
             app.store
                 .thread_unread_count(&account_id, &other_root)
@@ -17923,10 +17934,25 @@ mod tests {
             Some(new_root.as_ref())
         );
         assert_eq!(app.state.focus, FocusPane::Details);
-        assert_eq!(app.store.thread_unread_count(&account_id, &new_root).await?, 1);
+        assert_eq!(
+            app.store
+                .thread_unread_count(&account_id, &new_root)
+                .await?,
+            1
+        );
         app.flush_pending_thread_read().await?;
-        assert_eq!(app.store.thread_unread_count(&account_id, &new_root).await?, 0);
-        assert_eq!(app.store.thread_unread_count(&account_id, &old_root).await?, 1);
+        assert_eq!(
+            app.store
+                .thread_unread_count(&account_id, &new_root)
+                .await?,
+            0
+        );
+        assert_eq!(
+            app.store
+                .thread_unread_count(&account_id, &old_root)
+                .await?,
+            1
+        );
 
         app.state.focus = FocusPane::ChatList;
         app.handle_event(AppEvent::Key(key(KeyCode::Char('t'), KeyModifiers::NONE)))
@@ -17935,7 +17961,12 @@ mod tests {
             app.state.thread_root.as_ref().map(|id| id.as_ref()),
             Some(old_root.as_ref())
         );
-        assert_eq!(app.store.thread_unread_count(&account_id, &old_root).await?, 0);
+        assert_eq!(
+            app.store
+                .thread_unread_count(&account_id, &old_root)
+                .await?,
+            0
+        );
 
         Ok(())
     }
@@ -18017,7 +18048,7 @@ mod tests {
                         &app.state.thread_unread_other_by_chat,
                         app.settings.thread_marker_scope,
                     ) == Some(background_index))
-                        .then_some((column, row))
+                    .then_some((column, row))
                 })
             })
             .expect("background chat thread marker should be hit-testable");

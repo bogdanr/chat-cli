@@ -1129,7 +1129,6 @@ fn use_recent_activity_fallback(
         && !visible_chat_indices.iter().any(|chat_index| {
             let chat = &chats[*chat_index];
             chat.membership != ChatMembership::NotJoined
-                && !(chat.muted && chat.unread_count == 0)
                 && matches!(
                     activity_date_section(chat, false, false),
                     Some("Today" | "Yesterday")
@@ -1153,11 +1152,11 @@ fn activity_first_chat_section(chat: &Chat, use_recent_fallback: bool) -> &'stat
     if chat.membership == ChatMembership::NotJoined {
         return "Browse Channels";
     }
-    if chat.muted && chat.unread_count == 0 {
-        return "Muted";
-    }
     if let Some(section) = activity_date_section(chat, true, use_recent_fallback) {
         return section;
+    }
+    if chat.muted && chat.unread_count == 0 {
+        return "Muted";
     }
     type_browse_section(chat)
 }
@@ -1166,11 +1165,11 @@ fn people_first_chat_section(chat: &Chat) -> &'static str {
     if chat.membership == ChatMembership::NotJoined {
         return "Browse Channels";
     }
-    if chat.muted && chat.unread_count == 0 {
-        return "Muted";
-    }
     if let Some(section) = activity_date_section(chat, false, false) {
         return section;
+    }
+    if chat.muted && chat.unread_count == 0 {
+        return "Muted";
     }
     if is_direct_chat(chat) {
         "People"
@@ -1183,11 +1182,11 @@ fn groups_first_chat_section(chat: &Chat) -> &'static str {
     if chat.membership == ChatMembership::NotJoined {
         return "Browse Channels";
     }
-    if chat.muted && chat.unread_count == 0 {
-        return "Muted";
-    }
     if let Some(section) = activity_date_section(chat, false, false) {
         return section;
+    }
+    if chat.muted && chat.unread_count == 0 {
+        return "Muted";
     }
     if is_shared_space(chat) {
         "Groups & Channels"
@@ -1960,6 +1959,103 @@ mod tests {
                 ChatListRow::Chat { chat_index: 2 },
             ]
         );
+    }
+
+    #[test]
+    fn recent_muted_chats_stay_in_activity_sections() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].pinned = false;
+        chats[0].unread_count = 0;
+        chats[0].muted = true;
+        chats[0].last_message_at = Some(now);
+        chats[1].muted = true;
+        chats[1].last_message_at = Some(now - Duration::days(1));
+        chats[4].muted = true;
+        chats[4].last_message_at = Some(now - Duration::days(8));
+
+        let rows = build_rows(&chats, &[0, 1, 4], ChatInboxStyle::ActivityFirst);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Section {
+                    title: "Today".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Section {
+                    title: "Yesterday".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 1 },
+                ChatListRow::Section {
+                    title: "Muted".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 4 },
+            ]
+        );
+    }
+
+    #[test]
+    fn muted_recent_activity_prevents_recent_fallback() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].pinned = false;
+        chats[0].unread_count = 0;
+        chats[0].muted = true;
+        chats[0].last_message_at = Some(now);
+        chats[1].last_message_at = Some(now - Duration::days(3));
+
+        let rows = build_rows(&chats, &[0, 1], ChatInboxStyle::ActivityFirst);
+
+        assert_eq!(
+            rows,
+            vec![
+                ChatListRow::Section {
+                    title: "Today".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 0 },
+                ChatListRow::Section {
+                    title: "Earlier This Week".to_owned()
+                },
+                ChatListRow::Chat { chat_index: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn people_and_groups_first_keep_recent_muted_chats_in_activity_sections() {
+        let mut chats = sample_chats();
+        let now = Utc::now();
+        chats[0].pinned = false;
+        chats[0].unread_count = 0;
+        chats[0].muted = true;
+        chats[0].last_message_at = Some(now);
+        chats[1].muted = true;
+        chats[1].last_message_at = Some(now - Duration::days(1));
+        chats[4].muted = true;
+        chats[4].last_message_at = Some(now - Duration::days(8));
+
+        for inbox_style in [ChatInboxStyle::PeopleFirst, ChatInboxStyle::GroupsFirst] {
+            let rows = build_rows(&chats, &[0, 1, 4], inbox_style);
+
+            assert_eq!(
+                rows,
+                vec![
+                    ChatListRow::Section {
+                        title: "Today".to_owned()
+                    },
+                    ChatListRow::Chat { chat_index: 0 },
+                    ChatListRow::Section {
+                        title: "Yesterday".to_owned()
+                    },
+                    ChatListRow::Chat { chat_index: 1 },
+                    ChatListRow::Section {
+                        title: "Muted".to_owned()
+                    },
+                    ChatListRow::Chat { chat_index: 4 },
+                ]
+            );
+        }
     }
 
     #[test]

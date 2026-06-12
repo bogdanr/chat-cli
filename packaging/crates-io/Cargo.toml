@@ -1,0 +1,55 @@
+# This package is intentionally NOT a workspace member. It is a lightweight
+# stub whose only job is to exist on crates.io so that `cargo binstall chat-cli`
+# can resolve a version and read the binstall metadata below, then download the
+# prebuilt binary from the matching GitHub Release. It is never compiled by end
+# users and carries none of the real application's dependencies.
+#
+# The `version` is overwritten from the git tag by the release workflow before
+# publishing; the value committed here is only a placeholder.
+
+[package]
+name = "chat-cli"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Your chats, in the terminal. A fast, keyboard-first TUI inbox for WhatsApp and Slack."
+repository = "https://github.com/bogdanr/chat-cli"
+homepage = "https://github.com/bogdanr/chat-cli"
+readme = "README.md"
+keywords = ["chat", "slack", "whatsapp", "tui", "messaging"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "chat-cli"
+path = "src/main.rs"
+
+# cargo-binstall reads these URLs from the published crate, then downloads the
+# matching GitHub Release asset. Asset names MUST stay in sync with
+# `.github/workflows/release.yml`. Release tags are `vX.Y.Z`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target-arch }-{ target-family }.{ archive-suffix }"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/chat-cli-x86_64-linux-gnu.tar.gz"
+bin-dir = "chat-cli-x86_64-linux-gnu/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-musl]
+pkg-url = "{ repo }/releases/download/v{ version }/chat-cli-x86_64-linux-musl.tar.gz"
+bin-dir = "chat-cli-x86_64-linux-musl/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/chat-cli-aarch64-macos.tar.gz"
+bin-dir = "chat-cli-aarch64-macos/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/chat-cli-x86_64-macos.tar.gz"
+bin-dir = "chat-cli-x86_64-macos/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/chat-cli-x86_64-windows.zip"
+bin-dir = "chat-cli-x86_64-windows/{ bin }{ binary-ext }"
+pkg-fmt = "zip"

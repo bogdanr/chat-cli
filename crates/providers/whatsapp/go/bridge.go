@@ -1022,8 +1022,38 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 	emit(bridgeEvent{Type: "sync", Progress: 100})
 }
 
+func displayableMessage(message *waProto.Message) *waProto.Message {
+	for message != nil {
+		switch {
+		case message.GetEphemeralMessage() != nil:
+			message = message.GetEphemeralMessage().GetMessage()
+		case message.GetViewOnceMessage() != nil:
+			message = message.GetViewOnceMessage().GetMessage()
+		case message.GetViewOnceMessageV2() != nil:
+			message = message.GetViewOnceMessageV2().GetMessage()
+		case message.GetViewOnceMessageV2Extension() != nil:
+			message = message.GetViewOnceMessageV2Extension().GetMessage()
+		case message.GetDocumentWithCaptionMessage() != nil:
+			message = message.GetDocumentWithCaptionMessage().GetMessage()
+		case message.GetLottieStickerMessage() != nil:
+			message = message.GetLottieStickerMessage().GetMessage()
+		case message.GetDeviceSentMessage() != nil:
+			message = message.GetDeviceSentMessage().GetMessage()
+		case message.GetEditedMessage() != nil:
+			message = message.GetEditedMessage().GetMessage()
+		default:
+			return message
+		}
+	}
+	return nil
+}
+
 func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	if message == nil {
+		return
+	}
+	messagePayload := displayableMessage(message.Message)
+	if messagePayload == nil {
 		return
 	}
 	ctx := context.Background()
@@ -1053,13 +1083,13 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	if c != nil {
 		ownJID = c.ownJID()
 	}
-	mentionsMe := !message.Info.IsFromMe && messageMentionsUser(message.Message, ownJID)
+	mentionsMe := !message.Info.IsFromMe && messageMentionsUser(messagePayload, ownJID)
 
-	if reaction := message.Message.GetReactionMessage(); reaction != nil {
+	if reaction := messagePayload.GetReactionMessage(); reaction != nil {
 		emitReactionMessageEvent(c, message, reaction, chatJID, chatName, senderName, isGroup)
 		return
 	}
-	if message.Message.GetEncReactionMessage() != nil {
+	if messagePayload.GetEncReactionMessage() != nil {
 		if c != nil && c.wa != nil {
 			reaction, err := c.wa.DecryptReaction(ctx, message)
 			if err == nil && reaction != nil {
@@ -1068,7 +1098,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		}
 		return
 	}
-	if message.Message.GetPollUpdateMessage() != nil {
+	if messagePayload.GetPollUpdateMessage() != nil {
 		if c != nil && c.wa != nil {
 			vote, err := c.wa.DecryptPollVote(ctx, message)
 			if err == nil && vote != nil {
@@ -1088,7 +1118,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		ChatName:   chatName,
 		SenderJID:  canonicalSenderJID.String(),
 		SenderName: senderName,
-		Text:       messageText(message.Message),
+		Text:       messageText(messagePayload),
 		Timestamp:  message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
 		FromMe:     message.Info.IsFromMe,
 		MentionsMe: mentionsMe,
@@ -1100,7 +1130,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		event.CanonicalJID = canonicalChatAlias.canonical.String()
 		event.AltJID = canonicalChatAlias.alternate.String()
 	}
-	if poll := pollCreation(message.Message); poll != nil {
+	if poll := pollCreation(messagePayload); poll != nil {
 		event.ContentType = "poll"
 		event.PollQuestion = poll.GetName()
 		event.Text = poll.GetName()
@@ -1113,7 +1143,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 			}
 		}
 	} else {
-		applyMedia(c, message.Info.ID, message.Message, &event)
+		applyMedia(c, message.Info.ID, messagePayload, &event)
 	}
 	if shouldSkipUnsupportedDisplayMessage(event) {
 		return
@@ -1604,6 +1634,7 @@ func (c *client) downloadProfilePicture(ctx context.Context, jid, pictureID, url
 }
 
 func pollCreation(message *waProto.Message) *waProto.PollCreationMessage {
+	message = displayableMessage(message)
 	if message == nil {
 		return nil
 	}
@@ -1846,6 +1877,7 @@ func outboundMediaMessage(contentType string, upload whatsmeow.UploadResponse, m
 }
 
 func applyMedia(c *client, messageID string, message *waProto.Message, event *bridgeEvent) {
+	message = displayableMessage(message)
 	if message == nil || event == nil {
 		return
 	}
@@ -2030,6 +2062,7 @@ func whatsappCacheRoot() string {
 // messageMentionedJID returns the list of JIDs mentioned in the message via the
 // protocol ContextInfo, across the common message variants that carry it.
 func messageMentionedJID(message *waProto.Message) []string {
+	message = displayableMessage(message)
 	if message == nil {
 		return nil
 	}
@@ -2088,23 +2121,24 @@ func conversationActivity(messages []*events.Message, lastMsgTimestamp uint64) (
 	var newest time.Time
 	preview := ""
 	for _, message := range messages {
-		if message == nil || message.Message == nil {
+		if message == nil || displayableMessage(message.Message) == nil {
 			continue
 		}
-		if message.Message.GetReactionMessage() != nil ||
-			message.Message.GetEncReactionMessage() != nil ||
-			message.Message.GetPollUpdateMessage() != nil ||
-			message.Message.GetProtocolMessage() != nil {
+		payload := displayableMessage(message.Message)
+		if payload.GetReactionMessage() != nil ||
+			payload.GetEncReactionMessage() != nil ||
+			payload.GetPollUpdateMessage() != nil ||
+			payload.GetProtocolMessage() != nil {
 			continue
 		}
 		if !message.Info.Timestamp.After(newest) {
 			continue
 		}
-		text := messageText(message.Message)
+		text := messageText(payload)
 		if text == "[unsupported WhatsApp message]" {
 			continue
 		}
-		if text == "" && message.Message.GetImageMessage() != nil {
+		if text == "" && payload.GetImageMessage() != nil {
 			text = "[image]"
 		}
 		newest = message.Info.Timestamp
@@ -2117,6 +2151,7 @@ func conversationActivity(messages []*events.Message, lastMsgTimestamp uint64) (
 }
 
 func messageText(message *waProto.Message) string {
+	message = displayableMessage(message)
 	if message == nil {
 		return ""
 	}

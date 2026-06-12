@@ -4,6 +4,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Your chats, in the terminal. A fast, keyboard-first TUI inbox for WhatsApp and Slack."
+
+# NOTE: This crate is the real application and is NOT published to crates.io
+# (it has path dependencies). The crates.io entry that powers `cargo binstall`
+# is the lightweight stub in `packaging/crates-io/`, which carries the
+# `[package.metadata.binstall]` configuration and is published automatically by
+# `.github/workflows/release.yml` on every `v*` tag.
 
 [dependencies]
 anyhow.workspace = true

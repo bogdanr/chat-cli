@@ -10,6 +10,7 @@ WhatsApp and Slack in one tidy inbox — no browser tabs, no clutter, no waiting
 
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
+[![Crates.io](https://img.shields.io/crates/v/chat-cli)](https://crates.io/crates/chat-cli)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-lightgrey)
 
 </div>
@@ -34,7 +35,8 @@ If you live in the terminal, it should feel like it belongs there.
 
 ## Install
 
-Grab a prebuilt binary, make it executable, and run it.
+Grab a prebuilt binary from the [releases page](https://github.com/bogdanr/chat-cli/releases),
+make it executable, and run it. No toolchain, no build step.
 
 ```bash
 # Move the downloaded binary onto your PATH
@@ -45,7 +47,12 @@ sudo mv chat-cli /usr/local/bin/
 chat-cli
 ```
 
-That's it. No toolchain, no build step.
+Already have the Rust toolchain? [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall)
+fetches the same prebuilt binary for you (still no compiling):
+
+```bash
+cargo binstall chat-cli
+```
 
 ---
 
