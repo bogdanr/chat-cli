@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use notify_rust::{Notification, Timeout};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,8 +99,15 @@ fn notify_send_args(notification: &MessageNotification) -> Vec<String> {
 }
 
 fn send_via_notify_send(notification: &MessageNotification) -> Result<()> {
+    // Detach the child from the parent's stdio. libnotify prints failures such
+    // as "Failed to show notification: Error calling StartServiceByName ..."
+    // to stderr, and an inherited descriptor would land that text in the
+    // middle of the TUI's alternate screen, corrupting it.
     let status = Command::new("notify-send")
         .args(notify_send_args(notification))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("spawning notify-send")?;
     if status.success() {

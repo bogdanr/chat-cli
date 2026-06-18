@@ -255,6 +255,159 @@ pub struct Sender {
     pub avatar: Option<PathBuf>,
 }
 
+/// A participant's authority within a group/channel. Only some platforms
+/// expose this (e.g. WhatsApp group admins/owners); platforms without a
+/// per-member role concept always report [`ChatMemberRole::Member`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ChatMemberRole {
+    /// An ordinary participant with no elevated privileges.
+    #[default]
+    Member,
+    /// A group administrator.
+    Admin,
+    /// The group owner / creator (WhatsApp "super admin").
+    Owner,
+}
+
+impl ChatMemberRole {
+    /// Whether this role carries any administrative authority.
+    pub fn is_admin(self) -> bool {
+        matches!(self, Self::Admin | Self::Owner)
+    }
+
+    /// Short label for UI badges; empty for an ordinary member.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Member => "",
+            Self::Admin => "admin",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+/// A member of a group/channel: the underlying [`Sender`] identity plus the
+/// member's [`ChatMemberRole`] when the provider can report it.
+#[derive(Clone, Debug)]
+pub struct ChatMember {
+    pub sender: Sender,
+    pub role: ChatMemberRole,
+}
+
+impl ChatMember {
+    /// A plain member with no elevated role.
+    pub fn new(sender: Sender) -> Self {
+        Self {
+            sender,
+            role: ChatMemberRole::Member,
+        }
+    }
+
+    /// A member with an explicit role.
+    pub fn with_role(sender: Sender, role: ChatMemberRole) -> Self {
+        Self { sender, role }
+    }
+}
+
+/// Optional, provider-sourced metadata about a conversation used to enrich the
+/// details pane. Every field is optional so each provider populates only what
+/// it can supply; unknown fields render nothing. Loaded on demand (per chat
+/// selection) rather than carried on every [`Chat`] update.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChatDetails {
+    /// Group/channel description, topic, or purpose text.
+    pub description: Option<Arc<str>>,
+    /// When the conversation was created, when the provider reports it.
+    pub created_at: Option<Timestamp>,
+    /// Display name of the creator/owner, already resolved by the provider.
+    pub creator: Option<Arc<str>>,
+    /// Total participant count when known (may exceed the rendered roster).
+    pub member_count: Option<u32>,
+    /// Number of admins/owners when the provider distinguishes them.
+    pub admin_count: Option<u32>,
+    /// Workspace/team name (Slack) the conversation belongs to.
+    pub workspace: Option<Arc<str>>,
+    /// The conversation is archived/inactive.
+    pub is_archived: bool,
+    /// The conversation is shared with an external org/workspace.
+    pub is_externally_shared: bool,
+    /// Only admins may post (WhatsApp announcement groups).
+    pub only_admins_can_send: bool,
+    /// Only admins may edit group info (WhatsApp locked groups).
+    pub only_admins_can_edit: bool,
+    /// Disappearing-message timer in seconds, when enabled.
+    pub disappearing_seconds: Option<u32>,
+    /// Ordered platform-specific labeled facts for anything not modeled above.
+    pub facts: Vec<(Arc<str>, Arc<str>)>,
+}
+
+impl ChatDetails {
+    /// Whether any field carries displayable information.
+    pub fn is_empty(&self) -> bool {
+        self.description.is_none()
+            && self.created_at.is_none()
+            && self.creator.is_none()
+            && self.member_count.is_none()
+            && self.admin_count.is_none()
+            && self.workspace.is_none()
+            && !self.is_archived
+            && !self.is_externally_shared
+            && !self.only_admins_can_send
+            && !self.only_admins_can_edit
+            && self.disappearing_seconds.is_none()
+            && self.facts.is_empty()
+    }
+}
+
+/// Optional, provider-sourced profile detail for a single user/contact used to
+/// enrich the details pane. Every field is optional and loaded on demand.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContactProfile {
+    /// Best display name the provider can offer.
+    pub display_name: Option<Arc<str>>,
+    /// Platform handle (for example Slack `@name`).
+    pub handle: Option<Arc<str>>,
+    /// Job title / role text (Slack profile title).
+    pub title: Option<Arc<str>>,
+    /// Current status line (emoji + text), already combined for display.
+    pub status: Option<Arc<str>>,
+    /// Free-form "about"/bio text (WhatsApp about, etc.).
+    pub about: Option<Arc<str>>,
+    /// Phone number when exposed by the provider.
+    pub phone: Option<Arc<str>>,
+    /// Email address when exposed by the provider.
+    pub email: Option<Arc<str>>,
+    /// Timezone identifier or human label.
+    pub timezone: Option<Arc<str>>,
+    /// Pre-rendered current local time for the contact, when computable.
+    pub local_time: Option<Arc<str>>,
+    /// The account is a bot/app rather than a human.
+    pub is_bot: bool,
+    /// The contact is a business account.
+    pub is_business: bool,
+    /// The account is deactivated/deleted.
+    pub is_deactivated: bool,
+    /// Ordered platform-specific labeled facts for anything not modeled above.
+    pub facts: Vec<(Arc<str>, Arc<str>)>,
+}
+
+impl ContactProfile {
+    /// Whether any field beyond a bare display name carries information.
+    pub fn has_detail(&self) -> bool {
+        self.handle.is_some()
+            || self.title.is_some()
+            || self.status.is_some()
+            || self.about.is_some()
+            || self.phone.is_some()
+            || self.email.is_some()
+            || self.timezone.is_some()
+            || self.local_time.is_some()
+            || self.is_bot
+            || self.is_business
+            || self.is_deactivated
+            || !self.facts.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Content {
     Text(Arc<str>),

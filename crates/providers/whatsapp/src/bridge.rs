@@ -53,6 +53,7 @@ unsafe extern "C" {
         messages_json: *const c_char,
     ) -> *mut c_char;
     fn C_SearchContacts(client_id: u64, query: *const c_char, limit: i32) -> *mut c_char;
+    fn C_GroupMembers(client_id: u64, chat_jid: *const c_char) -> *mut c_char;
     fn C_FireSyntheticMessage(message: *const c_char) -> u8;
     fn C_FreeString(value: *mut c_char);
     fn C_Disconnect(client_id: u64);
@@ -205,6 +206,14 @@ pub fn search_contacts(handle: ClientHandle, query: &str, limit: usize) -> anyho
     let query = CString::new(query)?;
     let limit = limit.min(i32::MAX as usize) as i32;
     let response = unsafe { C_SearchContacts(handle, query.as_ptr(), limit) };
+    take_c_string(response)
+}
+
+/// Lists the participants of a WhatsApp group, including each member's admin
+/// authority, as a JSON `group_members` bridge event.
+pub fn group_members(handle: ClientHandle, chat_jid: &str) -> anyhow::Result<String> {
+    let chat_jid = CString::new(chat_jid)?;
+    let response = unsafe { C_GroupMembers(handle, chat_jid.as_ptr()) };
     take_c_string(response)
 }
 

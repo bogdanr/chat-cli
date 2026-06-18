@@ -61,6 +61,16 @@ type bridgeContact struct {
 	AvatarPath string `json:"avatar_path,omitempty"`
 }
 
+// bridgeMember describes one participant of a WhatsApp group, including the
+// participant's admin authority so the UI can badge owners/admins.
+type bridgeMember struct {
+	JID          string `json:"jid"`
+	Name         string `json:"name"`
+	AvatarPath   string `json:"avatar_path,omitempty"`
+	IsAdmin      bool   `json:"is_admin,omitempty"`
+	IsSuperAdmin bool   `json:"is_super_admin,omitempty"`
+}
+
 type bridgeEvent struct {
 	Type         string `json:"type"`
 	Event        string `json:"event,omitempty"`
@@ -106,6 +116,14 @@ type bridgeEvent struct {
 	PollVoteMessageID     string           `json:"poll_vote_message_id,omitempty"`
 	PollVoteOptions       []string         `json:"poll_vote_options,omitempty"`
 	Contacts              []bridgeContact  `json:"contacts,omitempty"`
+	Members               []bridgeMember   `json:"members,omitempty"`
+
+	GroupTopic                string `json:"group_topic,omitempty"`
+	GroupOwner                string `json:"group_owner,omitempty"`
+	GroupCreated              string `json:"group_created,omitempty"`
+	GroupOnlyAdminsSend       bool   `json:"group_only_admins_send,omitempty"`
+	GroupOnlyAdminsEdit       bool   `json:"group_only_admins_edit,omitempty"`
+	GroupDisappearingSeconds  uint32 `json:"group_disappearing_seconds,omitempty"`
 }
 
 var (
@@ -209,7 +227,12 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 
 	if wa.Store.ID != nil {
 		emit(bridgeEvent{Type: "connected", JID: wa.Store.ID.String()})
-		go c.fetchAndEmitProfile(context.Background(), *wa.Store.ID, "WhatsApp", false)
+		// Fetch the local user's own profile picture using the device-less JID.
+		// The raw store ID carries a device suffix (e.g. "...:74@s.whatsapp.net")
+		// which the profile-picture lookup does not resolve, leaving own messages
+		// without an avatar. Contact/member avatars already use device-less JIDs,
+		// so normalizing here makes the self avatar resolve like everyone else.
+		go c.fetchAndEmitProfile(context.Background(), wa.Store.ID.ToNonAD(), "WhatsApp", false)
 		go c.syncChatMuteSettings(context.Background())
 		go c.emitJoinedGroups(context.Background())
 		go c.emitContacts(context.Background())
@@ -652,6 +675,162 @@ func C_SearchContacts(clientID C.uint64_t, query *C.char, limit C.int) *C.char {
 	return cJSON(bridgeEvent{Type: "contact_search", Contacts: contacts})
 }
 
+// maxGroupMemberAvatars bounds how many participant profile pictures we resolve
+// over the network for a single group-member listing so very large groups do
+// not stall the request behind hundreds of sequential HTTP calls. Members past
+// this limit are still listed (name + role); the UI falls back to initials.
+const maxGroupMemberAvatars = 96
+
+//export C_GroupMembers
+func C_GroupMembers(clientID C.uint64_t, chatJID *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "unknown WhatsApp bridge client"})
+	}
+
+	chatRaw := C.GoString(chatJID)
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{Type: "group_members", ChatJID: chatRaw,
+			GroupTopic:   "Holiday planning",
+			GroupOwner:   "447700900123@s.whatsapp.net",
+			GroupCreated: "2021-06-01T10:00:00Z",
+			Members: []bridgeMember{
+				{JID: "447700900123@s.whatsapp.net", Name: "Alan Turing", IsSuperAdmin: true},
+				{JID: "447700900456@s.whatsapp.net", Name: "Katherine Johnson", IsAdmin: true},
+				{JID: "447700900789@s.whatsapp.net", Name: "Grace Hopper"},
+			}})
+	}
+	if c.wa == nil || !c.wa.IsConnected() {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	jid, err := types.ParseJID(chatRaw)
+	if err != nil || jid.IsEmpty() || jid.Server != types.GroupServer {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp group JID: %v", err)})
+	}
+
+	ctx := context.Background()
+	started := time.Now()
+	info, err := c.wa.GetGroupInfo(ctx, jid)
+	if err != nil || info == nil {
+		c.log("fetch WhatsApp group info failed chat=%s: %v", jid.String(), err)
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("fetch WhatsApp group info: %v", err)})
+	}
+
+	members := c.groupMembers(ctx, info)
+	c.log("listed WhatsApp group members chat=%s members=%d elapsed_ms=%d", jid.String(), len(members), time.Since(started).Milliseconds())
+	event := bridgeEvent{Type: "group_members", ChatJID: jid.String(), Members: members}
+	event.GroupTopic = strings.TrimSpace(info.Topic)
+	if !info.OwnerJID.IsEmpty() {
+		event.GroupOwner = canonicalJIDString(c, ctx, info.OwnerJID)
+	}
+	if !info.GroupCreated.IsZero() {
+		event.GroupCreated = info.GroupCreated.UTC().Format(time.RFC3339)
+	}
+	event.GroupOnlyAdminsSend = info.IsAnnounce
+	event.GroupOnlyAdminsEdit = info.IsLocked
+	if info.IsEphemeral {
+		event.GroupDisappearingSeconds = info.DisappearingTimer
+	}
+	return cJSON(event)
+}
+
+// groupMembers resolves display names, avatars and admin roles for every
+// participant of a group. Names come from the local contact store (with the
+// participant push/display name as a fallback) and avatars are resolved
+// best-effort up to maxGroupMemberAvatars.
+func (c *client) groupMembers(ctx context.Context, info *types.GroupInfo) []bridgeMember {
+	members := make([]bridgeMember, 0, len(info.Participants))
+	avatarsResolved := 0
+	for _, participant := range info.Participants {
+		primary := participant.JID
+		if primary.IsEmpty() {
+			primary = participant.LID
+		}
+		if primary.IsEmpty() {
+			continue
+		}
+		alternate := participant.PhoneNumber
+		if alternate.IsEmpty() {
+			alternate = participant.LID
+		}
+
+		name := participantName(c, ctx, primary, alternate, participant.DisplayName)
+		if strings.TrimSpace(name) == "" {
+			if !alternate.IsEmpty() {
+				name = alternate.User
+			} else {
+				name = primary.User
+			}
+		}
+
+		avatar := ""
+		if avatarsResolved < maxGroupMemberAvatars {
+			avatar = c.memberAvatarPath(ctx, primary, alternate)
+			if avatar != "" {
+				avatarsResolved++
+			}
+		}
+
+		members = append(members, bridgeMember{
+			JID:          canonicalJIDString(c, ctx, primary),
+			Name:         name,
+			AvatarPath:   avatar,
+			IsAdmin:      participant.IsAdmin || participant.IsSuperAdmin,
+			IsSuperAdmin: participant.IsSuperAdmin,
+		})
+	}
+
+	sort.SliceStable(members, func(i, j int) bool {
+		ri, rj := memberRank(members[i]), memberRank(members[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return strings.ToLower(members[i].Name) < strings.ToLower(members[j].Name)
+	})
+	return members
+}
+
+// memberRank orders owners before admins before ordinary members so the most
+// authoritative participants surface at the top of the list.
+func memberRank(member bridgeMember) int {
+	switch {
+	case member.IsSuperAdmin:
+		return 0
+	case member.IsAdmin:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// memberAvatarPath resolves a cached/downloaded profile-picture path for a
+// group participant. It prefers the phone-number identity when the primary JID
+// is a privacy @lid (those frequently have no directly fetchable picture).
+func (c *client) memberAvatarPath(ctx context.Context, primary, alternate types.JID) string {
+	if c == nil || c.wa == nil {
+		return ""
+	}
+	target := primary
+	if primary.Server == types.HiddenUserServer && !alternate.IsEmpty() {
+		target = alternate
+	}
+	if target.IsEmpty() {
+		return ""
+	}
+	info, err := c.wa.GetProfilePictureInfo(ctx, target, &whatsmeow.GetProfilePictureParams{Preview: true})
+	if err != nil || info == nil || info.URL == "" {
+		return ""
+	}
+	path, err := c.downloadProfilePicture(ctx, target.String(), info.ID, info.URL)
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
 type markReadEntry struct {
 	ID        string `json:"id"`
 	SenderJID string `json:"sender_jid"`
@@ -797,10 +976,18 @@ func canonicalJIDAlias(c *client, ctx context.Context, jid types.JID) jidAlias {
 	if c == nil || c.wa == nil || c.wa.Store == nil || jid.IsEmpty() || jid.Server == types.GroupServer {
 		return jidAlias{canonical: jid}
 	}
+	// Message-routing JIDs carry a device/agent suffix (e.g.
+	// "40721274801:42@s.whatsapp.net") that contact, profile and group-member
+	// JIDs never include. Strip it so a sender's identity matches the
+	// device-less JID used everywhere else (avatars, names, member lists);
+	// otherwise the same person shows up as two distinct identities and the
+	// message header avatar can never be resolved from the member list.
+	jid = jid.ToNonAD()
 	alt, err := c.wa.Store.GetAltJID(ctx, jid)
 	if err != nil || alt.IsEmpty() {
 		return jidAlias{canonical: jid}
 	}
+	alt = alt.ToNonAD()
 	canonical := chooseCanonicalJID(jid, alt)
 	alternate := alt
 	if canonical == alt {
@@ -1124,7 +1311,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		MentionsMe: mentionsMe,
 		IsGroup:    isGroup,
 		Muted:      boolPtr(chatMuted(c, ctx, chatJID)),
-		Reactions:  messageReactions(message),
+		Reactions:  messageReactions(c, ctx, message),
 	}
 	if !canonicalChatAlias.alternate.IsEmpty() && canonicalChatAlias.alternate != canonicalChatAlias.canonical {
 		event.CanonicalJID = canonicalChatAlias.canonical.String()
@@ -1222,7 +1409,7 @@ func emitPollVoteEvent(c *client, message *events.Message, vote *waProto.PollVot
 	})
 }
 
-func messageReactions(message *events.Message) []bridgeReaction {
+func messageReactions(c *client, ctx context.Context, message *events.Message) []bridgeReaction {
 	if message == nil || message.SourceWebMsg == nil {
 		return nil
 	}
@@ -1243,6 +1430,13 @@ func messageReactions(message *events.Message) []bridgeReaction {
 		sender := reactionSenderID(reaction.GetKey())
 		if sender == "" {
 			sender = message.Info.Sender.String()
+		}
+		// History-synced reactions carry the raw participant JID, which can be
+		// a LID or device-suffixed JID. Canonicalize it to the same device-less
+		// identity used for message senders and group members so the reactor
+		// resolves to a contact name instead of a raw phone number/JID.
+		if parsed, err := types.ParseJID(sender); err == nil && !parsed.IsEmpty() {
+			sender = canonicalJIDString(c, ctx, parsed)
 		}
 		if byEmoji[emoji] == nil {
 			byEmoji[emoji] = make(map[string]struct{})

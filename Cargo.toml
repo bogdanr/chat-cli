@@ -29,6 +29,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 directories = "6"
 flate2 = "1"
+libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png"] }
 notify-rust = "4"
 open = "5"

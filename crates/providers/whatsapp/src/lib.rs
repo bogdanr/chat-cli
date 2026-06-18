@@ -1,11 +1,12 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chat_core::{
-    Account, AuthChallenge, Chat, ChatId, ChatKind, ChatMembership, Content, DiscoveryAction,
-    DiscoveryCapabilities, DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message,
-    MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform,
-    PlatformData, PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent, ProviderId,
-    Reaction, Sender, Timestamp, WhatsAppData,
+    Account, AuthChallenge, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMemberRole,
+    ChatMembership, ContactProfile, Content, DiscoveryAction, DiscoveryCapabilities,
+    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message, MessageId,
+    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform, PlatformData,
+    PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent, ProviderId, Reaction, Sender,
+    Timestamp, WhatsAppData,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -436,6 +437,12 @@ impl Provider for WhatsAppProvider {
         if chat_jid.is_empty() {
             bail!("cannot send WhatsApp message to bridge/system chat")
         }
+        // whatsmeow rejects recipients that still carry a device/agent suffix
+        // (e.g. "<phone>:73@s.whatsapp.net" -> "message recipient must be a user
+        // JID with no device part"). Message-routing chat ids can retain that
+        // suffix, so normalize to the device-less identity before sending.
+        // Group JIDs have no device part, so this is a no-op for them.
+        let chat_jid = normalize_whatsapp_jid(&chat_jid);
 
         let raw_response = match &content {
             Content::Text(text) => self.bridge_call(NetworkActivityKind::Send, || {
@@ -855,6 +862,156 @@ impl Provider for WhatsAppProvider {
             .find(|message| message.sender.platform_id == *platform_id)
             .map(|message| message.sender.clone()))
     }
+
+    async fn chat_members(&self, chat_id: &ChatId) -> Result<Vec<ChatMember>> {
+        let chat_jid = whatsapp_jid_from_chat_id(chat_id);
+        if !chat_jid.contains("@g.us") {
+            bail!("WhatsApp member listing is only available for groups");
+        }
+
+        let handle = self.handle;
+        let bridge_jid = chat_jid.clone();
+        self.emit_network_activity(NetworkActivityDirection::Tx, NetworkActivityKind::Other);
+        let raw_response =
+            tokio::task::spawn_blocking(move || bridge::group_members(handle, &bridge_jid))
+                .await??;
+        if !raw_response.trim_start().starts_with('{') {
+            bail!("WhatsApp group member listing returned an invalid bridge response");
+        }
+        self.emit_network_activity(NetworkActivityDirection::Rx, NetworkActivityKind::Other);
+
+        let event = BridgeEvent::decode(&raw_response)?;
+        if event.kind == "error" {
+            bail!(
+                "{}",
+                event
+                    .message
+                    .unwrap_or_else(|| "WhatsApp group member listing failed".to_owned())
+            );
+        }
+
+        let mut members = Vec::with_capacity(event.members.len());
+        for member in event.members {
+            if member.jid.is_empty() {
+                continue;
+            }
+            let display_name = if member.name.trim().is_empty() {
+                sender_name_from_jid(&member.jid)
+            } else {
+                member.name.clone()
+            };
+            let sender = upsert_profile(
+                &self.profiles,
+                member.jid,
+                display_name,
+                member.avatar_path,
+            );
+            let role = if member.is_super_admin {
+                ChatMemberRole::Owner
+            } else if member.is_admin {
+                ChatMemberRole::Admin
+            } else {
+                ChatMemberRole::Member
+            };
+            members.push(ChatMember::with_role(sender, role));
+        }
+        Ok(members)
+    }
+
+    async fn chat_details(&self, chat_id: &ChatId) -> Result<ChatDetails> {
+        let chat_jid = whatsapp_jid_from_chat_id(chat_id);
+        if !chat_jid.contains("@g.us") {
+            return Ok(ChatDetails::default());
+        }
+
+        let handle = self.handle;
+        let bridge_jid = chat_jid.clone();
+        self.emit_network_activity(NetworkActivityDirection::Tx, NetworkActivityKind::Other);
+        let raw_response =
+            tokio::task::spawn_blocking(move || bridge::group_members(handle, &bridge_jid))
+                .await??;
+        if !raw_response.trim_start().starts_with('{') {
+            return Ok(ChatDetails::default());
+        }
+        self.emit_network_activity(NetworkActivityDirection::Rx, NetworkActivityKind::Other);
+
+        let event = BridgeEvent::decode(&raw_response)?;
+        if event.kind == "error" {
+            return Ok(ChatDetails::default());
+        }
+
+        let member_count = u32::try_from(event.members.len()).ok();
+        let admin_count = u32::try_from(
+            event
+                .members
+                .iter()
+                .filter(|member| member.is_admin || member.is_super_admin)
+                .count(),
+        )
+        .ok();
+        let description = event
+            .group_topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(arc_str);
+        let created_at = event
+            .group_created
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc));
+        let creator = event.group_owner.as_deref().and_then(|owner| {
+            let owner = owner.trim();
+            if owner.is_empty() {
+                return None;
+            }
+            let resolved = lock_rw_read(&self.profiles)
+                .get(owner)
+                .map(|sender| sender.display_name.clone());
+            Some(resolved.unwrap_or_else(|| arc_str(sender_name_from_jid(owner))))
+        });
+
+        Ok(ChatDetails {
+            description,
+            created_at,
+            creator,
+            member_count,
+            admin_count,
+            workspace: None,
+            is_archived: false,
+            is_externally_shared: false,
+            only_admins_can_send: event.group_only_admins_send,
+            only_admins_can_edit: event.group_only_admins_edit,
+            disappearing_seconds: event
+                .group_disappearing_seconds
+                .filter(|seconds| *seconds > 0),
+            facts: Vec::new(),
+        })
+    }
+
+    async fn contact_profile(
+        &self,
+        platform_id: &PlatformId,
+    ) -> Result<Option<ContactProfile>> {
+        let display_name = lock_rw_read(&self.profiles)
+            .get(platform_id)
+            .map(|sender| sender.display_name.clone())
+            .or_else(|| {
+                lock_rw_read(&self.messages)
+                    .iter()
+                    .find(|message| message.sender.platform_id == *platform_id)
+                    .map(|message| message.sender.display_name.clone())
+            });
+        let phone = whatsapp_phone_from_jid(platform_id);
+        if display_name.is_none() && phone.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(ContactProfile {
+            display_name,
+            phone,
+            ..ContactProfile::default()
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -876,6 +1033,18 @@ struct BridgeContact {
     jid: String,
     name: String,
     avatar_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct BridgeMember {
+    jid: String,
+    #[serde(default)]
+    name: String,
+    avatar_path: Option<PathBuf>,
+    #[serde(default)]
+    is_admin: bool,
+    #[serde(default)]
+    is_super_admin: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -932,6 +1101,16 @@ struct BridgeEvent {
     poll_vote_options: Vec<String>,
     #[serde(default)]
     contacts: Vec<BridgeContact>,
+    #[serde(default)]
+    members: Vec<BridgeMember>,
+    group_topic: Option<String>,
+    group_owner: Option<String>,
+    group_created: Option<String>,
+    #[serde(default)]
+    group_only_admins_send: bool,
+    #[serde(default)]
+    group_only_admins_edit: bool,
+    group_disappearing_seconds: Option<u32>,
 }
 
 impl BridgeEvent {
@@ -982,6 +1161,13 @@ impl BridgeEvent {
                 poll_vote_message_id: None,
                 poll_vote_options: Vec::new(),
                 contacts: Vec::new(),
+                members: Vec::new(),
+                group_topic: None,
+                group_owner: None,
+                group_created: None,
+                group_only_admins_send: false,
+                group_only_admins_edit: false,
+                group_disappearing_seconds: None,
             })
         }
     }
@@ -1174,14 +1360,14 @@ fn forward_message_event(
             context.next_message.fetch_add(1, Ordering::Relaxed)
         )
     }));
-    let sender_jid = event.sender_jid.clone().unwrap_or_else(|| {
+    let sender_jid = normalize_whatsapp_jid(&event.sender_jid.clone().unwrap_or_else(|| {
         if event.from_me {
             "me"
         } else {
             BRIDGE_SENDER_ID
         }
         .to_owned()
-    });
+    }));
     let sender_name = event
         .sender_name
         .clone()
@@ -1742,7 +1928,7 @@ fn reactions_from_event(event: &BridgeEvent) -> Vec<Reaction> {
                 .senders
                 .iter()
                 .filter(|sender| !sender.is_empty())
-                .map(arc_str)
+                .map(|sender| arc_str(normalize_whatsapp_jid(sender)))
                 .collect(),
         })
         .filter(|reaction| !reaction.senders.is_empty())
@@ -1773,6 +1959,7 @@ fn reaction_sender(event: &BridgeEvent) -> String {
         .sender_jid
         .clone()
         .filter(|sender| !sender.is_empty())
+        .map(|sender| normalize_whatsapp_jid(&sender))
         .unwrap_or_else(|| BRIDGE_SENDER_ID.to_owned())
 }
 
@@ -1888,6 +2075,39 @@ fn append_whatsapp_contact_result(
 
 fn sender_name_from_jid(jid: &str) -> String {
     jid.split('@').next().unwrap_or(jid).to_owned()
+}
+
+/// Extract a phone number from an individual WhatsApp JID
+/// (`<phone>@s.whatsapp.net`). Returns `None` for group, LID, or non-numeric
+/// JIDs where the user part is not a real phone number.
+fn whatsapp_phone_from_jid(jid: &str) -> Option<Arc<str>> {
+    let (user, server) = jid.split_once('@')?;
+    if server != "s.whatsapp.net" {
+        return None;
+    }
+    let digits = user.split(['.', ':']).next().unwrap_or(user);
+    if digits.is_empty() || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    Some(arc_str(format!("+{digits}")))
+}
+
+/// Normalizes a WhatsApp JID to its device-less (non-AD) form by stripping any
+/// `:<device>` suffix from the user part (e.g.
+/// `40721274801:42@s.whatsapp.net` -> `40721274801@s.whatsapp.net`).
+///
+/// Message-routing JIDs carry this device suffix while contact, profile and
+/// group-member JIDs never do. Without normalization the same person enters
+/// the app under two distinct `platform_id` identities, so a sender's avatar
+/// (known only under the device-less member/profile JID) can never be matched
+/// to their messages and the message-header avatar silently falls back to the
+/// initials placeholder.
+fn normalize_whatsapp_jid(jid: &str) -> String {
+    let Some((user, server)) = jid.split_once('@') else {
+        return jid.to_owned();
+    };
+    let user = user.split(':').next().unwrap_or(user);
+    format!("{user}@{server}")
 }
 
 fn chat_id_to_name(chat_id: &ChatId) -> Arc<str> {
@@ -2244,6 +2464,60 @@ mod tests {
                 return Ok(event);
             }
         }
+    }
+
+    #[test]
+    fn normalize_whatsapp_jid_strips_device_suffix() {
+        // Message-routing JIDs carry a `:<device>` suffix; contact, profile and
+        // group-member JIDs never do. Both must collapse to the same identity
+        // so a sender's avatar resolves from the member list.
+        assert_eq!(
+            normalize_whatsapp_jid("40721274801:42@s.whatsapp.net"),
+            "40721274801@s.whatsapp.net"
+        );
+        assert_eq!(
+            normalize_whatsapp_jid("34819417346247:42@lid"),
+            "34819417346247@lid"
+        );
+        // Already-canonical JIDs are unchanged.
+        assert_eq!(
+            normalize_whatsapp_jid("40721274801@s.whatsapp.net"),
+            "40721274801@s.whatsapp.net"
+        );
+        // Group JIDs (the user part contains a `-`, never a device) and bare
+        // identifiers without a server are left intact.
+        assert_eq!(
+            normalize_whatsapp_jid("40723372866-1607983561@g.us"),
+            "40723372866-1607983561@g.us"
+        );
+        assert_eq!(normalize_whatsapp_jid("me"), "me");
+    }
+
+    #[test]
+    fn reaction_senders_are_normalized_to_device_less_identity() {
+        // History-synced reactions can carry a device-suffixed participant JID.
+        // It must collapse to the same device-less identity used for message
+        // senders and group members so the reactor resolves to a contact name
+        // instead of a raw phone number.
+        let history = BridgeEvent::decode(
+            r#"{"type":"history","id":"reacted","chat_jid":"123@s.whatsapp.net","sender_jid":"123@s.whatsapp.net","text":"reacted","reactions":[{"emoji":"😂","senders":["40745211188:42@s.whatsapp.net"]}]}"#,
+        )
+        .expect("decode reacted history");
+        let reactions = reactions_from_event(&history);
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].senders.len(), 1);
+        assert_eq!(
+            reactions[0].senders[0].as_ref(),
+            "40745211188@s.whatsapp.net"
+        );
+
+        // Live reaction events expose the sender through `sender_jid`, which is
+        // normalized the same way.
+        let live = BridgeEvent::decode(
+            r#"{"type":"reaction","chat_jid":"123@s.whatsapp.net","reaction_message_id":"abc","reaction_emoji":"😂","sender_jid":"40745211188:42@s.whatsapp.net"}"#,
+        )
+        .expect("decode live reaction");
+        assert_eq!(reaction_sender(&live), "40745211188@s.whatsapp.net");
     }
 
     #[test]
@@ -2874,6 +3148,49 @@ mod tests {
                 .iter()
                 .any(|chat| chat.last_message_preview.as_deref() == Some("File: debug log"))
         );
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_send_normalizes_device_suffixed_recipient_jid() -> Result<()> {
+        // Regression: forwarding to a contact whose chat id retained a device
+        // suffix (e.g. "<phone>:73@s.whatsapp.net") previously reached whatsmeow
+        // with the device part and failed with "message recipient must be a user
+        // JID with no device part". The recipient must be normalized first.
+        let _guard = ffi_test_guard().await;
+        let dir = tempfile::tempdir()?;
+        let file_path = dir.path().join("photo.png");
+        fs::write(&file_path, b"png-bytes")?;
+        let provider = WhatsAppProvider::new("test:send-device-suffix")?;
+        provider.connect().await?;
+
+        let chat_id = arc_str("whatsapp:40723372866:73@s.whatsapp.net");
+        provider
+            .send(
+                &chat_id,
+                Content::Image(Media {
+                    id: arc_str("img-1"),
+                    file_name: arc_str("photo.png"),
+                    mime_type: arc_str("image/png"),
+                    size_bytes: Some(9),
+                    caption: None,
+                    local_path: Some(file_path.clone()),
+                    thumbnail: None,
+                }),
+                None,
+            )
+            .await?;
+
+        let history = provider.history(&chat_id, None, 1).await?;
+        assert_eq!(history.len(), 1);
+        let jid = history[0]
+            .platform_data
+            .whatsapp
+            .as_ref()
+            .map(|data| data.jid.as_ref());
+        assert_eq!(jid, Some("40723372866@s.whatsapp.net"));
 
         provider.disconnect().await?;
         Ok(())

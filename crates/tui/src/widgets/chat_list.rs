@@ -7,7 +7,7 @@ use chrono::{Local, NaiveDateTime, Utc};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState},
 };
@@ -18,7 +18,6 @@ use unicode_width::UnicodeWidthStr;
 const CHAT_ROW_HEIGHT: u16 = 2;
 const CHAT_META_WIDTH: usize = 6;
 const CHAT_RIGHT_PADDING: usize = 1;
-const SELECTED_CHAT_BG: Color = Color::Rgb(0, 48, 48);
 const OLDER_CHAT_DAYS: i64 = 365;
 pub const CHAT_AVATAR_WIDTH: u16 = 4;
 pub const CHAT_AVATAR_ROWS: u16 = CHAT_ROW_HEIGHT;
@@ -154,13 +153,16 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
     let list = List::new(items)
         .block(
             Block::default()
-                .title(title(
-                    props.filter,
-                    props.filter_mode,
-                    props.account_filter,
-                    props.visible_chat_indices.len(),
-                    props.inbox_style,
-                ))
+                .title(Line::from(Span::styled(
+                    title(
+                        props.filter,
+                        props.filter_mode,
+                        props.account_filter,
+                        props.visible_chat_indices.len(),
+                        props.inbox_style,
+                    ),
+                    props.theme.pane_title_for(props.focused),
+                )))
                 .borders(Borders::ALL)
                 .border_style(props.theme.focus_border(props.focused)),
         )
@@ -914,12 +916,16 @@ fn chat_item(
     let unread_marker = unread_marker(chat.unread_count);
     let pinned_marker = if chat.pinned { " [P]" } else { "" };
     let muted_marker = if chat.muted { " [M]" } else { "" };
-    let name_style = if has_unread {
+    let name_style = if selected {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else if has_unread {
         theme.unread()
     } else {
-        Style::default()
+        Style::default().fg(theme.subtle)
     };
-    let fallback_avatar = avatar_placeholder(chat, theme, selected.then_some(SELECTED_CHAT_BG));
+    let fallback_avatar = avatar_placeholder(chat, theme, None);
     let first_avatar_line = avatar_rows
         .and_then(|rows| rows.first().cloned())
         .unwrap_or_else(|| fallback_avatar[0].clone());
@@ -927,9 +933,11 @@ fn chat_item(
         .and_then(|rows| rows.get(1).cloned())
         .unwrap_or_else(|| fallback_avatar[1].clone());
 
-    let selected_bg = selected.then_some(SELECTED_CHAT_BG);
+    // The active chat is highlighted with an accent bar and accent-colored
+    // text rather than an opaque background fill.
+    let selected_bg: Option<Color> = None;
     let selected_message_style = if selected {
-        Style::default().fg(theme.accent).bg(SELECTED_CHAT_BG)
+        Style::default().fg(theme.accent)
     } else if has_unread {
         theme.unread()
     } else {
@@ -985,7 +993,7 @@ fn chat_item(
     ListItem::new(vec![
         Line::from({
             let mut spans = first_avatar_line;
-            spans.extend([styled_raw(" ", selected_bg)]);
+            spans.push(selection_separator(selected, theme));
             if let Some(badge_line) = first_badge_line.clone() {
                 spans.extend(badge_line);
             } else {
@@ -1005,7 +1013,7 @@ fn chat_item(
         }),
         Line::from({
             let mut spans = second_avatar_line;
-            spans.extend([styled_raw(" ", selected_bg)]);
+            spans.push(selection_separator(selected, theme));
             if !thread_marker.is_empty() {
                 let marker_style = if thread_marker_dim {
                     Style::default().fg(theme.muted)
@@ -1046,11 +1054,16 @@ fn older_chats_item(
     let label = format!("{indicator} Older chats · {count}");
     let effective_width = row_width.saturating_sub(CHAT_RIGHT_PADDING);
     let label = truncate_to_width(&label, effective_width);
-    let bg = selected.then_some(SELECTED_CHAT_BG);
-    let style = style_with_optional_bg(Style::default().fg(theme.accent), bg);
+    let style = if selected {
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.accent)
+    };
     ListItem::new(Line::from(vec![
         Span::styled(label, style),
-        styled_raw(" ".repeat(CHAT_RIGHT_PADDING), bg),
+        Span::raw(" ".repeat(CHAT_RIGHT_PADDING)),
     ]))
 }
 
@@ -1577,6 +1590,16 @@ fn style_with_optional_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
+/// The active chat is marked with a thin accent bar rather than an opaque
+/// background fill; unselected rows use a plain space to preserve alignment.
+fn selection_separator(selected: bool, theme: Theme) -> Span<'static> {
+    if selected {
+        Span::styled("▎", Style::default().fg(theme.accent))
+    } else {
+        Span::raw(" ")
+    }
+}
+
 fn styled_raw(
     value: impl Into<std::borrow::Cow<'static, str>>,
     bg: Option<Color>,
@@ -1630,13 +1653,16 @@ fn title(
     } else {
         format!(" · Account: {account_filter}")
     };
-    if filter_mode {
-        format!("Chats{style}{account} · Filter: {filter}")
+    let label = if filter_mode {
+        format!("Chats{style}{account} · [FILTER: {filter} · {visible_count} match · Esc clears]")
     } else if filter.is_empty() {
         format!("Chats{style}{account}")
     } else {
-        format!("Chats ({visible_count}){style}{account} · Filter: {filter}")
-    }
+        format!(
+            "Chats ({visible_count}){style}{account} · [FILTER: {filter} · {visible_count} match · Esc clears]"
+        )
+    };
+    crate::widgets::padded_title(label)
 }
 
 fn inbox_style_title(inbox_style: ChatInboxStyle) -> &'static str {
@@ -2458,12 +2484,12 @@ mod tests {
     #[test]
     fn whatsapp_avatar_placeholder_inherits_selected_row_background() {
         let chats = sample_chats();
-        let placeholder = avatar_placeholder(&chats[0], Theme::default(), Some(SELECTED_CHAT_BG));
+        let placeholder = avatar_placeholder(&chats[0], Theme::default(), Some(Theme::default().selection_bg));
 
-        assert_eq!(placeholder[0][0].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][0].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][1].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][2].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[0][0].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][0].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][1].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][2].style.bg, Some(Theme::default().selection_bg));
         assert_eq!(placeholder[1][1].style.fg, Some(avatar_color(&chats[0])));
     }
 
@@ -2499,12 +2525,12 @@ mod tests {
     #[test]
     fn slack_channel_avatar_placeholder_inherits_selected_row_background() {
         let chats = sample_chats();
-        let placeholder = avatar_placeholder(&chats[1], Theme::default(), Some(SELECTED_CHAT_BG));
+        let placeholder = avatar_placeholder(&chats[1], Theme::default(), Some(Theme::default().selection_bg));
 
-        assert_eq!(placeholder[0][0].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][0].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][1].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][2].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[0][0].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][0].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][1].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][2].style.bg, Some(Theme::default().selection_bg));
     }
 
     #[test]
@@ -2552,14 +2578,14 @@ mod tests {
         chat.is_group = true;
         chat.kind = ChatKind::GroupDirectMessage;
 
-        let placeholder = avatar_placeholder(&chat, Theme::default(), Some(SELECTED_CHAT_BG));
+        let placeholder = avatar_placeholder(&chat, Theme::default(), Some(Theme::default().selection_bg));
 
-        assert_eq!(placeholder[0][0].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[0][1].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[0][2].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][0].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][1].style.bg, Some(SELECTED_CHAT_BG));
-        assert_eq!(placeholder[1][2].style.bg, Some(SELECTED_CHAT_BG));
+        assert_eq!(placeholder[0][0].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[0][1].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[0][2].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][0].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][1].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(placeholder[1][2].style.bg, Some(Theme::default().selection_bg));
     }
 
     #[test]

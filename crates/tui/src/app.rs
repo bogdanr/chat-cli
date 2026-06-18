@@ -1,7 +1,8 @@
 use crate::{
     event::AppEvent,
     theme::Theme,
-    widgets::{chat_list, message_list},
+    voice_summary::{self, VoiceSummaryOutcome, VoiceSummaryPayload},
+    widgets::{chat_list, message_list, padded_title},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
@@ -12,11 +13,12 @@ use arboard::Clipboard;
 ))]
 use arboard::SetExtLinux;
 use chat_core::{
-    Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card, Chat,
-    ChatId, ChatKind, ChatMembership, Content, DiscoveryAction, DiscoveryResult, Media, Message,
-    MessageId, NetworkActivityDirection, OutboundCapabilities, Platform, PlatformData, PlatformId,
-    Poll, Provider, ProviderEvent, ProviderId, Reaction, Sender, ThreadId, ThreadParticipation,
-    Timestamp,
+    Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
+    CardKind, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMembership, ContactProfile,
+    Content,
+    DiscoveryAction, DiscoveryResult, Media, Message, MessageId, NetworkActivityDirection,
+    OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, Provider, ProviderEvent,
+    ProviderId, Reaction, Sender, ThreadId, ThreadParticipation, Timestamp,
 };
 use chat_notify::{DesktopNotifier, MessageNotification};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -33,7 +35,8 @@ use flate2::read::GzDecoder;
 use qrcode::{EcLevel, QrCode, types::Color as QrColor};
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
+    backend::{Backend, CrosstermBackend},
+    buffer::Cell,
     layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -66,13 +69,25 @@ use storage::{
     UiThemePreset,
 };
 use tokio::sync::{broadcast, mpsc};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
+/// How often the run loop forces a full terminal repaint. Anything that
+/// writes to the terminal behind ratatui's back (other processes sharing the
+/// TTY, kernel messages, stray child output) leaves damage that the diff
+/// renderer would otherwise never repair, because both internal buffers still
+/// agree with each other. A low-frequency forced repaint self-heals such
+/// corruption at negligible cost: one full-frame write per interval, which is
+/// a few tens of kilobytes of already-cached cells, rewritten in place so the
+/// repaint is invisible when the screen is intact.
+const FULL_REPAINT_INTERVAL: Duration = Duration::from_secs(10);
 /// Settle window for rapid sidebar navigation: while the user is still
 /// scrolling through chats, follow-up work (message loads, member fetches,
 /// history sync) for intermediate chats is deferred until selection rests.
 const NAVIGATION_LOAD_DEBOUNCE: Duration = Duration::from_millis(120);
+/// How long an applied filter may sit untouched before the tick handler
+/// auto-clears it (when the feature is enabled in settings).
+const FILTER_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
 const NETWORK_ACTIVITY_PULSE_MS: i64 = 900;
 const NETWORK_ACTIVITY_RECENT_WINDOW_SECS: i64 = 60;
 const NETWORK_ACTIVITY_RECENT_ARROW_IDLE_SECS: i64 = 3;
@@ -93,6 +108,11 @@ const ARCHIVE_BACKFILL_WINDOW_DAYS: i64 = 36500;
 const MOUSE_SCROLL_STEP: usize = 1;
 const MESSAGE_SCROLL_STEP: usize = 3;
 const IMAGE_VIEWER_MAX_WIDTH: u16 = 96;
+/// Cell dimensions for the HD sender-avatar block rendered in the message
+/// details pane. Mirrors the half-block "matrix" preview footprint so the
+/// reserved blank lines line up with the overlaid terminal image.
+const DETAILS_AVATAR_WIDTH: u16 = 12;
+const DETAILS_AVATAR_ROWS: u16 = 6;
 const EMBEDDED_WHATSAPP_ICON_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00, 0x46, 0x08, 0x03, 0x00, 0x00, 0x00, 0x46, 0xf0, 0x12,
@@ -157,7 +177,6 @@ const EMBEDDED_WHATSAPP_ICON_PNG: &[u8] = &[
     0xb6, 0x8d, 0xbf, 0x01, 0x69, 0xa6, 0x27, 0xd4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
     0xae, 0x42, 0x60, 0x82,
 ];
-const REACTION_OPTIONS: [&str; 6] = ["👍", "❤️", "😂", "🎉", "😮", "🙏"];
 const COMPOSE_EMOTICON_OPTIONS: &[(&str, &str)] = &[
     ("😊", "smile happy"),
     ("😂", "joy laugh tears"),
@@ -228,15 +247,20 @@ const COMPOSE_EMOTICON_OPTIONS: &[(&str, &str)] = &[
     ),
     ("( ˘ ɜ˘) ♬♪♫", "humming singing music ascii kaomoji"),
 ];
-const COMPOSE_EMOTICON_MAX_SUGGESTIONS: usize = 8;
+const COMPOSE_EMOTICON_VISIBLE_ROWS: usize = 8;
+const COMPOSE_EMOTICON_MAX_MATCHES: usize = 50;
 const LOCAL_REACTION_SENDER: &str = "me";
-const REACTION_OPTION_CELL_WIDTH: u16 = 6;
+/// Number of reaction rows shown at once before the picker scrolls internally.
+const REACTION_PICKER_VISIBLE_ROWS: usize = 8;
+/// Upper bound on filtered reaction matches kept in memory for the picker.
+const REACTION_PICKER_MAX_MATCHES: usize = COMPOSE_EMOTICON_OPTIONS.len();
 const NOTIFICATION_TICKS: u8 = 16;
 const NOTIFICATION_DELIVERY_DELAY: Duration = Duration::from_secs(5);
 const MAX_PENDING_NOTIFICATIONS_PER_TICK: usize = 8;
 const NOTIFICATION_PAUSE_RELOAD_TICKS: u64 = 4;
 const HELP_PAGE_STEP: usize = 8;
 const HELP_MOUSE_SCROLL_STEP: usize = 3;
+const SETTINGS_MOUSE_SCROLL_STEP: usize = 1;
 const QR_QUIET_ZONE: usize = 2;
 const MEDIA_SEND_SIZE_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
 const LINK_METADATA_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -244,7 +268,11 @@ const LINK_METADATA_MAX_BYTES: usize = 256 * 1024;
 const PERF_LOG_FILE_ENV: &str = "CHAT_CLI_PERF_LOG_FILE";
 const PERF_LOG_SLOW_MS_ENV: &str = "CHAT_CLI_PERF_SLOW_MS";
 const PERF_LOG_VERBOSE_ENV: &str = "CHAT_CLI_PERF_VERBOSE";
-const DEFAULT_PERF_LOG_SLOW_MS: u64 = 25;
+// Only treat work that blocks for at least this long as "slow" by default, so
+// the perf log surfaces genuinely serious stalls instead of routine sub-frame
+// activity. Override per run with `CHAT_CLI_PERF_SLOW_MS` (e.g. a lower value
+// while hunting a specific regression).
+const DEFAULT_PERF_LOG_SLOW_MS: u64 = 100;
 const EVENT_LOOP_STALL_LOG_MS: u64 = 750;
 const AVATAR_THUMBNAIL_SIZE: u32 = 32;
 const AVATAR_THUMBNAIL_CACHE_VERSION: i64 = 2;
@@ -263,11 +291,20 @@ struct AvatarPreviewKey {
     source: AvatarPreviewSource,
 }
 
+/// Position of a member-list avatar that should be overlaid as an HD terminal
+/// image once the chat-overview details paragraph has been rendered.
+/// `line_index` is the logical line (top row) of the member's reserved avatar
+/// block within the details paragraph.
+#[derive(Clone, Debug)]
+struct MemberAvatarOverlay {
+    line_index: usize,
+    key: AvatarPreviewKey,
+}
+
 #[derive(Debug)]
 struct AvatarPreviewFetchResult {
     key: AvatarPreviewKey,
     result: Option<Result<AvatarPreviewData, String>>,
-    elapsed: Duration,
     sqlite_hit: bool,
     stale: bool,
     refresh_on_stale: bool,
@@ -280,13 +317,11 @@ impl AvatarPreviewFetchResult {
     fn generated(
         key: AvatarPreviewKey,
         result: Result<AvatarPreviewData, String>,
-        elapsed: Duration,
         persisted: bool,
     ) -> Self {
         Self {
             key,
             result: Some(result),
-            elapsed,
             sqlite_hit: false,
             stale: false,
             refresh_on_stale: false,
@@ -299,13 +334,11 @@ impl AvatarPreviewFetchResult {
     fn sqlite_hit(
         key: AvatarPreviewKey,
         result: Result<AvatarPreviewData, String>,
-        elapsed: Duration,
         stale: bool,
     ) -> Self {
         Self {
             key,
             result: Some(result),
-            elapsed,
             sqlite_hit: true,
             stale,
             refresh_on_stale: stale,
@@ -315,11 +348,10 @@ impl AvatarPreviewFetchResult {
         }
     }
 
-    fn sqlite_miss(key: AvatarPreviewKey, elapsed: Duration) -> Self {
+    fn sqlite_miss(key: AvatarPreviewKey) -> Self {
         Self {
             key,
             result: None,
-            elapsed,
             sqlite_hit: false,
             stale: false,
             refresh_on_stale: false,
@@ -349,6 +381,16 @@ struct MediaDownloadResult {
     media_id: Arc<str>,
     file_name: Arc<str>,
     result: Result<PathBuf, String>,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct ForwardSendResult {
+    target: ForwardTarget,
+    /// On success, the sent message id plus the content that was actually
+    /// delivered (with any downloaded media path) so the echoed message renders
+    /// the real attachment instead of a placeholder.
+    result: Result<(MessageId, Content), String>,
     elapsed: Duration,
 }
 
@@ -506,7 +548,21 @@ struct HistoryFetchResult {
 struct ChatMembersFetchResult {
     account: ProviderId,
     chat_id: ChatId,
-    result: Result<Vec<Sender>, String>,
+    result: Result<Vec<ChatMember>, String>,
+}
+
+#[derive(Clone, Debug)]
+struct ChatDetailsFetchResult {
+    account: ProviderId,
+    chat_id: ChatId,
+    result: Result<ChatDetails, String>,
+}
+
+#[derive(Clone, Debug)]
+struct ContactProfileFetchResult {
+    account: ProviderId,
+    platform_id: PlatformId,
+    result: Result<Option<ContactProfile>, String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -651,6 +707,9 @@ pub async fn run_with_factory(
     providers: Vec<ProviderBox>,
     provider_factory: Option<AccountProviderFactory>,
 ) -> Result<()> {
+    // Keep stray stderr writes (our own, libraries', and every child
+    // process's) off the TTY for as long as the TUI owns the screen.
+    let stderr_redirect = redirect_stderr_for_tui();
     let mut terminal = init_terminal()?;
     terminal.draw(draw_startup_screen)?;
 
@@ -664,6 +723,7 @@ pub async fn run_with_factory(
     app.initialize_image_renderer();
     let result = run_app_loop(&mut terminal, &mut app).await;
     let restore_result = restore_terminal(&mut terminal);
+    drop(stderr_redirect);
     restore_result?;
     result
 }
@@ -681,7 +741,7 @@ fn draw_startup_screen(frame: &mut Frame<'_>) {
         Line::from("Connecting accounts and loading cached chats."),
         Line::from("Slack names and member details continue loading in the background."),
     ])
-    .block(Block::default().title("Starting").borders(Borders::ALL))
+    .block(Block::default().title(padded_title("Starting")).borders(Borders::ALL))
     .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -718,6 +778,47 @@ impl FilterScope {
             Self::Messages => "message",
             Self::Thread => "thread",
         }
+    }
+}
+
+/// Independent filter query buffers, one per [`FilterScope`].
+///
+/// Each pane owns its own filter text so a query typed for the chat list never
+/// silently re-applies to the message list (or vice versa) when focus moves
+/// between panes. The buffer for the scope currently being edited is selected
+/// via [`AppState::filter_scope`].
+#[derive(Clone, Debug, Default)]
+struct FilterQueries {
+    chats: String,
+    messages: String,
+    thread: String,
+}
+
+impl FilterQueries {
+    fn get(&self, scope: FilterScope) -> &str {
+        match scope {
+            FilterScope::Chats => &self.chats,
+            FilterScope::Messages => &self.messages,
+            FilterScope::Thread => &self.thread,
+        }
+    }
+
+    fn get_mut(&mut self, scope: FilterScope) -> &mut String {
+        match scope {
+            FilterScope::Chats => &mut self.chats,
+            FilterScope::Messages => &mut self.messages,
+            FilterScope::Thread => &mut self.thread,
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.chats.clear();
+        self.messages.clear();
+        self.thread.clear();
+    }
+
+    fn any_active(&self) -> bool {
+        !self.chats.is_empty() || !self.messages.is_empty() || !self.thread.is_empty()
     }
 }
 
@@ -973,15 +1074,76 @@ struct ForwardTarget {
 #[derive(Clone, Debug)]
 struct ReactionPicker {
     message_id: MessageId,
+    /// Index into `matches` of the highlighted row.
     selected: usize,
+    /// First visible row of the scroll window (index into `matches`).
+    scroll_offset: usize,
+    /// Incremental search query typed by the user (no leading colon).
+    query: String,
+    /// Indices into `COMPOSE_EMOTICON_OPTIONS` for the current query/platform.
+    matches: Vec<usize>,
+    /// Whether the active provider accepts non-standard (kaomoji) reactions.
+    allow_freeform: bool,
+}
+
+impl ReactionPicker {
+    /// Adjust `scroll_offset` so `selected` stays inside the visible window of
+    /// `REACTION_PICKER_VISIBLE_ROWS` rows (scroll-on-edge), and clamp the
+    /// offset so the final window never runs past the end of the match list.
+    fn keep_selected_visible(&mut self) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + REACTION_PICKER_VISIBLE_ROWS {
+            self.scroll_offset = self.selected + 1 - REACTION_PICKER_VISIBLE_ROWS;
+        }
+        let max_offset = self
+            .matches
+            .len()
+            .saturating_sub(REACTION_PICKER_VISIBLE_ROWS);
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+    }
+
+    /// Re-filter the catalog after the query changed, preserving a valid
+    /// selection and resetting the scroll window so narrowed results never hide
+    /// behind a stale offset.
+    fn refresh_matches(&mut self) {
+        self.matches = reaction_catalog_matches(&self.query, self.allow_freeform);
+        if self.matches.is_empty() {
+            self.selected = 0;
+            self.scroll_offset = 0;
+            return;
+        }
+        self.selected = self.selected.min(self.matches.len() - 1);
+        self.scroll_offset = 0;
+        self.keep_selected_visible();
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct ComposeEmoticonPicker {
     selected: usize,
+    scroll_offset: usize,
     query: String,
     matches: Vec<usize>,
     token_char_len: usize,
+}
+
+impl ComposeEmoticonPicker {
+    /// Adjust `scroll_offset` so `selected` stays inside the visible window of
+    /// `COMPOSE_EMOTICON_VISIBLE_ROWS` rows (scroll-on-edge), and clamp the
+    /// offset so the final window never runs past the end of the match list.
+    fn keep_selected_visible(&mut self) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + COMPOSE_EMOTICON_VISIBLE_ROWS {
+            self.scroll_offset = self.selected + 1 - COMPOSE_EMOTICON_VISIBLE_ROWS;
+        }
+        let max_offset = self
+            .matches
+            .len()
+            .saturating_sub(COMPOSE_EMOTICON_VISIBLE_ROWS);
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1565,6 +1727,29 @@ struct ThreadsInbox {
 #[derive(Clone, Debug)]
 struct SettingsOverlay {
     selected: usize,
+    scroll: usize,
+}
+
+/// Identifies which scrollable region a rendered scrollbar controls, so mouse
+/// clicks and drags on a scrollbar track can be routed to the right scroll
+/// state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScrollbarTarget {
+    ChatList,
+    Messages,
+    Details,
+    HelpOverlay,
+    Settings,
+}
+
+/// Geometry and scroll range of a scrollbar rendered during the last draw.
+/// Recorded cache-only in the draw path and consumed by mouse hit-testing so
+/// input handling never re-measures content.
+#[derive(Clone, Copy, Debug)]
+struct ScrollbarHit {
+    target: ScrollbarTarget,
+    track: Rect,
+    max_position: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1578,13 +1763,16 @@ enum SettingsItem {
     ShowMutedChats,
     ShowBrowseChannels,
     ShowEmptyChats,
+    AutoResetFilter,
     ArchiveVisibleAccounts,
     Notifications,
     NotificationScope,
+    VoiceSummaries,
+    SuppressLowIntent,
 }
 
 impl SettingsItem {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 15] = [
         Self::InboxStyle,
         Self::Theme,
         Self::ConversationStyle,
@@ -1594,9 +1782,12 @@ impl SettingsItem {
         Self::ShowMutedChats,
         Self::ShowBrowseChannels,
         Self::ShowEmptyChats,
+        Self::AutoResetFilter,
         Self::ArchiveVisibleAccounts,
         Self::Notifications,
         Self::NotificationScope,
+        Self::VoiceSummaries,
+        Self::SuppressLowIntent,
     ];
 
     fn label(self) -> &'static str {
@@ -1610,9 +1801,12 @@ impl SettingsItem {
             Self::ShowMutedChats => "Show muted chats",
             Self::ShowBrowseChannels => "Show browse channels",
             Self::ShowEmptyChats => "Show empty chats",
+            Self::AutoResetFilter => "Auto-clear idle filters",
             Self::ArchiveVisibleAccounts => "Archive current accounts",
             Self::Notifications => "Notifications",
             Self::NotificationScope => "Notify for",
+            Self::VoiceSummaries => "Voice summaries",
+            Self::SuppressLowIntent => "Quiet low-intent",
         }
     }
 
@@ -1641,6 +1835,9 @@ impl SettingsItem {
             }
             Self::ShowBrowseChannels => "Show Slack channels you have not joined yet.",
             Self::ShowEmptyChats => "Show chats with no local message preview or timestamp yet.",
+            Self::AutoResetFilter => {
+                "Automatically clear an applied chat, message, or thread filter after about a minute of inactivity so a forgotten filter does not keep hiding content."
+            }
             Self::ArchiveVisibleAccounts => {
                 "Smart Sync keeps opened and visible chats fresh. Start on-demand archive sync for the current account filter when you want deeper local search or AI context."
             }
@@ -1649,6 +1846,12 @@ impl SettingsItem {
             }
             Self::NotificationScope => {
                 "Limit notifications to direct messages and mentions, or allow them for all messages. Group and channel messages without a mention are suppressed when limited. Has no effect while notifications are off."
+            }
+            Self::VoiceSummaries => {
+                "Speak a short summary of each delivered notification through the external fono voice assistant (requires the fono command). Fono summarizes who wants what in one or two sentences; raw message content is never read aloud."
+            }
+            Self::SuppressLowIntent => {
+                "Keep low-intent interactions quiet: a bare shared link with no message body, or a pure link preview. These raise no notification while on, and are never voice-summarized regardless. Reactions are always quiet."
             }
         }
     }
@@ -1666,6 +1869,7 @@ impl SettingsItem {
             Self::ShowMutedChats => on_off(settings.show_muted_chats),
             Self::ShowBrowseChannels => on_off(settings.show_browse_channels),
             Self::ShowEmptyChats => on_off(settings.show_empty_chats),
+            Self::AutoResetFilter => on_off(settings.auto_reset_filter),
             Self::ArchiveVisibleAccounts => {
                 if archive_running {
                     "running"
@@ -1675,6 +1879,8 @@ impl SettingsItem {
             }
             Self::Notifications => notification_mode_label(settings.notifications),
             Self::NotificationScope => notification_scope_label(settings.notification_scope),
+            Self::VoiceSummaries => on_off(settings.voice_summaries),
+            Self::SuppressLowIntent => on_off(settings.suppress_low_intent_notifications),
         }
     }
 
@@ -1683,6 +1889,9 @@ impl SettingsItem {
             Self::ShowMutedChats => Some(settings.show_muted_chats),
             Self::ShowBrowseChannels => Some(settings.show_browse_channels),
             Self::ShowEmptyChats => Some(settings.show_empty_chats),
+            Self::AutoResetFilter => Some(settings.auto_reset_filter),
+            Self::VoiceSummaries => Some(settings.voice_summaries),
+            Self::SuppressLowIntent => Some(settings.suppress_low_intent_notifications),
             Self::InboxStyle
             | Self::Theme
             | Self::ConversationStyle
@@ -1736,6 +1945,10 @@ impl SettingsItem {
                 settings.show_empty_chats = !settings.show_empty_chats;
                 true
             }
+            Self::AutoResetFilter => {
+                settings.auto_reset_filter = !settings.auto_reset_filter;
+                false
+            }
             Self::ArchiveVisibleAccounts => false,
             Self::Notifications => {
                 settings.notifications = next_notification_mode(settings.notifications);
@@ -1743,6 +1956,15 @@ impl SettingsItem {
             }
             Self::NotificationScope => {
                 settings.notification_scope = next_notification_scope(settings.notification_scope);
+                false
+            }
+            Self::VoiceSummaries => {
+                settings.voice_summaries = !settings.voice_summaries;
+                false
+            }
+            Self::SuppressLowIntent => {
+                settings.suppress_low_intent_notifications =
+                    !settings.suppress_low_intent_notifications;
                 false
             }
         }
@@ -1992,6 +2214,31 @@ impl PendingNotification {
     }
 }
 
+/// A voice summary waiting out its grouping window before dispatch to fono.
+/// Keyed by (account, chat, sender): every additional message from the same
+/// sender within [`voice_summary::GROUP_WINDOW`] folds into `payload` and
+/// pushes `deliver_at` out, so a burst is spoken once, after it settles.
+/// Built only for messages that already passed every queue-time notification
+/// gate and are not from the user themselves; delivery-time gates
+/// (off/pause/mute) are re-checked when the window expires.
+#[derive(Clone, Debug)]
+struct PendingVoiceSummary {
+    account: ProviderId,
+    chat_id: ChatId,
+    sender_id: PlatformId,
+    /// The newest grouped message id, used for outcome instrumentation.
+    message_id: MessageId,
+    deliver_at: Instant,
+    message_count: usize,
+    payload: VoiceSummaryPayload,
+}
+
+impl PendingVoiceSummary {
+    fn chat_matches(&self, account: &ProviderId, chat_id: &ChatId) -> bool {
+        self.account == *account && self.chat_id == *chat_id
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     chats: Vec<Chat>,
@@ -2001,10 +2248,15 @@ pub struct AppState {
     selected_chat: usize,
     older_chats_expanded: bool,
     older_chats_selected: bool,
-    filter: String,
+    filters: FilterQueries,
     filter_scope: FilterScope,
     discovery_results: Vec<DiscoveryResult>,
     filter_mode: bool,
+    /// Timestamp of the most recent filter interaction (keystroke, scope
+    /// change, or filter-driven navigation). Used by the tick handler to
+    /// auto-reset stale filters after a period of inactivity. `None` when no
+    /// filter is active.
+    filter_last_interaction: Option<Instant>,
     compose: TextArea<'static>,
     compose_text: String,
     compose_cursor: usize,
@@ -2016,6 +2268,12 @@ pub struct AppState {
     pane_areas: PaneAreas,
     media_hits: Vec<message_list::MediaHit>,
     message_hits: Vec<message_list::MessageHit>,
+    /// Scrollbar tracks rendered during the last draw, used for click/drag
+    /// hit-testing. Cleared and re-recorded on every frame.
+    scrollbar_hits: Vec<ScrollbarHit>,
+    /// The scrollbar currently being dragged with the left mouse button, if
+    /// any. Cleared on mouse-up.
+    scrollbar_drag: Option<ScrollbarHit>,
     selected_message_id: Option<MessageId>,
     action_menu: Option<ActionMenu>,
     forward_picker: Option<ForwardPicker>,
@@ -2042,6 +2300,8 @@ pub struct AppState {
     active_account: Option<ProviderId>,
     notification: Option<NotificationOverlay>,
     pending_notifications: Vec<PendingNotification>,
+    /// Voice summaries debouncing through their per-sender grouping window.
+    pending_voice_summaries: Vec<PendingVoiceSummary>,
     notification_pause: NotificationPauseState,
     account_statuses: HashMap<ProviderId, AccountStatus>,
     network_activity: HashMap<ProviderId, AccountNetworkActivity>,
@@ -2075,8 +2335,12 @@ pub struct AppState {
     monthly_backfill_exhausted_chats: HashSet<(ProviderId, ChatId)>,
     monthly_backfill_cursor: usize,
     monthly_backfill_tick: u64,
-    chat_members: HashMap<(ProviderId, ChatId), Vec<Sender>>,
+    chat_members: HashMap<(ProviderId, ChatId), Vec<ChatMember>>,
     loading_chat_members: HashSet<(ProviderId, ChatId)>,
+    chat_details: HashMap<(ProviderId, ChatId), ChatDetails>,
+    loading_chat_details: HashSet<(ProviderId, ChatId)>,
+    contact_profiles: HashMap<(ProviderId, PlatformId), ContactProfile>,
+    loading_contact_profiles: HashSet<(ProviderId, PlatformId)>,
     sender_cache: HashMap<(ProviderId, PlatformId), Sender>,
     loading_sender_info: HashSet<(ProviderId, PlatformId)>,
     fetched_sender_info: HashSet<(ProviderId, PlatformId)>,
@@ -2103,10 +2367,11 @@ impl Default for AppState {
             selected_chat: 0,
             older_chats_expanded: false,
             older_chats_selected: false,
-            filter: String::new(),
+            filters: FilterQueries::default(),
             filter_scope: FilterScope::Chats,
             discovery_results: Vec::new(),
             filter_mode: false,
+            filter_last_interaction: None,
             compose: new_compose_textarea(),
             compose_text: String::new(),
             compose_cursor: 0,
@@ -2118,6 +2383,8 @@ impl Default for AppState {
             pane_areas: PaneAreas::default(),
             media_hits: Vec::new(),
             message_hits: Vec::new(),
+            scrollbar_hits: Vec::new(),
+            scrollbar_drag: None,
             selected_message_id: None,
             action_menu: None,
             forward_picker: None,
@@ -2137,6 +2404,7 @@ impl Default for AppState {
             active_account: None,
             notification: None,
             pending_notifications: Vec::new(),
+            pending_voice_summaries: Vec::new(),
             notification_pause: NotificationPauseState::default(),
             account_statuses: HashMap::new(),
             network_activity: HashMap::new(),
@@ -2165,6 +2433,10 @@ impl Default for AppState {
             monthly_backfill_tick: 0,
             chat_members: HashMap::new(),
             loading_chat_members: HashSet::new(),
+            chat_details: HashMap::new(),
+            loading_chat_details: HashSet::new(),
+            contact_profiles: HashMap::new(),
+            loading_contact_profiles: HashSet::new(),
             sender_cache: HashMap::new(),
             loading_sender_info: HashSet::new(),
             fetched_sender_info: HashSet::new(),
@@ -2202,7 +2474,11 @@ impl AppState {
     }
 
     pub fn filter(&self) -> &str {
-        &self.filter
+        self.filters.get(self.filter_scope)
+    }
+
+    fn active_filter(&self) -> &str {
+        self.filters.get(self.filter_scope)
     }
 
     pub fn filter_mode(&self) -> bool {
@@ -2271,6 +2547,20 @@ impl AppState {
 
     pub fn help_overlay_scroll(&self) -> Option<usize> {
         self.help_overlay.as_ref().map(|help| help.scroll)
+    }
+
+    pub fn settings_overlay_open(&self) -> bool {
+        self.settings_overlay.is_some()
+    }
+
+    pub fn settings_overlay_scroll(&self) -> Option<usize> {
+        self.settings_overlay.as_ref().map(|overlay| overlay.scroll)
+    }
+
+    pub fn settings_overlay_selected(&self) -> Option<usize> {
+        self.settings_overlay
+            .as_ref()
+            .map(|overlay| overlay.selected)
     }
 
     pub fn account_switcher_open(&self) -> bool {
@@ -2364,6 +2654,8 @@ pub struct App {
     pending_media_downloads: HashSet<Arc<str>>,
     media_download_tx: mpsc::UnboundedSender<MediaDownloadResult>,
     media_download_rx: mpsc::UnboundedReceiver<MediaDownloadResult>,
+    forward_send_tx: mpsc::UnboundedSender<ForwardSendResult>,
+    forward_send_rx: mpsc::UnboundedReceiver<ForwardSendResult>,
     message_layout_cache: message_list::MessageLayoutCache,
     avatar_preview_cache: HashMap<AvatarPreviewKey, Result<AvatarPreviewData, String>>,
     pending_avatar_previews: HashSet<AvatarPreviewKey>,
@@ -2378,6 +2670,10 @@ pub struct App {
     history_rx: mpsc::UnboundedReceiver<HistoryFetchResult>,
     chat_members_tx: mpsc::UnboundedSender<ChatMembersFetchResult>,
     chat_members_rx: mpsc::UnboundedReceiver<ChatMembersFetchResult>,
+    chat_details_tx: mpsc::UnboundedSender<ChatDetailsFetchResult>,
+    chat_details_rx: mpsc::UnboundedReceiver<ChatDetailsFetchResult>,
+    contact_profile_tx: mpsc::UnboundedSender<ContactProfileFetchResult>,
+    contact_profile_rx: mpsc::UnboundedReceiver<ContactProfileFetchResult>,
     sender_info_tx: mpsc::UnboundedSender<SenderInfoFetchResult>,
     sender_info_rx: mpsc::UnboundedReceiver<SenderInfoFetchResult>,
     selected_messages_tx: mpsc::UnboundedSender<SelectedMessagesFetchResult>,
@@ -2395,6 +2691,12 @@ pub struct App {
     image_protocol_rx: mpsc::UnboundedReceiver<ImageProtocolFetchResult>,
     chat_persist_tx: mpsc::UnboundedSender<Chat>,
     chat_persist_in_flight: Arc<AtomicUsize>,
+    /// Argv used to dispatch voice summaries (`fono summarize --json` by
+    /// default). Kept as a field so tests can substitute a harmless command
+    /// without touching the process environment.
+    voice_summary_command: Vec<String>,
+    voice_summary_tx: mpsc::UnboundedSender<VoiceSummaryOutcome>,
+    voice_summary_rx: mpsc::UnboundedReceiver<VoiceSummaryOutcome>,
     sidebar_resort_pending: bool,
     deferred_navigation_load: Option<DeferredNavigationLoad>,
     last_navigation_load_at: Option<Instant>,
@@ -2421,13 +2723,17 @@ impl App {
         let (link_metadata_tx, link_metadata_rx) = mpsc::unbounded_channel();
         let (media_preview_tx, media_preview_rx) = mpsc::unbounded_channel();
         let (media_download_tx, media_download_rx) = mpsc::unbounded_channel();
+        let (forward_send_tx, forward_send_rx) = mpsc::unbounded_channel();
         let (avatar_preview_tx, avatar_preview_rx) = mpsc::unbounded_channel();
         let (image_protocol_tx, image_protocol_rx) = mpsc::unbounded_channel();
         let (history_tx, history_rx) = mpsc::unbounded_channel();
         let (chat_members_tx, chat_members_rx) = mpsc::unbounded_channel();
+        let (chat_details_tx, chat_details_rx) = mpsc::unbounded_channel();
+        let (contact_profile_tx, contact_profile_rx) = mpsc::unbounded_channel();
         let (sender_info_tx, sender_info_rx) = mpsc::unbounded_channel();
         let (selected_messages_tx, selected_messages_rx) = mpsc::unbounded_channel();
         let (discovery_tx, discovery_rx) = mpsc::unbounded_channel();
+        let (voice_summary_tx, voice_summary_rx) = mpsc::unbounded_channel();
         // Single-writer queue for chat row persistence. Hot paths (preview
         // refresh, unread bumps, provider chat snapshots) enqueue here instead
         // of awaiting sqlite on the event loop; the dedicated task applies the
@@ -2468,6 +2774,8 @@ impl App {
             pending_media_downloads: HashSet::new(),
             media_download_tx,
             media_download_rx,
+            forward_send_tx,
+            forward_send_rx,
             message_layout_cache: message_list::MessageLayoutCache::default(),
             avatar_preview_cache: HashMap::new(),
             pending_avatar_previews: HashSet::new(),
@@ -2482,6 +2790,10 @@ impl App {
             history_rx,
             chat_members_tx,
             chat_members_rx,
+            chat_details_tx,
+            chat_details_rx,
+            contact_profile_tx,
+            contact_profile_rx,
             sender_info_tx,
             sender_info_rx,
             selected_messages_tx,
@@ -2499,6 +2811,9 @@ impl App {
             image_protocol_rx,
             chat_persist_tx,
             chat_persist_in_flight,
+            voice_summary_command: voice_summary::default_command(),
+            voice_summary_tx,
+            voice_summary_rx,
             sidebar_resort_pending: false,
             deferred_navigation_load: None,
             last_navigation_load_at: None,
@@ -2657,12 +2972,19 @@ impl App {
     }
 
     fn should_schedule_navigation_load(&self, selection_changed: bool) -> bool {
-        selection_changed && !self.state.filter_mode
+        if !selection_changed {
+            return false;
+        }
+        // Normal navigation always loads. While filtering, only the chat scope
+        // moves the chat selection, so allow its (debounced) load so highlighting
+        // a result opens it without requiring Enter. Message/thread filtering only
+        // moves an in-chat selection or scroll, so no chat load is scheduled.
+        !self.state.filter_mode || self.state.filter_scope == FilterScope::Chats
     }
 
     fn schedule_discovery_refresh(&mut self) {
         self.state.discovery_results.clear();
-        let query = self.state.filter.trim().to_owned();
+        let query = self.state.filters.chats.trim().to_owned();
         if query.len() < 2 {
             self.pending_discovery_query = None;
             return;
@@ -2739,7 +3061,7 @@ impl App {
                 .pending_discovery_query
                 .as_ref()
                 .is_some_and(|pending| pending.0 == result.query && pending.1 == result.generation)
-                && self.state.filter.trim() == result.query;
+                && self.state.filters.chats.trim() == result.query;
             if !is_current {
                 stale += 1;
                 continue;
@@ -2963,27 +3285,39 @@ impl App {
             if result.result.as_ref().is_some_and(Result::is_err) {
                 errors += 1;
             }
-            self.log_slow_perf_elapsed(
-                "avatar_preview.complete",
-                result.elapsed,
-                format!(
-                    "path={} result={} sqlite_hit={} sqlite_miss={} stale={} generated={} persisted={}",
-                    result.key.path.display(),
-                    match &result.result {
-                        Some(Ok(_)) => "ok",
-                        Some(Err(_)) => "err",
-                        None => "none",
-                    },
-                    result.sqlite_hit,
-                    result.cache_miss,
-                    result.stale,
-                    result.generated,
-                    result.persisted,
-                ),
-            );
+            // The per-item `elapsed` is cumulative from the start of the batch
+            // load (all keys share one sqlite query), so it is not a meaningful
+            // per-avatar blocking measure and the batch is already summarized by
+            // `avatar_preview.drain`. Only emit a per-item line when an
+            // individual avatar actually failed, which the aggregate cannot
+            // attribute to a specific path.
+            if result.result.as_ref().is_some_and(Result::is_err) {
+                self.log_perf_marker(
+                    "avatar_preview.error",
+                    format!(
+                        "path={} sqlite_hit={} sqlite_miss={} stale={} generated={} persisted={}",
+                        result.key.path.display(),
+                        result.sqlite_hit,
+                        result.cache_miss,
+                        result.stale,
+                        result.generated,
+                        result.persisted,
+                    ),
+                );
+            }
             if let Some(data) = result.result {
-                self.avatar_preview_cache.insert(result.key, data);
-                changed = true;
+                // A failed (re)decode must never clobber a preview that is
+                // already cached successfully. Stale-refresh and on-demand
+                // decodes can fail transiently (e.g. the source avatar file is
+                // mid-rewrite or was pruned while its thumbnail survives), and
+                // overwriting a good `Ok` with that `Err` is what made cached
+                // avatars intermittently disappear. Keep the good entry.
+                let keep_existing_ok = data.is_err()
+                    && matches!(self.avatar_preview_cache.get(&result.key), Some(Ok(_)));
+                if !keep_existing_ok {
+                    self.avatar_preview_cache.insert(result.key, data);
+                    changed = true;
+                }
             }
         }
         if changed || drained > 0 {
@@ -3450,6 +3784,58 @@ impl App {
         changed
     }
 
+    fn drain_chat_detail_fetches(&mut self) -> bool {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.chat_details_rx.try_recv()
+        {
+            drained += 1;
+            let key = (result.account.clone(), result.chat_id.clone());
+            self.state.loading_chat_details.remove(&key);
+            if let Ok(details) = result.result {
+                self.state.chat_details.insert(key, details);
+            }
+            changed = true;
+        }
+        if changed {
+            self.log_slow_perf_duration(
+                "chat_details.drain",
+                drain_started,
+                format!("count={drained}"),
+            );
+        }
+        changed
+    }
+
+    fn drain_contact_profile_fetches(&mut self) -> bool {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.contact_profile_rx.try_recv()
+        {
+            drained += 1;
+            let key = (result.account.clone(), result.platform_id.clone());
+            self.state.loading_contact_profiles.remove(&key);
+            if let Ok(Some(profile)) = result.result {
+                self.state.contact_profiles.insert(key, profile);
+                changed = true;
+            }
+        }
+        if changed {
+            self.log_slow_perf_duration(
+                "contact_profile.drain",
+                drain_started,
+                format!("count={drained}"),
+            );
+        }
+        changed
+    }
+
     fn drain_sender_info_fetches(&mut self) -> bool {
         let drain_started = Instant::now();
         let mut changed = false;
@@ -3514,15 +3900,15 @@ impl App {
     fn remember_sender_info_from_members(
         &mut self,
         account: &ProviderId,
-        members: &[Sender],
+        members: &[ChatMember],
         fetched: bool,
     ) {
         for member in members {
-            let key = (account.clone(), member.platform_id.clone());
+            let key = (account.clone(), member.sender.platform_id.clone());
             if fetched {
                 self.state.fetched_sender_info.insert(key);
             }
-            self.cache_sender_info(account, member);
+            self.cache_sender_info(account, &member.sender);
         }
     }
 
@@ -3545,9 +3931,49 @@ impl App {
                 changed |= merge_sender_info(&mut message.sender, sender);
             }
         }
+        changed |= self.backfill_self_avatar_in_selected_messages();
         if changed {
             self.apply_message_filter();
             self.clear_message_layout_cache();
+        }
+        changed
+    }
+
+    /// WhatsApp (and some other providers) attribute locally-sent message
+    /// echoes to a self identity whose `platform_id` differs from the one
+    /// carried by synced inbound copies of the user's own messages, so the
+    /// per-id [`Self::cache_sender_info`] backfill (which keys on
+    /// `platform_id`) can't fill their missing avatar — producing the visible
+    /// inconsistency where one "Me" message shows the avatar and another shows
+    /// only its initials. Because `is_from_me` is an unambiguous identity
+    /// signal, reuse any avatar already resolved for the user within the same
+    /// account across every `is_from_me` message that lacks one. Operates only
+    /// on the already-loaded message buffer (no IO), so it stays bounded.
+    fn backfill_self_avatar_in_selected_messages(&mut self) -> bool {
+        let mut self_avatars: HashMap<ProviderId, PathBuf> = HashMap::new();
+        for message in &self.state.messages {
+            if !message.is_from_me {
+                continue;
+            }
+            if let Some(avatar) = &message.sender.avatar {
+                self_avatars
+                    .entry(message.account.clone())
+                    .or_insert_with(|| avatar.clone());
+            }
+        }
+        if self_avatars.is_empty() {
+            return false;
+        }
+
+        let mut changed = false;
+        for message in &mut self.state.messages {
+            if !message.is_from_me || message.sender.avatar.is_some() {
+                continue;
+            }
+            if let Some(avatar) = self_avatars.get(&message.account) {
+                message.sender.avatar = Some(avatar.clone());
+                changed = true;
+            }
         }
         changed
     }
@@ -3623,7 +4049,7 @@ impl App {
         &mut self,
         account: &ProviderId,
         chat_id: &ChatId,
-        members: &[Sender],
+        members: &[ChatMember],
     ) {
         let Some(chat) = self.state.selected_chat() else {
             return;
@@ -3634,7 +4060,7 @@ impl App {
 
         let member_names = members
             .iter()
-            .map(|member| (member.platform_id.clone(), member.clone()))
+            .map(|member| (member.sender.platform_id.clone(), member.sender.clone()))
             .collect::<HashMap<_, _>>();
         let mut changed = false;
         for message in &mut self.state.messages {
@@ -3702,10 +4128,13 @@ impl App {
         let discovery_changed = self.drain_discovery_fetches();
         let media_preview_changed = self.drain_media_preview_fetches();
         let media_download_changed = self.drain_media_downloads();
+        let forward_send_changed = self.drain_forward_sends().await?;
         let image_protocol_changed = self.drain_image_protocol_fetches();
         let avatar_preview_changed = self.drain_avatar_preview_fetches();
         let link_metadata_changed = self.drain_link_metadata_fetches();
         let chat_members_changed = self.drain_chat_member_fetches();
+        let chat_details_changed = self.drain_chat_detail_fetches();
+        let contact_profile_changed = self.drain_contact_profile_fetches();
         let sender_info_changed = self.drain_sender_info_fetches();
         // Safety net: any deferred resort not flushed by the per-event or
         // history paths above is applied once per batch here.
@@ -3717,10 +4146,13 @@ impl App {
             || discovery_changed
             || media_preview_changed
             || media_download_changed
+            || forward_send_changed
             || image_protocol_changed
             || avatar_preview_changed
             || link_metadata_changed
             || chat_members_changed
+            || chat_details_changed
+            || contact_profile_changed
             || sender_info_changed
             || history_changed;
         if changed {
@@ -3748,6 +4180,7 @@ impl App {
         );
         self.state.layout_mode = layout.mode;
         self.state.pane_areas = self.visible_pane_areas(layout);
+        self.state.scrollbar_hits.clear();
         self.clamp_message_scroll();
         self.clamp_details_scroll();
         self.apply_pending_scroll_to_latest();
@@ -4007,6 +4440,7 @@ impl App {
             area,
             chat_layout.content_height,
             chat_layout.scroll_position,
+            ScrollbarTarget::ChatList,
         );
         self.log_draw_step(
             "draw.chat_list.scrollbar",
@@ -4247,7 +4681,6 @@ impl App {
         let tx = self.avatar_preview_tx.clone();
         let store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            let started = Instant::now();
             let result = tokio::task::spawn_blocking({
                 let key = key.clone();
                 move || {
@@ -4270,7 +4703,6 @@ impl App {
             let _ = tx.send(AvatarPreviewFetchResult::generated(
                 key,
                 result,
-                started.elapsed(),
                 persisted,
             ));
         });
@@ -4296,7 +4728,6 @@ impl App {
         let tx = self.avatar_preview_tx.clone();
         let store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            let started = Instant::now();
             let cache_keys = keys
                 .iter()
                 .map(avatar_thumbnail_cache_key)
@@ -4312,10 +4743,7 @@ impl App {
             for key in keys {
                 let cache_key = avatar_thumbnail_cache_key(&key);
                 let Some(record) = records_by_key.remove(&cache_key) else {
-                    let _ = tx.send(AvatarPreviewFetchResult::sqlite_miss(
-                        key,
-                        started.elapsed(),
-                    ));
+                    let _ = tx.send(AvatarPreviewFetchResult::sqlite_miss(key));
                     continue;
                 };
                 let stale = avatar_thumbnail_record_is_stale(&key, &record);
@@ -4323,7 +4751,6 @@ impl App {
                 let _ = tx.send(AvatarPreviewFetchResult::sqlite_hit(
                     key,
                     rows,
-                    started.elapsed(),
                     stale,
                 ));
             }
@@ -4337,7 +4764,6 @@ impl App {
         let tx = self.avatar_preview_tx.clone();
         let store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            let started = Instant::now();
             let result = tokio::task::spawn_blocking({
                 let key = key.clone();
                 move || decode_avatar_preview_with_thumbnail(&key)
@@ -4356,7 +4782,6 @@ impl App {
             let _ = tx.send(AvatarPreviewFetchResult::generated(
                 key,
                 result,
-                started.elapsed(),
                 persisted,
             ));
         });
@@ -4413,15 +4838,26 @@ impl App {
             .state
             .selected_chat()
             .map(|chat| {
-                let messages_filter_scope =
+                let editing_messages_filter =
                     self.state.filter_mode && self.state.filter_scope == FilterScope::Messages;
-                if messages_filter_scope || self.message_filter_active() {
-                    let query = if self.state.filter.is_empty() {
+                if editing_messages_filter || self.message_filter_active() {
+                    let query = if self.state.filters.messages.is_empty() {
                         "(type to filter)".to_owned()
                     } else {
-                        self.state.filter.clone()
+                        self.state.filters.messages.clone()
                     };
-                    format!("Messages - {} - filter: {}", chat.name, query)
+                    let hint = if editing_messages_filter {
+                        "Esc clears"
+                    } else {
+                        "filter active · Esc clears"
+                    };
+                    format!(
+                        "Messages - {} - [FILTER: {} · {} match · {}]",
+                        chat.name,
+                        query,
+                        self.state.filtered_messages.len(),
+                        hint
+                    )
                 } else {
                     format!("Messages - {}", chat.name)
                 }
@@ -4455,7 +4891,7 @@ impl App {
             self.state.media_hits.clear();
             self.state.message_hits.clear();
             let empty_message = if message_filter_active && !self.state.messages.is_empty() {
-                format!("No messages match {}.", self.state.filter)
+                format!("No messages match {}.", self.state.filters.messages)
             } else {
                 "No messages yet. Open or click this chat to sync today's messages.".to_owned()
             };
@@ -4515,6 +4951,7 @@ impl App {
         );
         self.render_inline_hd_image_previews(frame, area);
         self.render_message_hd_avatars(frame, area);
+        self.record_scrollbar_hit(area, total_lines, ScrollbarTarget::Messages);
         self.log_draw_step(
             "draw.messages.render",
             render_started.elapsed(),
@@ -4530,18 +4967,10 @@ impl App {
             return area.height.min(3);
         }
 
-        let content_lines = self.state.thread_compose.lines().len() as u16;
-        let wrapped_extra = self
-            .state
-            .thread_compose
-            .lines()
-            .iter()
-            .map(|line| {
-                let width = area.width.saturating_sub(4).max(24) as usize;
-                line.chars().count().saturating_div(width)
-            })
-            .sum::<usize>() as u16;
-        (content_lines + wrapped_extra + 2).clamp(3, 8)
+        let inner_width = area.width.saturating_sub(2).max(1) as usize;
+        let wrapped_rows =
+            compose_wrapped_row_count(self.state.thread_compose.lines(), inner_width) as u16;
+        (wrapped_rows + 2).clamp(3, 8)
     }
 
     fn compose_height(&self, area: Rect) -> u16 {
@@ -4549,20 +4978,16 @@ impl App {
             return area.height.min(3);
         }
 
-        let content_lines = self.state.compose.lines().len() as u16;
         let reply_extra = u16::from(self.state.reply_to.is_some());
         let attachment_extra = u16::from(self.state.pending_attachment.is_some());
-        let wrapped_extra = self
-            .state
-            .compose
-            .lines()
-            .iter()
-            .map(|line| {
-                let width = area.width.saturating_div(2).max(24) as usize;
-                line.chars().count().saturating_div(width)
-            })
-            .sum::<usize>() as u16;
-        (content_lines + wrapped_extra + reply_extra + attachment_extra + 2).clamp(3, 8)
+        // The compose editor renders inside the middle column; derive its real
+        // inner width from the same layout used during draw so the soft-wrapped
+        // row count here matches what `draw_compose` actually renders.
+        let thread_open = self.state.thread_root.is_some();
+        let compose_rect = AppLayout::for_area(area, 3, thread_open).compose;
+        let inner_width = compose_rect.width.saturating_sub(2).max(1) as usize;
+        let wrapped_rows = compose_wrapped_row_count(self.state.compose.lines(), inner_width) as u16;
+        (wrapped_rows + reply_extra + attachment_extra + 2).clamp(3, 8)
     }
 
     fn draw_compose(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -4577,7 +5002,10 @@ impl App {
             .unwrap_or_else(|| "Compose".to_owned());
         let is_focused = self.state.focus == FocusPane::Compose;
         let block = Block::default()
-            .title(title)
+            .title(Line::from(Span::styled(
+                padded_title(&title),
+                self.theme.pane_title_for(is_focused),
+            )))
             .borders(Borders::ALL)
             .border_style(self.theme.focus_border(is_focused));
         let inner = block.inner(area);
@@ -4631,33 +5059,89 @@ impl App {
 
             areas[area_index]
         };
-        let mut compose =
-            self.compose_textarea_for_render(&self.state.compose, is_focused, "Type a message...");
-        compose.remove_block();
-        frame.render_widget(&compose, editor_area);
+        self.render_wrapped_compose(
+            frame,
+            editor_area,
+            &self.state.compose,
+            is_focused,
+            "Type a message...",
+        );
     }
 
-    fn compose_textarea_for_render(
+    /// Render a compose `TextArea`'s content soft-wrapped to `area`'s width.
+    ///
+    /// `ratatui-textarea` has no soft-wrap support, so long logical lines would
+    /// otherwise scroll horizontally on a single display row. This renders the
+    /// wrapped display rows ourselves (the `TextArea` stays the single source of
+    /// truth for editing) and draws a manual block cursor at the mapped wrapped
+    /// position when focused. Wrapping is purely visual; it never alters the
+    /// buffer or injects newlines.
+    fn render_wrapped_compose(
         &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
         source: &TextArea<'static>,
         is_focused: bool,
-        placeholder: &'static str,
-    ) -> TextArea<'static> {
-        let mut compose = source.clone();
-        compose.set_style(Style::default().fg(self.theme.foreground));
-        compose.set_cursor_line_style(if is_focused {
-            Style::default().bg(Color::Black)
+        placeholder: &str,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+
+        let base_style = Style::default().fg(self.theme.foreground);
+        let cursor_style = Style::default().fg(Color::Black).bg(self.theme.accent);
+        let lines = source.lines();
+        let is_empty = lines.iter().all(String::is_empty);
+
+        if is_empty {
+            let placeholder_line = if is_focused {
+                let mut chars = placeholder.chars();
+                match chars.next() {
+                    Some(first) => Line::from(vec![
+                        Span::styled(first.to_string(), cursor_style),
+                        Span::styled(chars.as_str().to_owned(), self.theme.muted()),
+                    ]),
+                    None => Line::from(Span::styled(" ".to_owned(), cursor_style)),
+                }
+            } else {
+                Line::from(Span::styled(placeholder.to_owned(), self.theme.muted()))
+            };
+            frame.render_widget(Paragraph::new(placeholder_line), area);
+            return;
+        }
+
+        let width = area.width.max(1) as usize;
+        let (rows, (cursor_row, cursor_col)) =
+            compose_wrapped_layout(lines, source.cursor(), width);
+
+        let visible_rows = area.height.max(1) as usize;
+        let first_visible = if cursor_row >= visible_rows {
+            cursor_row + 1 - visible_rows
         } else {
-            Style::default()
-        });
-        compose.set_cursor_style(if is_focused {
-            Style::default().fg(Color::Black).bg(self.theme.accent)
-        } else {
-            Style::default()
-        });
-        compose.set_placeholder_text(placeholder);
-        compose.set_placeholder_style(self.theme.muted());
-        compose
+            0
+        };
+
+        let mut text_lines: Vec<Line<'static>> = Vec::with_capacity(visible_rows);
+        for (display_row, row_text) in rows
+            .iter()
+            .enumerate()
+            .skip(first_visible)
+            .take(visible_rows)
+        {
+            let cursor_here = if is_focused && display_row == cursor_row {
+                Some(cursor_col)
+            } else {
+                None
+            };
+            text_lines.push(compose_display_line(
+                row_text,
+                cursor_here,
+                base_style,
+                cursor_style,
+            ));
+        }
+
+        frame.render_widget(Paragraph::new(text_lines), area);
     }
 
     fn draw_compose_attach_menu(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -4694,7 +5178,7 @@ impl App {
 
         let paragraph = Paragraph::new(lines).block(
             Block::default()
-                .title("Attach")
+                .title(padded_title("Attach"))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
@@ -4709,7 +5193,7 @@ impl App {
 
         frame.render_widget(Clear, area);
 
-        if self.thread_filter_active() && !self.state.filter.is_empty() {
+        if self.thread_filter_active() {
             self.draw_filtered_thread_details(frame, area);
             return;
         }
@@ -4726,12 +5210,20 @@ impl App {
             return;
         }
 
-        let details = self.overview_detail_lines();
+        self.queue_selected_chat_member_avatars();
+        self.request_selected_chat_details();
+        self.request_selected_contact_profile();
+        let inner_width = area.width.saturating_sub(2);
+        let (details, member_overlays) = self.overview_detail_lines(inner_width);
         let details_len = details.len();
         let paragraph = Paragraph::new(details)
             .block(
                 Block::default()
-                    .title("Details")
+                    .title(Line::from(Span::styled(
+                        padded_title("Details"),
+                        self.theme
+                            .pane_title_for(self.state.focus == FocusPane::Details),
+                    )))
                     .borders(Borders::ALL)
                     .border_style(
                         self.theme
@@ -4740,33 +5232,113 @@ impl App {
             )
             .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(paragraph, area);
-        self.draw_vertical_scrollbar(frame, area, details_len, self.state.details_scroll);
+        self.render_member_hd_avatars(frame, area, &member_overlays);
+        self.draw_vertical_scrollbar(
+            frame,
+            area,
+            details_len,
+            self.state.details_scroll,
+            ScrollbarTarget::Details,
+        );
     }
 
-    fn overview_detail_lines(&self) -> Vec<Line<'static>> {
-        let selected_chat = self.state.selected_chat();
+    /// Overlays member-list avatars as HD terminal images in the chat-overview
+    /// details pane. The overview paragraph does not wrap, so each member's
+    /// reserved `line_index` maps directly to a screen row (adjusted by the
+    /// current details scroll offset).
+    fn render_member_hd_avatars(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        overlays: &[MemberAvatarOverlay],
+    ) {
+        if overlays.is_empty() {
+            return;
+        }
+        let inner = inner_area(area);
+        if inner.is_empty() {
+            return;
+        }
+        // Mirror the inline layout: two-space indent before the avatar block.
+        let avatar_x = inner.x.saturating_add(2);
+        if avatar_x >= inner.x.saturating_add(inner.width) {
+            return;
+        }
+        let max_width = inner.x.saturating_add(inner.width).saturating_sub(avatar_x);
+        let width = chat_list::CHAT_AVATAR_WIDTH.min(max_width);
+        if width == 0 {
+            return;
+        }
+        for overlay in overlays {
+            if overlay.line_index < self.state.details_scroll {
+                continue;
+            }
+            let relative = (overlay.line_index - self.state.details_scroll) as u16;
+            if relative >= inner.height {
+                continue;
+            }
+            let y = inner.y.saturating_add(relative);
+            let available_rows = inner.height.saturating_sub(relative);
+            let rows = chat_list::CHAT_AVATAR_ROWS.min(available_rows);
+            if rows == 0 {
+                continue;
+            }
+            let avatar_area = Rect::new(avatar_x, y, width, rows);
+            self.render_hd_avatar_for_key(frame, avatar_area, &overlay.key);
+        }
+    }
+
+    fn overview_detail_lines(
+        &self,
+        inner_width: u16,
+    ) -> (Vec<Line<'static>>, Vec<MemberAvatarOverlay>) {
+        let hd_avatars = self.settings.image_preview_mode == ImagePreviewMode::Hd
+            && self.terminal_hd_images_supported();
+        let mut member_overlays = Vec::new();
+        let selected_chat = self.state.selected_chat().cloned();
         let selected_chat_name = selected_chat
-            .map(|chat| chat.name.as_ref())
-            .unwrap_or("None");
-        let filter = if self.state.filter.is_empty() {
+            .as_ref()
+            .map(|chat| chat.name.to_string())
+            .unwrap_or_else(|| "None".to_owned());
+        let filter = if self.state.active_filter().is_empty() {
             "none".to_owned()
         } else {
-            self.state.filter.clone()
+            self.state.active_filter().to_owned()
         };
         let mode = if self.state.filter_mode {
             format!("filtering {}", self.state.filter_scope.status_label())
         } else {
             "normal".to_owned()
         };
+        // For a selected chat, report only that chat's own account rather than a
+        // global summary of every connected account.
+        let account_line = match selected_chat.as_ref() {
+            Some(chat) => self
+                .state
+                .account_statuses
+                .get(&chat.account)
+                .map(AccountStatus::summary)
+                .unwrap_or_else(|| chat.account.to_string()),
+            None => self.state.account_status_summary(),
+        };
         let mut details = vec![
-            Line::from(format!("Selected: {selected_chat_name}")),
+            Line::from(truncate_to_width(
+                &format!("Selected: {selected_chat_name}"),
+                inner_width as usize,
+            )),
             Line::from(format!(
                 "Focus: {} · Mode: {mode}",
                 self.state.focus.label()
             )),
             Line::from(format!("Layout: {}", self.state.layout_mode.label())),
-            Line::from(format!("Account: {}", self.state.account_status_summary())),
-            Line::from(format!("Account filter: {}", self.account_filter_label())),
+            Line::from(truncate_to_width(
+                &format!("Account: {account_line}"),
+                inner_width as usize,
+            )),
+            Line::from(truncate_to_width(
+                &format!("Account filter: {}", self.account_filter_label()),
+                inner_width as usize,
+            )),
             Line::from(format!("Filter: {filter}")),
             Line::from(format!(
                 "Chats: {}/{} · Messages: {}",
@@ -4797,24 +5369,17 @@ impl App {
                     message_list::format_message_datetime(last_message_at)
                 )));
             }
-            if chat.platform == Platform::Slack && !matches!(chat.kind, ChatKind::Direct) {
-                details.push(Line::from(""));
-                details.push(Line::from(Span::styled("Members", self.theme.status_key())));
-                let key = (chat.account.clone(), chat.id.clone());
-                if let Some(members) = self.state.chat_members.get(&key) {
-                    details.push(Line::from(format!("  {} members loaded", members.len())));
-                    for member in members.iter().take(30) {
-                        details.push(Line::from(format!("  {}", member.display_name)));
-                    }
-                    if members.len() > 30 {
-                        details.push(Line::from(format!("  … {} more", members.len() - 30)));
-                    }
-                } else if self.state.loading_chat_members.contains(&key) {
-                    details.push(Line::from("  Loading members…"));
-                } else {
-                    details.push(Line::from("  Members unavailable"));
-                }
+            self.append_chat_detail_lines(&mut details, &chat, inner_width);
+            if chat_supports_member_listing(&chat) {
+                self.append_member_detail_lines(
+                    &mut details,
+                    &chat,
+                    inner_width,
+                    hd_avatars,
+                    &mut member_overlays,
+                );
             }
+            self.append_contact_profile_lines(&mut details, &chat, inner_width);
         }
 
         details.extend([
@@ -4837,7 +5402,361 @@ impl App {
             Line::from("  Home/End: edges"),
             Line::from("  Ctrl+Q or Ctrl+C: quit"),
         ]);
-        details
+        (details, member_overlays)
+    }
+
+    /// Appends the "Members" section to the chat-overview details: a count line
+    /// followed by one entry per member rendered as a small avatar thumbnail
+    /// (or initials placeholder) beside the display name, with any admin/owner
+    /// role badge right-aligned to the panel margin.
+    fn append_member_detail_lines(
+        &self,
+        details: &mut Vec<Line<'static>>,
+        chat: &Chat,
+        inner_width: u16,
+        hd_avatars: bool,
+        overlays: &mut Vec<MemberAvatarOverlay>,
+    ) {
+        const MAX_RENDERED_MEMBERS: usize = 40;
+
+        details.push(Line::from(""));
+        details.push(Line::from(Span::styled("Members", self.theme.status_key())));
+
+        let key = (chat.account.clone(), chat.id.clone());
+        let Some(members) = self.state.chat_members.get(&key) else {
+            if self.state.loading_chat_members.contains(&key) {
+                details.push(Line::from("  Loading members…"));
+            } else {
+                details.push(Line::from("  Members unavailable"));
+            }
+            return;
+        };
+
+        if members.is_empty() {
+            details.push(Line::from("  No members"));
+            return;
+        }
+        details.push(Line::from(format!("  {} members", members.len())));
+
+        for member in members.iter().take(MAX_RENDERED_MEMBERS) {
+            let name = member.sender.display_name.to_string();
+            let role_label = member.role.label();
+
+            let indent_width = 2usize;
+            let avatar_width = chat_list::CHAT_AVATAR_WIDTH as usize;
+            let gap_width = 1usize;
+            let prefix_width = indent_width + avatar_width + gap_width;
+            let total_width = inner_width as usize;
+            let role_reserved = if role_label.is_empty() {
+                0
+            } else {
+                role_label.len() + 1
+            };
+            let max_name_width = total_width
+                .saturating_sub(prefix_width)
+                .saturating_sub(role_reserved);
+            let name = truncate_to_width(&name, max_name_width.max(1));
+            let name_width = UnicodeWidthStr::width(name.as_str());
+
+            // In HD mode, members with an on-disk avatar reserve blank space the
+            // size of the avatar block; the HD terminal image is overlaid after
+            // the paragraph is drawn. Members without an avatar (or any member
+            // when HD is off) keep the half-block / initials rendering inline.
+            let hd_key = if hd_avatars {
+                self.member_avatar_preview_key(member)
+            } else {
+                None
+            };
+            let (top_row, bottom_row) = if let Some(key) = hd_key {
+                let blank = vec![Span::raw(" ".repeat(avatar_width))];
+                overlays.push(MemberAvatarOverlay {
+                    line_index: details.len(),
+                    key,
+                });
+                (blank.clone(), blank)
+            } else {
+                let rows = self.member_avatar_rows(member);
+                let top_row = rows.first().cloned().unwrap_or_default();
+                let bottom_row = rows.get(1).cloned().unwrap_or_default();
+                (top_row, bottom_row)
+            };
+
+            let mut first_line = vec![Span::raw("  ")];
+            first_line.extend(top_row);
+            first_line.push(Span::raw(" "));
+            first_line.push(Span::styled(
+                name,
+                Style::default().fg(self.theme.foreground),
+            ));
+            if !role_label.is_empty() {
+                let used = prefix_width + name_width;
+                let pad = total_width
+                    .saturating_sub(used)
+                    .saturating_sub(role_label.len())
+                    .max(1);
+                first_line.push(Span::raw(" ".repeat(pad)));
+                first_line.push(Span::styled(role_label.to_owned(), self.theme.muted()));
+            }
+            details.push(Line::from(first_line));
+
+            let mut second_line = vec![Span::raw("  ")];
+            second_line.extend(bottom_row);
+            details.push(Line::from(second_line));
+        }
+
+        if members.len() > MAX_RENDERED_MEMBERS {
+            details.push(Line::from(format!(
+                "  … {} more",
+                members.len() - MAX_RENDERED_MEMBERS
+            )));
+        }
+    }
+
+    /// Appends provider-sourced [`ChatDetails`] (description, creation, counts,
+    /// settings, workspace, and platform-specific facts) to the chat-overview
+    /// details. No-op when no enrichment is loaded yet or the provider supplies
+    /// nothing displayable.
+    fn append_chat_detail_lines(
+        &self,
+        details: &mut Vec<Line<'static>>,
+        chat: &Chat,
+        inner_width: u16,
+    ) {
+        let key = (chat.account.clone(), chat.id.clone());
+        let Some(detail) = self.state.chat_details.get(&key) else {
+            return;
+        };
+        if detail.is_empty() {
+            return;
+        }
+        // Width available after the two-space indent for wrapped free text.
+        let wrap_width = (inner_width as usize).saturating_sub(2).max(1);
+
+        if let Some(description) = detail.description.as_ref() {
+            details.push(Line::from(Span::styled(
+                "  Description",
+                self.theme.muted(),
+            )));
+            for line in message_list::wrap_text(description, wrap_width) {
+                details.push(Line::from(format!("  {line}")));
+            }
+        }
+        if let Some(created_at) = detail.created_at {
+            let created = message_list::format_message_datetime(created_at);
+            let line = match detail.creator.as_ref() {
+                Some(creator) => format!("  Created: {created} by {creator}"),
+                None => format!("  Created: {created}"),
+            };
+            details.push(Line::from(line));
+        } else if let Some(creator) = detail.creator.as_ref() {
+            details.push(Line::from(format!("  Created by: {creator}")));
+        }
+        if let Some(member_count) = detail.member_count {
+            let line = match detail.admin_count {
+                Some(admins) if admins > 0 => {
+                    format!("  Members: {member_count} · {admins} admins")
+                }
+                _ => format!("  Members: {member_count}"),
+            };
+            details.push(Line::from(line));
+        }
+        if let Some(workspace) = detail.workspace.as_ref() {
+            details.push(Line::from(format!("  Workspace: {workspace}")));
+        }
+
+        let mut flags: Vec<&str> = Vec::new();
+        if detail.is_archived {
+            flags.push("Archived");
+        }
+        if detail.is_externally_shared {
+            flags.push("Externally shared");
+        }
+        if detail.only_admins_can_send {
+            flags.push("Only admins can send");
+        }
+        if detail.only_admins_can_edit {
+            flags.push("Only admins can edit info");
+        }
+        for flag in flags {
+            details.push(Line::from(format!("  {flag}")));
+        }
+        if let Some(seconds) = detail.disappearing_seconds
+            && seconds > 0
+        {
+            details.push(Line::from(format!(
+                "  Disappearing messages: {}",
+                format_duration_label(seconds)
+            )));
+        }
+        for (label, value) in &detail.facts {
+            for (index, line) in message_list::wrap_text(value, wrap_width).into_iter().enumerate() {
+                if index == 0 {
+                    details.push(Line::from(format!("  {label}: {line}")));
+                } else {
+                    details.push(Line::from(format!("    {line}")));
+                }
+            }
+        }
+    }
+
+    /// Appends a "Contact" section for direct-message chats using the loaded
+    /// [`ContactProfile`] for the peer. No-op for groups/channels, while the
+    /// peer is unidentified, or when no displayable profile detail is loaded.
+    fn append_contact_profile_lines(
+        &self,
+        details: &mut Vec<Line<'static>>,
+        chat: &Chat,
+        inner_width: u16,
+    ) {
+        if chat.is_group || chat.kind != ChatKind::Direct {
+            return;
+        }
+        let Some(platform_id) = self.selected_dm_peer_platform_id() else {
+            return;
+        };
+        let key = (chat.account.clone(), platform_id);
+        let Some(profile) = self.state.contact_profiles.get(&key) else {
+            return;
+        };
+        if !profile.has_detail() {
+            return;
+        }
+        let wrap_width = (inner_width as usize).saturating_sub(2).max(1);
+
+        details.push(Line::from(""));
+        details.push(Line::from(Span::styled("Contact", self.theme.pane_title())));
+        if let Some(handle) = profile.handle.as_ref() {
+            details.push(Line::from(format!("  Handle: {handle}")));
+        }
+        if let Some(title) = profile.title.as_ref() {
+            details.push(Line::from(format!("  Title: {title}")));
+        }
+        if let Some(status) = profile.status.as_ref() {
+            for line in message_list::wrap_text(status, wrap_width) {
+                details.push(Line::from(format!("  Status: {line}")));
+            }
+        }
+        if let Some(about) = profile.about.as_ref() {
+            details.push(Line::from(Span::styled("  About", self.theme.muted())));
+            for line in message_list::wrap_text(about, wrap_width) {
+                details.push(Line::from(format!("  {line}")));
+            }
+        }
+        if let Some(phone) = profile.phone.as_ref() {
+            details.push(Line::from(format!("  Phone: {phone}")));
+        }
+        if let Some(email) = profile.email.as_ref() {
+            details.push(Line::from(format!("  Email: {email}")));
+        }
+        if let Some(local_time) = profile.local_time.as_ref() {
+            details.push(Line::from(format!("  Local time: {local_time}")));
+        } else if let Some(timezone) = profile.timezone.as_ref() {
+            details.push(Line::from(format!("  Timezone: {timezone}")));
+        }
+
+        let mut flags: Vec<&str> = Vec::new();
+        if profile.is_bot {
+            flags.push("Bot / app");
+        }
+        if profile.is_business {
+            flags.push("Business account");
+        }
+        if profile.is_deactivated {
+            flags.push("Deactivated");
+        }
+        for flag in flags {
+            details.push(Line::from(format!("  {flag}")));
+        }
+        for (label, value) in &profile.facts {
+            for (index, line) in message_list::wrap_text(value, wrap_width).into_iter().enumerate() {
+                if index == 0 {
+                    details.push(Line::from(format!("  {label}: {line}")));
+                } else {
+                    details.push(Line::from(format!("    {line}")));
+                }
+            }
+        }
+    }
+
+    /// Builds the [`AvatarPreviewKey`] for a member's cached avatar, if the
+    /// member has an on-disk avatar file. Reuses the chat-avatar dimensions so
+    /// thumbnails are shared with the sidebar cache.
+    fn member_avatar_preview_key(&self, member: &ChatMember) -> Option<AvatarPreviewKey> {
+        let path = member.sender.avatar.as_deref().filter(|path| path.exists())?;
+        Some(AvatarPreviewKey {
+            path: path.to_path_buf(),
+            width: chat_list::CHAT_AVATAR_WIDTH,
+            rows: chat_list::CHAT_AVATAR_ROWS,
+            source: AvatarPreviewSource::Avatar,
+        })
+    }
+
+    /// Returns the cached half-block avatar rows for a member, falling back to
+    /// an initials placeholder when the thumbnail is not (yet) cached. Decoding
+    /// is queued separately by [`Self::queue_selected_chat_member_avatars`] so
+    /// this stays a cache-only read safe to call from draw/measure paths.
+    fn member_avatar_rows(&self, member: &ChatMember) -> chat_list::AvatarRows {
+        if let Some(key) = self.member_avatar_preview_key(member)
+            && let Some(Ok(avatar)) = self.avatar_preview_cache.get(&key)
+        {
+            return avatar.rows.clone();
+        }
+        member_avatar_placeholder_rows(&member.sender, self.theme)
+    }
+
+    /// Queues background avatar-thumbnail decodes for the members of the
+    /// currently selected group/channel so the details panel can render their
+    /// avatars. Called from the draw path; the actual decode happens off the
+    /// UI thread and results are applied on later frames.
+    fn queue_selected_chat_member_avatars(&mut self) {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            return;
+        };
+        if !chat_supports_member_listing(&chat) {
+            return;
+        }
+        let key = (chat.account.clone(), chat.id.clone());
+        let Some(members) = self.state.chat_members.get(&key) else {
+            return;
+        };
+        let avatar_keys = members
+            .iter()
+            .take(40)
+            .filter_map(|member| self.member_avatar_preview_key(member))
+            .collect::<Vec<_>>();
+        self.queue_avatar_preview_loads(avatar_keys);
+    }
+
+    /// Builds the reaction/poll sender-name map for the selected chat.
+    ///
+    /// Loaded message senders alone are not enough: a contact can react to (or
+    /// vote in) a message without having sent any message visible in the
+    /// current window, so resolving names only from `state.messages` leaves
+    /// those senders showing a raw phone-number/JID fallback. Merging the
+    /// cached sender directory (which is populated from fetched group members)
+    /// lets such reactors resolve to their contact name. Cache entries fill
+    /// gaps and also replace fallback names that still equal the platform id.
+    fn reaction_sender_name_map(&self) -> HashMap<Arc<str>, String> {
+        let mut names = reaction_sender_names(&self.state.messages);
+        if let Some(chat) = self.state.selected_chat() {
+            for ((account, platform_id), sender) in &self.state.sender_cache {
+                if account.as_ref() != chat.account.as_ref()
+                    || !sender_has_resolved_info(sender)
+                {
+                    continue;
+                }
+                match names.get_mut(platform_id.as_ref()) {
+                    Some(existing) if existing.as_str() == platform_id.as_ref() => {
+                        *existing = sender.display_name.to_string();
+                    }
+                    Some(_) => {}
+                    None => {
+                        names.insert(platform_id.clone(), sender.display_name.to_string());
+                    }
+                }
+            }
+        }
+        names
     }
 
     fn draw_message_details(
@@ -4863,12 +5782,21 @@ impl App {
             .as_ref()
             .map(|id| short_id(id).to_string())
             .unwrap_or_else(|| "none".to_owned());
-        let avatar_rows = message
+        let avatar_path = message
             .sender
             .avatar
             .as_deref()
             .filter(|path| path.exists())
-            .and_then(|path| {
+            .map(Path::to_path_buf);
+        // HD previews are rendered as terminal images overlaid on reserved blank
+        // lines; the half-block "matrix" rows are only used when HD is off or the
+        // terminal can't display inline images.
+        let hd_avatar = self.settings.image_preview_mode == ImagePreviewMode::Hd
+            && self.terminal_hd_images_supported();
+        let avatar_rows = if hd_avatar {
+            None
+        } else {
+            avatar_path.as_deref().and_then(|path| {
                 let key = message_list::MediaPreviewKey {
                     path: path.to_path_buf(),
                     width: area.width.saturating_sub(4).clamp(1, 16),
@@ -4884,7 +5812,8 @@ impl App {
                         None
                     }
                 }
-            });
+            })
+        };
         let avatar_status = if message.sender.avatar.is_some() {
             "avatar preview"
         } else {
@@ -4893,7 +5822,7 @@ impl App {
         let reactions = if message.reactions.is_empty() {
             "none".to_owned()
         } else {
-            let reaction_sender_names = reaction_sender_names(&self.state.messages);
+            let reaction_sender_names = self.reaction_sender_name_map();
             message
                 .reactions
                 .iter()
@@ -4942,9 +5871,22 @@ impl App {
             Line::from(Span::styled("Content", self.theme.status_key())),
         ];
 
+        let mut hd_avatar_overlay = None;
         if let Some(avatar_rows) = avatar_rows {
             lines.extend(avatar_rows.into_iter().map(Line::from));
             lines.push(Line::from(""));
+        } else if hd_avatar
+            && let Some(path) = avatar_path.clone()
+        {
+            // Reserve blank lines so the overlaid HD image (drawn after the
+            // paragraph) does not collide with surrounding text and scrolls with
+            // the rest of the details content.
+            let start_idx = lines.len();
+            lines.extend(
+                std::iter::repeat_n(Line::from(""), DETAILS_AVATAR_ROWS as usize)
+                    .chain(std::iter::once(Line::from(""))),
+            );
+            hd_avatar_overlay = Some((path, start_idx));
         }
 
         let content = content_copy_text(&message.content);
@@ -4963,7 +5905,7 @@ impl App {
             )));
             lines.extend(poll_result_lines(
                 poll,
-                &reaction_sender_names(&self.state.messages),
+                &self.reaction_sender_name_map(),
                 self.theme,
             ));
         }
@@ -4972,7 +5914,11 @@ impl App {
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Details")
+                    .title(Line::from(Span::styled(
+                        padded_title("Details"),
+                        self.theme
+                            .pane_title_for(self.state.focus == FocusPane::Details),
+                    )))
                     .borders(Borders::ALL)
                     .border_style(
                         self.theme
@@ -4982,7 +5928,16 @@ impl App {
             .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
-        self.draw_vertical_scrollbar(frame, area, content_len, self.state.details_scroll);
+        if let Some((path, line_index)) = hd_avatar_overlay {
+            self.render_details_hd_avatar(frame, area, &path, line_index);
+        }
+        self.draw_vertical_scrollbar(
+            frame,
+            area,
+            content_len,
+            self.state.details_scroll,
+            ScrollbarTarget::Details,
+        );
     }
 
     fn draw_thread_details(
@@ -5021,7 +5976,7 @@ impl App {
         let compose_area = chunks[1];
 
         let outer = Block::default()
-            .title(" Thread ")
+            .title(padded_title("Thread"))
             .borders(Borders::ALL)
             .border_style(
                 self.theme
@@ -5112,7 +6067,13 @@ impl App {
             .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(body, chunks[1]);
-        self.draw_vertical_scrollbar(frame, chunks[1], content_len, self.state.details_scroll);
+        self.draw_vertical_scrollbar(
+            frame,
+            chunks[1],
+            content_len,
+            self.state.details_scroll,
+            ScrollbarTarget::Details,
+        );
 
         let is_thread_focused = self.state.focus == FocusPane::Details;
         self.draw_thread_compose(frame, compose_area, is_thread_focused);
@@ -5124,12 +6085,12 @@ impl App {
         };
         let mut matches = Vec::new();
         if let Some(root) = self.message_by_id(thread_root)
-            && message_matches_filter(root, &self.state.filter)
+            && message_matches_filter(root, &self.state.filters.thread)
         {
             matches.push(root);
         }
         for reply in self.thread_replies(thread_root) {
-            if message_matches_filter(reply, &self.state.filter) {
+            if message_matches_filter(reply, &self.state.filters.thread) {
                 matches.push(reply);
             }
         }
@@ -5157,7 +6118,7 @@ impl App {
             .unwrap_or("Current chat");
 
         let outer = Block::default()
-            .title(" Thread ")
+            .title(padded_title("Thread"))
             .borders(Borders::ALL)
             .border_style(
                 self.theme
@@ -5182,8 +6143,8 @@ impl App {
             ]),
             Line::from(Span::styled(
                 format!(
-                    "filter: {} · {} matches · Esc finishes",
-                    self.state.filter,
+                    "filter: {} · {} matches · Esc clears",
+                    self.state.filters.thread,
                     matches.len()
                 ),
                 self.theme.muted(),
@@ -5223,7 +6184,13 @@ impl App {
             .scroll((self.state.details_scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(body, chunks[1]);
-        self.draw_vertical_scrollbar(frame, chunks[1], content_len, self.state.details_scroll);
+        self.draw_vertical_scrollbar(
+            frame,
+            chunks[1],
+            content_len,
+            self.state.details_scroll,
+            ScrollbarTarget::Details,
+        );
     }
 
     fn draw_thread_compose(&self, frame: &mut Frame<'_>, area: Rect, is_focused: bool) {
@@ -5232,19 +6199,19 @@ impl App {
         }
 
         let block = Block::default()
-            .title("Reply in thread")
+            .title(padded_title("Reply in thread"))
             .borders(Borders::ALL)
             .border_style(self.theme.focus_border(is_focused));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let mut compose = self.compose_textarea_for_render(
+        self.render_wrapped_compose(
+            frame,
+            inner,
             &self.state.thread_compose,
             is_focused,
             "Reply in thread...",
         );
-        compose.remove_block();
-        frame.render_widget(&compose, inner);
     }
 
     fn draw_status_bar(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -5360,7 +6327,8 @@ impl App {
         if self.state.reaction_picker.is_some() {
             return vec![
                 hint("Choose reaction"),
-                hint("Arrow keys move"),
+                hint("↑↓ scroll"),
+                hint("Type to filter"),
                 hint("Enter toggles"),
                 hint("Esc cancels"),
             ];
@@ -5384,19 +6352,23 @@ impl App {
         }
 
         if self.state.filter_mode {
+            let scope = self.state.filter_scope;
+            let query = self.state.active_filter();
+            let badge = if query.is_empty() {
+                format!("FILTER {} (type to filter)", scope.label())
+            } else {
+                format!("FILTER {}: {}", scope.label(), query)
+            };
             return vec![
-                Span::styled(
-                    format!("Filter {}", self.state.filter_scope.label()),
-                    self.theme.status_bar(),
-                ),
+                Span::styled(badge, self.theme.status_bar()),
                 hint("Type to filter"),
                 hint("↑↓/Enter select"),
-                hint("←→ switch scope"),
-                hint("Esc finishes"),
+                hint("←→ switch pane"),
+                hint("Esc clears"),
             ];
         }
 
-        match self.state.focus {
+        let mut hints = match self.state.focus {
             FocusPane::ChatList => {
                 let mut hints = vec![
                     hint("↑↓ choose chat"),
@@ -5457,21 +6429,81 @@ impl App {
                 hint("← returns"),
                 hint("? help"),
             ],
+        };
+        // Surface a persistent badge whenever a filter is still applied but the
+        // user is no longer editing it, so a lingering filter can never be lost.
+        if let Some(badge) = self.active_filter_badge() {
+            hints.insert(0, badge);
         }
+        hints
+    }
+
+    /// A highlighted status-bar badge naming every scope that currently has an
+    /// applied filter, shown only when not actively editing a filter.
+    fn active_filter_badge(&self) -> Option<Span<'static>> {
+        if self.state.filter_mode || !self.state.filters.any_active() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !self.state.filters.chats.is_empty() {
+            parts.push(format!("chats: {}", self.state.filters.chats));
+        }
+        if !self.state.filters.messages.is_empty() {
+            parts.push(format!("messages: {}", self.state.filters.messages));
+        }
+        if self.thread_filter_active() {
+            parts.push(format!("thread: {}", self.state.filters.thread));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(Span::styled(
+            format!("FILTER ACTIVE [{}] · Esc clears", parts.join(" · ")),
+            self.theme.status_bar(),
+        ))
+    }
+
+    /// Records the clickable track of a scrollbar that is about to render so
+    /// mouse hit-testing can route clicks and drags to the matching scroll
+    /// state. Returns false when the scrollbar would not render (content fits
+    /// the viewport or the area is too small).
+    fn record_scrollbar_hit(
+        &mut self,
+        area: Rect,
+        content_len: usize,
+        target: ScrollbarTarget,
+    ) -> bool {
+        let viewport = inner_area(area).height as usize;
+        if area.width < 3 || area.height < 3 || content_len <= viewport.max(1) {
+            return false;
+        }
+
+        self.state.scrollbar_hits.push(ScrollbarHit {
+            target,
+            track: Rect::new(
+                area.x.saturating_add(area.width.saturating_sub(1)),
+                area.y,
+                1,
+                area.height,
+            ),
+            max_position: content_len.saturating_sub(viewport),
+        });
+        true
     }
 
     fn draw_vertical_scrollbar(
-        &self,
+        &mut self,
         frame: &mut Frame<'_>,
         area: Rect,
         content_len: usize,
         position: usize,
+        target: ScrollbarTarget,
     ) {
-        let viewport = inner_area(area).height as usize;
-        if area.width < 3 || area.height < 3 || content_len <= viewport.max(1) {
+        if !self.record_scrollbar_hit(area, content_len, target) {
             return;
         }
 
+        let viewport = inner_area(area).height as usize;
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .thumb_style(Style::default().fg(self.theme.muted))
             .track_style(Style::default().fg(Color::Black))
@@ -5517,7 +6549,7 @@ impl App {
 
         let paragraph = Paragraph::new(lines).block(
             Block::default()
-                .title("Actions")
+                .title(padded_title("Actions"))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
@@ -5599,7 +6631,7 @@ impl App {
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Forward")
+                    .title(padded_title("Forward"))
                     .borders(Borders::ALL)
                     .border_style(self.theme.overlay_border()),
             )
@@ -5618,53 +6650,79 @@ impl App {
             return;
         }
 
-        let reacted_by_me = self
-            .message_by_id(&picker.message_id)
-            .map(|message| {
-                REACTION_OPTIONS
-                    .iter()
-                    .map(|emoji| message_reacted_by_sender(message, emoji, LOCAL_REACTION_SENDER))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![false; REACTION_OPTIONS.len()]);
+        let message = self.message_by_id(&picker.message_id);
+        let total = picker.matches.len();
+        let scroll_offset = picker
+            .scroll_offset
+            .min(total.saturating_sub(REACTION_PICKER_VISIBLE_ROWS));
+        let window_end = (scroll_offset + REACTION_PICKER_VISIBLE_ROWS).min(total);
 
-        let mut spans = vec![Span::raw(" ")];
-        for (index, emoji) in REACTION_OPTIONS.iter().enumerate() {
-            let under_cursor = index == picker.selected;
-            let already_selected = reacted_by_me.get(index).copied().unwrap_or_default();
-            let label = if under_cursor {
-                format!("›{emoji}‹")
-            } else {
-                format!(" {emoji} ")
-            };
-            let style = match (under_cursor, already_selected) {
-                (true, true) => Style::default()
-                    .fg(Color::Black)
-                    .bg(self.theme.accent)
-                    .add_modifier(Modifier::BOLD),
-                (true, false) => self.theme.status_key(),
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Choose reaction ", self.theme.pane_title()),
+            Span::styled(
+                if picker.query.is_empty() {
+                    String::new()
+                } else {
+                    format!(":{}", picker.query)
+                },
+                self.theme.status_key(),
+            ),
+        ])];
+
+        if total == 0 {
+            lines.push(Line::from(Span::styled(
+                "  no matching reactions",
+                self.theme.muted(),
+            )));
+        }
+
+        if scroll_offset > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ↑ {scroll_offset} more"),
+                self.theme.muted(),
+            )));
+        }
+
+        for (window_row, option_index) in picker.matches[scroll_offset..window_end]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let row = scroll_offset + window_row;
+            let (value, label) = COMPOSE_EMOTICON_OPTIONS[option_index];
+            let selected = row == picker.selected;
+            let reacted = message
+                .is_some_and(|message| message_reacted_by_sender(message, value, LOCAL_REACTION_SENDER));
+            let prefix = if selected { "› " } else { "  " };
+            let marker = if reacted { "● " } else { "  " };
+            let style = match (selected, reacted) {
+                (true, _) => self.theme.status_key(),
                 (false, true) => Style::default()
                     .fg(self.theme.accent)
                     .add_modifier(Modifier::BOLD),
                 (false, false) => self.theme.status_bar(),
             };
-            spans.push(Span::styled(label, style));
-            if index + 1 < REACTION_OPTIONS.len() {
-                spans.push(Span::raw(" "));
-            }
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{marker}{value} {label}"),
+                style,
+            )));
         }
 
-        let paragraph = Paragraph::new(vec![
-            Line::from(Span::styled("Choose reaction", self.theme.pane_title())),
-            Line::from(spans),
-            Line::from(Span::styled(
-                "Enter toggles selected reaction",
+        if window_end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ↓ {} more", total - window_end),
                 self.theme.muted(),
-            )),
-        ])
-        .block(
+            )));
+        }
+
+        lines.push(Line::from(Span::styled(
+            "Enter toggles · Esc cancels · ↑↓ scrolls · type to filter",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines).block(
             Block::default()
-                .title("React")
+                .title(padded_title("React"))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
@@ -5682,11 +6740,30 @@ impl App {
             return;
         }
 
+        let total = picker.matches.len();
+        let scroll_offset = picker
+            .scroll_offset
+            .min(total.saturating_sub(COMPOSE_EMOTICON_VISIBLE_ROWS));
+        let window_end = (scroll_offset + COMPOSE_EMOTICON_VISIBLE_ROWS).min(total);
+
         let mut lines = vec![Line::from(vec![
             Span::styled("Emoji suggestions ", self.theme.pane_title()),
             Span::styled(format!(":{}", picker.query), self.theme.status_key()),
         ])];
-        for (row, option_index) in picker.matches.iter().copied().enumerate() {
+
+        if scroll_offset > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  ↑ {scroll_offset} more"),
+                self.theme.muted(),
+            )));
+        }
+
+        for (window_row, option_index) in picker.matches[scroll_offset..window_end]
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            let row = scroll_offset + window_row;
             let (value, label) = COMPOSE_EMOTICON_OPTIONS[option_index];
             let selected = row == picker.selected;
             let prefix = if selected { "› " } else { "  " };
@@ -5700,14 +6777,22 @@ impl App {
                 style,
             )));
         }
+
+        if window_end < total {
+            lines.push(Line::from(Span::styled(
+                format!("  ↓ {} more", total - window_end),
+                self.theme.muted(),
+            )));
+        }
+
         lines.push(Line::from(Span::styled(
-            "Enter/Tab inserts · Esc cancels · keep typing to narrow",
+            "Enter/Tab inserts · Esc cancels · ↑↓ scrolls · keep typing to narrow",
             self.theme.muted(),
         )));
 
         let paragraph = Paragraph::new(lines).block(
             Block::default()
-                .title("Emoji")
+                .title(padded_title("Emoji"))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
@@ -5771,7 +6856,7 @@ impl App {
 
         let paragraph = Paragraph::new(lines).block(
             Block::default()
-                .title("Vote")
+                .title(padded_title("Vote"))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
@@ -5808,7 +6893,7 @@ impl App {
             let paragraph = Paragraph::new(lines)
                 .block(
                     Block::default()
-                        .title("Slack help")
+                        .title(padded_title("Slack help"))
                         .borders(Borders::ALL)
                         .border_style(self.theme.overlay_border()),
                 )
@@ -6079,7 +7164,7 @@ impl App {
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Slack setup")
+                    .title(padded_title("Slack setup"))
                     .borders(Borders::ALL)
                     .border_style(self.theme.overlay_border()),
             )
@@ -6183,7 +7268,7 @@ impl App {
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Authentication")
+                    .title(padded_title("Authentication"))
                     .borders(Borders::ALL)
                     .border_style(self.theme.overlay_border()),
             )
@@ -6192,7 +7277,7 @@ impl App {
         frame.render_widget(paragraph, modal);
     }
 
-    fn draw_help_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_help_overlay(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let Some(help) = &self.state.help_overlay else {
             return;
         };
@@ -6215,7 +7300,7 @@ impl App {
         let paragraph = Paragraph::new(lines.clone())
             .block(
                 Block::default()
-                    .title(title)
+                    .title(padded_title(&title))
                     .borders(Borders::ALL)
                     .border_style(self.theme.help_overlay_border()),
             )
@@ -6226,7 +7311,13 @@ impl App {
         frame.render_widget(backdrop_widget, backdrop);
         frame.render_widget(Clear, modal);
         frame.render_widget(paragraph, modal);
-        self.draw_vertical_scrollbar(frame, modal, lines.len(), scroll);
+        self.draw_vertical_scrollbar(
+            frame,
+            modal,
+            lines.len(),
+            scroll,
+            ScrollbarTarget::HelpOverlay,
+        );
     }
 
     fn help_overlay_lines(&self) -> Vec<Line<'static>> {
@@ -6243,10 +7334,10 @@ impl App {
             .map(|id| short_id(id).to_string())
             .unwrap_or_else(|| "none".to_owned());
         let account_filter = self.account_filter_label();
-        let filter = if self.state.filter.is_empty() {
+        let filter = if self.state.active_filter().is_empty() {
             "none".to_owned()
         } else {
-            self.state.filter.clone()
+            self.state.active_filter().to_owned()
         };
 
         vec![
@@ -6294,7 +7385,7 @@ impl App {
             Line::from(Span::styled("Message actions", self.theme.status_key())),
             Line::from("  Reply: quote the selected message in compose"),
             Line::from("  View thread: open replies in the details pane"),
-            Line::from("  React: choose an emoji reaction"),
+            Line::from("  React: scroll or type to filter, then toggle an emoji reaction"),
             Line::from("  Copy text: copy message text when clipboard is available"),
             Line::from("  Open image: preview image media"),
             Line::from(""),
@@ -6309,6 +7400,7 @@ impl App {
             Line::from(""),
             Line::from(Span::styled("Popups", self.theme.status_key())),
             Line::from("  Arrow keys: move inside action, reaction, and account popups"),
+            Line::from("  Reaction picker: type to filter, ↑↓/PageUp/PageDown or scroll to move"),
             Line::from("  Enter: apply selected popup option"),
             Line::from("  Click outside: close most popups"),
             Line::from("  Scroll in help: move this page"),
@@ -6343,7 +7435,7 @@ impl App {
         ])
         .block(
             Block::default()
-                .title("Notification")
+                .title(padded_title("Notification"))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         )
@@ -6352,64 +7444,102 @@ impl App {
         frame.render_widget(paragraph, popup);
     }
 
-    fn draw_settings_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_settings_overlay(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let Some(settings_overlay) = &self.state.settings_overlay else {
             return;
         };
         if area.width < 40 || area.height < 12 {
             return;
         }
+        let selected = settings_overlay
+            .selected
+            .min(SettingsItem::ALL.len().saturating_sub(1));
+        let raw_scroll = settings_overlay.scroll;
 
         let modal = self.settings_overlay_rect(area);
-        let mut lines = vec![
+        let metrics = settings_overlay_metrics(modal);
+        let scroll = raw_scroll.min(metrics.max_scroll);
+
+        frame.render_widget(Clear, modal);
+        frame.render_widget(
+            Block::default()
+                .title(padded_title("Settings"))
+                .borders(Borders::ALL)
+                .border_style(self.theme.overlay_border()),
+            modal,
+        );
+
+        let inner = inner_area(modal);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let header = Paragraph::new(vec![
             Line::from(Span::styled(
                 "Chat organization and notification settings",
                 self.theme.pane_title(),
             )),
             Line::from(Span::styled(
-                "Up/Down selects · Enter/Space changes · Esc closes",
+                "Up/Down selects · Enter/Space/Click changes · Wheel scrolls · Esc closes",
                 self.theme.muted(),
             )),
-            Line::from(""),
-        ];
-        for (index, item) in SettingsItem::ALL.iter().enumerate() {
-            let selected = index == settings_overlay.selected;
-            let marker = if selected { "›" } else { " " };
-            let value =
-                item.value_text(&self.settings, self.archive_running_for_current_accounts());
-            let style = if selected {
+        ]);
+        frame.render_widget(
+            header,
+            Rect::new(inner.x, inner.y, inner.width, inner.height.min(2)),
+        );
+
+        let archive_running = self.archive_running_for_current_accounts();
+        let mut list_lines = Vec::new();
+        for (index, item) in SettingsItem::ALL
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(metrics.viewport_rows)
+        {
+            let is_selected = index == selected;
+            let marker = if is_selected { "› " } else { "  " };
+            let style = if is_selected {
                 self.theme.status_key()
             } else {
                 self.theme.status_bar()
             };
-            let marker_text = item
+            let checkbox = item
                 .checkbox(&self.settings)
                 .map(|checked| format!("[{}] ", if checked { "x" } else { " " }))
                 .unwrap_or_else(|| "    ".to_owned());
-            lines.push(Line::from(vec![
-                Span::styled(format!("{marker} "), style),
-                Span::styled(marker_text, style),
+            let value = item.value_text(&self.settings, archive_running);
+            list_lines.push(Line::from(vec![
+                Span::styled(marker, style),
+                Span::styled(checkbox, style),
                 Span::styled(item.label(), style),
                 Span::styled(format!(" ({value})"), self.theme.muted()),
             ]));
-            if selected {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", item.description()),
-                    self.theme.muted(),
-                )));
-            }
+        }
+        frame.render_widget(Paragraph::new(list_lines), metrics.list);
+
+        if metrics.description.height > 0 {
+            let description = Paragraph::new(Line::from(Span::styled(
+                SettingsItem::ALL[selected].description(),
+                self.theme.muted(),
+            )))
+            .wrap(Wrap { trim: true });
+            frame.render_widget(description, metrics.description);
         }
 
-        let paragraph = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .title("Settings")
-                    .borders(Borders::ALL)
-                    .border_style(self.theme.overlay_border()),
-            )
-            .wrap(Wrap { trim: true });
-        frame.render_widget(Clear, modal);
-        frame.render_widget(paragraph, modal);
+        let scrollbar_area = Rect::new(
+            modal.x,
+            metrics.list.y.saturating_sub(1),
+            modal.width,
+            metrics.list.height.saturating_add(2),
+        );
+        self.draw_vertical_scrollbar(
+            frame,
+            scrollbar_area,
+            SettingsItem::ALL.len(),
+            scroll,
+            ScrollbarTarget::Settings,
+        );
     }
 
     fn draw_account_setup_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -6469,7 +7599,7 @@ impl App {
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Connect chat app")
+                    .title(padded_title("Connect chat app"))
                     .borders(Borders::ALL)
                     .border_style(self.theme.overlay_border()),
             )
@@ -6538,7 +7668,7 @@ impl App {
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Accounts")
+                    .title(padded_title("Accounts"))
                     .borders(Borders::ALL)
                     .border_style(self.theme.overlay_border()),
             )
@@ -6639,7 +7769,7 @@ impl App {
         let paragraph = Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(title)
+                    .title(padded_title(&title))
                     .borders(Borders::ALL)
                     .border_style(self.theme.overlay_border()),
             )
@@ -6958,6 +8088,43 @@ impl App {
             let image = TerminalImage::new(&protocol).allow_clipping(true);
             frame.render_widget(image, area);
         }
+    }
+
+    /// Overlays the sender avatar as an HD terminal image in the message
+    /// details pane. `line_index` is the logical line within the details
+    /// paragraph where the avatar block was reserved; it is translated to a
+    /// screen row using the current details scroll offset, mirroring the
+    /// paragraph's own scroll handling.
+    fn render_details_hd_avatar(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        path: &Path,
+        line_index: usize,
+    ) {
+        let inner = inner_area(area);
+        if inner.is_empty() || line_index < self.state.details_scroll {
+            return;
+        }
+        let relative = (line_index - self.state.details_scroll) as u16;
+        if relative >= inner.height {
+            return;
+        }
+        let y = inner.y.saturating_add(relative);
+        let available_rows = inner.height.saturating_sub(relative);
+        let rows = DETAILS_AVATAR_ROWS.min(available_rows);
+        let width = DETAILS_AVATAR_WIDTH.min(inner.width);
+        if rows == 0 || width == 0 {
+            return;
+        }
+        let avatar_area = Rect::new(inner.x, y, width, rows);
+        let key = AvatarPreviewKey {
+            path: path.to_path_buf(),
+            width: DETAILS_AVATAR_WIDTH,
+            rows: DETAILS_AVATAR_ROWS,
+            source: AvatarPreviewSource::Avatar,
+        };
+        self.render_hd_avatar_for_key(frame, avatar_area, &key);
     }
 
     fn terminal_hd_images_supported(&self) -> bool {
@@ -7874,7 +9041,7 @@ impl App {
     }
 
     async fn handle_reaction_picker_key(&mut self, key: KeyEvent) -> Result<bool> {
-        let Some(picker) = &mut self.state.reaction_picker else {
+        if self.state.reaction_picker.is_none() {
             return Ok(false);
         };
 
@@ -7883,20 +9050,61 @@ impl App {
                 self.state.reaction_picker = None;
                 self.state.status = "reaction cancelled".to_owned();
             }
-            KeyCode::Left | KeyCode::Up => {
-                picker.selected = picker.selected.saturating_sub(1);
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.state.reaction_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    picker.keep_selected_visible();
+                }
             }
-            KeyCode::Right | KeyCode::Down => {
-                picker.selected = picker
-                    .selected
-                    .saturating_add(1)
-                    .min(REACTION_OPTIONS.len().saturating_sub(1));
+            KeyCode::Down => {
+                if let Some(picker) = &mut self.state.reaction_picker {
+                    let max = picker.matches.len().saturating_sub(1);
+                    picker.selected = picker.selected.saturating_add(1).min(max);
+                    picker.keep_selected_visible();
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(picker) = &mut self.state.reaction_picker {
+                    picker.selected = picker.selected.saturating_sub(REACTION_PICKER_VISIBLE_ROWS);
+                    picker.keep_selected_visible();
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(picker) = &mut self.state.reaction_picker {
+                    let max = picker.matches.len().saturating_sub(1);
+                    picker.selected = picker
+                        .selected
+                        .saturating_add(REACTION_PICKER_VISIBLE_ROWS)
+                        .min(max);
+                    picker.keep_selected_visible();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(picker) = &mut self.state.reaction_picker
+                    && picker.query.pop().is_some()
+                {
+                    picker.refresh_matches();
+                }
+            }
+            KeyCode::Char(value)
+                if value.is_alphanumeric() || matches!(value, '_' | '-' | '+') =>
+            {
+                if let Some(picker) = &mut self.state.reaction_picker {
+                    picker.query.push(value.to_ascii_lowercase());
+                    picker.refresh_matches();
+                }
             }
             KeyCode::Enter => {
-                let message_id = picker.message_id.clone();
-                let emoji = REACTION_OPTIONS[picker.selected];
-                self.state.reaction_picker = None;
-                self.apply_reaction(message_id, emoji).await?;
+                let chosen = self.state.reaction_picker.as_ref().and_then(|picker| {
+                    picker
+                        .matches
+                        .get(picker.selected)
+                        .map(|&index| (picker.message_id.clone(), COMPOSE_EMOTICON_OPTIONS[index].0))
+                });
+                if let Some((message_id, emoji)) = chosen {
+                    self.state.reaction_picker = None;
+                    self.apply_reaction(message_id, emoji).await?;
+                }
             }
             _ => {}
         }
@@ -7917,6 +9125,7 @@ impl App {
             KeyCode::Up => {
                 if let Some(picker) = &mut self.state.compose_emoticon_picker {
                     picker.selected = picker.selected.saturating_sub(1);
+                    picker.keep_selected_visible();
                 }
                 true
             }
@@ -7924,6 +9133,7 @@ impl App {
                 if let Some(picker) = &mut self.state.compose_emoticon_picker {
                     let max = picker.matches.len().saturating_sub(1);
                     picker.selected = picker.selected.saturating_add(1).min(max);
+                    picker.keep_selected_visible();
                 }
                 true
             }
@@ -8019,14 +9229,26 @@ impl App {
             ActionMenuItem::Reply => self.start_reply(message_id),
             ActionMenuItem::ViewThread => self.open_thread(message_id),
             ActionMenuItem::React => {
+                let allow_freeform = self
+                    .state
+                    .selected_chat()
+                    .map(|chat| platform_allows_freeform_reactions(&chat.platform))
+                    .unwrap_or(true);
+                let matches = reaction_catalog_matches("", allow_freeform);
                 let selected = self
                     .message_by_id(&message_id)
-                    .and_then(local_reaction_option)
+                    .and_then(|message| reaction_catalog_selected_index(message, &matches))
                     .unwrap_or_default();
-                self.state.reaction_picker = Some(ReactionPicker {
+                let mut picker = ReactionPicker {
                     message_id,
                     selected,
-                });
+                    scroll_offset: 0,
+                    query: String::new(),
+                    matches,
+                    allow_freeform,
+                };
+                picker.keep_selected_visible();
+                self.state.reaction_picker = Some(picker);
                 self.state.status = "choose a reaction".to_owned();
             }
             ActionMenuItem::Forward => self.open_forward_picker(message_id),
@@ -8600,24 +9822,28 @@ impl App {
                         .saturating_add(1)
                         .min(SettingsItem::ALL.len().saturating_sub(1));
                 }
+                self.ensure_settings_selection_visible();
                 self.state.status = "choose setting".to_owned();
             }
             KeyCode::Up | KeyCode::Left | KeyCode::BackTab => {
                 if let Some(settings_overlay) = &mut self.state.settings_overlay {
                     settings_overlay.selected = settings_overlay.selected.saturating_sub(1);
                 }
+                self.ensure_settings_selection_visible();
                 self.state.status = "choose setting".to_owned();
             }
             KeyCode::Home => {
                 if let Some(settings_overlay) = &mut self.state.settings_overlay {
                     settings_overlay.selected = 0;
                 }
+                self.ensure_settings_selection_visible();
                 self.state.status = "choose setting".to_owned();
             }
             KeyCode::End => {
                 if let Some(settings_overlay) = &mut self.state.settings_overlay {
                     settings_overlay.selected = SettingsItem::ALL.len().saturating_sub(1);
                 }
+                self.ensure_settings_selection_visible();
                 self.state.status = "choose setting".to_owned();
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
@@ -8629,34 +9855,90 @@ impl App {
                 else {
                     return Ok(false);
                 };
-                let item = SettingsItem::ALL[selected];
-                if item == SettingsItem::ArchiveVisibleAccounts {
-                    self.toggle_archive_for_current_accounts();
-                    return Ok(false);
-                }
-
-                let reorganize_chats = item.apply(&mut self.settings);
-                self.theme = Theme::from_preset(self.settings.ui_theme);
-                self.store.save_app_settings(&self.settings).await?;
-                if reorganize_chats {
-                    let selection_changed = self.apply_filter();
-                    if selection_changed {
-                        self.reset_history_window_state();
-                    }
-                }
-                if item == SettingsItem::ConversationStyle {
-                    self.clamp_message_scroll();
-                }
-                if item == SettingsItem::ImagePreviewMode {
-                    self.clear_image_protocol_work();
-                }
-                let value =
-                    item.value_text(&self.settings, self.archive_running_for_current_accounts());
-                self.state.status = format!("{}: {value}", item.label());
+                self.activate_settings_item(selected).await?;
             }
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Applies the setting at `selected`, exactly as pressing Enter on it
+    /// would. Shared by the keyboard handler and mouse clicks on list rows.
+    async fn activate_settings_item(&mut self, selected: usize) -> Result<()> {
+        let Some(item) = SettingsItem::ALL.get(selected).copied() else {
+            return Ok(());
+        };
+        if item == SettingsItem::ArchiveVisibleAccounts {
+            self.toggle_archive_for_current_accounts();
+            return Ok(());
+        }
+
+        let reorganize_chats = item.apply(&mut self.settings);
+        self.theme = Theme::from_preset(self.settings.ui_theme);
+        self.store.save_app_settings(&self.settings).await?;
+        if reorganize_chats {
+            let selection_changed = self.apply_filter();
+            if selection_changed {
+                self.reset_history_window_state();
+            }
+        }
+        if item == SettingsItem::ConversationStyle {
+            self.clamp_message_scroll();
+        }
+        if item == SettingsItem::ImagePreviewMode {
+            self.clear_image_protocol_work();
+        }
+        let value = item.value_text(&self.settings, self.archive_running_for_current_accounts());
+        self.state.status = format!("{}: {value}", item.label());
+        Ok(())
+    }
+
+    /// Adjusts the settings overlay scroll so the selected item stays inside
+    /// the list viewport.
+    fn ensure_settings_selection_visible(&mut self) {
+        let metrics =
+            settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
+        let Some(overlay) = &mut self.state.settings_overlay else {
+            return;
+        };
+        let viewport = metrics.viewport_rows.max(1);
+        let mut scroll = overlay.scroll.min(metrics.max_scroll);
+        if overlay.selected < scroll {
+            scroll = overlay.selected;
+        } else if overlay.selected >= scroll.saturating_add(viewport) {
+            scroll = overlay.selected.saturating_add(1).saturating_sub(viewport);
+        }
+        overlay.scroll = scroll.min(metrics.max_scroll);
+    }
+
+    /// Scrolls the settings list by `delta` rows without moving the selection.
+    fn scroll_settings_overlay(&mut self, delta: isize) {
+        let metrics =
+            settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
+        let Some(overlay) = &mut self.state.settings_overlay else {
+            return;
+        };
+        let current = overlay.scroll.min(metrics.max_scroll);
+        overlay.scroll = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current
+                .saturating_add(delta.unsigned_abs())
+                .min(metrics.max_scroll)
+        };
+    }
+
+    /// Maps a mouse position to the settings list item rendered on that row.
+    fn settings_item_at(&self, column: u16, row: u16) -> Option<usize> {
+        let overlay = self.state.settings_overlay.as_ref()?;
+        let metrics =
+            settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
+        if !rect_contains(metrics.list, column, row) {
+            return None;
+        }
+        let scroll = overlay.scroll.min(metrics.max_scroll);
+        let index = scroll.saturating_add(usize::from(row.saturating_sub(metrics.list.y)));
+        (index < SettingsItem::ALL.len()).then_some(index)
     }
 
     async fn toggle_image_preview_mode(&mut self) -> Result<()> {
@@ -8837,6 +10119,29 @@ impl App {
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        // Scrollbar click/drag handling first: an active drag captures all
+        // drag/up events, and a left click on a recorded scrollbar track jumps
+        // the thumb and starts a drag.
+        match mouse.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(hit) = self.state.scrollbar_drag {
+                    return Ok(self.apply_scrollbar_position(hit, mouse.row));
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.state.scrollbar_drag.take().is_some() {
+                    return Ok(false);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(hit) = self.scrollbar_hit_at(mouse.column, mouse.row) {
+                    self.state.scrollbar_drag = Some(hit);
+                    return Ok(self.apply_scrollbar_position(hit, mouse.row));
+                }
+            }
+            _ => {}
+        }
+
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.state.image_viewer.is_some()
         {
@@ -8902,15 +10207,33 @@ impl App {
             return Ok(false);
         }
 
-        if self.state.reaction_picker.is_some()
-            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-        {
-            if self.handle_reaction_picker_click(mouse).await? {
-                return Ok(false);
+        if self.state.reaction_picker.is_some() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.handle_reaction_picker_click(mouse).await? {
+                        return Ok(false);
+                    }
+                    self.state.reaction_picker = None;
+                    self.state.status = "reaction picker closed".to_owned();
+                    return Ok(false);
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(picker) = &mut self.state.reaction_picker {
+                        let max = picker.matches.len().saturating_sub(1);
+                        picker.selected = picker.selected.saturating_add(1).min(max);
+                        picker.keep_selected_visible();
+                    }
+                    return Ok(false);
+                }
+                MouseEventKind::ScrollUp => {
+                    if let Some(picker) = &mut self.state.reaction_picker {
+                        picker.selected = picker.selected.saturating_sub(1);
+                        picker.keep_selected_visible();
+                    }
+                    return Ok(false);
+                }
+                _ => {}
             }
-            self.state.reaction_picker = None;
-            self.state.status = "reaction picker closed".to_owned();
-            return Ok(false);
         }
 
         if self.state.compose_attach_menu.is_some()
@@ -8954,6 +10277,31 @@ impl App {
             }
             self.state.account_setup = None;
             self.state.status = "account setup cancelled".to_owned();
+            return Ok(false);
+        }
+
+        if self.state.settings_overlay.is_some() {
+            match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let modal = self.settings_overlay_rect(self.state.frame_area);
+                    if !rect_contains(modal, mouse.column, mouse.row) {
+                        self.state.settings_overlay = None;
+                        self.state.status = "settings closed".to_owned();
+                    } else if let Some(index) = self.settings_item_at(mouse.column, mouse.row) {
+                        if let Some(overlay) = &mut self.state.settings_overlay {
+                            overlay.selected = index;
+                        }
+                        self.activate_settings_item(index).await?;
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_settings_overlay(SETTINGS_MOUSE_SCROLL_STEP as isize);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.scroll_settings_overlay(-(SETTINGS_MOUSE_SCROLL_STEP as isize));
+                }
+                _ => {}
+            }
             return Ok(false);
         }
 
@@ -9061,8 +10409,10 @@ impl App {
         let Some(index) = self.reaction_picker_option_at(mouse.column, mouse.row, &picker) else {
             return Ok(false);
         };
-
-        let emoji = REACTION_OPTIONS[index];
+        let Some(&option_index) = picker.matches.get(index) else {
+            return Ok(false);
+        };
+        let emoji = COMPOSE_EMOTICON_OPTIONS[option_index].0;
         self.state.reaction_picker = None;
         self.apply_reaction(picker.message_id, emoji).await?;
         Ok(true)
@@ -9128,6 +10478,95 @@ impl App {
         }
 
         false
+    }
+
+    /// Finds the scrollbar track under the cursor, honoring overlay stacking:
+    /// while the help or settings overlay is open only its own scrollbar is
+    /// interactive, and other modal overlays disable scrollbar interaction
+    /// entirely.
+    fn scrollbar_hit_at(&self, column: u16, row: u16) -> Option<ScrollbarHit> {
+        let required_target = if self.state.help_overlay.is_some() {
+            Some(ScrollbarTarget::HelpOverlay)
+        } else if self.state.settings_overlay.is_some() {
+            Some(ScrollbarTarget::Settings)
+        } else if self.state.image_viewer.is_some()
+            || self.state.auth_overlay.is_some()
+            || self.state.action_menu.is_some()
+            || self.state.forward_picker.is_some()
+            || self.state.reaction_picker.is_some()
+            || self.state.compose_attach_menu.is_some()
+            || self.state.compose_emoticon_picker.is_some()
+            || self.state.poll_vote_picker.is_some()
+            || self.state.account_switcher.is_some()
+            || self.state.account_setup.is_some()
+            || self.state.slack_setup.is_some()
+            || self.state.threads_inbox.is_some()
+        {
+            return None;
+        } else {
+            None
+        };
+
+        self.state
+            .scrollbar_hits
+            .iter()
+            .rev()
+            .find(|hit| {
+                rect_contains(hit.track, column, row)
+                    && required_target.is_none_or(|target| hit.target == target)
+            })
+            .copied()
+    }
+
+    /// Moves the scroll state behind `hit` so the scrollbar thumb tracks the
+    /// given row on its track. Returns true when the chat selection changed
+    /// (chat-list scrollbar drags move the selection, which drives that
+    /// pane's scroll position).
+    fn apply_scrollbar_position(&mut self, hit: ScrollbarHit, row: u16) -> bool {
+        let span = hit.track.height.saturating_sub(1).max(1) as f64;
+        let offset = row
+            .saturating_sub(hit.track.y)
+            .min(hit.track.height.saturating_sub(1)) as f64;
+        let ratio = (offset / span).clamp(0.0, 1.0);
+        let position = (((ratio * hit.max_position as f64).round()) as usize)
+            .min(hit.max_position);
+
+        match hit.target {
+            ScrollbarTarget::ChatList => {
+                let selectable = self.selectable_chat_rows().len();
+                if selectable == 0 {
+                    return false;
+                }
+                let target = (((ratio * (selectable - 1) as f64).round()) as usize)
+                    .min(selectable - 1);
+                let current = self.selected_visible_position().unwrap_or(0);
+                self.move_chat_selection(target as isize - current as isize)
+            }
+            ScrollbarTarget::Messages => {
+                self.state.message_scroll = position;
+                false
+            }
+            ScrollbarTarget::Details => {
+                self.state.details_scroll = position;
+                false
+            }
+            ScrollbarTarget::HelpOverlay => {
+                let max_scroll = self.help_scroll_max();
+                if let Some(help) = &mut self.state.help_overlay {
+                    help.scroll = position.min(max_scroll);
+                }
+                false
+            }
+            ScrollbarTarget::Settings => {
+                let max_scroll =
+                    settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area))
+                        .max_scroll;
+                if let Some(overlay) = &mut self.state.settings_overlay {
+                    overlay.scroll = position.min(max_scroll);
+                }
+                false
+            }
+        }
     }
 
     fn open_compose_attach_menu(&mut self) {
@@ -9282,45 +10721,74 @@ impl App {
         if scope == self.state.filter_scope {
             return false;
         }
+        // Switching the edited scope only changes which pane's independent
+        // buffer receives keystrokes; it never copies the query across scopes.
         self.state.filter_scope = scope;
+        self.note_filter_interaction();
         let selection_changed = self.apply_active_filter();
         self.state.status = self.filter_status();
         selection_changed
     }
 
+    /// Record that the user just interacted with the filter, resetting the
+    /// inactivity window used by [`Self::auto_reset_idle_filter`].
+    fn note_filter_interaction(&mut self) {
+        self.state.filter_last_interaction = Some(Instant::now());
+    }
+
+    /// Clear an applied filter that has gone untouched for longer than
+    /// [`FILTER_INACTIVITY_TIMEOUT`], when the feature is enabled. Called from
+    /// the tick handler so the check stays off the input/draw hot path.
+    fn auto_reset_idle_filter(&mut self) -> bool {
+        if !self.settings.auto_reset_filter {
+            return false;
+        }
+        if self.state.filter_mode || !self.state.filters.any_active() {
+            return false;
+        }
+        let Some(last) = self.state.filter_last_interaction else {
+            return false;
+        };
+        if last.elapsed() < FILTER_INACTIVITY_TIMEOUT {
+            return false;
+        }
+        let selection_changed = self.clear_filter();
+        self.state.status = "filter auto-cleared after inactivity".to_owned();
+        selection_changed
+    }
+
     fn chat_filter_active(&self) -> bool {
-        self.state.filter_scope == FilterScope::Chats
+        !self.state.filters.chats.is_empty()
     }
 
     fn message_filter_active(&self) -> bool {
-        self.state.filter_scope == FilterScope::Messages && !self.state.filter.is_empty()
+        !self.state.filters.messages.is_empty()
     }
 
     fn thread_filter_active(&self) -> bool {
-        self.state.filter_scope == FilterScope::Thread
-            && self.state.thread_root.is_some()
-            && !self.state.filter.is_empty()
+        self.state.thread_root.is_some() && !self.state.filters.thread.is_empty()
     }
 
     fn chat_list_filter(&self) -> &str {
-        if self.chat_filter_active() {
-            &self.state.filter
-        } else {
-            ""
-        }
+        &self.state.filters.chats
     }
 
     fn apply_active_filter(&mut self) -> bool {
         let selection_changed = self.apply_filter();
         self.apply_message_filter();
-        if self.chat_filter_active() {
-            self.schedule_discovery_refresh();
-            if selection_changed {
-                self.request_selected_chat_history_sync();
+        // Discovery is a chat-list concern and spawns provider queries, so only
+        // refresh it while the chat scope is the one being edited. This keeps
+        // typing in the message/thread scopes from re-spawning chat discovery.
+        if self.state.filter_scope == FilterScope::Chats {
+            if self.chat_filter_active() {
+                self.schedule_discovery_refresh();
+                if selection_changed {
+                    self.request_selected_chat_history_sync();
+                }
+            } else {
+                self.state.discovery_results.clear();
+                self.pending_discovery_query = None;
             }
-        } else {
-            self.state.discovery_results.clear();
-            self.pending_discovery_query = None;
         }
         if self.thread_filter_active() {
             self.state.details_scroll = self.state.details_scroll.min(self.max_details_scroll());
@@ -9445,15 +10913,27 @@ impl App {
     }
 
     async fn handle_filter_key(&mut self, key: KeyEvent) -> Result<bool> {
+        self.note_filter_interaction();
         match key.code {
             KeyCode::Enter => self.confirm_filter_selection().await,
             KeyCode::Esc => {
+                // Single-stage clear: Esc empties the scope currently being
+                // edited and exits filter mode, so no query is left silently
+                // applied. Filters in other scopes (if any) are untouched and
+                // can be cleared with a further Esc from the chat list.
+                let scope = self.state.filter_scope;
+                self.state.filters.get_mut(scope).clear();
+                let selection_changed = self.apply_active_filter();
                 self.state.filter_mode = false;
+                if !self.state.filters.any_active() {
+                    self.state.filter_last_interaction = None;
+                }
                 self.state.status = self.filter_status();
-                Ok(false)
+                Ok(selection_changed)
             }
             KeyCode::Backspace => {
-                self.state.filter.pop();
+                let scope = self.state.filter_scope;
+                self.state.filters.get_mut(scope).pop();
                 let selection_changed = self.apply_active_filter();
                 self.state.status = self.filter_status();
                 Ok(selection_changed)
@@ -9485,7 +10965,8 @@ impl App {
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.state.filter.push(value);
+                let scope = self.state.filter_scope;
+                self.state.filters.get_mut(scope).push(value);
                 let selection_changed = self.apply_active_filter();
                 self.state.status = self.filter_status();
                 Ok(selection_changed)
@@ -9651,7 +11132,7 @@ impl App {
                     || value.contains(&query))
                 .then_some(index)
             })
-            .take(COMPOSE_EMOTICON_MAX_SUGGESTIONS)
+            .take(COMPOSE_EMOTICON_MAX_MATCHES)
             .collect::<Vec<_>>();
 
         if matches.is_empty() {
@@ -9659,18 +11140,24 @@ impl App {
             return;
         }
 
+        // Preserve the prior selection where possible (clamped to the new match
+        // count), then recompute a fresh scroll window so a narrowed query never
+        // leaves a stale offset hiding the top matches.
         let selected = self
             .state
             .compose_emoticon_picker
             .as_ref()
             .map(|picker| picker.selected.min(matches.len().saturating_sub(1)))
             .unwrap_or_default();
-        self.state.compose_emoticon_picker = Some(ComposeEmoticonPicker {
+        let mut picker = ComposeEmoticonPicker {
             selected,
+            scroll_offset: 0,
             query,
             matches,
             token_char_len,
-        });
+        };
+        picker.keep_selected_visible();
+        self.state.compose_emoticon_picker = Some(picker);
     }
 
     fn insert_selected_compose_emoticon(&mut self) {
@@ -10320,11 +11807,12 @@ impl App {
     async fn enter_filter_mode(&mut self) -> Result<bool> {
         self.state.filter_scope = self.active_filter_scope();
         self.state.filter_mode = true;
+        self.note_filter_interaction();
         let selection_changed = self.apply_active_filter();
         self.state.status = match self.state.filter_scope {
-            FilterScope::Chats => "type to find chats, contacts, or channels; arrows/click still select; Enter opens; Esc finishes".to_owned(),
-            FilterScope::Messages => "type to filter messages in this chat; arrows/click still select; Enter opens actions; Esc finishes".to_owned(),
-            FilterScope::Thread => "type to filter this thread; arrows or mouse still scroll/select; Esc finishes".to_owned(),
+            FilterScope::Chats => "type to find chats, contacts, or channels; arrows/click still select; pause to open; Esc clears".to_owned(),
+            FilterScope::Messages => "type to filter messages in this chat; arrows/click still select; Enter opens actions; Esc clears".to_owned(),
+            FilterScope::Thread => "type to filter this thread; arrows or mouse still scroll/select; Esc clears".to_owned(),
         };
         Ok(selection_changed)
     }
@@ -10490,12 +11978,13 @@ impl App {
     }
 
     fn clear_filter(&mut self) -> bool {
-        if self.state.filter.is_empty() {
+        if !self.state.filters.any_active() && !self.state.filter_mode {
             return false;
         }
 
         self.state.filter_mode = false;
-        self.state.filter.clear();
+        self.state.filters.clear_all();
+        self.state.filter_last_interaction = None;
         self.state.discovery_results.clear();
         self.state.filtered_messages.clear();
         self.pending_discovery_query = None;
@@ -10552,7 +12041,7 @@ impl App {
     }
 
     fn older_chats_fold(&self) -> chat_list::OlderChatsFold {
-        let filter_is_searching_chats = self.chat_filter_active() && !self.state.filter.is_empty();
+        let filter_is_searching_chats = self.chat_filter_active();
         chat_list::OlderChatsFold {
             enabled: !filter_is_searching_chats,
             expanded: self.state.older_chats_expanded,
@@ -10669,7 +12158,7 @@ impl App {
         let Some(chat) = self.state.selected_chat().cloned() else {
             return;
         };
-        if chat.platform != Platform::Slack || matches!(chat.kind, ChatKind::Direct) {
+        if !chat_supports_member_listing(&chat) {
             return;
         }
         let key = (chat.account.clone(), chat.id.clone());
@@ -10698,6 +12187,111 @@ impl App {
                 result,
             });
         });
+    }
+
+    /// Loads enriched [`ChatDetails`] for the selected chat in the background.
+    /// Cache/loading-guarded so it runs at most once per chat; results are
+    /// applied by [`Self::drain_chat_detail_fetches`].
+    fn request_selected_chat_details(&mut self) {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            return;
+        };
+        let key = (chat.account.clone(), chat.id.clone());
+        if self.state.chat_details.contains_key(&key)
+            || !self.state.loading_chat_details.insert(key.clone())
+        {
+            return;
+        }
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == chat.account.as_ref())
+            .cloned()
+        else {
+            self.state.loading_chat_details.remove(&key);
+            return;
+        };
+        let tx = self.chat_details_tx.clone();
+        tokio::spawn(async move {
+            let result = provider
+                .chat_details(&chat.id)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(ChatDetailsFetchResult {
+                account: key.0,
+                chat_id: key.1,
+                result,
+            });
+        });
+    }
+
+    /// Loads an enriched [`ContactProfile`] for a sender/contact in the
+    /// background. Cache/loading-guarded so it runs at most once per
+    /// (account, platform id); results are applied by
+    /// [`Self::drain_contact_profile_fetches`]. Safe to call from the draw path.
+    fn request_contact_profile(&mut self, account: &ProviderId, platform_id: &PlatformId) {
+        let key = (account.clone(), platform_id.clone());
+        if self.state.contact_profiles.contains_key(&key)
+            || !self.state.loading_contact_profiles.insert(key.clone())
+        {
+            return;
+        }
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == account.as_ref())
+            .cloned()
+        else {
+            self.state.loading_contact_profiles.remove(&key);
+            return;
+        };
+        let tx = self.contact_profile_tx.clone();
+        tokio::spawn(async move {
+            let result = provider
+                .contact_profile(&key.1)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(ContactProfileFetchResult {
+                account: key.0,
+                platform_id: key.1,
+                result,
+            });
+        });
+    }
+
+    /// Resolves the peer's platform id for the selected direct-message chat by
+    /// reusing already-loaded messages: the most recent inbound (not-from-me)
+    /// message's sender. Returns `None` for groups/channels or when no inbound
+    /// message is loaded yet.
+    fn selected_dm_peer_platform_id(&self) -> Option<PlatformId> {
+        let chat = self.state.selected_chat()?;
+        if chat.is_group || chat.kind != ChatKind::Direct {
+            return None;
+        }
+        self.state
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                !message.is_from_me
+                    && message.account == chat.account
+                    && message.chat_id.as_ref() == chat.id.as_ref()
+            })
+            .map(|message| message.sender.platform_id.clone())
+    }
+
+    /// Loads an enriched [`ContactProfile`] for the selected direct-message
+    /// chat's peer in the background. No-op for groups/channels or until an
+    /// inbound message identifies the peer. Cache/loading-guarded; safe to call
+    /// from the draw path.
+    fn request_selected_contact_profile(&mut self) {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            return;
+        };
+        let Some(platform_id) = self.selected_dm_peer_platform_id() else {
+            return;
+        };
+        self.request_contact_profile(&chat.account, &platform_id);
     }
 
     fn consume_pending_history_sync_for_selected_chat(&mut self) -> bool {
@@ -11549,11 +13143,57 @@ impl App {
             self.state.status = format!("{} cannot send this forwarded content", target.label);
             return Ok(());
         };
+
+        // Media forwards must upload the real bytes; keep the source provider so
+        // the background task can fetch them on demand when the cached copy is
+        // missing (e.g. large Slack uploads only reserve a cache path).
+        let source_provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == source.account.as_ref())
+            .cloned();
+
+        // The download + upload run off the event loop so the TUI stays
+        // responsive; the drain step applies the echoed message and status.
+        self.state.status = format!("forwarding to {}…", target.label);
+        let tx = self.forward_send_tx.clone();
+        let task_target = target;
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = forward_send_content(
+                provider,
+                source_provider,
+                &task_target.chat_id,
+                content,
+            )
+            .await
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(ForwardSendResult {
+                target: task_target,
+                result,
+                elapsed: started.elapsed(),
+            });
+        });
+        Ok(())
+    }
+
+    /// Applies the bookkeeping for a completed forward: persists the echoed
+    /// message with the content that was actually delivered, refreshes the
+    /// sidebar, and re-renders the destination chat when it is still selected.
+    async fn apply_forwarded_message(
+        &mut self,
+        target: ForwardTarget,
+        sent_id: MessageId,
+        content: Content,
+    ) -> Result<()> {
         let preview = content_send_preview(&content);
-        let account = provider.account_info();
-        let sent_id = provider
-            .send(&target.chat_id, content.clone(), None)
-            .await?;
+        let Some(account) = self
+            .provider_for_id(&target.account)
+            .map(|provider| provider.account_info())
+        else {
+            self.state.status = format!("forwarded to {} (account unavailable)", target.label);
+            return Ok(());
+        };
         let timestamp = Utc::now();
         let message = Message {
             id: sent_id,
@@ -11597,6 +13237,57 @@ impl App {
         }
         self.state.status = format!("forwarded to {}", target.label);
         Ok(())
+    }
+
+    /// Drains completed forward sends in bounded batches, applying the echoed
+    /// message for successes and surfacing a clear status for failures.
+    async fn drain_forward_sends(&mut self) -> Result<bool> {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        let mut errors = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.forward_send_rx.try_recv()
+        {
+            drained += 1;
+            let failed = result.result.is_err();
+            if failed {
+                errors += 1;
+            }
+            self.log_slow_perf_elapsed(
+                "forward_send.complete",
+                result.elapsed,
+                format!(
+                    "account={} chat={} result={}",
+                    result.target.account,
+                    result.target.chat_id,
+                    if failed { "err" } else { "ok" }
+                ),
+            );
+            match result.result {
+                Ok((sent_id, content)) => {
+                    self.apply_forwarded_message(result.target, sent_id, content)
+                        .await?;
+                }
+                Err(error) => {
+                    self.state.status =
+                        format!("forward to {} failed: {error}", result.target.label);
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.log_slow_perf_duration(
+                "forward_send.drain",
+                drain_started,
+                format!(
+                    "count={drained} errors={errors} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
+            );
+        }
+        Ok(changed)
     }
 
     fn forward_targets_for_message(&self, message: &Message) -> Vec<ForwardTarget> {
@@ -11783,7 +13474,15 @@ impl App {
         if had_reaction {
             remove_reaction(message, emoji, &Arc::from(LOCAL_REACTION_SENDER));
         } else {
-            add_reaction(message, emoji, Arc::from(LOCAL_REACTION_SENDER));
+            // WhatsApp keeps only one reaction per user per message: sending a
+            // new emoji replaces any prior one server-side. Mirror that in the
+            // optimistic local state so the UI does not show duplicate "me"
+            // reactions that never reconcile with the bridge.
+            if chat.platform == Platform::WhatsApp {
+                replace_single_local_reaction(message, emoji);
+            } else {
+                add_reaction(message, emoji, Arc::from(LOCAL_REACTION_SENDER));
+            }
         }
         let updated = message.clone();
         self.clear_message_layout_cache();
@@ -11922,8 +13621,8 @@ impl App {
                     .and_then(|members| {
                         members
                             .iter()
-                            .find(|member| member.platform_id == *sender)
-                            .map(|member| member.display_name.to_string())
+                            .find(|member| member.sender.platform_id == *sender)
+                            .map(|member| member.sender.display_name.to_string())
                     })
             })
     }
@@ -12245,6 +13944,35 @@ impl App {
             return;
         }
 
+        // "Low intent" interactions (a bare shared link with no message body,
+        // or a pure link-preview card) are quiet by default: they raise no
+        // notification when `suppress_low_intent_notifications` is on, and they
+        // are never voice-summarized regardless of that toggle, because a bare
+        // URL is the worst possible input for a spoken summary.
+        let is_low_intent = is_low_intent_content(&message.content);
+        if is_low_intent && self.settings.suppress_low_intent_notifications {
+            self.log_perf_marker(
+                "notification.suppress",
+                format!(
+                    "reason=low_intent account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
+            return;
+        }
+        // When low-intent notifications are allowed, the visual notification
+        // still fires, but the voice summary is skipped. Log it here, before
+        // the immutable `chat` borrow below, to avoid borrow conflicts.
+        if is_low_intent && self.settings.voice_summaries && !message.is_from_me {
+            self.log_perf_marker(
+                "voice_summary.suppress",
+                format!(
+                    "reason=low_intent account={} chat={} message={}",
+                    message.account, message.chat_id, message.id
+                ),
+            );
+        }
+
         let Some(chat) = self.notification_chat_for(message) else {
             self.log_perf_marker(
                 "notification.suppress",
@@ -12284,6 +14012,27 @@ impl App {
 
         let chat_name = chat.name.to_string();
         let notification = NotificationOverlay::new(chat, message, true);
+        // Build the optional fono voice-summary payload now, while the full
+        // message (text + attachment metadata) is in hand; the delivery path
+        // only sees the trimmed notification preview. Messages the user sent
+        // themselves never produce a voice summary, even when
+        // `notify_self_messages` lets them raise a visual notification.
+        let voice_payload = if self.settings.voice_summaries && !message.is_from_me && !is_low_intent
+        {
+            let account_label = self
+                .account_for_provider(&message.account)
+                .map(|account| account.display_name.to_string())
+                .unwrap_or_else(|| message.account.to_string());
+            Some(voice_summary::payload_for_message(
+                chat,
+                &account_label,
+                message,
+                content_copy_text(&message.content),
+                is_slack_thread_reply(message),
+            ))
+        } else {
+            None
+        };
         let deliver_at = Instant::now() + NOTIFICATION_DELIVERY_DELAY;
         if let Some(pending) = self
             .state
@@ -12321,7 +14070,70 @@ impl App {
                 ),
             );
         }
+        if let Some(payload) = voice_payload {
+            self.queue_voice_summary(message, payload);
+        }
         self.state.status = format!("notification queued for {chat_name}");
+    }
+
+    /// Queue (or merge into) the pending voice summary for this message.
+    /// Messages from the same sender in the same chat arriving within
+    /// [`voice_summary::GROUP_WINDOW`] of each other fold into one payload
+    /// and the deadline restarts, so the burst is spoken as a single
+    /// summary once the sender goes quiet for the whole window.
+    fn queue_voice_summary(&mut self, message: &Message, payload: VoiceSummaryPayload) {
+        let deliver_at = Instant::now() + voice_summary::GROUP_WINDOW;
+        let merged_count = if let Some(pending) = self
+            .state
+            .pending_voice_summaries
+            .iter_mut()
+            .find(|pending| {
+                pending.account == message.account
+                    && pending.chat_id == message.chat_id
+                    && pending.sender_id == message.sender.platform_id
+            }) {
+            pending.message_count += 1;
+            let total = pending.message_count;
+            pending.payload.merge_grouped(payload, total);
+            pending.message_id = message.id.clone();
+            pending.deliver_at = deliver_at;
+            Some(total)
+        } else {
+            self.state
+                .pending_voice_summaries
+                .push(PendingVoiceSummary {
+                    account: message.account.clone(),
+                    chat_id: message.chat_id.clone(),
+                    sender_id: message.sender.platform_id.clone(),
+                    message_id: message.id.clone(),
+                    deliver_at,
+                    message_count: 1,
+                    payload,
+                });
+            None
+        };
+        match merged_count {
+            Some(count) => self.log_perf_marker(
+                "voice_summary.coalesce",
+                format!(
+                    "account={} chat={} message={} grouped={count} window_ms={}",
+                    message.account,
+                    message.chat_id,
+                    message.id,
+                    voice_summary::GROUP_WINDOW.as_millis()
+                ),
+            ),
+            None => self.log_perf_marker(
+                "voice_summary.queue",
+                format!(
+                    "account={} chat={} message={} window_ms={}",
+                    message.account,
+                    message.chat_id,
+                    message.id,
+                    voice_summary::GROUP_WINDOW.as_millis()
+                ),
+            ),
+        }
     }
 
     fn notification_chat_for(&self, message: &Message) -> Option<&Chat> {
@@ -12367,6 +14179,20 @@ impl App {
                 format!("reason={reason} account={account} chat={chat_id} count={cancelled}"),
             );
         }
+        // Attending a chat also silences its pending voice summaries: the
+        // user is already looking at the messages, speaking them later
+        // would be noise.
+        let voice_before = self.state.pending_voice_summaries.len();
+        self.state
+            .pending_voice_summaries
+            .retain(|pending| !pending.chat_matches(account, chat_id));
+        let voice_cancelled = voice_before.saturating_sub(self.state.pending_voice_summaries.len());
+        if voice_cancelled > 0 {
+            self.log_perf_marker(
+                "voice_summary.cancel",
+                format!("reason={reason} account={account} chat={chat_id} count={voice_cancelled}"),
+            );
+        }
     }
 
     fn drain_due_pending_notifications(&mut self) {
@@ -12384,6 +14210,151 @@ impl App {
             let pending = self.state.pending_notifications.remove(index);
             drained += 1;
             self.deliver_pending_notification(pending);
+        }
+    }
+
+    /// Dispatch voice summaries whose grouping window has elapsed. Bounded
+    /// per tick like the notification drain; each dispatch is a
+    /// fire-and-forget background process, so this never blocks the loop.
+    fn drain_due_voice_summaries(&mut self) {
+        if self.state.pending_voice_summaries.is_empty() {
+            return;
+        }
+        if !self.settings.voice_summaries {
+            // The setting was turned off while summaries were debouncing;
+            // they must not be spoken later.
+            let dropped = self.state.pending_voice_summaries.len();
+            self.state.pending_voice_summaries.clear();
+            self.log_perf_marker(
+                "voice_summary.cancel",
+                format!("reason=disabled count={dropped}"),
+            );
+            return;
+        }
+        let now = Instant::now();
+        let mut drained = 0usize;
+        while drained < MAX_PENDING_NOTIFICATIONS_PER_TICK {
+            let Some(index) = self
+                .state
+                .pending_voice_summaries
+                .iter()
+                .position(|pending| pending.deliver_at <= now)
+            else {
+                break;
+            };
+            let pending = self.state.pending_voice_summaries.remove(index);
+            drained += 1;
+            self.dispatch_pending_voice_summary(pending);
+        }
+    }
+
+    /// Re-check the delivery-time gates and start the background fono
+    /// process for one grouped summary.
+    fn dispatch_pending_voice_summary(&mut self, pending: PendingVoiceSummary) {
+        if self.settings.notifications == NotificationMode::Off {
+            self.log_perf_marker(
+                "voice_summary.suppress",
+                format!(
+                    "reason=off_at_delivery account={} chat={} message={}",
+                    pending.account, pending.chat_id, pending.message_id
+                ),
+            );
+            return;
+        }
+        if self.state.notification_pause.is_paused_at(Utc::now()) {
+            self.log_perf_marker(
+                "voice_summary.suppress",
+                format!(
+                    "reason=paused_at_delivery account={} chat={} message={}",
+                    pending.account, pending.chat_id, pending.message_id
+                ),
+            );
+            return;
+        }
+        if self
+            .state
+            .chats
+            .iter()
+            .find(|chat| pending.chat_matches(&chat.account, &chat.id))
+            .is_some_and(|chat| chat.muted)
+        {
+            self.log_perf_marker(
+                "voice_summary.suppress",
+                format!(
+                    "reason=muted_at_delivery account={} chat={} message={}",
+                    pending.account, pending.chat_id, pending.message_id
+                ),
+            );
+            return;
+        }
+        voice_summary::dispatch(
+            &self.voice_summary_command,
+            &pending.payload,
+            self.voice_summary_tx.clone(),
+            pending.account.clone(),
+            pending.chat_id.clone(),
+            pending.message_id.clone(),
+        );
+        self.log_perf_marker(
+            "voice_summary.dispatch",
+            format!(
+                "account={} chat={} message={} grouped={}",
+                pending.account, pending.chat_id, pending.message_id, pending.message_count
+            ),
+        );
+    }
+
+    /// Drain completion reports from background voice-summary processes.
+    /// Bounded like every other completion drain so a burst of outcomes can
+    /// never stall a tick. Failures surface in the status line because a
+    /// missing/broken `fono` binary is otherwise silent.
+    fn drain_voice_summary_outcomes(&mut self) {
+        let drain_started = Instant::now();
+        let mut drained = 0;
+        let mut errors = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(outcome) = self.voice_summary_rx.try_recv()
+        {
+            drained += 1;
+            match outcome.result {
+                Ok(()) => {
+                    self.log_perf_marker(
+                        "voice_summary.complete",
+                        format!(
+                            "account={} chat={} message={} elapsed_ms={}",
+                            outcome.account,
+                            outcome.chat_id,
+                            outcome.message_id,
+                            outcome.elapsed.as_millis()
+                        ),
+                    );
+                }
+                Err(error) => {
+                    errors += 1;
+                    self.state.status = format!("voice summary failed: {error}");
+                    self.log_perf_marker(
+                        "voice_summary.error",
+                        format!(
+                            "account={} chat={} message={} elapsed_ms={} error={error}",
+                            outcome.account,
+                            outcome.chat_id,
+                            outcome.message_id,
+                            outcome.elapsed.as_millis()
+                        ),
+                    );
+                }
+            }
+        }
+        if drained > 0 {
+            self.log_slow_perf_duration(
+                "voice_summary.drain",
+                drain_started,
+                format!(
+                    "count={drained} errors={errors} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
+            );
         }
     }
 
@@ -12425,6 +14396,9 @@ impl App {
             return;
         }
 
+        // The notification passed every delivery-time gate; deliver the
+        // visual notification. Voice summaries run on their own grouped
+        // queue (see `drain_due_voice_summaries`).
         let chat_name = pending.notification.chat_name.clone();
         match self.settings.notifications {
             NotificationMode::Off => {}
@@ -12535,6 +14509,7 @@ impl App {
 
     async fn handle_tick(&mut self) -> Result<()> {
         self.state.monthly_backfill_tick = self.state.monthly_backfill_tick.wrapping_add(1);
+        self.auto_reset_idle_filter();
         if self
             .state
             .monthly_backfill_tick
@@ -12549,8 +14524,12 @@ impl App {
             }
         }
         self.drain_due_pending_notifications();
+        self.drain_due_voice_summaries();
+        self.drain_voice_summary_outcomes();
         let metadata_changed = self.drain_link_metadata_fetches();
         let members_changed = self.drain_chat_member_fetches();
+        let details_changed = self.drain_chat_detail_fetches();
+        let profile_changed = self.drain_contact_profile_fetches();
         let expired = if let Some(notification) = &mut self.state.notification {
             notification.ticks_remaining = notification.ticks_remaining.saturating_sub(1);
             notification.ticks_remaining == 0
@@ -12560,7 +14539,7 @@ impl App {
         if expired {
             self.state.notification = None;
         }
-        if metadata_changed || members_changed {
+        if metadata_changed || members_changed || details_changed || profile_changed {
             self.state.status = "background details updated".to_owned();
         }
         Ok(())
@@ -12636,7 +14615,10 @@ impl App {
         self.state.poll_vote_picker = None;
         self.state.help_overlay = None;
         self.state.account_switcher = None;
-        self.state.settings_overlay = Some(SettingsOverlay { selected: 0 });
+        self.state.settings_overlay = Some(SettingsOverlay {
+            selected: 0,
+            scroll: 0,
+        });
         self.state.status = "settings".to_owned();
     }
 
@@ -12861,11 +14843,25 @@ impl App {
     }
 
     fn reaction_picker_rect(&self, area: Rect, message_id: &MessageId) -> Rect {
-        let width = REACTION_OPTIONS
-            .len()
-            .saturating_mul(REACTION_OPTION_CELL_WIDTH as usize)
-            .saturating_add(4) as u16;
-        self.anchored_message_popup_rect(area, message_id, width, 5)
+        // Size to a fixed viewport of rows; longer lists scroll internally
+        // rather than growing the modal. Reserve both scroll indicators when the
+        // list overflows so the height stays stable while scrolling. Chrome =
+        // title + hint + 2 borders.
+        let total = self
+            .state
+            .reaction_picker
+            .as_ref()
+            .map(|picker| picker.matches.len())
+            .unwrap_or_default();
+        let visible = total.clamp(1, REACTION_PICKER_VISIBLE_ROWS);
+        let indicator_rows = if total > REACTION_PICKER_VISIBLE_ROWS {
+            2
+        } else {
+            0
+        };
+        let height = (visible + indicator_rows + 4).clamp(6, 16) as u16;
+        let width = area.width.saturating_sub(4).clamp(34, 56);
+        self.anchored_message_popup_rect(area, message_id, width, height)
     }
 
     fn poll_vote_picker_rect(&self, area: Rect, picker: &PollVotePicker) -> Rect {
@@ -12888,7 +14884,17 @@ impl App {
             .as_ref()
             .map(|picker| picker.matches.len())
             .unwrap_or_default();
-        let height = suggestion_count.saturating_add(4).clamp(4, 12) as u16;
+        // The body shows at most one fixed viewport of rows; longer lists scroll
+        // internally rather than growing the modal. Reserve both scroll
+        // indicators when the list overflows so the height stays constant while
+        // the user scrolls. Chrome = title + hint + 2 borders.
+        let visible = suggestion_count.min(COMPOSE_EMOTICON_VISIBLE_ROWS);
+        let indicator_rows = if suggestion_count > COMPOSE_EMOTICON_VISIBLE_ROWS {
+            2
+        } else {
+            0
+        };
+        let height = (visible + indicator_rows + 4).clamp(4, 14) as u16;
         let width = area.width.saturating_sub(4).clamp(36, 64);
         let compose_area = self.state.pane_areas.compose;
         let x = compose_area.x.min(area.width.saturating_sub(width));
@@ -12957,7 +14963,12 @@ impl App {
             .saturating_div(100)
             .clamp(44, 78)
             .min(area.width.saturating_sub(2).max(1));
-        let height = 20.min(area.height.saturating_sub(2).max(1));
+        let height = area
+            .height
+            .saturating_mul(72)
+            .saturating_div(100)
+            .clamp(16, 26)
+            .min(area.height.saturating_sub(2).max(1));
         centered_fixed_rect(area, width, height)
     }
 
@@ -13072,16 +15083,24 @@ impl App {
         picker: &ReactionPicker,
     ) -> Option<usize> {
         let modal = self.reaction_picker_rect(self.state.frame_area, &picker.message_id);
-        if row != modal.y.saturating_add(2) || !rect_contains(modal, column, row) {
+        if !rect_contains(modal, column, row) {
             return None;
         }
-        let first_option_column = modal.x.saturating_add(2);
-        let relative_column = column.checked_sub(first_option_column)?;
-        let option = (relative_column / REACTION_OPTION_CELL_WIDTH) as usize;
-        if relative_column % REACTION_OPTION_CELL_WIDTH >= REACTION_OPTION_CELL_WIDTH - 1 {
+        let total = picker.matches.len();
+        let scroll_offset = picker
+            .scroll_offset
+            .min(total.saturating_sub(REACTION_PICKER_VISIBLE_ROWS));
+        let window_end = (scroll_offset + REACTION_PICKER_VISIBLE_ROWS).min(total);
+        // Content begins one row below the top border. The header consumes the
+        // first content row, and an "↑ N more" indicator (when scrolled) pushes
+        // the first option down by one more row.
+        let indicator = u16::from(scroll_offset > 0);
+        let first_option_row = modal.y.saturating_add(2).saturating_add(indicator);
+        let window_row = row.checked_sub(first_option_row)? as usize;
+        if window_row >= window_end.saturating_sub(scroll_offset) {
             return None;
         }
-        (option < REACTION_OPTIONS.len()).then_some(option)
+        Some(scroll_offset + window_row)
     }
 
     fn poll_vote_picker_option_at(
@@ -13240,7 +15259,10 @@ impl App {
     }
 
     fn overview_details_line_count(&self) -> usize {
-        self.overview_detail_lines().len()
+        // Line count is independent of width here (the details paragraph does
+        // not wrap, and each member always renders a fixed two rows), so any
+        // representative width yields the correct count for scroll bounding.
+        self.overview_detail_lines(80).0.len()
     }
 
     fn message_details_line_count(&self, message: &Message) -> usize {
@@ -13323,7 +15345,7 @@ impl App {
             self.state
                 .messages
                 .iter()
-                .filter(|message| message_matches_filter(message, &self.state.filter))
+                .filter(|message| message_matches_filter(message, &self.state.filters.messages))
                 .cloned()
                 .collect()
         } else {
@@ -13338,11 +15360,7 @@ impl App {
             .state
             .selected_chat()
             .map(|chat| (chat.id.clone(), chat.account.clone()));
-        let chat_filter = if self.chat_filter_active() {
-            self.state.filter.as_str()
-        } else {
-            ""
-        };
+        let chat_filter = self.state.filters.chats.as_str();
         self.state.visible_chat_indices =
             chat_list::filter_chat_indices(&self.state.chats, chat_filter)
                 .into_iter()
@@ -13567,7 +15585,7 @@ impl App {
     }
 
     fn filter_status(&self) -> String {
-        if self.state.filter.is_empty() {
+        if self.state.active_filter().is_empty() {
             "filter cleared".to_owned()
         } else {
             match self.state.filter_scope {
@@ -13576,13 +15594,13 @@ impl App {
                     if discovery_count == 0 {
                         format!(
                             "filter {}: {} chats",
-                            self.state.filter,
+                            self.state.filters.chats,
                             self.state.visible_chat_indices.len()
                         )
                     } else {
                         format!(
                             "filter {}: {} chats · {} discoverable destinations",
-                            self.state.filter,
+                            self.state.filters.chats,
                             self.state.visible_chat_indices.len(),
                             discovery_count
                         )
@@ -13590,12 +15608,12 @@ impl App {
                 }
                 FilterScope::Messages => format!(
                     "filter {}: {} messages",
-                    self.state.filter,
+                    self.state.filters.messages,
                     self.state.filtered_messages.len()
                 ),
                 FilterScope::Thread => format!(
                     "filter {}: {} thread items",
-                    self.state.filter,
+                    self.state.filters.thread,
                     self.filtered_thread_matches().len()
                 ),
             }
@@ -14636,14 +16654,59 @@ fn build_terminal_image_protocol_from_bytes(
         .map_err(|error| format!("rendering image bytes: {error}"))
 }
 
+/// Marks every terminal cell dirty so the next draw rewrites the whole frame
+/// in place, without blanking the screen first. `Terminal::clear` flushes a
+/// whole-screen erase immediately while the replacement frame only arrives
+/// once the next draw has composed it; users perceive that gap as a flash.
+/// Poisoning the diff reference buffer instead keeps the current frame
+/// visible until each cell is overwritten, so the periodic repaint is
+/// invisible when the screen is intact while still repairing externally
+/// corrupted cells — including blank ones, because the sentinel differs from
+/// the default cell too.
+fn invalidate_rendered_cells<B: Backend>(terminal: &mut Terminal<B>) {
+    let sentinel = repaint_sentinel_cell();
+    // Between draws the current buffer is the reset scratch buffer. Fill it
+    // with the sentinel and swap: the sentinel buffer becomes the diff
+    // reference for the next draw, while the frame renders into the other
+    // (reset) buffer and is therefore emitted cell by cell.
+    for cell in &mut terminal.current_buffer_mut().content {
+        *cell = sentinel.clone();
+    }
+    terminal.swap_buffers();
+}
+
+/// A cell that no rendered frame realistically produces, so diffing any real
+/// frame against a sentinel-filled buffer rewrites every cell.
+fn repaint_sentinel_cell() -> Cell {
+    let mut cell = Cell::new(" ");
+    cell.set_style(
+        Style::default()
+            .fg(Color::Indexed(187))
+            .bg(Color::Indexed(188))
+            .add_modifier(Modifier::HIDDEN | Modifier::RAPID_BLINK | Modifier::CROSSED_OUT),
+    );
+    cell
+}
+
 async fn run_app_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
     let mut needs_draw = true;
     let mut loop_started = Instant::now();
+    let mut last_full_repaint = Instant::now();
 
     while !app.state.should_quit() {
+        // Self-heal terminal corruption caused by writes ratatui never saw:
+        // periodically force the next draw to rewrite every cell. Bounded,
+        // cache-only work once per interval — no extra layout or decoding
+        // happens here, and nothing is erased so there is no visible flash.
+        if last_full_repaint.elapsed() >= FULL_REPAINT_INTERVAL {
+            invalidate_rendered_cells(terminal);
+            needs_draw = true;
+            last_full_repaint = Instant::now();
+        }
+
         if needs_draw {
             let draw_started = Instant::now();
             terminal.draw(|frame| app.draw(frame))?;
@@ -14882,6 +16945,66 @@ fn provider_event_label(event: &ProviderEvent) -> &'static str {
     }
 }
 
+/// Guard that keeps the process-wide stderr descriptor (fd 2) pointed away
+/// from the terminal while the TUI owns the screen. Anything in this process
+/// — or in any child process that inherits fd 2 (notify-send, D-Bus
+/// autolaunch daemons, provider bridges) — that writes to stderr would
+/// otherwise land in the middle of the alternate screen and corrupt it.
+/// Dropping the guard restores the original stderr so errors printed after
+/// the terminal is restored remain visible.
+#[cfg(unix)]
+struct StderrRedirectGuard {
+    saved_stderr: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+impl Drop for StderrRedirectGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // Best-effort: if restoring fails there is no channel left to report on.
+        unsafe {
+            libc::dup2(self.saved_stderr.as_raw_fd(), libc::STDERR_FILENO);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct StderrRedirectGuard;
+
+/// Redirects stderr to the opt-in diagnostic log when one is configured, and
+/// to `/dev/null` otherwise. Returns `None` (leaving stderr untouched) when
+/// neither target can be opened.
+#[cfg(unix)]
+fn redirect_stderr_for_tui() -> Option<StderrRedirectGuard> {
+    let target = std::env::var_os(PERF_LOG_FILE_ENV)
+        .map(PathBuf::from)
+        .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
+        .or_else(|| OpenOptions::new().write(true).open("/dev/null").ok())?;
+    redirect_stderr_to(&target)
+}
+
+#[cfg(not(unix))]
+fn redirect_stderr_for_tui() -> Option<StderrRedirectGuard> {
+    None
+}
+
+#[cfg(unix)]
+fn redirect_stderr_to(target: &fs::File) -> Option<StderrRedirectGuard> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // F_DUPFD_CLOEXEC keeps the saved terminal descriptor out of child
+    // processes so they can never write to the TTY through it either.
+    let saved = unsafe { libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    if saved < 0 {
+        return None;
+    }
+    let saved_stderr = unsafe { OwnedFd::from_raw_fd(saved) };
+    if unsafe { libc::dup2(target.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        return None;
+    }
+    Some(StderrRedirectGuard { saved_stderr })
+}
+
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -14980,6 +17103,76 @@ fn chat_membership_label(membership: ChatMembership) -> &'static str {
         ChatMembership::NotJoined => "not joined",
         ChatMembership::Unknown => "unknown",
     }
+}
+
+/// Formats a disappearing-message timer (in seconds) as a compact human label
+/// such as "7 days", "24 hours", or "90 days", falling back to seconds.
+fn format_duration_label(seconds: u32) -> String {
+    const MINUTE: u32 = 60;
+    const HOUR: u32 = 60 * MINUTE;
+    const DAY: u32 = 24 * HOUR;
+    if seconds.is_multiple_of(DAY) {
+        let days = seconds / DAY;
+        format!("{days} day{}", if days == 1 { "" } else { "s" })
+    } else if seconds.is_multiple_of(HOUR) {
+        let hours = seconds / HOUR;
+        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+    } else if seconds.is_multiple_of(MINUTE) {
+        let minutes = seconds / MINUTE;
+        format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else {
+        format!("{seconds} seconds")
+    }
+}
+
+/// Whether the chat is a multi-party conversation whose participant list the
+/// provider can enumerate: Slack channels/group DMs and WhatsApp groups.
+fn chat_supports_member_listing(chat: &Chat) -> bool {
+    match chat.platform {
+        Platform::Slack => !matches!(chat.kind, ChatKind::Direct),
+        Platform::WhatsApp => matches!(chat.kind, ChatKind::Group),
+        _ => false,
+    }
+}
+
+/// Builds a two-row, four-column initials placeholder tile for a member whose
+/// avatar thumbnail is not available, mirroring the sidebar avatar geometry.
+fn member_avatar_placeholder_rows(sender: &Sender, theme: Theme) -> chat_list::AvatarRows {
+    let initial = sender
+        .display_name
+        .chars()
+        .find(|ch| ch.is_alphanumeric())
+        .map(|ch| ch.to_uppercase().next().unwrap_or(ch))
+        .unwrap_or('?');
+    let label_style = Style::default().fg(theme.accent);
+    vec![
+        vec![Span::raw("    ")],
+        vec![Span::styled(format!(" {initial}  "), label_style)],
+    ]
+}
+
+/// Truncates `text` so its rendered width does not exceed `max_width`,
+/// appending an ellipsis when characters are dropped.
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let budget = max_width.saturating_sub(1);
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > budget {
+            break;
+        }
+        result.push(ch);
+        width += ch_width;
+    }
+    result.push('…');
+    result
 }
 
 fn compare_chats_for_sidebar(a: &Chat, b: &Chat) -> std::cmp::Ordering {
@@ -15264,6 +17457,132 @@ fn textarea_byte_cursor(textarea: &TextArea<'_>) -> usize {
     cursor
 }
 
+/// Compute the char offsets at which each soft-wrapped display row of a single
+/// logical line begins. Always returns at least `[0]`. Wrapping prefers word
+/// boundaries (breaking just after a space) and falls back to character-level
+/// breaks for long unbroken tokens. Every character is preserved, so the
+/// concatenation of the produced row slices equals the original line; this
+/// keeps the logical→display cursor mapping exact.
+fn compose_wrap_line_starts(chars: &[char], width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut starts = vec![0usize];
+    if chars.is_empty() {
+        return starts;
+    }
+
+    let mut row_start = 0usize;
+    // Char index just after the most recent space within the current row; a
+    // candidate word-boundary break point.
+    let mut last_break: Option<usize> = None;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if i - row_start == width {
+            let break_at = match last_break {
+                Some(boundary) if boundary > row_start && boundary <= i => boundary,
+                _ => i,
+            };
+            starts.push(break_at);
+            row_start = break_at;
+            last_break = None;
+            continue;
+        }
+        if chars[i] == ' ' {
+            last_break = Some(i + 1);
+        }
+        i += 1;
+    }
+    starts
+}
+
+/// Total number of soft-wrapped display rows for the given logical lines at the
+/// provided inner width. Bounded and cheap: O(total chars).
+fn compose_wrapped_row_count(lines: &[String], width: usize) -> usize {
+    let width = width.max(1);
+    let mut count = 0usize;
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        count += compose_wrap_line_starts(&chars, width).len();
+    }
+    count.max(1)
+}
+
+/// Build the soft-wrapped display rows for the compose content and map the
+/// logical cursor `(row, col)` (char-based, as returned by
+/// `TextArea::cursor()`) to a display `(row, col)`. Wrapping is visual only and
+/// never injects newlines.
+fn compose_wrapped_layout(
+    lines: &[String],
+    cursor: (usize, usize),
+    width: usize,
+) -> (Vec<String>, (usize, usize)) {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cursor_display = (0usize, 0usize);
+    let (cursor_row, cursor_col) = cursor;
+
+    for (logical_index, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let starts = compose_wrap_line_starts(&chars, width);
+        let base_display_row = rows.len();
+        for (segment, &start) in starts.iter().enumerate() {
+            let end = starts.get(segment + 1).copied().unwrap_or(chars.len());
+            rows.push(chars[start..end].iter().collect());
+        }
+
+        if logical_index == cursor_row {
+            let mut sub = 0usize;
+            for (segment, &start) in starts.iter().enumerate() {
+                if start <= cursor_col {
+                    sub = segment;
+                } else {
+                    break;
+                }
+            }
+            let col = cursor_col.saturating_sub(starts[sub]);
+            cursor_display = (base_display_row + sub, col);
+        }
+    }
+
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    (rows, cursor_display)
+}
+
+/// Build a styled `Line` for one wrapped compose display row. When
+/// `cursor_col` is `Some`, the character at that column is highlighted as a
+/// block cursor (a trailing space is highlighted when the cursor sits at the
+/// row end).
+fn compose_display_line(
+    row: &str,
+    cursor_col: Option<usize>,
+    base: Style,
+    cursor_style: Style,
+) -> Line<'static> {
+    let Some(col) = cursor_col else {
+        return Line::from(Span::styled(row.to_owned(), base));
+    };
+
+    let chars: Vec<char> = row.chars().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if col > 0 {
+        let before: String = chars.iter().take(col.min(chars.len())).collect();
+        if !before.is_empty() {
+            spans.push(Span::styled(before, base));
+        }
+    }
+    if col < chars.len() {
+        spans.push(Span::styled(chars[col].to_string(), cursor_style));
+        let after: String = chars.iter().skip(col + 1).collect();
+        if !after.is_empty() {
+            spans.push(Span::styled(after, base));
+        }
+    } else {
+        spans.push(Span::styled(" ".to_owned(), cursor_style));
+    }
+    Line::from(spans)
+}
+
 fn textarea_input(key: TextAreaKey, modifiers: KeyModifiers) -> TextAreaInput {
     TextAreaInput {
         key,
@@ -15320,6 +17639,48 @@ fn centered_fixed_rect(area: Rect, width: u16, height: u16) -> Rect {
 fn help_scroll_max(content_len: usize, area: Rect) -> usize {
     let viewport = inner_area(area).height as usize;
     content_len.saturating_sub(viewport.max(1))
+}
+
+/// Fixed rows reserved above the settings list: title, hint line, blank.
+const SETTINGS_OVERLAY_HEADER_ROWS: u16 = 3;
+/// Fixed rows reserved below the settings list for the wrapped description of
+/// the selected item (plus one blank separator row).
+const SETTINGS_OVERLAY_DESCRIPTION_ROWS: u16 = 4;
+
+/// Layout of the settings overlay interior: a fixed header, a scrollable
+/// one-row-per-item list, and a fixed description footer.
+struct SettingsOverlayMetrics {
+    list: Rect,
+    description: Rect,
+    viewport_rows: usize,
+    max_scroll: usize,
+}
+
+fn settings_overlay_metrics(modal: Rect) -> SettingsOverlayMetrics {
+    let inner = inner_area(modal);
+    let footer_rows = SETTINGS_OVERLAY_DESCRIPTION_ROWS + 1;
+    let list_height = inner
+        .height
+        .saturating_sub(SETTINGS_OVERLAY_HEADER_ROWS + footer_rows)
+        .max(1);
+    let list_y = inner.y.saturating_add(
+        SETTINGS_OVERLAY_HEADER_ROWS.min(inner.height.saturating_sub(list_height)),
+    );
+    let list = Rect::new(inner.x, list_y, inner.width, list_height);
+    let description_y = list.y.saturating_add(list.height).saturating_add(1);
+    let description_height = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(description_y)
+        .min(SETTINGS_OVERLAY_DESCRIPTION_ROWS);
+    let description = Rect::new(inner.x, description_y, inner.width, description_height);
+    let viewport_rows = list.height as usize;
+    SettingsOverlayMetrics {
+        list,
+        description,
+        viewport_rows,
+        max_scroll: SettingsItem::ALL.len().saturating_sub(viewport_rows),
+    }
 }
 
 fn is_ctrl_char(key: KeyEvent, expected: char) -> bool {
@@ -15763,11 +18124,142 @@ fn portable_forward_content(content: &Content) -> Option<Content> {
         | Content::File(_)
         | Content::Sticker(_) => Some(content.clone()),
         Content::LinkPreview(link) => non_empty_text_content(&link.url),
-        Content::Cards(cards) => cards.iter().find_map(card_forward_text).and_then(|text| {
-            let text: Arc<str> = Arc::from(text);
-            non_empty_text_content(text.as_ref())
-        }),
+        Content::Cards(cards) => {
+            // Prefer forwarding the real uploaded bytes: Slack image/file
+            // uploads arrive as `MediaPreview` cards, so recipients on another
+            // platform should receive a native attachment instead of a link
+            // they cannot open. Fall back to the card's text/URL otherwise.
+            if let Some(media_content) = cards.iter().find_map(card_forward_media) {
+                return Some(media_content);
+            }
+            cards.iter().find_map(card_forward_text).and_then(|text| {
+                let text: Arc<str> = Arc::from(text);
+                non_empty_text_content(text.as_ref())
+            })
+        }
         Content::Poll(_) | Content::Deleted | Content::Unsupported(_) => None,
+    }
+}
+
+/// Surfaces a card's embedded upload (such as a Slack `MediaPreview` image) as
+/// real media [`Content`] so forwarding re-uploads the actual bytes. Only
+/// genuine media-preview cards qualify; link/social previews keep their URL so
+/// they continue to forward as text. The card title becomes the caption when
+/// the media carries none of its own.
+fn card_forward_media(card: &Card) -> Option<Content> {
+    if !matches!(card.kind, CardKind::MediaPreview) {
+        return None;
+    }
+    let media = card.image.clone().or_else(|| card.thumbnail.clone())?;
+    let media = with_card_caption(media, card.title.as_deref());
+    Some(media_content_for_mime(media))
+}
+
+fn with_card_caption(mut media: Media, title: Option<&str>) -> Media {
+    if media.caption.is_none()
+        && let Some(title) = title.map(str::trim).filter(|title| !title.is_empty())
+    {
+        media.caption = Some(Arc::from(title));
+    }
+    media
+}
+
+/// Chooses the media-bearing [`Content`] variant for a MIME type so capability
+/// gating and provider upload paths treat the forwarded attachment correctly.
+fn media_content_for_mime(media: Media) -> Content {
+    match media.mime_type.split('/').next() {
+        Some("image") => Content::Image(media),
+        Some("video") => Content::Video(media),
+        Some("audio") => Content::Audio(media),
+        _ => Content::File(media),
+    }
+}
+
+/// Performs a forward off the event loop: ensures media bytes exist locally
+/// (fetching them through the source provider when needed), then uploads the
+/// content to the destination chat. Returns the sent id and the content that
+/// was actually delivered so the echoed message renders the real attachment.
+async fn forward_send_content(
+    destination: ProviderBox,
+    source: Option<ProviderBox>,
+    chat_id: &ChatId,
+    content: Content,
+) -> Result<(MessageId, Content)> {
+    let content = ensure_forward_media_local(content, source).await?;
+    let sent_id = destination.send(chat_id, content.clone(), None).await?;
+    Ok((sent_id, content))
+}
+
+/// Guarantees that a media forward has real bytes on disk before upload,
+/// fetching them through the source provider when the cached copy is absent.
+/// Non-media content passes through unchanged.
+async fn ensure_forward_media_local(
+    content: Content,
+    source: Option<ProviderBox>,
+) -> Result<Content> {
+    let Some(media) = forward_media_ref(&content) else {
+        return Ok(content);
+    };
+    if media_file_present(media) {
+        return Ok(content);
+    }
+    let Some(source) = source else {
+        bail!(
+            "cannot forward {}: source account is unavailable",
+            media.file_name
+        );
+    };
+    let file_name = media.file_name.clone();
+    let path = source
+        .download_media(media)
+        .await
+        .with_context(|| format!("cannot forward {file_name}: media not available"))?;
+    Ok(replace_forward_media_path(content, path))
+}
+
+fn forward_media_ref(content: &Content) -> Option<&Media> {
+    match content {
+        Content::Image(media)
+        | Content::Video(media)
+        | Content::Audio(media)
+        | Content::File(media)
+        | Content::Sticker(media) => Some(media),
+        Content::Text(_)
+        | Content::LinkPreview(_)
+        | Content::Cards(_)
+        | Content::Poll(_)
+        | Content::Deleted
+        | Content::Unsupported(_) => None,
+    }
+}
+
+fn media_file_present(media: &Media) -> bool {
+    media.local_path.as_ref().is_some_and(|path| path.exists())
+}
+
+fn replace_forward_media_path(content: Content, path: PathBuf) -> Content {
+    match content {
+        Content::Image(mut media) => {
+            media.local_path = Some(path);
+            Content::Image(media)
+        }
+        Content::Video(mut media) => {
+            media.local_path = Some(path);
+            Content::Video(media)
+        }
+        Content::Audio(mut media) => {
+            media.local_path = Some(path);
+            Content::Audio(media)
+        }
+        Content::File(mut media) => {
+            media.local_path = Some(path);
+            Content::File(media)
+        }
+        Content::Sticker(mut media) => {
+            media.local_path = Some(path);
+            Content::Sticker(media)
+        }
+        other => other,
     }
 }
 
@@ -15913,6 +18405,71 @@ fn is_openable_url(url: &str) -> bool {
     reqwest::Url::parse(url)
         .ok()
         .is_some_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+}
+
+/// Whether a message's content is a "low intent" interaction that should stay
+/// quiet: a bare shared link with no human-authored message body, or a pure
+/// link-preview card. A link that comes with a caption or a Slack labelled
+/// link (`<url|label>`) carries real intent and is *not* low intent.
+///
+/// Reactions are also low intent, but they arrive via
+/// `ProviderEvent::ReactionChanged` and never reach the notification path, so
+/// they are inherently covered without a branch here.
+fn is_low_intent_content(content: &Content) -> bool {
+    match content {
+        // A pure link-preview card has no message body of its own.
+        Content::LinkPreview(_) => true,
+        // Plain text whose entire body is a single URL.
+        Content::Text(text) => text_is_bare_url(text),
+        // Cards that are exclusively link previews, with no other body.
+        Content::Cards(cards) => {
+            !cards.is_empty()
+                && cards
+                    .iter()
+                    .all(|card| matches!(card.kind, CardKind::LinkPreview))
+        }
+        Content::Image(_)
+        | Content::Video(_)
+        | Content::Audio(_)
+        | Content::File(_)
+        | Content::Sticker(_)
+        | Content::Poll(_)
+        | Content::Deleted
+        | Content::Unsupported(_) => false,
+    }
+}
+
+/// Whether `text` is nothing but a single bare URL. A Slack labelled link
+/// (`<url|label>`) or any surrounding words count as intent and return false.
+fn text_is_bare_url(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let Some(token) = tokens.next() else {
+        return false;
+    };
+    if tokens.next().is_some() {
+        // More than one whitespace-delimited token means surrounding words.
+        return false;
+    }
+    // Strip Slack angle-bracket wrapping: `<url>` or `<url|label>`.
+    let inner = token
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_suffix('>'))
+        .unwrap_or(token);
+    if let Some((url, label)) = inner.split_once('|') {
+        // A non-empty label is human-authored intent, not a bare link.
+        return label.trim().is_empty() && is_openable_url(url.trim());
+    }
+    let cleaned = inner.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '<' | '>' | '(' | ')' | '[' | ']' | '"' | '\'' | ',' | '.'
+        )
+    });
+    is_openable_url(cleaned)
 }
 
 #[cfg(not(test))]
@@ -16565,10 +19122,52 @@ fn message_reacted_by_sender(message: &Message, emoji: &str, sender: &str) -> bo
     })
 }
 
-fn local_reaction_option(message: &Message) -> Option<usize> {
-    REACTION_OPTIONS
+/// Whether a catalog entry is a standard Unicode emoji (safe for every
+/// provider) rather than a kaomoji / freeform token. Kaomoji entries are tagged
+/// with the `kaomoji` alias in `COMPOSE_EMOTICON_OPTIONS`.
+fn reaction_entry_is_standard(label: &str) -> bool {
+    !label.contains("kaomoji")
+}
+
+/// Whether a platform accepts arbitrary (non-shortcode) reaction strings such
+/// as kaomoji. Slack validates reactions against emoji shortcodes server-side
+/// and rejects freeform text, so it is excluded.
+fn platform_allows_freeform_reactions(platform: &Platform) -> bool {
+    !matches!(platform, Platform::Slack)
+}
+
+/// Filter the reaction catalog by `query` (prefix/substring over aliases and
+/// the glyph) and provider capability, returning indices into
+/// `COMPOSE_EMOTICON_OPTIONS`.
+fn reaction_catalog_matches(query: &str, allow_freeform: bool) -> Vec<usize> {
+    let query_lower = query.to_ascii_lowercase();
+    COMPOSE_EMOTICON_OPTIONS
         .iter()
-        .position(|emoji| message_reacted_by_sender(message, emoji, LOCAL_REACTION_SENDER))
+        .enumerate()
+        .filter(|(_, (_, label))| allow_freeform || reaction_entry_is_standard(label))
+        .filter_map(|(index, (value, label))| {
+            if query_lower.is_empty() {
+                return Some(index);
+            }
+            let label_lower = label.to_ascii_lowercase();
+            (label_lower
+                .split_whitespace()
+                .any(|alias| alias.starts_with(&query_lower))
+                || label_lower.contains(&query_lower)
+                || value.contains(query))
+            .then_some(index)
+        })
+        .take(REACTION_PICKER_MAX_MATCHES)
+        .collect()
+}
+
+/// Position within `matches` of the first reaction the local user already
+/// applied, so reopening the picker lands on an existing reaction.
+fn reaction_catalog_selected_index(message: &Message, matches: &[usize]) -> Option<usize> {
+    matches.iter().position(|&option_index| {
+        let value = COMPOSE_EMOTICON_OPTIONS[option_index].0;
+        message_reacted_by_sender(message, value, LOCAL_REACTION_SENDER)
+    })
 }
 
 fn add_reaction(message: &mut Message, emoji: &str, sender: Arc<str>) {
@@ -16590,6 +19189,20 @@ fn add_reaction(message: &mut Message, emoji: &str, sender: Arc<str>) {
             senders: vec![sender],
         });
     }
+}
+
+/// Replace the local user's reaction on a message with a single `emoji`,
+/// dropping any other reaction they previously applied. Models WhatsApp's
+/// one-reaction-per-user semantics for optimistic local state.
+fn replace_single_local_reaction(message: &mut Message, emoji: &str) {
+    let me: Arc<str> = Arc::from(LOCAL_REACTION_SENDER);
+    for reaction in &mut message.reactions {
+        reaction.senders.retain(|candidate| candidate != &me);
+    }
+    message
+        .reactions
+        .retain(|reaction| !reaction.senders.is_empty());
+    add_reaction(message, emoji, me);
 }
 
 fn remove_reaction(message: &mut Message, emoji: &str, sender: &Arc<str>) {
@@ -16696,6 +19309,58 @@ mod tests {
         sync::Mutex,
     };
 
+    /// Writes directly to fd 2 so the check cannot be fooled by the test
+    /// harness's output capture, which only intercepts the `eprintln!` macro
+    /// family.
+    #[cfg(unix)]
+    fn write_to_raw_stderr(marker: &str) {
+        let bytes = marker.as_bytes();
+        let written =
+            unsafe { libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+        assert_eq!(written, bytes.len() as isize);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_redirect_guard_captures_fd_two_and_restores_it_on_drop() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("stderr-capture.log");
+        let target = OpenOptions::new().create(true).append(true).open(&path)?;
+
+        let guard = redirect_stderr_to(&target).expect("stderr redirection should succeed");
+        write_to_raw_stderr("captured-while-redirected\n");
+        drop(guard);
+        write_to_raw_stderr("\n");
+
+        let captured = fs::read_to_string(&path)?;
+        assert!(captured.contains("captured-while-redirected"));
+        Ok(())
+    }
+
+    #[test]
+    fn periodic_repaint_invalidation_redraws_every_cell_without_clearing_screen() -> Result<()> {
+        use ratatui::buffer::Buffer;
+
+        // The sentinel must differ from every cell a frame can contain —
+        // including fully default blank cells — so corruption in empty
+        // regions of the screen is repainted as well.
+        let area = Rect::new(0, 0, 12, 3);
+        let reference = Buffer::filled(area, repaint_sentinel_cell());
+        let blank_frame = Buffer::empty(area);
+        assert_eq!(reference.diff(&blank_frame).len(), 12 * 3);
+
+        // Invalidation must not disturb what subsequent draws render: the
+        // same frame drawn after invalidation reproduces the same screen.
+        let mut terminal = Terminal::new(TestBackend::new(12, 3))?;
+        terminal.draw(|frame| frame.render_widget(Paragraph::new("hello"), frame.area()))?;
+        let drawn = terminal.backend().buffer().clone();
+
+        invalidate_rendered_cells(&mut terminal);
+        terminal.draw(|frame| frame.render_widget(Paragraph::new("hello"), frame.area()))?;
+        terminal.backend().assert_buffer(&drawn);
+        Ok(())
+    }
+
     #[test]
     fn compare_chats_places_unread_chats_first_by_recency_across_platforms() {
         let now = Utc::now();
@@ -16801,10 +19466,10 @@ mod tests {
             app.state().selected_chat().map(|chat| chat.name.as_ref()),
             Some("Family Weekend 🏡")
         );
-        assert_eq!(app.state().messages().len(), 2);
+        assert_eq!(app.state().messages().len(), 5);
         assert_eq!(
             app.state().visible_chat_indices(),
-            &[0, 1, 2, 3, 8, 4, 7, 5, 6, 9]
+            &[0, 1, 2, 4, 8, 3, 7, 5, 6, 9]
         );
         assert_eq!(app.state().filter(), "");
         assert_eq!(app.state().focus(), FocusPane::ChatList);
@@ -16911,6 +19576,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reaction_sender_name_map_resolves_members_without_messages() -> Result<()> {
+        // A contact can react to a message without having sent any message in
+        // the loaded window. Their name must still resolve from the fetched
+        // group-member directory instead of falling back to a raw JID.
+        let account_id: ProviderId = Arc::from("whatsapp:reaction-names");
+        let chat_id: ChatId = Arc::from("whatsapp:group@g.us");
+        let reactor: PlatformId = Arc::from("40745211186@s.whatsapp.net");
+        let chat = Chat {
+            id: chat_id.clone(),
+            account: account_id.clone(),
+            platform: Platform::WhatsApp,
+            name: Arc::from("Vin"),
+            avatar: None,
+            is_group: true,
+            kind: ChatKind::Group,
+            last_message_at: None,
+            last_message_preview: None,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            thread_id: None,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+        };
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::WhatsApp,
+            display_name: Arc::from("Test WhatsApp"),
+            avatar: None,
+        };
+        // The reaction's sender is the reactor, who is NOT the message sender.
+        let messages = vec![Message {
+            id: Arc::from("m1"),
+            chat_id: chat_id.clone(),
+            account: account_id.clone(),
+            sender: Sender {
+                platform_id: Arc::from("40711111111@s.whatsapp.net"),
+                display_name: Arc::from("Razvan"),
+                avatar: None,
+            },
+            timestamp: Utc::now(),
+            edited_at: None,
+            content: Content::Text(Arc::from("hi")),
+            reply_to: None,
+            thread_id: None,
+            reactions: vec![Reaction {
+                emoji: Arc::from("😂"),
+                senders: vec![reactor.clone()],
+            }],
+            receipts: Vec::new(),
+            is_from_me: false,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        }];
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![chat],
+            messages.clone(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.store.upsert_message(&messages[0]).await?;
+        app.reload_selected_messages().await?;
+
+        // Before the member directory is known, the reactor falls back to a
+        // truncated JID/phone rather than a contact name.
+        let before = app.reaction_sender_name_map();
+        assert_eq!(
+            before.get(&reactor).map(String::as_str),
+            None,
+            "reactor should be unresolved until members are fetched"
+        );
+
+        app.chat_members_tx.send(ChatMembersFetchResult {
+            account: account_id,
+            chat_id,
+            result: Ok(vec![ChatMember::new(Sender {
+                platform_id: reactor.clone(),
+                display_name: Arc::from("Andrei Gavrilescu"),
+                avatar: Some(PathBuf::from("andrei.jpg")),
+            })]),
+        })?;
+        assert!(app.drain_chat_member_fetches());
+
+        let after = app.reaction_sender_name_map();
+        assert_eq!(
+            after.get(&reactor).map(String::as_str),
+            Some("Andrei Gavrilescu"),
+            "reactor should resolve from the fetched member directory"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_uses_workspace_avatar_for_slack_system_chat() -> Result<()> {
         let account_id: ProviderId = Arc::from("slack:system-avatar");
         let workspace_avatar = PathBuf::from("/tmp/test-slack-workspace.png");
@@ -17010,11 +19770,11 @@ mod tests {
         app.chat_members_tx.send(ChatMembersFetchResult {
             account: account_id,
             chat_id,
-            result: Ok(vec![Sender {
+            result: Ok(vec![ChatMember::new(Sender {
                 platform_id: Arc::from("U123"),
                 display_name: Arc::from("Alice Designer"),
                 avatar: Some(PathBuf::from("alice.png")),
-            }]),
+            })]),
         })?;
         assert!(app.drain_chat_member_fetches());
 
@@ -17202,13 +19962,13 @@ mod tests {
             .await?;
         drain_async_app_work(&mut app).await?;
         assert_eq!(app.state().selected_chat_index(), 1);
-        assert_eq!(app.state().messages().len(), 3);
+        assert_eq!(app.state().messages().len(), 4);
 
         app.handle_event(AppEvent::Key(key(KeyCode::Up, KeyModifiers::NONE)))
             .await?;
         drain_async_app_work(&mut app).await?;
         assert_eq!(app.state().selected_chat_index(), 0);
-        assert_eq!(app.state().messages().len(), 2);
+        assert_eq!(app.state().messages().len(), 5);
 
         app.handle_event(AppEvent::Key(key(
             KeyCode::Char('q'),
@@ -17223,7 +19983,6 @@ mod tests {
     #[tokio::test]
     async fn filter_typing_schedules_discovery_without_blocking_message_load() -> Result<()> {
         let mut app = test_app().await?;
-        let initial_message_count = app.state().messages().len();
 
         app.handle_event(AppEvent::Key(key(
             KeyCode::Char('f'),
@@ -17239,8 +19998,9 @@ mod tests {
 
         assert!(app.state().filter_mode());
         assert_eq!(app.state().filter(), "me");
-        assert_eq!(app.state().messages().len(), initial_message_count);
-        assert!(app.pending_selected_messages.is_none());
+        // Typing in the chat filter schedules destination discovery and, because
+        // a matching chat becomes selected, a debounced navigation load so the
+        // chat opens without Enter.
         assert!(app.pending_discovery_query.is_some());
 
         drain_async_app_work(&mut app).await?;
@@ -17570,6 +20330,505 @@ mod tests {
             "expected a thread-aware desktop notification, got {sent:?}"
         );
 
+        Ok(())
+    }
+
+    /// Two-phase contract for voice summaries: queueing an eligible message
+    /// immediately enqueues the structured fono payload on the grouped voice
+    /// queue, and draining an expired grouping window dispatches the
+    /// background process whose completion is observable without blocking
+    /// the event loop.
+    #[tokio::test]
+    async fn voice_summary_payload_attaches_on_queue_and_dispatches_on_delivery() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        app.settings.voice_summaries = true;
+        // `cat` consumes the JSON payload from stdin and exits 0 — a
+        // deterministic stand-in for a healthy `fono summarize --json`.
+        app.voice_summary_command = vec!["cat".to_owned()];
+        let _capture = capture_desktop_notifications(&mut app);
+
+        let message = test_incoming_message(
+            &background_chat,
+            "slack:msg:voice-1",
+            "Mihai",
+            "staging deploy fails after the auth-service migration",
+        );
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        // Phase 1: the queued voice summary carries the full structured
+        // payload (not the trimmed preview) built while the message was
+        // still in hand, debouncing through its grouping window.
+        assert_eq!(app.state().pending_notification_count(), 1);
+        assert_eq!(app.state.pending_voice_summaries.len(), 1);
+        let pending = &app.state.pending_voice_summaries[0];
+        assert_eq!(pending.message_count, 1);
+        let payload = &pending.payload;
+        assert_eq!(payload.source_app, "chat-cli");
+        assert_eq!(payload.sender_name, "Mihai");
+        assert_eq!(payload.chat_name, "background");
+        assert_eq!(payload.account, "Engineering Slack");
+        assert!(payload.message_text.contains("auth-service migration"));
+
+        // Phase 2: once the grouping window elapses, the drain dispatches
+        // the background process and the completion arrives asynchronously
+        // on the outcome channel.
+        app.state.pending_voice_summaries[0].deliver_at = Instant::now();
+        app.drain_due_voice_summaries();
+        assert!(app.state.pending_voice_summaries.is_empty());
+        let mut outcome = None;
+        for _ in 0..500 {
+            if let Ok(received) = app.voice_summary_rx.try_recv() {
+                outcome = Some(received);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let outcome = outcome.expect("voice summary outcome should arrive");
+        assert!(outcome.result.is_ok(), "got {:?}", outcome.result);
+        assert_eq!(outcome.message_id.as_ref(), "slack:msg:voice-1");
+        Ok(())
+    }
+
+    /// A broken/missing fono binary must surface in the status line through
+    /// the bounded tick drain instead of failing silently or panicking.
+    #[tokio::test]
+    async fn voice_summary_failure_surfaces_in_status_via_drain() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        app.settings.voice_summaries = true;
+        app.voice_summary_command = vec!["/nonexistent/fono-test-binary".to_owned()];
+        let _capture = capture_desktop_notifications(&mut app);
+
+        let message = test_incoming_message(
+            &background_chat,
+            "slack:msg:voice-2",
+            "Alex",
+            "can Dan get SSH access to staging?",
+        );
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(app.state.pending_voice_summaries.len(), 1);
+
+        app.state.pending_voice_summaries[0].deliver_at = Instant::now();
+        app.drain_due_voice_summaries();
+        let mut failed = false;
+        for _ in 0..500 {
+            app.drain_voice_summary_outcomes();
+            if app.state.status.contains("voice summary failed") {
+                failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(failed, "expected failure status, got: {}", app.state.status);
+        assert!(
+            app.state.status.contains("could not start"),
+            "status should carry the spawn error: {}",
+            app.state.status
+        );
+        Ok(())
+    }
+
+    /// With the setting disabled (the default), nothing is enqueued on the
+    /// voice queue and no process is ever spawned.
+    #[tokio::test]
+    async fn voice_summary_disabled_attaches_no_payload() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        assert!(!app.settings.voice_summaries, "off by default");
+
+        let message =
+            test_incoming_message(&background_chat, "slack:msg:voice-3", "Maya", "lunch?");
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        assert_eq!(app.state().pending_notification_count(), 1);
+        assert!(
+            app.state.pending_voice_summaries.is_empty(),
+            "no voice summary may be queued while the setting is off"
+        );
+        Ok(())
+    }
+
+    /// A bare-link ("low intent") message raises neither a notification nor a
+    /// voice summary while `suppress_low_intent_notifications` is on (default).
+    #[tokio::test]
+    async fn low_intent_message_suppresses_notification_and_summary() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        app.settings.voice_summaries = true;
+        app.voice_summary_command = vec!["cat".to_owned()];
+        assert!(
+            app.settings.suppress_low_intent_notifications,
+            "suppression defaults on; this test relies on it"
+        );
+
+        let message = test_incoming_message(
+            &background_chat,
+            "slack:msg:low-intent-1",
+            "Maya",
+            "https://example.com/story",
+        );
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        assert_eq!(
+            app.state().pending_notification_count(),
+            0,
+            "a bare link must not raise a notification by default"
+        );
+        assert!(
+            app.state.pending_voice_summaries.is_empty(),
+            "a bare link must never be voice-summarized"
+        );
+        Ok(())
+    }
+
+    /// With low-intent notifications allowed, the visual notification fires for
+    /// a bare link but the voice summary is still suppressed.
+    #[tokio::test]
+    async fn low_intent_notification_allowed_still_skips_summary() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        app.settings.voice_summaries = true;
+        app.settings.suppress_low_intent_notifications = false;
+        app.voice_summary_command = vec!["cat".to_owned()];
+
+        let message = test_incoming_message(
+            &background_chat,
+            "slack:msg:low-intent-2",
+            "Maya",
+            "https://example.com/story",
+        );
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        assert_eq!(
+            app.state().pending_notification_count(),
+            1,
+            "the notification still fires when low-intent suppression is off"
+        );
+        assert!(
+            app.state.pending_voice_summaries.is_empty(),
+            "a bare link is never voice-summarized, regardless of the toggle"
+        );
+        Ok(())
+    }
+
+    /// Messages the user sent themselves must never produce a voice
+    /// summary, even when `notify_self_messages` (on by default) lets them
+    /// raise a visual notification.
+    #[tokio::test]
+    async fn voice_summary_never_queued_for_own_messages() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        app.settings.voice_summaries = true;
+        app.voice_summary_command = vec!["cat".to_owned()];
+        assert!(
+            app.settings.notify_self_messages,
+            "notify_self_messages defaults on; this test relies on it"
+        );
+        let _capture = capture_desktop_notifications(&mut app);
+
+        let mut message = test_incoming_message(
+            &background_chat,
+            "slack:msg:voice-self",
+            "Me",
+            "note to self: buy milk",
+        );
+        message.is_from_me = true;
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        // The visual notification still queues (notify_self_messages is
+        // on), but the voice queue stays empty.
+        assert_eq!(app.state().pending_notification_count(), 1);
+        assert!(
+            app.state.pending_voice_summaries.is_empty(),
+            "own messages must never be summarized aloud"
+        );
+        Ok(())
+    }
+
+    /// A burst of messages from the same sender within the grouping window
+    /// folds into one pending summary and dispatches exactly one fono
+    /// process; a different sender in the same chat groups separately.
+    #[tokio::test]
+    async fn voice_summary_groups_same_sender_burst_into_one_dispatch() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        app.settings.voice_summaries = true;
+        app.voice_summary_command = vec!["cat".to_owned()];
+        let _capture = capture_desktop_notifications(&mut app);
+
+        for (id, text) in [
+            ("slack:msg:burst-1", "deploy failed"),
+            ("slack:msg:burst-2", "rolling back now"),
+            ("slack:msg:burst-3", "rollback done, please review"),
+        ] {
+            let message = test_incoming_message(&background_chat, id, "Mihai", text);
+            app.handle_event(AppEvent::Provider(
+                account_id.clone(),
+                Box::new(ProviderEvent::Message {
+                    message,
+                    is_historical: false,
+                }),
+            ))
+            .await?;
+        }
+        // A different sender in the same chat must not fold into Mihai's
+        // group.
+        let other = test_incoming_message(
+            &background_chat,
+            "slack:msg:other-1",
+            "Alex",
+            "I can take the review",
+        );
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message: other,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+
+        assert_eq!(app.state.pending_voice_summaries.len(), 2);
+        let mihai = app
+            .state
+            .pending_voice_summaries
+            .iter()
+            .find(|pending| pending.payload.sender_name == "Mihai")
+            .expect("Mihai's grouped summary");
+        assert_eq!(mihai.message_count, 3);
+        assert_eq!(mihai.message_id.as_ref(), "slack:msg:burst-3");
+        assert!(mihai.payload.message_text.contains("deploy failed"));
+        assert!(mihai.payload.message_text.contains("rolling back now"));
+        assert!(mihai.payload.message_text.contains("rollback done"));
+        assert!(mihai.payload.instructions.contains("3 consecutive"));
+        let alex = app
+            .state
+            .pending_voice_summaries
+            .iter()
+            .find(|pending| pending.payload.sender_name == "Alex")
+            .expect("Alex's separate summary");
+        assert_eq!(alex.message_count, 1);
+
+        // Expire both windows: exactly two dispatches (one per sender), not
+        // four.
+        for pending in &mut app.state.pending_voice_summaries {
+            pending.deliver_at = Instant::now();
+        }
+        app.drain_due_voice_summaries();
+        assert!(app.state.pending_voice_summaries.is_empty());
+        let mut outcomes = Vec::new();
+        for _ in 0..500 {
+            while let Ok(received) = app.voice_summary_rx.try_recv() {
+                outcomes.push(received);
+            }
+            if outcomes.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "one dispatch per sender group, got {outcomes:?}"
+        );
+        Ok(())
+    }
+
+    /// Opening (attending) a chat cancels its pending voice summaries along
+    /// with the visual notifications: the user is already reading them.
+    #[tokio::test]
+    async fn voice_summary_cancelled_when_chat_is_attended() -> Result<()> {
+        let account_id: ProviderId = Arc::from("slack:workspace");
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::Slack,
+            display_name: Arc::from("Engineering Slack"),
+            avatar: None,
+        };
+        let (active_chat, background_chat) = slack_thread_test_chats(&account_id);
+        let provider = StaticTestProvider::with_account(
+            account,
+            vec![active_chat, background_chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.settings.notifications = NotificationMode::Desktop;
+        app.settings.voice_summaries = true;
+        app.voice_summary_command = vec!["cat".to_owned()];
+        let _capture = capture_desktop_notifications(&mut app);
+
+        let message = test_incoming_message(
+            &background_chat,
+            "slack:msg:attend-1",
+            "Mihai",
+            "can you look at staging?",
+        );
+        app.handle_event(AppEvent::Provider(
+            account_id.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(app.state.pending_voice_summaries.len(), 1);
+
+        app.cancel_pending_notifications_for_chat(&account_id, &background_chat.id, "test_attend");
+        assert!(
+            app.state.pending_voice_summaries.is_empty(),
+            "attending the chat must cancel its pending voice summaries"
+        );
+        assert!(app.voice_summary_rx.try_recv().is_err(), "nothing spoken");
         Ok(())
     }
 
@@ -18870,6 +22129,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_settings_overlay_scrolls_keeps_selection_visible_and_handles_mouse() -> Result<()>
+    {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 20))?;
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert!(app.state().settings_overlay_open());
+        assert_eq!(app.state().settings_overlay_scroll(), Some(0));
+
+        // Immediate draw: header, first items, footer description, and a
+        // scrollbar viewport that cannot fit all items.
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Settings"));
+        assert!(content.contains("Inbox style"));
+        assert!(content.contains("Pick the inbox flow"));
+        assert!(!content.contains("Voice summaries"));
+
+        let modal = app.settings_overlay_rect(app.state.frame_area);
+        let metrics = settings_overlay_metrics(modal);
+        assert!(metrics.viewport_rows < SettingsItem::ALL.len());
+        let max_scroll = metrics.max_scroll;
+
+        // End scrolls the last item into view; Home returns to the top.
+        app.handle_event(AppEvent::Key(key(KeyCode::End, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().settings_overlay_selected(), Some(14));
+        assert_eq!(app.state().settings_overlay_scroll(), Some(max_scroll));
+        terminal.draw(|frame| app.draw(frame))?;
+        let scrolled = buffer_text(terminal.backend().buffer());
+        assert!(scrolled.contains("Voice summaries"));
+        assert!(!scrolled.contains("Inbox style"));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Home, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().settings_overlay_scroll(), Some(0));
+
+        // Mouse wheel scrolls the list without moving the selection.
+        let wheel_x = modal.x + modal.width / 2;
+        let wheel_y = metrics.list.y + 1;
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::ScrollDown,
+            wheel_x,
+            wheel_y,
+        )))
+        .await?;
+        assert_eq!(app.state().settings_overlay_scroll(), Some(1));
+        assert_eq!(app.state().settings_overlay_selected(), Some(0));
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::ScrollUp,
+            wheel_x,
+            wheel_y,
+        )))
+        .await?;
+        assert_eq!(app.state().settings_overlay_scroll(), Some(0));
+
+        // Clicking a list row selects and activates that item.
+        terminal.draw(|frame| app.draw(frame))?;
+        let click_row = metrics.list.y + 2;
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            metrics.list.x + 4,
+            click_row,
+        )))
+        .await?;
+        assert_eq!(app.state().settings_overlay_selected(), Some(2));
+        assert!(app.state().status().starts_with("Conversation style:"));
+
+        // Clicking the scrollbar track jumps the scroll position and dragging
+        // follows the pointer.
+        terminal.draw(|frame| app.draw(frame))?;
+        let track_x = modal.x + modal.width - 1;
+        let track_top = metrics.list.y.saturating_sub(1);
+        let track_bottom = track_top + metrics.list.height + 1;
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track_x,
+            track_bottom,
+        )))
+        .await?;
+        assert_eq!(app.state().settings_overlay_scroll(), Some(max_scroll));
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track_x,
+            track_top,
+        )))
+        .await?;
+        assert_eq!(app.state().settings_overlay_scroll(), Some(0));
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track_x,
+            track_top,
+        )))
+        .await?;
+
+        // Clicking outside the modal closes settings.
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+        )))
+        .await?;
+        assert!(!app.state().settings_overlay_open());
+        assert_eq!(app.state().status(), "settings closed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_help_overlay_scrollbar_is_clickable_and_draggable() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
+
+        app.handle_event(AppEvent::Key(key(KeyCode::F(1), KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state().help_overlay_open());
+        terminal.draw(|frame| app.draw(frame))?;
+
+        let modal = app.help_overlay_rect(app.state.frame_area);
+        let max_scroll = app.help_scroll_max();
+        assert!(max_scroll > 0);
+        let track_x = modal.x + modal.width - 1;
+
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            track_x,
+            modal.y + modal.height - 1,
+        )))
+        .await?;
+        assert_eq!(app.state().help_overlay_scroll(), Some(max_scroll));
+        assert!(app.state().help_overlay_open());
+
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            track_x,
+            modal.y,
+        )))
+        .await?;
+        assert_eq!(app.state().help_overlay_scroll(), Some(0));
+
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            track_x,
+            modal.y,
+        )))
+        .await?;
+        assert!(app.state().help_overlay_open());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_handles_filtering_and_filter_clear() -> Result<()> {
         let mut app = test_app().await?;
 
@@ -18898,8 +22313,9 @@ mod tests {
             app.state().selected_chat().map(|chat| chat.name.as_ref()),
             Some("Media Samples")
         );
-        assert_eq!(app.state().messages().len(), 2);
-        assert!(app.pending_selected_messages.is_none());
+        // Highlighting a chat while filtering now opens it via a debounced load,
+        // so its messages are present without pressing Enter.
+        assert_eq!(app.state().messages().len(), 3);
 
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
@@ -18946,20 +22362,120 @@ mod tests {
             .expect("media chat should exist");
         assert_eq!(app.state().visible_chat_indices(), &[media_index]);
 
-        // Moving focus into the Messages pane switches the filter to message
-        // scope, so the chat list is no longer narrowed by the query.
+        // Moving focus into the Messages pane switches the *edited* scope to
+        // messages, but the chat-list filter stays applied: the query never
+        // leaks across panes, so the sidebar remains narrowed and the now-active
+        // message scope starts from its own empty buffer.
         app.handle_event(AppEvent::Key(key(KeyCode::Right, KeyModifiers::NONE)))
             .await?;
         assert_eq!(app.state().focus(), FocusPane::Messages);
         assert!(app.state().filter_mode());
-        assert!(app.state().visible_chat_indices().len() > 1);
+        assert_eq!(app.state().visible_chat_indices(), &[media_index]);
+        assert_eq!(app.state().filter(), "");
 
-        // Moving focus back to the chat list restores chat-scoped filtering.
+        // Moving focus back to the chat list resumes editing the chat filter,
+        // whose buffer was preserved untouched.
         app.handle_event(AppEvent::Key(key(KeyCode::Left, KeyModifiers::NONE)))
             .await?;
         assert_eq!(app.state().focus(), FocusPane::ChatList);
         assert!(app.state().filter_mode());
+        assert_eq!(app.state().filter(), "media");
         assert_eq!(app.state().visible_chat_indices(), &[media_index]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_esc_clears_active_filter_and_exits_mode() -> Result<()> {
+        let mut app = test_app().await?;
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        for value in "media".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        drain_async_app_work(&mut app).await?;
+        assert!(app.state().filter_mode());
+        assert_eq!(app.state().filter(), "media");
+        assert_eq!(app.state().visible_chat_indices().len(), 1);
+
+        // A single Esc fully clears the edited scope and exits filter mode, so
+        // no filter is left silently applied.
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().filter_mode());
+        assert_eq!(app.state().filter(), "");
+        let identity: Vec<usize> = (0..app.state().chats().len()).collect();
+        assert_eq!(app.state().visible_chat_indices(), identity.as_slice());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_filter_auto_resets_when_enabled() -> Result<()> {
+        let mut app = test_app().await?;
+        app.settings.auto_reset_filter = true;
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        for value in "media".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        // Confirming keeps the filter applied while leaving filter mode.
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        drain_async_app_work(&mut app).await?;
+        assert!(!app.state().filter_mode());
+        assert_eq!(app.state().filter(), "media");
+        assert_eq!(app.state().visible_chat_indices().len(), 1);
+
+        // Backdate the last interaction beyond the inactivity window; the tick
+        // handler should then auto-clear the lingering filter.
+        app.state.filter_last_interaction = Instant::now()
+            .checked_sub(FILTER_INACTIVITY_TIMEOUT + Duration::from_secs(1));
+        app.handle_event(AppEvent::Tick).await?;
+
+        assert_eq!(app.state().filter(), "");
+        let identity: Vec<usize> = (0..app.state().chats().len()).collect();
+        assert_eq!(app.state().visible_chat_indices(), identity.as_slice());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_filter_preserved_when_auto_reset_disabled() -> Result<()> {
+        let mut app = test_app().await?;
+        app.settings.auto_reset_filter = false;
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        for value in "media".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(app.state().filter(), "media");
+
+        app.state.filter_last_interaction = Instant::now()
+            .checked_sub(FILTER_INACTIVITY_TIMEOUT + Duration::from_secs(1));
+        app.handle_event(AppEvent::Tick).await?;
+
+        // With auto-reset disabled the filter stays applied.
+        assert_eq!(app.state().filter(), "media");
+        assert_eq!(app.state().visible_chat_indices().len(), 1);
 
         Ok(())
     }
@@ -19040,7 +22556,7 @@ mod tests {
         drain_async_app_work(&mut app).await?;
         assert_eq!(app.selected_visible_position(), Some(9));
         assert_eq!(app.state().selected_chat_index(), 9);
-        assert_eq!(app.state().messages().len(), 1);
+        assert_eq!(app.state().messages().len(), 2);
 
         app.handle_event(AppEvent::Key(key(KeyCode::Home, KeyModifiers::NONE)))
             .await?;
@@ -19461,7 +22977,7 @@ mod tests {
             app.state().selected_chat().map(|chat| chat.name.as_ref()),
             Some("Alice Chen")
         );
-        assert_eq!(app.state().messages().len(), 3);
+        assert_eq!(app.state().messages().len(), 4);
         let position_after_click = app
             .selected_visible_position()
             .expect("clicked chat should be visible");
@@ -19653,12 +23169,19 @@ mod tests {
         assert!(app.state().reaction_picker_open());
 
         terminal.draw(|frame| app.draw(frame))?;
+        // Filter to a single known reaction so the click target is deterministic
+        // regardless of any reactions the message already carries (which would
+        // otherwise open the list pre-scrolled onto an existing reaction).
+        for value in "rocket".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
         let picker = app.state.reaction_picker.clone().unwrap();
         let picker_rect = app.reaction_picker_rect(app.state.frame_area, &picker.message_id);
-        let emoji_index = 3;
+        let expected_emoji = COMPOSE_EMOTICON_OPTIONS[picker.matches[0]].0;
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            picker_rect.x + 2 + emoji_index as u16 * REACTION_OPTION_CELL_WIDTH,
+            picker_rect.x + 2,
             picker_rect.y + 2,
         )))
         .await?;
@@ -19668,7 +23191,7 @@ mod tests {
             reacted
                 .reactions
                 .iter()
-                .any(|reaction| reaction.emoji.as_ref() == REACTION_OPTIONS[emoji_index])
+                .any(|reaction| reaction.emoji.as_ref() == expected_emoji)
         );
 
         let selected_message_id = app.state().selected_message_id().cloned().unwrap();
@@ -19685,11 +23208,17 @@ mod tests {
             .await?;
         assert!(app.state().reaction_picker_open());
         terminal.draw(|frame| app.draw(frame))?;
+        // Filter to the same single reaction; clicking the only row toggles it
+        // back off.
+        for value in "rocket".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
         let picker = app.state.reaction_picker.clone().unwrap();
         let picker_rect = app.reaction_picker_rect(app.state.frame_area, &picker.message_id);
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            picker_rect.x + 2 + emoji_index as u16 * REACTION_OPTION_CELL_WIDTH,
+            picker_rect.x + 2,
             picker_rect.y + 2,
         )))
         .await?;
@@ -19698,9 +23227,145 @@ mod tests {
             reacted
                 .reactions
                 .iter()
-                .all(|reaction| reaction.emoji.as_ref() != REACTION_OPTIONS[emoji_index])
+                .all(|reaction| reaction.emoji.as_ref() != expected_emoji)
         );
 
+        Ok(())
+    }
+
+    /// Open the reaction picker on the first selectable message of the default
+    /// test chat. Returns the focused message id.
+    async fn open_reaction_picker_in_test(app: &mut App) -> Result<MessageId> {
+        let mut terminal = Terminal::new(TestBackend::new(140, 40))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        drain_async_app_work(app).await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+            .await?;
+        let message_id = app.state().selected_message_id().cloned().unwrap();
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        let mut menu = app.state.action_menu.clone().unwrap();
+        menu.selected = menu
+            .items
+            .iter()
+            .position(|item| *item == ActionMenuItem::React)
+            .unwrap();
+        app.state.action_menu = Some(menu);
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state().reaction_picker_open());
+        Ok(message_id)
+    }
+
+    #[test]
+    fn platform_allows_freeform_reactions_excludes_slack() {
+        assert!(!platform_allows_freeform_reactions(&Platform::Slack));
+        assert!(platform_allows_freeform_reactions(&Platform::WhatsApp));
+        assert!(platform_allows_freeform_reactions(&Platform::Discord));
+    }
+
+    #[test]
+    fn reaction_catalog_filters_kaomoji_for_non_freeform_platforms() {
+        let kaomoji_present = |matches: &[usize]| {
+            matches
+                .iter()
+                .any(|&index| !reaction_entry_is_standard(COMPOSE_EMOTICON_OPTIONS[index].1))
+        };
+
+        let standard_only = reaction_catalog_matches("", false);
+        let everything = reaction_catalog_matches("", true);
+
+        assert!(everything.len() > standard_only.len());
+        assert!(kaomoji_present(&everything));
+        assert!(!kaomoji_present(&standard_only));
+        assert!(standard_only
+            .iter()
+            .all(|&index| reaction_entry_is_standard(COMPOSE_EMOTICON_OPTIONS[index].1)));
+    }
+
+    #[test]
+    fn reaction_catalog_matches_narrows_by_query() {
+        let matches = reaction_catalog_matches("heart", true);
+        assert!(!matches.is_empty());
+        assert!(matches.iter().all(|&index| {
+            let (value, label) = COMPOSE_EMOTICON_OPTIONS[index];
+            label.contains("heart") || value.contains("heart")
+        }));
+    }
+
+    #[test]
+    fn replace_single_local_reaction_keeps_one_local_reaction() {
+        let mut message = test_message_with_content(Content::Text(Arc::from("hello")));
+        add_reaction(&mut message, "👍", Arc::from("alice"));
+        replace_single_local_reaction(&mut message, "👍");
+        replace_single_local_reaction(&mut message, "❤️");
+
+        let me_reactions: Vec<&str> = message
+            .reactions
+            .iter()
+            .filter(|reaction| {
+                reaction
+                    .senders
+                    .iter()
+                    .any(|sender| sender.as_ref() == LOCAL_REACTION_SENDER)
+            })
+            .map(|reaction| reaction.emoji.as_ref())
+            .collect();
+        assert_eq!(me_reactions, vec!["❤️"]);
+        // Another user's reaction on a different emoji is untouched.
+        assert!(message
+            .reactions
+            .iter()
+            .any(|reaction| reaction.emoji.as_ref() == "👍"
+                && reaction.senders.iter().any(|s| s.as_ref() == "alice")));
+    }
+
+    #[tokio::test]
+    async fn reaction_picker_scrolls_beyond_visible_window() -> Result<()> {
+        let mut app = test_app().await?;
+        open_reaction_picker_in_test(&mut app).await?;
+
+        let total = app.state.reaction_picker.as_ref().unwrap().matches.len();
+        assert!(total > REACTION_PICKER_VISIBLE_ROWS);
+
+        for _ in 0..(REACTION_PICKER_VISIBLE_ROWS + 2) {
+            app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+                .await?;
+        }
+
+        let picker = app.state.reaction_picker.as_ref().unwrap();
+        assert!(picker.scroll_offset > 0);
+        assert!(picker.selected >= picker.scroll_offset);
+        assert!(picker.selected < picker.scroll_offset + REACTION_PICKER_VISIBLE_ROWS);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reaction_picker_filters_by_typed_query_and_applies() -> Result<()> {
+        let mut app = test_app().await?;
+        let message_id = open_reaction_picker_in_test(&mut app).await?;
+
+        for value in "fire".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+
+        let picker = app.state.reaction_picker.clone().unwrap();
+        assert!(!picker.matches.is_empty());
+        assert_eq!(picker.query, "fire");
+        let chosen = COMPOSE_EMOTICON_OPTIONS[picker.matches[picker.selected]].0;
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().reaction_picker_open());
+
+        let reacted = app.message_by_id(&message_id).unwrap();
+        assert!(reacted
+            .reactions
+            .iter()
+            .any(|reaction| reaction.emoji.as_ref() == chosen));
         Ok(())
     }
 
@@ -20807,9 +24472,40 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(140, 40))?;
         terminal.draw(|frame| app.draw(frame))?;
 
-        let hit = app.state.message_hits.first().cloned().unwrap();
-        let line_hit = hit.line_hits.first().cloned().unwrap();
         let content_area = inner_area(app.state.pane_areas.messages);
+        let visible_lines = app.state.message_scroll
+            ..app
+                .state
+                .message_scroll
+                .saturating_add(content_area.height as usize);
+        let (hit, body_line_hit) = app
+            .state
+            .message_hits
+            .iter()
+            .rev()
+            .find_map(|hit| {
+                if hit.thread_summary_hit.is_some() {
+                    return None;
+                }
+                let avatar_hit = hit.avatar_hit.as_ref()?;
+                let body_line_hit = hit
+                    .line_hits
+                    .iter()
+                    .find(|line_hit| line_hit.line == avatar_hit.line)?;
+                if !visible_lines.contains(&body_line_hit.line) {
+                    return None;
+                }
+                if app
+                    .state
+                    .media_hits
+                    .iter()
+                    .any(|media| body_line_hit.line >= media.start_line && body_line_hit.line <= media.end_line)
+                {
+                    return None;
+                }
+                Some((hit.clone(), body_line_hit.clone()))
+            })
+            .unwrap();
         let blank_row_offset = (0..content_area.height as usize)
             .find(|offset| {
                 let clicked_line = app.state.message_scroll.saturating_add(*offset);
@@ -20843,14 +24539,14 @@ mod tests {
         assert_eq!(app.state().selected_message_id(), None);
         assert!(!app.state().action_menu_open());
 
-        let avatar_hit = hit.avatar_hit.as_ref().unwrap();
         let line_row = content_area
             .y
             .saturating_add(app.state.message_top_padding as u16)
-            .saturating_add(line_hit.line.saturating_sub(app.state.message_scroll) as u16);
+            .saturating_add(body_line_hit.line.saturating_sub(app.state.message_scroll) as u16);
+        let avatar_end_col = hit.avatar_hit.as_ref().unwrap().end_col;
         app.handle_event(AppEvent::Mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            content_area.x + avatar_hit.end_col + 1,
+            content_area.x + avatar_end_col + 1,
             line_row,
         )))
         .await?;
@@ -21067,7 +24763,9 @@ mod tests {
     #[tokio::test]
     async fn app_draws_three_pane_shell() -> Result<()> {
         let mut app = test_app().await?;
-        let backend = TestBackend::new(110, 24);
+        // Tall enough for the details panel to show the discoverable-controls
+        // footer below the group Members section asserted on by this test.
+        let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend)?;
 
         terminal.draw(|frame| app.draw(frame))?;
@@ -21196,6 +24894,162 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn compose_wrap_preserves_all_characters_across_rows() {
+        let lines = vec!["the quick brown fox jumps over the lazy dog".to_owned()];
+        let (rows, _) = compose_wrapped_layout(&lines, (0, 0), 10);
+        assert!(rows.len() > 1, "long line must wrap to multiple rows");
+        // Soft-wrap is visual only: concatenating the display rows must
+        // reproduce the original logical line exactly (no dropped/added chars).
+        assert_eq!(rows.concat(), lines[0]);
+        assert_eq!(compose_wrapped_row_count(&lines, 10), rows.len());
+    }
+
+    #[test]
+    fn compose_wrap_breaks_long_unbroken_token_at_char_level() {
+        let lines = vec!["abcdefghij".to_owned()];
+        let (rows, _) = compose_wrapped_layout(&lines, (0, 0), 4);
+        assert_eq!(rows, vec!["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn compose_wrap_maps_logical_cursor_to_display_position() {
+        let lines = vec!["aaaaa bbbbb ccccc".to_owned()];
+        let (rows, cursor) = compose_wrapped_layout(&lines, (0, 13), 6);
+        assert_eq!(rows, vec!["aaaaa ", "bbbbb ", "ccccc"]);
+        // Char 13 is the second 'c', i.e. column 1 of the third display row.
+        assert_eq!(cursor, (2, 1));
+    }
+
+    #[tokio::test]
+    async fn app_compose_soft_wraps_long_line_without_injecting_newlines() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        let area = Rect::new(0, 0, 80, 24);
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let long_line = "word ".repeat(60);
+        for value in long_line.chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        assert_eq!(app.state().focus(), FocusPane::Compose);
+
+        // The single logical line wraps visually but no newline is injected.
+        assert!(!app.state().compose_text().contains('\n'));
+
+        // After a draw, the compose box has grown beyond the 3-row minimum to
+        // reflect the wrapped rows, bounded by the clamp(3, 8) maximum.
+        terminal.draw(|frame| app.draw(frame))?;
+        let height = app.compose_height(area);
+        assert!(height > 3, "compose box should grow for wrapped content");
+        assert!(height <= 8, "compose box growth must stay bounded");
+
+        // The number of wrapped rows agrees with what draw renders for the same
+        // inner width (mirrors compose_height's own derivation).
+        let compose_rect = AppLayout::for_area(area, 3, false).compose;
+        let inner_width = compose_rect.width.saturating_sub(2).max(1) as usize;
+        let wrapped_rows = compose_wrapped_row_count(app.state.compose.lines(), inner_width);
+        assert!(wrapped_rows > 1);
+
+        // Alt+Enter still inserts an explicit hard newline.
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::ALT)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('x'), KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state().compose_text().contains('\n'));
+        assert!(app.state().compose_text().ends_with("\nx"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_emoji_picker_scrolls_past_visible_window() -> Result<()> {
+        let mut app = test_app().await?;
+        let area = Rect::new(0, 0, 80, 24);
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        for value in ":kaomoji".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+
+        let total = {
+            let picker = app
+                .state
+                .compose_emoticon_picker
+                .as_ref()
+                .expect("emoji picker should be open");
+            assert!(
+                picker.matches.len() > COMPOSE_EMOTICON_VISIBLE_ROWS,
+                "kaomoji query should yield more than one viewport of matches"
+            );
+            assert_eq!(picker.selected, 0);
+            assert_eq!(picker.scroll_offset, 0);
+            picker.matches.len()
+        };
+        assert!(total <= COMPOSE_EMOTICON_MAX_MATCHES);
+
+        // Modal height is fixed to the viewport, independent of match count.
+        let height_top = app.compose_emoticon_picker_rect(area).height;
+
+        // Pressing Down past the visible window advances the scroll offset and
+        // reveals later matches while keeping the selection in view.
+        for _ in 0..COMPOSE_EMOTICON_VISIBLE_ROWS {
+            app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+                .await?;
+        }
+        {
+            let picker = app
+                .state
+                .compose_emoticon_picker
+                .as_ref()
+                .expect("emoji picker should remain open");
+            assert_eq!(picker.selected, COMPOSE_EMOTICON_VISIBLE_ROWS);
+            assert_eq!(picker.scroll_offset, 1);
+        }
+        let height_scrolled = app.compose_emoticon_picker_rect(area).height;
+        assert_eq!(
+            height_top, height_scrolled,
+            "modal height must stay fixed while scrolling"
+        );
+
+        // Up scrolls back to the top.
+        for _ in 0..COMPOSE_EMOTICON_VISIBLE_ROWS {
+            app.handle_event(AppEvent::Key(key(KeyCode::Up, KeyModifiers::NONE)))
+                .await?;
+        }
+        {
+            let picker = app
+                .state
+                .compose_emoticon_picker
+                .as_ref()
+                .expect("emoji picker should remain open");
+            assert_eq!(picker.selected, 0);
+            assert_eq!(picker.scroll_offset, 0);
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_pane_titles_have_side_margins() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+
+        // The chat list title must read like a label with a leading space after
+        // the border corner, never flush against it.
+        assert!(content.contains("┌ Chats"));
+        assert!(!content.contains("┌Chats"));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn app_clamps_message_scroll_at_bottom() -> Result<()> {
         let mut app = test_app().await?;
@@ -21309,6 +25163,58 @@ mod tests {
     }
 
     #[test]
+    fn low_intent_content_classification() {
+        // A bare URL with no surrounding words is low intent.
+        assert!(is_low_intent_content(&Content::Text(Arc::from(
+            "https://example.com/story"
+        ))));
+        // Surrounding whitespace does not change that.
+        assert!(is_low_intent_content(&Content::Text(Arc::from(
+            "  https://example.com/story  "
+        ))));
+        // Slack angle-bracket wrapping is still a bare link.
+        assert!(is_low_intent_content(&Content::Text(Arc::from(
+            "<https://example.com/story>"
+        ))));
+        // A pure link-preview card is low intent.
+        assert!(is_low_intent_content(&Content::LinkPreview(
+            chat_core::LinkPreview {
+                url: Arc::from("https://example.com"),
+                title: Some(Arc::from("Title")),
+                description: None,
+                image: None,
+            }
+        )));
+
+        // A caption alongside the link carries intent.
+        assert!(!is_low_intent_content(&Content::Text(Arc::from(
+            "check this out https://example.com/story"
+        ))));
+        // A Slack labelled link carries human-authored intent.
+        assert!(!is_low_intent_content(&Content::Text(Arc::from(
+            "<https://example.com/story|release notes>"
+        ))));
+        // Ordinary prose is not low intent.
+        assert!(!is_low_intent_content(&Content::Text(Arc::from(
+            "are you around?"
+        ))));
+        // Empty text is not classified as a bare link.
+        assert!(!is_low_intent_content(&Content::Text(Arc::from(""))));
+        // Non-text content stays eligible for notifications/summaries.
+        assert!(!is_low_intent_content(&Content::Image(Media::default())));
+        assert!(!is_low_intent_content(&Content::Deleted));
+    }
+
+    #[test]
+    fn text_is_bare_url_handles_punctuation_and_labels() {
+        assert!(text_is_bare_url("https://example.com/path?x=1."));
+        assert!(text_is_bare_url("(https://example.com)"));
+        assert!(!text_is_bare_url("ftp://example.com"));
+        assert!(!text_is_bare_url("<https://example.com|docs>"));
+        assert!(!text_is_bare_url("two https://a.com https://b.com"));
+    }
+
+    #[test]
     fn action_menu_items_are_specific_to_message_content() {
         let link_message =
             test_message_with_content(Content::LinkPreview(chat_core::LinkPreview {
@@ -21366,6 +25272,188 @@ mod tests {
         assert!(
             forward_content_for_capabilities(&poll_content, &OutboundCapabilities::all()).is_none()
         );
+    }
+
+    #[test]
+    fn forward_promotes_media_preview_card_to_real_image() {
+        // Slack image uploads arrive as a MediaPreview card carrying the image
+        // media. Forwarding must surface the real bytes (not the permalink) so
+        // recipients on another platform receive a native attachment.
+        let image_media = Media {
+            id: Arc::<str>::from("https://files.slack.com/private/photo.png"),
+            file_name: Arc::<str>::from("photo.png"),
+            mime_type: Arc::<str>::from("image/png"),
+            size_bytes: Some(2048),
+            caption: None,
+            local_path: Some(PathBuf::from("/tmp/photo.png")),
+            thumbnail: None,
+        };
+        let card = Card {
+            kind: CardKind::MediaPreview,
+            source: chat_core::CardSource::Slack,
+            title: Some(Arc::<str>::from("photo.png")),
+            subtitle: None,
+            body: None,
+            footer: None,
+            url: Some(Arc::<str>::from("https://workspace.slack.com/files/photo")),
+            accent_color: None,
+            thumbnail: None,
+            image: Some(image_media),
+            fields: Vec::new(),
+            actions: Vec::new(),
+        };
+        let cards = Content::Cards(vec![card]);
+        match forward_content_for_capabilities(&cards, &OutboundCapabilities::all()) {
+            Some(Content::Image(media)) => {
+                assert_eq!(media.file_name.as_ref(), "photo.png");
+                assert_eq!(media.caption.as_deref(), Some("photo.png"));
+            }
+            other => panic!("expected promoted image content, got {other:?}"),
+        }
+        // A text-only destination cannot accept the promoted image.
+        assert!(forward_content_for_capabilities(&cards, &OutboundCapabilities::default()).is_none());
+    }
+
+    #[test]
+    fn forward_keeps_link_preview_card_as_text() {
+        // A link-preview card may carry an OpenGraph thumbnail, but forwarding a
+        // shared link should still send the URL, not the preview image.
+        let card = Card {
+            kind: CardKind::LinkPreview,
+            source: chat_core::CardSource::OpenGraph,
+            title: Some(Arc::<str>::from("Example")),
+            subtitle: None,
+            body: None,
+            footer: None,
+            url: Some(Arc::<str>::from("https://example.com/story")),
+            accent_color: None,
+            thumbnail: None,
+            image: Some(Media {
+                id: Arc::<str>::from("https://example.com/og.png"),
+                file_name: Arc::<str>::from("og.png"),
+                mime_type: Arc::<str>::from("image/png"),
+                size_bytes: None,
+                caption: None,
+                local_path: None,
+                thumbnail: None,
+            }),
+            fields: Vec::new(),
+            actions: Vec::new(),
+        };
+        let cards = Content::Cards(vec![card]);
+        assert!(matches!(
+            forward_content_for_capabilities(&cards, &OutboundCapabilities::all()),
+            Some(Content::Text(text)) if text.as_ref() == "https://example.com/story"
+        ));
+    }
+
+    #[test]
+    fn media_content_for_mime_maps_kind_from_mime() {
+        let make = |mime: &str| Media {
+            id: Arc::<str>::from("m"),
+            file_name: Arc::<str>::from("f"),
+            mime_type: Arc::<str>::from(mime),
+            size_bytes: None,
+            caption: None,
+            local_path: None,
+            thumbnail: None,
+        };
+        assert!(matches!(
+            media_content_for_mime(make("image/png")),
+            Content::Image(_)
+        ));
+        assert!(matches!(
+            media_content_for_mime(make("video/mp4")),
+            Content::Video(_)
+        ));
+        assert!(matches!(
+            media_content_for_mime(make("audio/ogg")),
+            Content::Audio(_)
+        ));
+        assert!(matches!(
+            media_content_for_mime(make("application/pdf")),
+            Content::File(_)
+        ));
+    }
+
+    // Two-phase contract for forwarding media: dispatching reports progress
+    // immediately and queues the upload off the event loop; draining the
+    // background completion delivers the echoed message and final status.
+    #[tokio::test]
+    async fn forwarding_media_shows_progress_then_delivers_after_drain() -> Result<()> {
+        let account: ProviderId = Arc::from("wa");
+        let mut app = test_app_with_providers(vec![Arc::new(
+            StaticTestProvider::whatsapp_setup("wa", "WhatsApp"),
+        )])
+        .await?;
+
+        let path = std::env::temp_dir().join("chat-cli-test-forward-media.png");
+        std::fs::write(&path, b"img-bytes")?;
+        let media = Media {
+            id: Arc::<str>::from("https://files.slack.com/private/photo.png"),
+            file_name: Arc::<str>::from("photo.png"),
+            mime_type: Arc::<str>::from("image/png"),
+            size_bytes: Some(9),
+            caption: None,
+            local_path: Some(path.clone()),
+            thumbnail: None,
+        };
+        let mut source = test_message_with_content(Content::Image(media));
+        source.id = Arc::from("src");
+        source.account = account.clone();
+        app.state.messages = vec![source.clone()];
+        app.state.chats = vec![test_chat(
+            &account,
+            Platform::WhatsApp,
+            "wa:dest",
+            "Dest",
+            ChatKind::Direct,
+        )];
+
+        let target = ForwardTarget {
+            account: account.clone(),
+            chat_id: Arc::from("wa:dest"),
+            label: "Dest".to_owned(),
+            subtitle: String::new(),
+        };
+
+        // Phase 1: dispatch reports progress and does not block on the upload.
+        app.forward_message_to_target(source.id.clone(), target).await?;
+        assert_eq!(app.state().status(), "forwarding to Dest…");
+
+        // Phase 2: draining the background completion delivers the message.
+        let mut delivered = false;
+        for _ in 0..200 {
+            if app.drain_forward_sends().await? {
+                delivered = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(delivered, "forward completion should arrive");
+        assert_eq!(app.state().status(), "forwarded to Dest");
+        std::fs::remove_file(&path).ok();
+        Ok(())
+    }
+
+    // When media bytes are missing and the source provider cannot supply them,
+    // the forward aborts with a clear error instead of sending a broken upload.
+    #[tokio::test]
+    async fn ensure_forward_media_local_errors_when_source_unavailable() -> Result<()> {
+        let media = Media {
+            id: Arc::<str>::from("https://files.slack.com/private/missing.png"),
+            file_name: Arc::<str>::from("missing.png"),
+            mime_type: Arc::<str>::from("image/png"),
+            size_bytes: Some(1024),
+            caption: None,
+            local_path: None,
+            thumbnail: None,
+        };
+        let error = ensure_forward_media_local(Content::Image(media), None)
+            .await
+            .expect_err("missing source provider must abort the forward");
+        assert!(error.to_string().contains("missing.png"));
+        Ok(())
     }
 
     #[test]
@@ -22028,7 +26116,7 @@ mod tests {
                 .collect())
         }
 
-        async fn chat_members(&self, chat_id: &Arc<str>) -> Result<Vec<Sender>> {
+        async fn chat_members(&self, chat_id: &Arc<str>) -> Result<Vec<ChatMember>> {
             let mut members = self
                 .messages
                 .iter()
@@ -22037,7 +26125,7 @@ mod tests {
                 .collect::<Vec<_>>();
             members.sort_by_key(|member| member.display_name.to_ascii_lowercase());
             members.dedup_by(|left, right| left.platform_id == right.platform_id);
-            Ok(members)
+            Ok(members.into_iter().map(ChatMember::new).collect())
         }
 
         async fn contact_info(&self, platform_id: &Arc<str>) -> Result<Option<Sender>> {
@@ -22389,6 +26477,76 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    #[test]
+    fn format_duration_label_uses_largest_whole_unit() {
+        assert_eq!(format_duration_label(7 * 24 * 3600), "7 days");
+        assert_eq!(format_duration_label(24 * 3600), "1 day");
+        assert_eq!(format_duration_label(3600), "1 hour");
+        assert_eq!(format_duration_label(90 * 60), "90 minutes");
+        assert_eq!(format_duration_label(45), "45 seconds");
+    }
+
+    #[tokio::test]
+    async fn details_pane_renders_enriched_chat_details() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = app
+            .state
+            .selected_chat()
+            .cloned()
+            .expect("a chat is selected");
+        let key = (chat.account.clone(), chat.id.clone());
+        app.state.chat_details.insert(
+            key,
+            ChatDetails {
+                description: Some(Arc::from("Trip planning and logistics")),
+                member_count: Some(11),
+                admin_count: Some(2),
+                workspace: Some(Arc::from("Acme")),
+                only_admins_can_send: true,
+                disappearing_seconds: Some(7 * 24 * 3600),
+                ..ChatDetails::default()
+            },
+        );
+
+        let (lines, _) = app.overview_detail_lines(80);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+
+        assert!(text.iter().any(|line| line.contains("Description")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Trip planning and logistics"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Members: 11 · 2 admins"))
+        );
+        assert!(text.iter().any(|line| line.contains("Workspace: Acme")));
+        assert!(text.iter().any(|line| line.contains("Only admins can send")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Disappearing messages: 7 days"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn details_pane_skips_empty_chat_details() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = app
+            .state
+            .selected_chat()
+            .cloned()
+            .expect("a chat is selected");
+        let baseline = app.overview_detail_lines(80).0.len();
+
+        app.state
+            .chat_details
+            .insert((chat.account, chat.id), ChatDetails::default());
+
+        assert_eq!(app.overview_detail_lines(80).0.len(), baseline);
+        Ok(())
     }
 
     fn rgb_cell_at(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {

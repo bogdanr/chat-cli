@@ -11,11 +11,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
-    CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatId, ChatKind,
-    ChatMembership, Content, DiscoveryAction, DiscoveryCapabilities, DiscoveryResult,
-    DiscoveryResultKind, EventBus, Media, Message, MessageId, NetworkActivityDirection,
-    NetworkActivityKind, OutboundCapabilities, Platform, PlatformData, PlatformId, Provider,
-    ProviderEvent, ProviderId, Reaction, Sender, SlackData, Timestamp,
+    CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatDetails, ChatId, ChatKind,
+    ChatMember, ChatMembership, ContactProfile, Content, DiscoveryAction, DiscoveryCapabilities,
+    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message, MessageId,
+    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform, PlatformData,
+    PlatformId, Provider, ProviderEvent, ProviderId, Reaction, Sender, SlackData, Timestamp,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -294,7 +294,7 @@ struct SlackValidatedConnection {
     connection: SlackConnectionState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SlackUser {
     pub id: String,
     pub name: Option<String>,
@@ -303,6 +303,14 @@ pub struct SlackUser {
     pub avatar: Option<String>,
     pub deleted: bool,
     pub is_bot: bool,
+    pub title: Option<String>,
+    pub status_text: Option<String>,
+    pub status_emoji: Option<String>,
+    pub phone: Option<String>,
+    pub email: Option<String>,
+    pub tz: Option<String>,
+    pub tz_label: Option<String>,
+    pub tz_offset: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -345,6 +353,8 @@ pub struct SlackConversation {
     pub is_pinned: bool,
     pub unread_count: u32,
     pub updated: Option<i64>,
+    pub created: Option<i64>,
+    pub creator: Option<String>,
     pub topic: Option<String>,
     pub purpose: Option<String>,
     pub num_members: Option<u32>,
@@ -435,6 +445,13 @@ struct SlackResponseMetadata {
 }
 
 #[derive(Debug, Deserialize)]
+struct SlackConversationInfoResponse {
+    ok: bool,
+    error: Option<String>,
+    channel: Option<SlackConversationResponse>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SlackConversationResponse {
     id: String,
     name: Option<String>,
@@ -452,6 +469,8 @@ struct SlackConversationResponse {
     unread_count: Option<u32>,
     unread_count_display: Option<u32>,
     updated: Option<i64>,
+    created: Option<i64>,
+    creator: Option<String>,
     topic: Option<SlackTextValue>,
     purpose: Option<SlackTextValue>,
     num_members: Option<u32>,
@@ -672,6 +691,9 @@ struct SlackUserResponse {
     profile: Option<SlackUserProfileResponse>,
     deleted: Option<bool>,
     is_bot: Option<bool>,
+    tz: Option<String>,
+    tz_label: Option<String>,
+    tz_offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +701,11 @@ struct SlackUserProfileResponse {
     real_name: Option<String>,
     display_name: Option<String>,
     image_72: Option<String>,
+    title: Option<String>,
+    status_text: Option<String>,
+    status_emoji: Option<String>,
+    phone: Option<String>,
+    email: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -766,6 +793,26 @@ impl SlackUser {
             .as_ref()
             .and_then(|profile| profile.display_name.clone())
             .and_then(non_empty_string);
+        let title = profile
+            .as_ref()
+            .and_then(|profile| profile.title.clone())
+            .and_then(non_empty_string);
+        let status_text = profile
+            .as_ref()
+            .and_then(|profile| profile.status_text.clone())
+            .and_then(non_empty_string);
+        let status_emoji = profile
+            .as_ref()
+            .and_then(|profile| profile.status_emoji.clone())
+            .and_then(non_empty_string);
+        let phone = profile
+            .as_ref()
+            .and_then(|profile| profile.phone.clone())
+            .and_then(non_empty_string);
+        let email = profile
+            .as_ref()
+            .and_then(|profile| profile.email.clone())
+            .and_then(non_empty_string);
         let avatar = profile
             .and_then(|profile| profile.image_72)
             .and_then(non_empty_string);
@@ -781,6 +828,14 @@ impl SlackUser {
             avatar,
             deleted: response.deleted.unwrap_or(false),
             is_bot: response.is_bot.unwrap_or(false),
+            title,
+            status_text,
+            status_emoji,
+            phone,
+            email,
+            tz: response.tz.and_then(non_empty_string),
+            tz_label: response.tz_label.and_then(non_empty_string),
+            tz_offset: response.tz_offset,
         })
     }
 
@@ -797,6 +852,39 @@ impl SlackUser {
             platform_id: arc_str(&self.id),
             display_name: arc_str(self.best_name()),
             avatar: self.avatar.as_deref().and_then(slack_avatar_path),
+        }
+    }
+
+    /// Build an enriched [`ContactProfile`] from the resolved Slack user,
+    /// combining status emoji + text and computing the contact's local time
+    /// from the reported timezone offset.
+    fn profile(&self) -> ContactProfile {
+        let status = match (self.status_emoji.as_deref(), self.status_text.as_deref()) {
+            (Some(emoji), Some(text)) => Some(format!("{emoji} {text}")),
+            (Some(emoji), None) => Some(emoji.to_owned()),
+            (None, Some(text)) => Some(text.to_owned()),
+            (None, None) => None,
+        };
+        let local_time = self.tz_offset.and_then(slack_local_time_for_offset);
+        let timezone = self
+            .tz_label
+            .clone()
+            .or_else(|| self.tz.clone())
+            .map(|value| arc_str(&value));
+        ContactProfile {
+            display_name: Some(arc_str(self.best_name())),
+            handle: self.name.as_deref().map(arc_str),
+            title: self.title.as_deref().map(arc_str),
+            status: status.map(|value| arc_str(&value)),
+            about: None,
+            phone: self.phone.as_deref().map(arc_str),
+            email: self.email.as_deref().map(arc_str),
+            timezone,
+            local_time: local_time.map(|value| arc_str(&value)),
+            is_bot: self.is_bot,
+            is_business: false,
+            is_deactivated: self.deleted,
+            facts: Vec::new(),
         }
     }
 }
@@ -846,6 +934,23 @@ pub trait SlackApiClient: Send + Sync {
         credential: SlackCredential,
         channel: &str,
     ) -> Result<Vec<String>>;
+
+    /// Fetch enriched metadata for a single conversation (topic, purpose,
+    /// member count, created, creator). The default falls back to scanning
+    /// `conversations.list`; the real Web API client overrides this with a
+    /// direct `conversations.info` call so creation metadata is populated.
+    async fn conversation_info(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+    ) -> Result<Option<SlackConversation>> {
+        let channel = channel.to_owned();
+        Ok(self
+            .list_conversations(credential)
+            .await?
+            .into_iter()
+            .find(|conversation| conversation.id == channel))
+    }
 
     async fn add_reaction(
         &self,
@@ -1091,6 +1196,8 @@ impl SlackConversation {
                 .or(response.unread_count)
                 .unwrap_or(0),
             updated: response.updated,
+            created: response.created,
+            creator: response.creator.and_then(non_empty_string),
             topic: response
                 .topic
                 .and_then(|topic| topic.value)
@@ -1186,6 +1293,14 @@ impl SlackApiClient for SlackWebApiClient {
         channel: &str,
     ) -> Result<Vec<String>> {
         list_web_api_conversation_members(credential, channel).await
+    }
+
+    async fn conversation_info(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+    ) -> Result<Option<SlackConversation>> {
+        get_web_api_conversation_info(credential, channel).await
     }
 
     async fn add_reaction(
@@ -1615,6 +1730,44 @@ async fn get_web_api_team_info(
     })
     .await
     .context("joining Slack team info task")?
+}
+
+async fn get_web_api_conversation_info(
+    credential: SlackCredential,
+    channel: &str,
+) -> Result<Option<SlackConversation>> {
+    if !matches!(
+        credential.kind,
+        SlackCredentialKind::UserToken
+            | SlackCredentialKind::BotToken
+            | SlackCredentialKind::Unknown
+    ) {
+        bail!("Slack conversations.info requires a user or bot Web API token");
+    }
+
+    let token = credential.value;
+    let channel = channel.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut response = slack_http_agent()
+            .get("https://slack.com/api/conversations.info")
+            .header("Authorization", format!("Bearer {token}"))
+            .query("channel", &channel)
+            .call()
+            .context("calling Slack conversations.info")?;
+        let info: SlackConversationInfoResponse = response
+            .body_mut()
+            .read_json()
+            .context("decoding Slack conversations.info response")?;
+        if !info.ok {
+            bail!(
+                "Slack conversations.info failed: {}",
+                info.error.unwrap_or_else(|| "unknown_error".to_owned())
+            );
+        }
+        Ok(info.channel.and_then(SlackConversation::from_response))
+    })
+    .await
+    .context("joining Slack conversation info task")?
 }
 
 async fn list_web_api_conversation_members(
@@ -4153,7 +4306,7 @@ impl Provider for SlackProvider {
         }
     }
 
-    async fn chat_members(&self, chat_id: &ChatId) -> Result<Vec<Sender>> {
+    async fn chat_members(&self, chat_id: &ChatId) -> Result<Vec<ChatMember>> {
         if self.capabilities().can_read_history {
             let connection = read_lock(&self.connection).clone();
             let credential = connection
@@ -4175,10 +4328,83 @@ impl Provider for SlackProvider {
                 }
             }
             members.sort_by_key(|member| member.display_name.to_ascii_lowercase());
-            Ok(members)
+            Ok(members.into_iter().map(ChatMember::new).collect())
         } else {
             Err(self.unsupported("member listing"))
         }
+    }
+
+    async fn chat_details(&self, chat_id: &ChatId) -> Result<ChatDetails> {
+        if !self.capabilities().can_read_history {
+            return Ok(ChatDetails::default());
+        }
+        let connection = read_lock(&self.connection).clone();
+        let Some(credential) = connection.read_credential() else {
+            return Ok(ChatDetails::default());
+        };
+        let Some(conversation) = self
+            .api_client
+            .conversation_info(credential.clone(), chat_id.as_ref())
+            .await
+            .map_err(|error| anyhow!(sanitize_slack_error(&error)))?
+        else {
+            return Ok(ChatDetails::default());
+        };
+
+        let description = non_empty_option(&conversation.topic)
+            .or_else(|| non_empty_option(&conversation.purpose))
+            .map(|value| arc_str(&value));
+        let created_at = conversation
+            .created
+            .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+        let creator = match conversation.creator.as_deref() {
+            Some(creator_id) if !creator_id.trim().is_empty() => self
+                .resolve_user(&credential, creator_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|user| arc_str(user.best_name()))
+                .or_else(|| Some(arc_str(creator_id))),
+            _ => None,
+        };
+        let workspace = self
+            .options()
+            .workspace
+            .as_deref()
+            .and_then(|value| non_empty_string(value.to_owned()))
+            .map(|value| arc_str(&value));
+
+        Ok(ChatDetails {
+            description,
+            created_at,
+            creator,
+            member_count: conversation.num_members,
+            admin_count: None,
+            workspace,
+            is_archived: conversation.is_archived,
+            is_externally_shared: conversation.is_ext_shared,
+            only_admins_can_send: false,
+            only_admins_can_edit: false,
+            disappearing_seconds: None,
+            facts: Vec::new(),
+        })
+    }
+
+    async fn contact_profile(
+        &self,
+        platform_id: &PlatformId,
+    ) -> Result<Option<ContactProfile>> {
+        if !self.capabilities().can_read_history {
+            return Ok(None);
+        }
+        let connection = read_lock(&self.connection).clone();
+        let Some(credential) = connection.read_credential() else {
+            return Ok(None);
+        };
+        Ok(self
+            .resolve_user(&credential, platform_id.as_ref())
+            .await?
+            .map(|user| user.profile()))
     }
 }
 
@@ -5602,13 +5828,15 @@ fn slack_card_media(kind: &str, url: &str) -> Media {
 fn slack_block_responses(values: Vec<serde_json::Value>) -> Vec<SlackBlockResponse> {
     values
         .into_iter()
-        .filter_map(|value| match serde_json::from_value::<SlackBlockResponse>(value) {
-            Ok(block) => Some(block),
-            Err(error) => {
-                slack_diagnostic_log("slack.blocks.decode_skipped", error.to_string());
-                None
-            }
-        })
+        .filter_map(
+            |value| match serde_json::from_value::<SlackBlockResponse>(value) {
+                Ok(block) => Some(block),
+                Err(error) => {
+                    slack_diagnostic_log("slack.blocks.decode_skipped", error.to_string());
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -6035,8 +6263,8 @@ fn convert_mrkdwn_delimiter_line(line: &str, delimiter: char, replacement: &str)
 }
 
 fn mrkdwn_delimiter_opens(chars: &[char], index: usize, delimiter: char) -> bool {
-    let preceded_ok = index == 0
-        || (!chars[index - 1].is_alphanumeric() && chars[index - 1] != delimiter);
+    let preceded_ok =
+        index == 0 || (!chars[index - 1].is_alphanumeric() && chars[index - 1] != delimiter);
     let next = chars.get(index + 1);
     preceded_ok && next.is_some_and(|next| !next.is_whitespace() && *next != delimiter)
 }
@@ -6878,6 +7106,7 @@ fn fallback_slack_user(user_id: &str) -> Option<SlackUser> {
         avatar: None,
         is_bot: false,
         deleted: false,
+        ..SlackUser::default()
     })
 }
 
@@ -6893,6 +7122,7 @@ fn fallback_slack_bot_user(bot_id: &str) -> SlackUser {
         avatar: None,
         is_bot: true,
         deleted: false,
+        ..SlackUser::default()
     }
 }
 
@@ -6920,6 +7150,16 @@ fn slack_timestamp_from_datetime(timestamp: Timestamp) -> String {
 fn slack_ts_to_timestamp(ts: &str) -> Option<Timestamp> {
     let seconds = ts.split('.').next()?.parse::<i64>().ok()?;
     DateTime::<Utc>::from_timestamp(seconds, 0)
+}
+
+/// Render the contact's current local clock time (HH:MM) from their Slack
+/// `tz_offset` (seconds east of UTC). Returns `None` for implausible offsets.
+fn slack_local_time_for_offset(offset_seconds: i64) -> Option<String> {
+    if offset_seconds.abs() > 14 * 3600 {
+        return None;
+    }
+    let local = Utc::now() + chrono::Duration::seconds(offset_seconds);
+    Some(local.format("%H:%M").to_string())
 }
 
 fn json_escape(value: &str) -> String {
@@ -7507,6 +7747,8 @@ mod tests {
             topic: None,
             purpose: None,
             num_members: None,
+            created: None,
+            creator: None,
         }
     }
 
@@ -7530,6 +7772,8 @@ mod tests {
             topic: None,
             purpose: None,
             num_members: None,
+            created: None,
+            creator: None,
         }
     }
 
@@ -7553,6 +7797,8 @@ mod tests {
             topic: None,
             purpose: None,
             num_members: None,
+            created: None,
+            creator: None,
         }
     }
 
@@ -9319,7 +9565,11 @@ mod tests {
         let Content::Cards(cards) = &message.content else {
             panic!("Block Kit message should render as cards");
         };
-        assert_eq!(cards.len(), 4, "status+buttons, alert event, image, details");
+        assert_eq!(
+            cards.len(),
+            4,
+            "status+buttons, alert event, image, details"
+        );
 
         // Group 1: status line + linked title + buttons.
         let lead = &cards[0];
@@ -9365,7 +9615,13 @@ mod tests {
 
         // Group 4: detail sections + context footer with link label.
         let details = &cards[3];
-        assert!(details.body.as_deref().unwrap().contains("**1 policy** · Webshop"));
+        assert!(
+            details
+                .body
+                .as_deref()
+                .unwrap()
+                .contains("**1 policy** · Webshop")
+        );
         let footer = details.footer.as_deref().expect("context becomes footer");
         assert!(footer.contains("⚙️ Edit workflow"));
         assert!(!footer.contains("<https://"));
@@ -9752,6 +10008,7 @@ mod tests {
                 avatar: None,
                 is_bot: false,
                 deleted: false,
+                ..SlackUser::default()
             },
         )])));
 
@@ -9944,6 +10201,7 @@ mod tests {
                 avatar: Some("https://example.com/alice.png".to_owned()),
                 deleted: false,
                 is_bot: false,
+                ..SlackUser::default()
             },
         )])));
         let message = slack_history_message(

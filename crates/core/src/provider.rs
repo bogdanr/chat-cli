@@ -280,7 +280,30 @@ pub trait Provider: Send + Sync + 'static {
     async fn contact_info(&self, platform_id: &PlatformId) -> anyhow::Result<Option<Sender>>;
 
     /// List known members/participants for a chat when the provider supports it.
-    async fn chat_members(&self, _chat_id: &ChatId) -> anyhow::Result<Vec<Sender>> {
+    async fn chat_members(&self, _chat_id: &ChatId) -> anyhow::Result<Vec<ChatMember>> {
         bail!("chat member listing is not supported by this provider")
+    }
+
+    /// Optional rich metadata about a conversation (description, creation,
+    /// counts, settings) used to enrich the details pane. The default returns
+    /// empty details; providers override it to surface what they can fetch.
+    async fn chat_details(&self, _chat_id: &ChatId) -> anyhow::Result<ChatDetails> {
+        Ok(ChatDetails::default())
+    }
+
+    /// Optional rich profile for a single user/contact used to enrich the
+    /// details pane. The default derives a minimal profile from
+    /// [`Provider::contact_info`]; providers override it to add title, status,
+    /// timezone, about, phone, and similar fields.
+    async fn contact_profile(
+        &self,
+        platform_id: &PlatformId,
+    ) -> anyhow::Result<Option<ContactProfile>> {
+        Ok(self.contact_info(platform_id).await?.map(|sender| {
+            ContactProfile {
+                display_name: Some(sender.display_name),
+                ..ContactProfile::default()
+            }
+        }))
     }
 }

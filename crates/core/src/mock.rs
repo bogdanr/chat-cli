@@ -1,7 +1,9 @@
 use crate::{
-    Account, Chat, ChatId, ChatKind, ChatMembership, Content, EventBus, LinkPreview, Media,
-    Message, MessageId, Platform, PlatformData, PlatformId, Provider, ProviderEvent, ProviderId,
-    Reaction, Receipt, ReceiptKind, Sender, Timestamp,
+    Account, Card, CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatDetails,
+    ChatId, ChatKind, ChatMember, ChatMemberRole, ChatMembership, Content, ContactProfile,
+    EventBus, LinkPreview, Media, Message, MessageId, Platform, PlatformData, PlatformId, Poll,
+    PollOption, PollVote, Provider, ProviderEvent, ProviderId, Reaction, Receipt, ReceiptKind,
+    Sender, Timestamp,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -273,6 +275,26 @@ impl Provider for MockProvider {
             .find(|message| message.sender.platform_id == *platform_id)
             .map(|message| message.sender.clone()))
     }
+
+    async fn chat_members(&self, chat_id: &ChatId) -> Result<Vec<ChatMember>> {
+        Ok(mock_chat_members(chat_id.as_ref()))
+    }
+
+    async fn chat_details(&self, chat_id: &ChatId) -> Result<ChatDetails> {
+        Ok(mock_chat_details(chat_id.as_ref()))
+    }
+
+    async fn contact_profile(&self, platform_id: &PlatformId) -> Result<Option<ContactProfile>> {
+        if let Some(profile) = mock_contact_profile(platform_id.as_ref()) {
+            return Ok(Some(profile));
+        }
+        Ok(self.contact_info(platform_id).await?.map(|sender| {
+            ContactProfile {
+                display_name: Some(sender.display_name),
+                ..ContactProfile::default()
+            }
+        }))
+    }
 }
 
 struct ChatSeed<'a> {
@@ -280,7 +302,7 @@ struct ChatSeed<'a> {
     platform: Platform,
     name: &'a str,
     avatar: &'a str,
-    is_group: bool,
+    kind: ChatKind,
     unread_count: u32,
     muted: bool,
     pinned: bool,
@@ -298,6 +320,22 @@ struct TextMessageSeed<'a> {
     is_from_me: bool,
     reactions: Vec<Reaction>,
     receipts: Vec<Receipt>,
+}
+
+impl Default for TextMessageSeed<'_> {
+    fn default() -> Self {
+        Self {
+            chat_id: "",
+            id: "",
+            sender_id: "",
+            sender_name: "",
+            timestamp: Utc::now(),
+            text: "",
+            is_from_me: false,
+            reactions: Vec::new(),
+            receipts: Vec::new(),
+        }
+    }
 }
 
 struct MediaMessageSeed<'a> {
@@ -328,7 +366,7 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::WhatsApp,
             name: "Family Weekend 🏡",
             avatar: "family-weekend",
-            is_group: true,
+            kind: ChatKind::Group,
             unread_count: 4,
             muted: false,
             pinned: true,
@@ -340,7 +378,7 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::WhatsApp,
             name: "Alice Chen",
             avatar: "alice",
-            is_group: false,
+            kind: ChatKind::Direct,
             unread_count: 2,
             muted: false,
             pinned: true,
@@ -352,19 +390,19 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::Slack,
             name: "#project-chat-cli",
             avatar: "project-chat-cli",
-            is_group: true,
+            kind: ChatKind::PublicChannel,
             unread_count: 0,
             muted: false,
             pinned: false,
-            last_seen_minutes_ago: 22,
-            preview: "CI is green on all platforms ✅",
+            last_seen_minutes_ago: 14,
+            preview: "Deploy to production succeeded ✅",
         },
         ChatSeed {
             id: "mock:chat:design",
             platform: Platform::Slack,
-            name: "Design Review",
+            name: "design-review",
             avatar: "design-review",
-            is_group: true,
+            kind: ChatKind::PrivateChannel,
             unread_count: 6,
             muted: false,
             pinned: false,
@@ -376,7 +414,7 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::WhatsApp,
             name: "Media Samples",
             avatar: "media-samples",
-            is_group: true,
+            kind: ChatKind::Group,
             unread_count: 1,
             muted: false,
             pinned: false,
@@ -388,7 +426,7 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::WhatsApp,
             name: "Alex Rivera",
             avatar: "alex",
-            is_group: false,
+            kind: ChatKind::Direct,
             unread_count: 0,
             muted: false,
             pinned: false,
@@ -400,7 +438,7 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::Discord,
             name: "Ops Room",
             avatar: "ops-room",
-            is_group: true,
+            kind: ChatKind::Group,
             unread_count: 3,
             muted: true,
             pinned: false,
@@ -412,19 +450,19 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::WhatsApp,
             name: "Lisbon Trip ✈️",
             avatar: "lisbon-trip",
-            is_group: true,
+            kind: ChatKind::Group,
             unread_count: 0,
             muted: false,
             pinned: false,
             last_seen_minutes_ago: 420,
-            preview: "Sofia: Pastéis at 10? 😋",
+            preview: "Sofia: Where should we have dinner? 🍽️",
         },
         ChatSeed {
             id: "mock:chat:bot",
             platform: Platform::Slack,
             name: "Release Bot",
             avatar: "release-bot",
-            is_group: false,
+            kind: ChatKind::Direct,
             unread_count: 0,
             muted: true,
             pinned: false,
@@ -436,7 +474,7 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
             platform: Platform::Discord,
             name: "Book Club",
             avatar: "book-club",
-            is_group: true,
+            kind: ChatKind::Group,
             unread_count: 0,
             muted: false,
             pinned: false,
@@ -457,18 +495,15 @@ fn mock_chats(account: &ProviderId, now: Timestamp) -> Vec<Chat> {
 }
 
 fn chat_from_seed(account: &ProviderId, seed: ChatSeed<'_>, now: Timestamp) -> Chat {
+    let is_group = seed.kind != ChatKind::Direct;
     Chat {
         id: arc_str(seed.id),
         account: account.clone(),
         platform: seed.platform,
         name: arc_str(seed.name),
         avatar: avatar_path(seed.avatar),
-        is_group: seed.is_group,
-        kind: if seed.is_group {
-            ChatKind::Group
-        } else {
-            ChatKind::Direct
-        },
+        is_group,
+        kind: seed.kind,
         membership: ChatMembership::Joined,
         is_shared: false,
         unread_count: seed.unread_count,
@@ -483,6 +518,8 @@ fn chat_from_seed(account: &ProviderId, seed: ChatSeed<'_>, now: Timestamp) -> C
 fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
     let mut messages = Vec::new();
 
+    // Family Weekend — a WhatsApp group showing a reply quote, a poll, an
+    // edited message, and an inline photo.
     messages.extend([
         mock_text_message(
             account,
@@ -497,6 +534,62 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
                 reactions: vec![reaction("👍", &["me", "dad"])],
                 receipts: Vec::new(),
             },
+        ),
+        mock_reply_message(
+            account,
+            TextMessageSeed {
+                chat_id: "mock:chat:family",
+                id: "mock:msg:family:reply",
+                sender_id: "dad",
+                sender_name: "Dad",
+                timestamp: now - Duration::minutes(16),
+                text: "Perfect — that's the shady one by the willow 🌥️",
+                is_from_me: false,
+                reactions: vec![reaction("❤️", &["maya"])],
+                receipts: Vec::new(),
+            },
+            "mock:msg:family:1",
+        ),
+        mock_poll_message(
+            account,
+            PollMessageSeed {
+                chat_id: "mock:chat:family",
+                id: "mock:msg:family:poll",
+                sender_id: "mom",
+                sender_name: "Mom",
+                timestamp: now - Duration::minutes(10),
+                poll: poll(
+                    "Which day works best for the picnic?",
+                    &[
+                        ("sat", "Saturday"),
+                        ("sun", "Sunday"),
+                        ("either", "Either is fine"),
+                    ],
+                    Some(1),
+                    &[
+                        ("me", &["sat"]),
+                        ("dad", &["sat"]),
+                        ("maya", &["sun"]),
+                        ("leo", &["either"]),
+                    ],
+                ),
+                reactions: vec![reaction("🗳️", &["maya"])],
+            },
+        ),
+        mock_edited_message(
+            account,
+            TextMessageSeed {
+                chat_id: "mock:chat:family",
+                id: "mock:msg:family:edited",
+                sender_id: "leo",
+                sender_name: "Leo",
+                timestamp: now - Duration::minutes(6),
+                text: "Bringing the frisbee — and the kite too! 🪁",
+                is_from_me: false,
+                reactions: vec![reaction("😄", &["me", "maya"])],
+                receipts: Vec::new(),
+            },
+            now - Duration::minutes(5),
         ),
         mock_media_message(
             account,
@@ -520,6 +613,8 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
         ),
     ]);
 
+    // Alice Chen — a WhatsApp direct chat showing read receipts plus an edited
+    // reply quote, and an enriched contact profile in the details pane.
     messages.extend([
         mock_text_message(
             account,
@@ -567,8 +662,33 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
                 receipts: Vec::new(),
             },
         ),
+        {
+            let mut reply = mock_reply_message(
+                account,
+                TextMessageSeed {
+                    chat_id: "mock:chat:alice",
+                    id: "mock:msg:alice:4",
+                    sender_id: "me",
+                    sender_name: "Me",
+                    timestamp: now - Duration::minutes(3),
+                    text: "On it — opening it in a split pane right now. 🖥️",
+                    is_from_me: true,
+                    reactions: Vec::new(),
+                    receipts: vec![receipt(
+                        "alice",
+                        ReceiptKind::Read,
+                        now - Duration::minutes(2),
+                    )],
+                },
+                "mock:msg:alice:3",
+            );
+            reply.edited_at = Some(now - Duration::minutes(2));
+            reply
+        },
     ]);
 
+    // #project-chat-cli — a Slack public channel showing a thread, an @-mention
+    // of the user, and a rich deployment status card.
     messages.extend([
         mock_text_message(
             account,
@@ -628,8 +748,59 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
             },
             "mock:msg:team:2",
         ),
+        mock_mention_message(
+            account,
+            TextMessageSeed {
+                chat_id: "mock:chat:team",
+                id: "mock:msg:team:3",
+                sender_id: "sam",
+                sender_name: "Sam",
+                timestamp: now - Duration::minutes(16),
+                text: "Heads up @Me — can you review the media-card PR before we deploy?",
+                is_from_me: false,
+                reactions: vec![reaction("👀", &["me"])],
+                receipts: Vec::new(),
+            },
+        ),
+        mock_card_message(
+            account,
+            CardMessageSeed {
+                chat_id: "mock:chat:team",
+                id: "mock:msg:team:card",
+                sender_id: "deploy-bot",
+                sender_name: "Deploy Bot",
+                timestamp: now - Duration::minutes(14),
+                card: Card {
+                    kind: CardKind::ProviderAttachment,
+                    source: CardSource::Slack,
+                    title: Some(arc_str("Deployment succeeded")),
+                    subtitle: Some(arc_str("production · v0.1.0")),
+                    body: Some(arc_str(
+                        "Rolled out chat-cli v0.1.0 to production with zero downtime.",
+                    )),
+                    footer: Some(arc_str("GitHub Actions")),
+                    url: Some(arc_str("https://example.com/chat-cli/runs/4821")),
+                    accent_color: Some(CardColor::Named(arc_str("good"))),
+                    thumbnail: None,
+                    image: None,
+                    fields: vec![
+                        card_field("Environment", "production", true),
+                        card_field("Duration", "2m 14s", true),
+                        card_field("Triggered by", "@sam", true),
+                        card_field("Commit", "a1b2c3d", true),
+                    ],
+                    actions: vec![
+                        card_action("View run", "https://example.com/chat-cli/runs/4821"),
+                        card_action("Rollback", "https://example.com/chat-cli/rollback"),
+                    ],
+                },
+                reactions: vec![reaction("✅", &["me"]), reaction("🚀", &["priya"])],
+            },
+        ),
     ]);
 
+    // design-review — a Slack private channel showing a reply quote and a link
+    // preview card.
     messages.extend([
         mock_text_message(
             account,
@@ -644,6 +815,21 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
                 reactions: vec![reaction("💯", &["me", "alice"])],
                 receipts: Vec::new(),
             },
+        ),
+        mock_reply_message(
+            account,
+            TextMessageSeed {
+                chat_id: "mock:chat:design",
+                id: "mock:msg:design:reply",
+                sender_id: "me",
+                sender_name: "Me",
+                timestamp: now - Duration::minutes(40),
+                text: "Agreed — the muted timestamps really help it breathe.",
+                is_from_me: true,
+                reactions: Vec::new(),
+                receipts: Vec::new(),
+            },
+            "mock:msg:design:1",
         ),
         mock_media_message(
             account,
@@ -674,6 +860,7 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
         ),
     ]);
 
+    // Media Samples — image, video, and sticker attachments.
     messages.extend([
         mock_media_message(
             account,
@@ -741,6 +928,7 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
         ),
     ]);
 
+    // Alex Rivera — a WhatsApp direct chat with a voice note.
     messages.extend([
         mock_media_message(
             account,
@@ -782,6 +970,8 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
         ),
     ]);
 
+    // Ops Room — a Discord group showing a file attachment, a deleted message,
+    // and gracefully handled unsupported content.
     messages.extend([
         mock_media_message(
             account,
@@ -803,6 +993,28 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
                 receipts: Vec::new(),
             },
         ),
+        mock_simple_message(
+            account,
+            "mock:chat:ops",
+            "mock:msg:ops:deleted",
+            "nora",
+            "Nora Ops",
+            now - Duration::minutes(252),
+            Content::Deleted,
+        ),
+        mock_simple_message(
+            account,
+            "mock:chat:ops",
+            "mock:msg:ops:unsupported",
+            "statuspage",
+            "Statuspage",
+            now - Duration::minutes(248),
+            Content::Unsupported(arc_str("Interactive incident workflow")),
+        ),
+    ]);
+
+    // Lisbon Trip — a WhatsApp group with a dinner poll.
+    messages.extend([
         mock_text_message(
             account,
             TextMessageSeed {
@@ -810,13 +1022,38 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
                 id: "mock:msg:travel:1",
                 sender_id: "sofia",
                 sender_name: "Sofia",
-                timestamp: now - Duration::minutes(420),
-                text: "Pastéis at 10? 😋",
+                timestamp: now - Duration::minutes(430),
+                text: "Landed! The apartment in Alfama is lovely 🏠",
                 is_from_me: false,
-                reactions: vec![reaction("😋", &["me"])],
+                reactions: vec![reaction("🎉", &["me"])],
                 receipts: Vec::new(),
             },
         ),
+        mock_poll_message(
+            account,
+            PollMessageSeed {
+                chat_id: "mock:chat:travel",
+                id: "mock:msg:travel:poll",
+                sender_id: "sofia",
+                sender_name: "Sofia",
+                timestamp: now - Duration::minutes(420),
+                poll: poll(
+                    "Where should we have dinner tonight?",
+                    &[
+                        ("market", "Time Out Market"),
+                        ("ceviche", "A Cevicheria"),
+                        ("avillez", "Cantinho do Avillez"),
+                    ],
+                    Some(1),
+                    &[("me", &["ceviche"]), ("sofia", &["market"])],
+                ),
+                reactions: vec![reaction("😋", &["me"])],
+            },
+        ),
+    ]);
+
+    // Release Bot — a Slack direct chat from a bot, showing a bot release card.
+    messages.extend([
         mock_text_message(
             account,
             TextMessageSeed {
@@ -824,28 +1061,64 @@ fn mock_messages(account: &ProviderId, now: Timestamp) -> Vec<Message> {
                 id: "mock:msg:bot:1",
                 sender_id: "release-bot",
                 sender_name: "Release Bot",
-                timestamp: now - Duration::minutes(900),
+                timestamp: now - Duration::minutes(905),
                 text: "v0.1.0 nightly build is ready 🚀",
                 is_from_me: false,
                 reactions: Vec::new(),
                 receipts: Vec::new(),
             },
         ),
-        mock_text_message(
+        mock_card_message(
             account,
-            TextMessageSeed {
-                chat_id: "mock:chat:bookclub",
-                id: "mock:msg:bookclub:1",
-                sender_id: "emma",
-                sender_name: "Emma",
-                timestamp: now - Duration::minutes(1500),
-                text: "Next pick: The Design of Everyday Things 📚",
-                is_from_me: false,
-                reactions: vec![reaction("📚", &["me", "alex"])],
-                receipts: Vec::new(),
+            CardMessageSeed {
+                chat_id: "mock:chat:bot",
+                id: "mock:msg:bot:card",
+                sender_id: "release-bot",
+                sender_name: "Release Bot",
+                timestamp: now - Duration::minutes(900),
+                card: Card {
+                    kind: CardKind::BotMessage,
+                    source: CardSource::Slack,
+                    title: Some(arc_str("Nightly build v0.1.0")),
+                    subtitle: Some(arc_str("automated release")),
+                    body: Some(arc_str(
+                        "• Faster startup and background history sync\n• Inline media cards and stickers\n• Calmer sidebar with muted timestamps",
+                    )),
+                    footer: Some(arc_str("Release Bot · just now")),
+                    url: Some(arc_str("https://example.com/chat-cli/releases/v0.1.0")),
+                    accent_color: Some(CardColor::Hex(arc_str("#4070F4"))),
+                    thumbnail: None,
+                    image: None,
+                    fields: vec![
+                        card_field("Platforms", "Linux · macOS · Windows", false),
+                        card_field("Size", "8.4 MB", true),
+                        card_field("Channel", "nightly", true),
+                    ],
+                    actions: vec![
+                        card_action("Download", "https://example.com/chat-cli/releases/v0.1.0"),
+                        card_action("Changelog", "https://example.com/chat-cli/changelog"),
+                    ],
+                },
+                reactions: vec![reaction("🚀", &["me"])],
             },
         ),
     ]);
+
+    // Book Club — a quiet Discord group.
+    messages.push(mock_text_message(
+        account,
+        TextMessageSeed {
+            chat_id: "mock:chat:bookclub",
+            id: "mock:msg:bookclub:1",
+            sender_id: "emma",
+            sender_name: "Emma",
+            timestamp: now - Duration::minutes(1500),
+            text: "Next pick: The Design of Everyday Things 📚",
+            is_from_me: false,
+            reactions: vec![reaction("📚", &["me", "alex"])],
+            receipts: Vec::new(),
+        },
+    ));
 
     messages
 }
@@ -859,10 +1132,12 @@ fn mock_text_message(account: &ProviderId, seed: TextMessageSeed<'_>) -> Message
             sender_id: seed.sender_id,
             sender_name: seed.sender_name,
             timestamp: seed.timestamp,
+            edited_at: None,
             content: Content::Text(arc_str(seed.text)),
             reply_to: None,
             thread_id: None,
             is_from_me: seed.is_from_me,
+            mentions_me: false,
             reactions: seed.reactions,
             receipts: seed.receipts,
         },
@@ -882,10 +1157,12 @@ fn mock_thread_reply(
             sender_id: seed.sender_id,
             sender_name: seed.sender_name,
             timestamp: seed.timestamp,
+            edited_at: None,
             content: Content::Text(arc_str(seed.text)),
             reply_to: Some(thread_root),
             thread_id: Some(thread_root),
             is_from_me: seed.is_from_me,
+            mentions_me: false,
             reactions: seed.reactions,
             receipts: seed.receipts,
         },
@@ -901,12 +1178,183 @@ fn mock_media_message(account: &ProviderId, seed: MediaMessageSeed<'_>) -> Messa
             sender_id: seed.sender_id,
             sender_name: seed.sender_name,
             timestamp: seed.timestamp,
+            edited_at: None,
             content: seed.content,
             reply_to: None,
             thread_id: None,
             is_from_me: seed.is_from_me,
+            mentions_me: false,
             reactions: seed.reactions,
             receipts: seed.receipts,
+        },
+    )
+}
+
+/// A text message that quotes another message in the same chat (a WhatsApp/
+/// Slack reply, distinct from a Slack thread reply).
+fn mock_reply_message(
+    account: &ProviderId,
+    seed: TextMessageSeed<'_>,
+    reply_to: &str,
+) -> Message {
+    message(
+        account,
+        MessageSeed {
+            chat_id: seed.chat_id,
+            id: seed.id,
+            sender_id: seed.sender_id,
+            sender_name: seed.sender_name,
+            timestamp: seed.timestamp,
+            edited_at: None,
+            content: Content::Text(arc_str(seed.text)),
+            reply_to: Some(reply_to),
+            thread_id: None,
+            is_from_me: seed.is_from_me,
+            mentions_me: false,
+            reactions: seed.reactions,
+            receipts: seed.receipts,
+        },
+    )
+}
+
+/// A text message carrying an `edited_at` marker so the timeline renders the
+/// "edited" indicator.
+fn mock_edited_message(
+    account: &ProviderId,
+    seed: TextMessageSeed<'_>,
+    edited_at: Timestamp,
+) -> Message {
+    message(
+        account,
+        MessageSeed {
+            chat_id: seed.chat_id,
+            id: seed.id,
+            sender_id: seed.sender_id,
+            sender_name: seed.sender_name,
+            timestamp: seed.timestamp,
+            edited_at: Some(edited_at),
+            content: Content::Text(arc_str(seed.text)),
+            reply_to: None,
+            thread_id: None,
+            is_from_me: seed.is_from_me,
+            mentions_me: false,
+            reactions: seed.reactions,
+            receipts: seed.receipts,
+        },
+    )
+}
+
+/// A text message that @-mentions the authenticated user.
+fn mock_mention_message(account: &ProviderId, seed: TextMessageSeed<'_>) -> Message {
+    message(
+        account,
+        MessageSeed {
+            chat_id: seed.chat_id,
+            id: seed.id,
+            sender_id: seed.sender_id,
+            sender_name: seed.sender_name,
+            timestamp: seed.timestamp,
+            edited_at: None,
+            content: Content::Text(arc_str(seed.text)),
+            reply_to: None,
+            thread_id: None,
+            is_from_me: seed.is_from_me,
+            mentions_me: true,
+            reactions: seed.reactions,
+            receipts: seed.receipts,
+        },
+    )
+}
+
+struct PollMessageSeed<'a> {
+    chat_id: &'a str,
+    id: &'a str,
+    sender_id: &'a str,
+    sender_name: &'a str,
+    timestamp: Timestamp,
+    poll: Poll,
+    reactions: Vec<Reaction>,
+}
+
+fn mock_poll_message(account: &ProviderId, seed: PollMessageSeed<'_>) -> Message {
+    message(
+        account,
+        MessageSeed {
+            chat_id: seed.chat_id,
+            id: seed.id,
+            sender_id: seed.sender_id,
+            sender_name: seed.sender_name,
+            timestamp: seed.timestamp,
+            edited_at: None,
+            content: Content::Poll(seed.poll),
+            reply_to: None,
+            thread_id: None,
+            is_from_me: false,
+            mentions_me: false,
+            reactions: seed.reactions,
+            receipts: Vec::new(),
+        },
+    )
+}
+
+struct CardMessageSeed<'a> {
+    chat_id: &'a str,
+    id: &'a str,
+    sender_id: &'a str,
+    sender_name: &'a str,
+    timestamp: Timestamp,
+    card: Card,
+    reactions: Vec<Reaction>,
+}
+
+fn mock_card_message(account: &ProviderId, seed: CardMessageSeed<'_>) -> Message {
+    message(
+        account,
+        MessageSeed {
+            chat_id: seed.chat_id,
+            id: seed.id,
+            sender_id: seed.sender_id,
+            sender_name: seed.sender_name,
+            timestamp: seed.timestamp,
+            edited_at: None,
+            content: Content::Cards(vec![seed.card]),
+            reply_to: None,
+            thread_id: None,
+            is_from_me: false,
+            mentions_me: false,
+            reactions: seed.reactions,
+            receipts: Vec::new(),
+        },
+    )
+}
+
+/// A bare message with arbitrary [`Content`] (used for deleted/unsupported
+/// placeholders that carry no reactions or receipts).
+fn mock_simple_message(
+    account: &ProviderId,
+    chat_id: &str,
+    id: &str,
+    sender_id: &str,
+    sender_name: &str,
+    timestamp: Timestamp,
+    content: Content,
+) -> Message {
+    message(
+        account,
+        MessageSeed {
+            chat_id,
+            id,
+            sender_id,
+            sender_name,
+            timestamp,
+            edited_at: None,
+            content,
+            reply_to: None,
+            thread_id: None,
+            is_from_me: false,
+            mentions_me: false,
+            reactions: Vec::new(),
+            receipts: Vec::new(),
         },
     )
 }
@@ -917,10 +1365,12 @@ struct MessageSeed<'a> {
     sender_id: &'a str,
     sender_name: &'a str,
     timestamp: Timestamp,
+    edited_at: Option<Timestamp>,
     content: Content,
     reply_to: Option<&'a str>,
     thread_id: Option<&'a str>,
     is_from_me: bool,
+    mentions_me: bool,
     reactions: Vec<Reaction>,
     receipts: Vec<Receipt>,
 }
@@ -936,14 +1386,14 @@ fn message(account: &ProviderId, seed: MessageSeed<'_>) -> Message {
             avatar: avatar_path(seed.sender_id),
         },
         timestamp: seed.timestamp,
-        edited_at: None,
+        edited_at: seed.edited_at,
         content: seed.content,
         reply_to: seed.reply_to.map(arc_str),
         thread_id: seed.thread_id.map(arc_str),
         reactions: seed.reactions,
         receipts: seed.receipts,
         is_from_me: seed.is_from_me,
-        mentions_me: false,
+        mentions_me: seed.mentions_me,
         platform_data: PlatformData::default(),
     }
 }
@@ -970,6 +1420,199 @@ fn reaction(emoji: &str, senders: &[&str]) -> Reaction {
     Reaction {
         emoji: arc_str(emoji),
         senders: senders.iter().map(arc_str).collect(),
+    }
+}
+
+/// Builds a [`Poll`] from `(option_id, label)` pairs and `(voter, option_ids)`
+/// votes, so the timeline renders tallies and the user's own choice.
+fn poll(
+    question: &str,
+    options: &[(&str, &str)],
+    selectable_options_count: Option<u32>,
+    votes: &[(&str, &[&str])],
+) -> Poll {
+    Poll {
+        question: arc_str(question),
+        options: options
+            .iter()
+            .map(|(id, label)| PollOption {
+                id: arc_str(id),
+                label: arc_str(label),
+            })
+            .collect(),
+        selectable_options_count,
+        votes: votes
+            .iter()
+            .map(|(sender, options)| PollVote {
+                sender: arc_str(sender),
+                options: options.iter().map(arc_str).collect(),
+                timestamp: None,
+            })
+            .collect(),
+    }
+}
+
+fn card_field(title: &str, value: &str, short: bool) -> CardField {
+    CardField {
+        title: Some(arc_str(title)),
+        value: arc_str(value),
+        short,
+    }
+}
+
+fn card_action(label: &str, url: &str) -> CardAction {
+    CardAction {
+        label: arc_str(label),
+        url: Some(arc_str(url)),
+    }
+}
+
+fn chat_member(platform_id: &str, display_name: &str, role: ChatMemberRole) -> ChatMember {
+    ChatMember::with_role(
+        Sender {
+            platform_id: arc_str(platform_id),
+            display_name: arc_str(display_name),
+            avatar: avatar_path(platform_id),
+        },
+        role,
+    )
+}
+
+/// Static member rosters (with roles) for the group/channel mock chats. Direct
+/// chats and platforms without member listing return an empty roster.
+fn mock_chat_members(chat_id: &str) -> Vec<ChatMember> {
+    use ChatMemberRole::{Admin, Member, Owner};
+    match chat_id {
+        "mock:chat:family" => vec![
+            chat_member("mom", "Mom", Owner),
+            chat_member("maya", "Maya", Admin),
+            chat_member("dad", "Dad", Member),
+            chat_member("leo", "Leo", Member),
+            chat_member("me", "Me", Member),
+        ],
+        "mock:chat:media" => vec![
+            chat_member("designer", "Designer", Admin),
+            chat_member("me", "Me", Member),
+        ],
+        "mock:chat:travel" => vec![
+            chat_member("sofia", "Sofia", Owner),
+            chat_member("me", "Me", Member),
+        ],
+        "mock:chat:team" => vec![
+            chat_member("sam", "Sam", Admin),
+            chat_member("priya", "Priya Shah", Member),
+            chat_member("ci-bot", "CI Bot", Member),
+            chat_member("deploy-bot", "Deploy Bot", Member),
+            chat_member("me", "Me", Member),
+        ],
+        "mock:chat:design" => vec![
+            chat_member("priya", "Priya Shah", Owner),
+            chat_member("alice", "Alice Chen", Member),
+            chat_member("me", "Me", Member),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Provider-sourced conversation metadata for the details pane. Returns empty
+/// details for direct chats (which surface a contact profile instead).
+fn mock_chat_details(chat_id: &str) -> ChatDetails {
+    let day = |days: i64| Some(mock_seed_now() - Duration::days(days));
+    match chat_id {
+        "mock:chat:family" => ChatDetails {
+            description: Some(arc_str("Planning weekends together by the lake 🌳")),
+            created_at: day(420),
+            creator: Some(arc_str("Mom")),
+            member_count: Some(5),
+            admin_count: Some(2),
+            disappearing_seconds: Some(7 * 24 * 60 * 60),
+            ..ChatDetails::default()
+        },
+        "mock:chat:team" => ChatDetails {
+            description: Some(arc_str(
+                "Building chat-cli in the open — releases, reviews, and CI.",
+            )),
+            created_at: day(210),
+            creator: Some(arc_str("Sam")),
+            member_count: Some(24),
+            admin_count: Some(3),
+            workspace: Some(arc_str("Acme Engineering")),
+            facts: vec![(arc_str("Topic"), arc_str("Ship v0.1.0 🚀"))],
+            ..ChatDetails::default()
+        },
+        "mock:chat:design" => ChatDetails {
+            description: Some(arc_str("Private space for design crits and explorations.")),
+            created_at: day(95),
+            creator: Some(arc_str("Priya Shah")),
+            member_count: Some(8),
+            admin_count: Some(1),
+            workspace: Some(arc_str("Acme Engineering")),
+            ..ChatDetails::default()
+        },
+        "mock:chat:media" => ChatDetails {
+            description: Some(arc_str("Sample attachments that show off media cards.")),
+            created_at: day(30),
+            member_count: Some(2),
+            ..ChatDetails::default()
+        },
+        "mock:chat:travel" => ChatDetails {
+            description: Some(arc_str("Lisbon, here we come ✈️ Itinerary and photos.")),
+            created_at: day(12),
+            creator: Some(arc_str("Sofia")),
+            member_count: Some(2),
+            disappearing_seconds: Some(24 * 60 * 60),
+            ..ChatDetails::default()
+        },
+        "mock:chat:ops" => ChatDetails {
+            description: Some(arc_str("Incident response and on-call coordination.")),
+            created_at: day(540),
+            member_count: Some(12),
+            facts: vec![(arc_str("On-call"), arc_str("Nora Ops"))],
+            ..ChatDetails::default()
+        },
+        "mock:chat:bookclub" => ChatDetails {
+            description: Some(arc_str("One book a month, no spoilers 📚")),
+            created_at: day(800),
+            member_count: Some(9),
+            ..ChatDetails::default()
+        },
+        _ => ChatDetails::default(),
+    }
+}
+
+/// Rich contact profiles for the direct-chat peers, surfaced in the details
+/// pane. Returns `None` for senders without a curated profile so the caller
+/// can fall back to a minimal name-only profile.
+fn mock_contact_profile(platform_id: &str) -> Option<ContactProfile> {
+    match platform_id {
+        "alice" => Some(ContactProfile {
+            display_name: Some(arc_str("Alice Chen")),
+            handle: Some(arc_str("@alice")),
+            title: Some(arc_str("Staff Engineer")),
+            status: Some(arc_str("🎧 Heads-down on the TUI")),
+            about: Some(arc_str(
+                "Terminal enthusiast. Rust, good coffee, and keyboard shortcuts.",
+            )),
+            timezone: Some(arc_str("America/Los_Angeles")),
+            local_time: Some(arc_str("9:14 AM")),
+            ..ContactProfile::default()
+        }),
+        "alex" => Some(ContactProfile {
+            display_name: Some(arc_str("Alex Rivera")),
+            about: Some(arc_str("On a hiking trip this week 🥾 Replies may be slow.")),
+            phone: Some(arc_str("+1 555-0102")),
+            timezone: Some(arc_str("Europe/Lisbon")),
+            is_business: true,
+            ..ContactProfile::default()
+        }),
+        "release-bot" => Some(ContactProfile {
+            display_name: Some(arc_str("Release Bot")),
+            handle: Some(arc_str("@release-bot")),
+            title: Some(arc_str("Automated release announcements")),
+            is_bot: true,
+            ..ContactProfile::default()
+        }),
+        _ => None,
     }
 }
 
@@ -1766,6 +2409,8 @@ fn mock_avatar_names() -> &'static [&'static str] {
         "nora",
         "sofia",
         "emma",
+        "deploy-bot",
+        "statuspage",
     ]
 }
 
@@ -1839,7 +2484,7 @@ mod tests {
 
         let chat_id = arc_str("mock:chat:alice");
         let messages = provider.history(&chat_id, None, 50).await?;
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
 
         let sent_id = provider
             .send(&chat_id, Content::Text(arc_str("hello")), None)
@@ -1953,6 +2598,70 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message.content, Content::LinkPreview(_)))
         );
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.content, Content::Poll(_)))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.content, Content::Cards(_)))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.content, Content::Deleted))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.content, Content::Unsupported(_)))
+        );
+        assert!(messages.iter().any(|message| message.edited_at.is_some()));
+        assert!(messages.iter().any(|message| message.mentions_me));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.reply_to.is_some() && message.thread_id.is_none())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mock_provider_exposes_details_pane_enrichment() -> Result<()> {
+        let provider = MockProvider::new();
+
+        let family = provider.chat_members(&arc_str("mock:chat:family")).await?;
+        assert!(family.len() >= 3);
+        assert!(family.iter().any(|member| member.role.is_admin()));
+        assert!(
+            family
+                .iter()
+                .any(|member| member.role == crate::ChatMemberRole::Owner)
+        );
+
+        let team_details = provider.chat_details(&arc_str("mock:chat:team")).await?;
+        assert!(!team_details.is_empty());
+        assert!(team_details.workspace.is_some());
+        assert!(team_details.member_count.is_some());
+
+        let direct_details = provider.chat_details(&arc_str("mock:chat:alice")).await?;
+        assert!(direct_details.is_empty());
+
+        let alice_profile = provider
+            .contact_profile(&arc_str("alice"))
+            .await?
+            .expect("alice has a curated profile");
+        assert!(alice_profile.has_detail());
+        assert!(alice_profile.title.is_some());
+
+        let bot_profile = provider
+            .contact_profile(&arc_str("release-bot"))
+            .await?
+            .expect("release bot has a curated profile");
+        assert!(bot_profile.is_bot);
 
         Ok(())
     }

@@ -7,6 +7,10 @@
 *.db
 *.db-shm
 *.db-wal
+.cache
+
+# Locally built Go bridge executable (real build emits libwhatsapp_bridge.a)
+crates/providers/whatsapp/go/whatsapp
 
 # Local secrets (sourced by test.sh)
 .env

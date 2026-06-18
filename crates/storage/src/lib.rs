@@ -113,6 +113,21 @@ pub struct AppSettings {
     /// are eligible for notifications. Defaults to `true` so users can verify
     /// notifications end-to-end by sending themselves a message from web clients.
     pub notify_self_messages: bool,
+    /// When enabled, every delivered message notification is also dispatched
+    /// to the external `fono` voice assistant, which summarizes the message
+    /// with its configured LLM and speaks one or two sentences about who
+    /// wants what. Requires the `fono` binary on `PATH` (override with the
+    /// `CHAT_CLI_FONO_BIN` environment variable). Inherits every notification
+    /// eligibility rule (mode, scope, mute, pause, attended-chat cancel).
+    pub voice_summaries: bool,
+    /// When enabled, "low intent" interactions raise no notification and are
+    /// never voice-summarized: a bare shared link with no human-authored
+    /// message body, or a pure link-preview card. Reactions are also low
+    /// intent, but they never reach the notification path, so they are
+    /// inherently covered. Defaults to `true` so links and similar noise stay
+    /// quiet out of the box; voice summaries are always suppressed for these
+    /// regardless of this toggle.
+    pub suppress_low_intent_notifications: bool,
     pub chat_inbox_style: ChatInboxStyle,
     pub ui_theme: UiThemePreset,
     pub conversation_presentation: ConversationPresentationSetting,
@@ -123,6 +138,10 @@ pub struct AppSettings {
     pub show_empty_chats: bool,
     /// Scope of the sidebar `⤷N` unread-thread marker.
     pub thread_marker_scope: ThreadMarkerScope,
+    /// When enabled, an applied chat/message/thread filter is automatically
+    /// cleared after a period of inactivity so a forgotten filter does not
+    /// silently keep hiding content.
+    pub auto_reset_filter: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -205,6 +224,8 @@ impl Default for AppSettings {
             notifications: NotificationMode::Desktop,
             notification_scope: NotificationScope::All,
             notify_self_messages: true,
+            voice_summaries: false,
+            suppress_low_intent_notifications: true,
             chat_inbox_style: ChatInboxStyle::ActivityFirst,
             ui_theme: UiThemePreset::DefaultDark,
             conversation_presentation: ConversationPresentationSetting::WhatsApp,
@@ -214,6 +235,7 @@ impl Default for AppSettings {
             show_browse_channels: false,
             show_empty_chats: true,
             thread_marker_scope: ThreadMarkerScope::Participating,
+            auto_reset_filter: true,
         }
     }
 }
@@ -231,6 +253,8 @@ impl<'de> Deserialize<'de> for AppSettings {
             in_app_notifications: Option<bool>,
             notification_scope: NotificationScope,
             notify_self_messages: bool,
+            voice_summaries: bool,
+            suppress_low_intent_notifications: bool,
             chat_inbox_style: ChatInboxStyle,
             ui_theme: UiThemePreset,
             conversation_presentation: ConversationPresentationSetting,
@@ -240,6 +264,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             show_browse_channels: bool,
             show_empty_chats: bool,
             thread_marker_scope: ThreadMarkerScope,
+            auto_reset_filter: bool,
         }
 
         impl Default for AppSettingsCompat {
@@ -251,6 +276,9 @@ impl<'de> Deserialize<'de> for AppSettings {
                     in_app_notifications: None,
                     notification_scope: defaults.notification_scope,
                     notify_self_messages: defaults.notify_self_messages,
+                    voice_summaries: defaults.voice_summaries,
+                    suppress_low_intent_notifications: defaults
+                        .suppress_low_intent_notifications,
                     chat_inbox_style: defaults.chat_inbox_style,
                     ui_theme: defaults.ui_theme,
                     conversation_presentation: defaults.conversation_presentation,
@@ -260,6 +288,7 @@ impl<'de> Deserialize<'de> for AppSettings {
                     show_browse_channels: defaults.show_browse_channels,
                     show_empty_chats: defaults.show_empty_chats,
                     thread_marker_scope: defaults.thread_marker_scope,
+                    auto_reset_filter: defaults.auto_reset_filter,
                 }
             }
         }
@@ -279,6 +308,8 @@ impl<'de> Deserialize<'de> for AppSettings {
             notifications,
             notification_scope: compat.notification_scope,
             notify_self_messages: compat.notify_self_messages,
+            voice_summaries: compat.voice_summaries,
+            suppress_low_intent_notifications: compat.suppress_low_intent_notifications,
             chat_inbox_style: compat.chat_inbox_style,
             ui_theme: compat.ui_theme,
             conversation_presentation: compat.conversation_presentation,
@@ -288,6 +319,7 @@ impl<'de> Deserialize<'de> for AppSettings {
             show_browse_channels: compat.show_browse_channels,
             show_empty_chats: compat.show_empty_chats,
             thread_marker_scope: compat.thread_marker_scope,
+            auto_reset_filter: compat.auto_reset_filter,
         })
     }
 }
@@ -319,6 +351,7 @@ impl Store {
             .context("running storage migrations")?;
         ensure_chat_metadata_columns(&conn).context("adding chat metadata columns")?;
         ensure_message_metadata_columns(&conn).context("adding message metadata columns")?;
+        normalize_message_sender_ids(&conn).context("normalizing message sender ids")?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -1639,6 +1672,36 @@ fn ensure_message_metadata_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// One-time data repair: strips the `:<device>` suffix from JID-style message
+/// sender ids stored before senders were normalized to their device-less
+/// identity (e.g. `40721274801:42@s.whatsapp.net` -> `40721274801@s.whatsapp.net`).
+///
+/// Message-routing JIDs carry a device/agent suffix that contact, profile and
+/// group-member JIDs never include, so historical rows keep a device-tagged
+/// sender id that never matches the device-less identity owning the avatar.
+/// Without this repair the message-header avatar of every pre-fix message stays
+/// an initials placeholder even though the same contact's photo shows in the
+/// member/details panel. Gated by `PRAGMA user_version` so it runs only once.
+fn normalize_message_sender_ids(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= 1 {
+        return Ok(());
+    }
+    // Only touch JID-style ids that carry a device suffix before the `@`
+    // (`user:device@server`); ids without an `@` (e.g. Slack) are left intact.
+    conn.execute(
+        "UPDATE messages \
+         SET sender_id = substr(sender_id, 1, instr(sender_id, ':') - 1) \
+             || substr(sender_id, instr(sender_id, '@')) \
+         WHERE instr(sender_id, '@') > 0 \
+           AND instr(sender_id, ':') > 0 \
+           AND instr(sender_id, ':') < instr(sender_id, '@')",
+        [],
+    )?;
+    conn.pragma_update(None, "user_version", 1)?;
+    Ok(())
+}
+
 fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
     Ok(Chat {
         id: arc_str(row.get::<_, String>(0)?),
@@ -2330,6 +2393,54 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn normalize_message_sender_ids_strips_device_suffix_once() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(schema::V1)?;
+        // Device-suffixed WhatsApp sender (the pre-fix stored form).
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, account_id, sender_id, sender_name, timestamp, content_type) \
+             VALUES ('m1', 'c1', 'a1', '40721274801:42@s.whatsapp.net', 'Razvan', 0, 'text')",
+            [],
+        )?;
+        // Non-JID sender (e.g. Slack) must be left untouched.
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, account_id, sender_id, sender_name, timestamp, content_type) \
+             VALUES ('m2', 'c1', 'a1', 'U123SLACK', 'Bob', 0, 'text')",
+            [],
+        )?;
+
+        normalize_message_sender_ids(&conn)?;
+
+        let razvan: String =
+            conn.query_row("SELECT sender_id FROM messages WHERE id = 'm1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(razvan, "40721274801@s.whatsapp.net");
+        let slack: String =
+            conn.query_row("SELECT sender_id FROM messages WHERE id = 'm2'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(slack, "U123SLACK");
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, 1);
+
+        // The repair is gated by user_version, so a second run is a no-op even
+        // if a device-suffixed id appears afterwards (new ids are normalized at
+        // ingest by the WhatsApp provider instead).
+        conn.execute(
+            "UPDATE messages SET sender_id = '40700000000:5@s.whatsapp.net' WHERE id = 'm1'",
+            [],
+        )?;
+        normalize_message_sender_ids(&conn)?;
+        let unchanged: String =
+            conn.query_row("SELECT sender_id FROM messages WHERE id = 'm1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(unchanged, "40700000000:5@s.whatsapp.net");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn avatar_thumbnail_cache_roundtrips_blob_metadata() -> Result<()> {
         let store = Store::open_memory().await?;
@@ -2367,6 +2478,7 @@ mod tests {
         let settings = AppSettings {
             ui_theme: UiThemePreset::Slack,
             conversation_presentation: ConversationPresentationSetting::ProviderNative,
+            voice_summaries: true,
             ..AppSettings::default()
         };
 
@@ -2378,6 +2490,7 @@ mod tests {
             loaded.conversation_presentation,
             ConversationPresentationSetting::ProviderNative
         );
+        assert!(loaded.voice_summaries);
         Ok(())
     }
 
@@ -2470,6 +2583,28 @@ mod tests {
         let json = serde_json::to_string(&settings)?;
         let restored = serde_json::from_str::<AppSettings>(&json)?;
         assert!(!restored.notify_self_messages);
+        Ok(())
+    }
+
+    #[test]
+    fn suppress_low_intent_notifications_defaults_on_and_roundtrips() -> Result<()> {
+        // Legacy settings without the field migrate to the enabled default so
+        // bare links and similar low-intent noise stay quiet out of the box.
+        let legacy = serde_json::from_str::<AppSettings>(
+            r#"{
+                "notifications": "desktop"
+            }"#,
+        )?;
+        assert!(legacy.suppress_low_intent_notifications);
+
+        // An explicit stored value survives a serialize/deserialize round-trip.
+        let settings = AppSettings {
+            suppress_low_intent_notifications: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings)?;
+        let restored = serde_json::from_str::<AppSettings>(&json)?;
+        assert!(!restored.suppress_low_intent_notifications);
         Ok(())
     }
 

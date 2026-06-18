@@ -189,12 +189,22 @@ struct MessageLayoutKey {
     messages_hash: u64,
 }
 
+/// Structured preview of the message a reply quotes. Kept split into the
+/// quoted sender's display name and a single-line snippet so the nested reply
+/// quote box can style them independently (bold colored title in the inner
+/// box border, muted snippet inside).
+#[derive(Clone, Debug)]
+struct ReplyPreview {
+    sender: Arc<str>,
+    snippet: Arc<str>,
+}
+
 #[derive(Debug, Default)]
 pub struct MessageLayoutCache {
     key: Option<MessageLayoutKey>,
     entries: Vec<MessageLayoutEntry>,
     total_lines: usize,
-    reply_previews: HashMap<Arc<str>, String>,
+    reply_previews: HashMap<Arc<str>, ReplyPreview>,
     thread_summaries: HashMap<MessageId, ThreadSummary>,
 }
 
@@ -287,7 +297,10 @@ pub fn render_message_list(frame: &mut Frame<'_>, area: Rect, props: MessageList
         bottom_aligned_message_lines(props.lines, props.total_lines, props.scroll, viewport_rows);
     let paragraph = Paragraph::new(lines).block(
         Block::default()
-            .title(props.title)
+            .title(Line::from(Span::styled(
+                crate::widgets::padded_title(props.title),
+                props.theme.pane_title_for(props.focused),
+            )))
             .borders(Borders::ALL)
             .border_style(props.theme.focus_border(props.focused)),
     );
@@ -428,7 +441,7 @@ pub fn build_message_lines_with_presentation(
     let mut media_preview_requests = Vec::new();
     let reply_previews = messages
         .iter()
-        .map(|message| (message.id.clone(), compact_message_preview(message)))
+        .map(|message| (message.id.clone(), reply_preview(message)))
         .collect::<HashMap<_, _>>();
     let mut context = MessageRenderContext {
         media_cache,
@@ -548,7 +561,7 @@ fn rebuild_message_layout_cache(
     cache.total_lines = 0;
     cache.reply_previews = messages
         .iter()
-        .map(|message| (message.id.clone(), compact_message_preview(message)))
+        .map(|message| (message.id.clone(), reply_preview(message)))
         .collect();
     cache.thread_summaries = thread_summaries(messages);
 
@@ -1288,7 +1301,7 @@ struct MessageRenderContext<'a> {
     media_hits: &'a mut Vec<MediaHit>,
     theme: Theme,
     previous_sender: Option<Arc<str>>,
-    reply_previews: &'a HashMap<Arc<str>, String>,
+    reply_previews: &'a HashMap<Arc<str>, ReplyPreview>,
     thread_summaries: &'a HashMap<MessageId, ThreadSummary>,
     /// Per-thread unread reply counts keyed by thread root message id. Applied
     /// at render time (not cached) so marking a thread read clears its badge.
@@ -1344,25 +1357,40 @@ fn message_lines(
     }
 
     if let Some(reply_to) = &message.reply_to {
-        let preview = context
-            .reply_previews
-            .get(reply_to)
-            .cloned()
-            .unwrap_or_else(|| format!("message {}", short_id(reply_to)));
-        lines.push(Line::from(Span::styled(
-            format!("  ↪ {preview}"),
-            context.theme.muted(),
-        )));
+        let (preview, color) = resolve_reply_preview(context, reply_to);
+        if let Some(text) = reply_inline_text(&message.content) {
+            lines.extend(reply_text_bubble_lines(
+                &preview,
+                &text,
+                context.content_width,
+                accent_style,
+                context.theme,
+                color,
+            ));
+        } else {
+            let box_width = bubble_inner_width(context.content_width);
+            for row in reply_quote_box_rows(&preview, box_width, context.theme, color) {
+                lines.push(Line::from(row));
+            }
+            lines.extend(content_lines(
+                &message.content,
+                context,
+                start_line + lines.len(),
+                message.is_from_me,
+                accent_style,
+                Some(&message.id),
+            ));
+        }
+    } else {
+        lines.extend(content_lines(
+            &message.content,
+            context,
+            start_line + lines.len(),
+            message.is_from_me,
+            accent_style,
+            Some(&message.id),
+        ));
     }
-
-    lines.extend(content_lines(
-        &message.content,
-        context,
-        start_line + lines.len(),
-        message.is_from_me,
-        accent_style,
-        Some(&message.id),
-    ));
 
     let receipts = receipt_summary(message);
     if message.is_from_me {
@@ -1434,8 +1462,14 @@ fn slack_message_lines(
     let mut lines = Vec::new();
     let spacer_lines = slack_message_spacer_lines(grouped, has_previous_message);
     lines.extend((0..spacer_lines).map(|_| Line::default()));
-    let body_start_line =
-        start_line + spacer_lines + usize::from(!grouped) + usize::from(message.reply_to.is_some());
+    let body_start_line = start_line
+        + spacer_lines
+        + usize::from(!grouped)
+        + if message.reply_to.is_some() {
+            QUOTE_BOX_ROWS
+        } else {
+            0
+        };
     let mut body_lines = slack_content_lines(message, context, body_start_line, accent_style);
     if body_lines.is_empty() {
         body_lines.push(Line::from(""));
@@ -1456,15 +1490,11 @@ fn slack_message_lines(
     }
 
     if let Some(reply_to) = &message.reply_to {
-        let preview = context
-            .reply_previews
-            .get(reply_to)
-            .cloned()
-            .unwrap_or_else(|| format!("message {}", short_id(reply_to)));
-        lines.push(slack_indented_line(vec![Span::styled(
-            format!("↪ {preview}"),
-            context.theme.muted(),
-        )]));
+        let (preview, color) = resolve_reply_preview(context, reply_to);
+        let box_width = slack_body_width(context.content_width);
+        for row in reply_quote_box_rows(&preview, box_width, context.theme, color) {
+            lines.push(slack_indented_line(row));
+        }
     }
 
     for (index, mut line) in body_lines.into_iter().enumerate() {
@@ -1504,7 +1534,7 @@ fn slack_message_spacer_lines(grouped: bool, has_previous_message: bool) -> usiz
 }
 
 fn apply_slack_timestamp_selection(line: &mut Line<'static>, theme: Theme) {
-    let selection_style = Style::default().fg(theme.foreground).bg(Color::DarkGray);
+    let selection_style = theme.selection();
     let mut remaining = SLACK_TIMESTAMP_WIDTH;
     let mut spans = Vec::new();
 
@@ -2340,13 +2370,13 @@ fn card_action_spans(actions: &[chat_core::CardAction]) -> Vec<Span<'static>> {
         if !spans.is_empty() {
             spans.push(Span::raw("  "));
         }
-        let style = Style::default().add_modifier(Modifier::BOLD).fg(
-            if action.url.is_some() {
+        let style = Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(if action.url.is_some() {
                 Color::Cyan
             } else {
                 Color::Gray
-            },
-        );
+            });
         spans.push(Span::styled(format!("[ {} ]", action.label), style));
     }
     spans
@@ -3690,7 +3720,7 @@ fn split_by_display_width(text: &str, width: usize) -> (String, String) {
     (selected, String::new())
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut wrapped = Vec::new();
     for paragraph in text.split('\n') {
@@ -4185,14 +4215,177 @@ fn compact_reply_avatar_spans(
     spans
 }
 
-fn compact_message_preview(message: &Message) -> String {
+/// Number of inner rows a reply quote box always occupies: the titled top
+/// border, exactly one snippet line, and the bottom border. Fixed so the
+/// line-count pass stays exact and independent of the (unbounded) snippet text.
+const QUOTE_BOX_ROWS: usize = 3;
+const QUOTE_MIN_BOX_WIDTH: usize = 8;
+
+/// Stable per-participant colors for reply quote boxes, emulating WhatsApp's
+/// distinct per-sender quote tint. Deterministic by sender so the same person
+/// keeps the same color across the timeline.
+const QUOTE_COLORS: [Color; 6] = [
+    Color::Cyan,
+    Color::Green,
+    Color::Yellow,
+    Color::Magenta,
+    Color::Blue,
+    Color::LightRed,
+];
+
+fn quote_color(theme: Theme, seed: &str) -> Color {
+    if seed.trim().is_empty() {
+        return theme.accent;
+    }
+    let mut hasher = DefaultHasher::new();
+    seed.hash(&mut hasher);
+    QUOTE_COLORS[(hasher.finish() as usize) % QUOTE_COLORS.len()]
+}
+
+fn reply_preview(message: &Message) -> ReplyPreview {
     let text = content_preview_text(&message.content);
-    let preview = if text.trim().is_empty() {
-        "attachment".to_owned()
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let snippet = if collapsed.is_empty() {
+        Arc::<str>::from("attachment")
     } else {
-        truncate_chars(text.trim(), 38)
+        Arc::<str>::from(collapsed.as_str())
     };
-    format!("{}: {preview}", message.sender.display_name)
+    ReplyPreview {
+        sender: message.sender.display_name.clone(),
+        snippet,
+    }
+}
+
+/// The text a reply's own body would render as a plain text bubble, when the
+/// content is text-like (so the quote box can be nested inside the same outer
+/// bubble). Returns `None` for media/cards/link content (rendered as their own
+/// cards) and for text carrying a URL (which may expand into a link-preview
+/// card), so those keep their existing rendering with a standalone quote box.
+fn reply_inline_text(content: &Content) -> Option<String> {
+    match content {
+        Content::Text(text) if first_url_in_text(text).is_none() => Some(text.to_string()),
+        Content::Poll(poll) => Some(poll_text(poll)),
+        Content::Deleted => Some("[deleted]".to_owned()),
+        Content::Unsupported(kind) => Some(format!("[unsupported: {kind}]")),
+        _ => None,
+    }
+}
+
+/// Truncates `text` to at most `max_width` display cells, appending `…` when it
+/// had to drop characters.
+fn truncate_display(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let budget = max_width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used.saturating_add(character_width) > budget {
+            break;
+        }
+        out.push(character);
+        used += character_width;
+    }
+    out.push('…');
+    out
+}
+
+/// Builds the rows of a nested reply quote box: a titled top border carrying the
+/// quoted sender's name, a single muted snippet line, and a bottom border. Each
+/// returned row is exactly `box_width` display cells wide so it can be embedded
+/// directly (bubbles via `bubble_text_line`, flat via `slack_indented_line`).
+fn reply_quote_box_rows(
+    preview: &ReplyPreview,
+    box_width: usize,
+    theme: Theme,
+    color: Color,
+) -> Vec<Vec<Span<'static>>> {
+    let box_width = box_width.max(QUOTE_MIN_BOX_WIDTH);
+    let border_style = Style::default().fg(color);
+    let name_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    let snippet_style = theme.muted();
+
+    // Top border: "┌─ {name} {dashes}┐" padded to exactly `box_width`.
+    let name_budget = box_width.saturating_sub(5).max(1);
+    let name = truncate_display(&preview.sender, name_budget);
+    let name_width = UnicodeWidthStr::width(name.as_str());
+    let dashes = box_width.saturating_sub(5 + name_width).max(1);
+    let top = vec![
+        Span::styled("┌─ ".to_owned(), border_style),
+        Span::styled(name, name_style),
+        Span::styled(format!(" {}┐", "─".repeat(dashes)), border_style),
+    ];
+
+    // Single snippet line inside the box.
+    let snippet_width = box_width.saturating_sub(4).max(1);
+    let snippet = truncate_display(&preview.snippet, snippet_width);
+    let snippet_pad = snippet_width.saturating_sub(UnicodeWidthStr::width(snippet.as_str()));
+    let body = vec![
+        Span::styled("│ ".to_owned(), border_style),
+        Span::styled(snippet, snippet_style),
+        Span::raw(" ".repeat(snippet_pad)),
+        Span::styled(" │".to_owned(), border_style),
+    ];
+
+    let bottom = vec![Span::styled(
+        format!("└{}┘", "─".repeat(box_width.saturating_sub(2))),
+        border_style,
+    )];
+
+    vec![top, body, bottom]
+}
+
+/// Builds one bubble that nests the reply quote box above the reply's own text
+/// body so both share a single outer border (the WhatsApp-style nested quote).
+fn reply_text_bubble_lines(
+    preview: &ReplyPreview,
+    text: &str,
+    content_width: u16,
+    accent: Style,
+    theme: Theme,
+    color: Color,
+) -> Vec<Line<'static>> {
+    let inner_width = bubble_inner_width(content_width);
+    let quote_rows = reply_quote_box_rows(preview, inner_width, theme, color);
+    let wrapped = wrap_markdown_text(text, inner_width);
+
+    let mut lines = Vec::with_capacity(quote_rows.len() + wrapped.len() + 2);
+    lines.push(bubble_border_line('╭', '─', '╮', inner_width, accent));
+    for row in quote_rows {
+        lines.push(bubble_text_line(row, inner_width, accent));
+    }
+    for spans in wrapped {
+        lines.push(bubble_text_line(spans, inner_width, accent));
+    }
+    lines.push(bubble_border_line('╰', '─', '╯', inner_width, accent));
+    lines
+}
+
+/// Resolves the quote preview and per-sender color for a reply target, falling
+/// back to a muted "not loaded" box when the quoted message is outside the
+/// loaded window.
+fn resolve_reply_preview(
+    context: &MessageRenderContext<'_>,
+    reply_to: &Arc<str>,
+) -> (ReplyPreview, Color) {
+    match context.reply_previews.get(reply_to) {
+        Some(preview) => {
+            let color = quote_color(context.theme, &preview.sender);
+            (preview.clone(), color)
+        }
+        None => (
+            ReplyPreview {
+                sender: Arc::<str>::from("Reply"),
+                snippet: Arc::<str>::from("[message not loaded]"),
+            },
+            context.theme.muted,
+        ),
+    }
 }
 
 fn content_preview_text(content: &Content) -> String {
@@ -4218,23 +4411,18 @@ fn content_preview_text(content: &Content) -> String {
     }
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}…")
+/// Extra timeline lines a reply quote box adds above/around the message body.
+/// Fixed at [`QUOTE_BOX_ROWS`] whenever the message replies to another (a
+/// titled top border, one snippet line, and a bottom border), and zero
+/// otherwise. Both the nested-text bubble and the standalone box add exactly
+/// these rows, so this single helper keeps the count pass aligned with the draw
+/// pass in both presentations.
+fn reply_quote_overhead_lines(message: &Message) -> usize {
+    if message.reply_to.is_some() {
+        QUOTE_BOX_ROWS
     } else {
-        truncated
+        0
     }
-}
-
-fn short_id(id: &str) -> String {
-    id.rsplit(':')
-        .next()
-        .unwrap_or(id)
-        .chars()
-        .take(10)
-        .collect()
 }
 
 fn message_lines_len(
@@ -4258,7 +4446,7 @@ fn message_lines_len(
     }
 
     usize::from(!grouped)
-        + usize::from(message.reply_to.is_some())
+        + reply_quote_overhead_lines(message)
         + content_lines_len(&message.content, content_width, link_metadata, presentation)
         + usize::from(message.is_from_me || !receipt_summary(message).is_empty())
         + usize::from(!message.reactions.is_empty())
@@ -4291,7 +4479,7 @@ fn slack_message_lines_len(
 
     slack_message_spacer_lines(grouped, has_previous_message)
         + usize::from(!grouped)
-        + usize::from(message.reply_to.is_some())
+        + reply_quote_overhead_lines(message)
         + content_count.saturating_sub(merged_content_line)
         + usize::from(!message.reactions.is_empty())
         + usize::from(thread_summary.is_some())
@@ -6166,7 +6354,7 @@ mod tests {
         link_preview_requests: &'a mut Vec<LinkPreviewRequest>,
         media_preview_requests: &'a mut Vec<MediaPreviewRequest>,
         link_metadata: &'a LinkMetadataCache,
-        reply_previews: &'a HashMap<Arc<str>, String>,
+        reply_previews: &'a HashMap<Arc<str>, ReplyPreview>,
         thread_summaries: &'a HashMap<MessageId, ThreadSummary>,
         thread_unread: &'a HashMap<MessageId, u32>,
     ) -> MessageRenderContext<'a> {
@@ -6580,6 +6768,253 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn sender(platform_id: &str, display_name: &str) -> Sender {
+        Sender {
+            platform_id: arc_str(platform_id),
+            display_name: arc_str(display_name),
+            avatar: None,
+        }
+    }
+
+    /// Renders a quoted original message and a reply to it, returning the
+    /// rendered line strings plus the full render for count/draw parity checks.
+    fn render_reply_fixture(
+        original: Option<Message>,
+        reply: Message,
+        presentation: ConversationPresentation,
+    ) -> (Vec<String>, MessageListRender) {
+        let mut messages = Vec::new();
+        if let Some(original) = original {
+            messages.push(original);
+        }
+        messages.push(reply);
+        let mut cache = MediaPreviewCache::default();
+        let render = build_message_lines_with_presentation(
+            &messages,
+            60,
+            0,
+            400,
+            None,
+            &HashSet::new(),
+            &HashMap::new(),
+            &mut cache,
+            &LinkMetadataCache::default(),
+            Theme::default(),
+            presentation,
+        );
+        (rendered_lines(&render.lines), render)
+    }
+
+    #[test]
+    fn text_reply_renders_nested_titled_quote_box() {
+        let account = arc_str("mock:local");
+        let chat_id = arc_str("mock:chat:alice");
+        let original = text_message(
+            "orig",
+            &chat_id,
+            &account,
+            sender("sorin", "Sorin"),
+            "Facem 1-2 drumuri si aia e",
+            22,
+            14,
+            false,
+        );
+        let mut reply = text_message(
+            "reply",
+            &chat_id,
+            &account,
+            sender("me", "Me"),
+            "Loool :)",
+            22,
+            33,
+            true,
+        );
+        reply.reply_to = Some(original.id.clone());
+
+        let (rendered, _) =
+            render_reply_fixture(Some(original), reply, ConversationPresentation::Bubbles);
+        let joined = rendered.join("\n");
+
+        assert!(
+            rendered.iter().any(|line| line.contains("┌─ Sorin")),
+            "quote box top border should carry the sender name:\n{joined}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("Facem 1-2 drumuri si aia e")),
+            "quoted snippet should appear in the box:\n{joined}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains('└')),
+            "quote box bottom border should close the box:\n{joined}"
+        );
+        assert!(joined.contains("Loool :)"), "reply body should render");
+    }
+
+    #[test]
+    fn reply_quote_box_keeps_count_and_draw_in_sync() {
+        let account = arc_str("mock:local");
+        let chat_id = arc_str("mock:chat:alice");
+
+        for presentation in [
+            ConversationPresentation::Bubbles,
+            ConversationPresentation::Flat,
+        ] {
+            let original = text_message(
+                "orig",
+                &chat_id,
+                &account,
+                sender("sorin", "Sorin"),
+                "Facem 1-2 drumuri si aia e",
+                22,
+                14,
+                false,
+            );
+            let mut reply = text_message(
+                "reply",
+                &chat_id,
+                &account,
+                sender("me", "Me"),
+                "Loool :)",
+                22,
+                33,
+                true,
+            );
+            reply.reply_to = Some(original.id.clone());
+
+            let (rendered, render) = render_reply_fixture(Some(original), reply, presentation);
+            assert_eq!(
+                render.lines.len(),
+                render.total_lines,
+                "count pass and draw pass disagree for {presentation:?}:\n{}",
+                rendered.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn reply_to_unloaded_message_renders_muted_placeholder_box() {
+        let account = arc_str("mock:local");
+        let chat_id = arc_str("mock:chat:alice");
+        let mut reply = text_message(
+            "reply",
+            &chat_id,
+            &account,
+            sender("me", "Me"),
+            "Loool :)",
+            22,
+            33,
+            true,
+        );
+        reply.reply_to = Some(arc_str("missing-original"));
+
+        let (rendered, _) = render_reply_fixture(None, reply, ConversationPresentation::Bubbles);
+        let joined = rendered.join("\n");
+
+        assert!(
+            rendered.iter().any(|line| line.contains("[message not loaded]")),
+            "unloaded reply should render a placeholder snippet:\n{joined}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("┌─ Reply")),
+            "unloaded reply should still render a titled box:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn long_quoted_text_is_bounded_to_a_single_snippet_line() {
+        let account = arc_str("mock:local");
+        let chat_id = arc_str("mock:chat:alice");
+        let long = "This is a very long quoted message that should be truncated to a single \
+                    snippet line inside the reply quote box so the layout stays bounded";
+        let original = text_message(
+            "orig",
+            &chat_id,
+            &account,
+            sender("sorin", "Sorin"),
+            long,
+            22,
+            14,
+            false,
+        );
+        let mut reply = text_message(
+            "reply",
+            &chat_id,
+            &account,
+            sender("me", "Me"),
+            "Loool :)",
+            22,
+            33,
+            true,
+        );
+        reply.reply_to = Some(original.id.clone());
+
+        let (rendered, _) =
+            render_reply_fixture(Some(original), reply, ConversationPresentation::Bubbles);
+        let joined = rendered.join("\n");
+
+        // The quote box occupies exactly three rows: top border, one snippet
+        // line (truncated with an ellipsis), and bottom border.
+        let top = rendered
+            .iter()
+            .position(|line| line.contains("┌─ Sorin"))
+            .expect("titled quote border present");
+        let snippet_line = &rendered[top + 1];
+        assert!(
+            snippet_line.contains('…'),
+            "long snippet should be truncated with an ellipsis: {snippet_line}"
+        );
+        assert!(
+            rendered[top + 2].contains('└'),
+            "snippet must be a single line so the bottom border follows it:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn long_quoted_sender_name_is_truncated_inside_the_border() {
+        let account = arc_str("mock:local");
+        let chat_id = arc_str("mock:chat:alice");
+        let long_name = "Bartholomew Aurelius Maximilian von Habsburg-Lothringen";
+        let original = text_message(
+            "orig",
+            &chat_id,
+            &account,
+            sender("sorin", long_name),
+            "short",
+            22,
+            14,
+            false,
+        );
+        let mut reply = text_message(
+            "reply",
+            &chat_id,
+            &account,
+            sender("me", "Me"),
+            "Loool :)",
+            22,
+            33,
+            true,
+        );
+        reply.reply_to = Some(original.id.clone());
+
+        let (rendered, _) =
+            render_reply_fixture(Some(original), reply, ConversationPresentation::Bubbles);
+        let border = rendered
+            .iter()
+            .find(|line| line.contains("┌─ "))
+            .expect("titled quote border present");
+
+        assert!(
+            border.contains('…'),
+            "an overlong sender name should be truncated in the border: {border}"
+        );
+        assert!(
+            UnicodeWidthStr::width(border.as_str()) <= 60,
+            "the quote border must not overflow the content width: {border}"
+        );
     }
 
     fn rendered_line_containing(lines: &[Line<'static>], needle: &str) -> String {
