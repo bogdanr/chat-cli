@@ -1192,7 +1192,7 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 		// Carry the conversation's real last-message activity even when the
 		// sync scope skips replaying the messages themselves, so recently
 		// contacted chats never show up as "No messages yet".
-		lastMessageAt, lastMessagePreview := conversationActivity(parsedMessages, conv.GetLastMsgTimestamp())
+		lastMessageAt, lastMessagePreview := conversationActivity(c, ctx, parsedMessages, conv.GetLastMsgTimestamp())
 		emitProfileEventWithActivity(c, ctx, chatJID, chatName, "", isGroup, &chatMuted, lastMessageAt, lastMessagePreview)
 		go c.fetchAndEmitProfile(ctx, chatJID, chatName, isGroup)
 
@@ -1305,7 +1305,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 		ChatName:   chatName,
 		SenderJID:  canonicalSenderJID.String(),
 		SenderName: senderName,
-		Text:       messageText(messagePayload),
+		Text:       resolveMentions(c, ctx, messageText(messagePayload), messageMentionedJID(messagePayload)),
 		Timestamp:  message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
 		FromMe:     message.Info.IsFromMe,
 		MentionsMe: mentionsMe,
@@ -2304,6 +2304,56 @@ func messageMentionsUser(message *waProto.Message, ownJID string) bool {
 	return false
 }
 
+// resolveMentions rewrites WhatsApp @<jid-user> mention tokens in a message
+// body to the mentioned contact's display name, e.g. "@34819417346247" becomes
+// "@Razvan". WhatsApp transmits mentions as the bare JID user-part inside the
+// text plus a parallel MentionedJID list in the ContextInfo; without this
+// rewrite the UI shows the raw phone number / LID instead of the person's name.
+// JIDs that cannot be resolved to a real name are left as-is so the mention is
+// never dropped.
+func resolveMentions(c *client, ctx context.Context, text string, mentionedJIDs []string) string {
+	if text == "" || len(mentionedJIDs) == 0 {
+		return text
+	}
+	names := make(map[string]string, len(mentionedJIDs))
+	for _, raw := range mentionedJIDs {
+		jid, err := types.ParseJID(raw)
+		if err != nil || jid.User == "" {
+			continue
+		}
+		if _, ok := names[jid.User]; ok {
+			continue
+		}
+		if name, ok := contactDisplayName(c, ctx, jid); ok {
+			if trimmed := strings.TrimSpace(name); trimmed != "" {
+				names[jid.User] = trimmed
+			}
+		}
+	}
+	return rewriteMentionTokens(text, names)
+}
+
+// rewriteMentionTokens replaces each "@<user>" token in text with "@<name>"
+// using the user-part -> display-name map. Tokens are applied longest user-part
+// first so a shorter number that is a prefix of a longer one (for example
+// "@1234" versus "@12345") cannot be partially rewritten.
+func rewriteMentionTokens(text string, names map[string]string) string {
+	if text == "" || len(names) == 0 {
+		return text
+	}
+	users := make([]string, 0, len(names))
+	for user := range names {
+		users = append(users, user)
+	}
+	sort.Slice(users, func(i, j int) bool {
+		return len(users[i]) > len(users[j])
+	})
+	for _, user := range users {
+		text = strings.ReplaceAll(text, "@"+user, "@"+names[user])
+	}
+	return text
+}
+
 // conversationActivity derives last-message activity for a history-synced
 // conversation from the actual messages included in the payload (newest
 // displayable message wins). When the payload carries no usable message —
@@ -2311,7 +2361,7 @@ func messageMentionsUser(message *waProto.Message, ownJID string) bool {
 // sync scope window — it falls back to the conversation's own last-message
 // timestamp, which still describes a real message even though its body is
 // unavailable. Returns a zero time when no activity is known.
-func conversationActivity(messages []*events.Message, lastMsgTimestamp uint64) (time.Time, string) {
+func conversationActivity(c *client, ctx context.Context, messages []*events.Message, lastMsgTimestamp uint64) (time.Time, string) {
 	var newest time.Time
 	preview := ""
 	for _, message := range messages {
@@ -2328,7 +2378,7 @@ func conversationActivity(messages []*events.Message, lastMsgTimestamp uint64) (
 		if !message.Info.Timestamp.After(newest) {
 			continue
 		}
-		text := messageText(payload)
+		text := resolveMentions(c, ctx, messageText(payload), messageMentionedJID(payload))
 		if text == "[unsupported WhatsApp message]" {
 			continue
 		}

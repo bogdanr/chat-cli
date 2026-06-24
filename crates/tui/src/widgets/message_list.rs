@@ -206,6 +206,14 @@ pub struct MessageLayoutCache {
     total_lines: usize,
     reply_previews: HashMap<Arc<str>, ReplyPreview>,
     thread_summaries: HashMap<MessageId, ThreadSummary>,
+    /// Token of the draw currently in progress, set by [`Self::begin_frame`]
+    /// and cleared by [`Self::end_frame`]. While a frame is active, repeated
+    /// cache lookups within that frame can skip the O(history) layout hash.
+    frame_token: Option<u64>,
+    /// Token at which [`Self::key`] was last confirmed against the message
+    /// history. When this matches the active `frame_token`, the cache is known
+    /// to be valid for the current frame without re-hashing.
+    validated_token: Option<u64>,
 }
 
 impl MessageLayoutCache {
@@ -215,6 +223,23 @@ impl MessageLayoutCache {
         self.total_lines = 0;
         self.reply_previews.clear();
         self.thread_summaries.clear();
+        // Force the next query to re-validate against the history.
+        self.validated_token = None;
+    }
+
+    /// Begin a draw frame. Within a frame, the message set cannot change, so
+    /// the first cache validation is reused by later lookups in the same frame,
+    /// avoiding repeated whole-history hashing (the layout hash currently runs
+    /// 3-4 times per draw).
+    pub fn begin_frame(&mut self, token: u64) {
+        self.frame_token = Some(token);
+    }
+
+    /// End the current draw frame. Outside a frame, every lookup re-hashes the
+    /// history (the original always-validate behaviour) so message mutations
+    /// made during event handling are never missed.
+    pub fn end_frame(&mut self) {
+        self.frame_token = None;
     }
 }
 
@@ -373,22 +398,14 @@ pub fn build_message_lines_with_cache(
     theme: Theme,
     presentation: ConversationPresentation,
 ) -> MessageListRender {
-    let key = MessageLayoutKey {
+    ensure_layout_cache(
+        messages,
         content_width,
-        presentation,
+        link_metadata,
         link_metadata_revision,
-        messages_hash: messages_layout_hash(messages),
-    };
-    if cache.key.as_ref() != Some(&key) {
-        rebuild_message_layout_cache(
-            cache,
-            key,
-            messages,
-            content_width,
-            link_metadata,
-            presentation,
-        );
-    }
+        cache,
+        presentation,
+    );
 
     build_message_lines_from_layout_cache(
         messages,
@@ -836,6 +853,19 @@ fn ensure_layout_cache(
     cache: &mut MessageLayoutCache,
     presentation: ConversationPresentation,
 ) {
+    // Fast path: if the cache was already validated earlier in the current draw
+    // frame and the non-content key fields still match, the message set cannot
+    // have changed mid-frame, so skip the expensive whole-history layout hash.
+    if let Some(token) = cache.frame_token
+        && cache.validated_token == Some(token)
+        && let Some(existing) = &cache.key
+        && existing.content_width == content_width
+        && existing.presentation == presentation
+        && existing.link_metadata_revision == link_metadata_revision
+    {
+        return;
+    }
+
     let key = MessageLayoutKey {
         content_width,
         presentation,
@@ -852,6 +882,9 @@ fn ensure_layout_cache(
             presentation,
         );
     }
+    // Record the token this validation belongs to. Outside a draw frame this is
+    // `None`, so subsequent event-handling lookups always re-hash.
+    cache.validated_token = cache.frame_token;
 }
 
 /// Returns the message id rendered at the absolute layout line `line` plus the

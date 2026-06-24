@@ -41,6 +41,17 @@ const PROVIDER_ID: &str = "slack:setup";
 const PROVIDER_ID_PREFIX: &str = "slack";
 const SLACK_CONVERSATION_TYPES: &str = "public_channel,private_channel,mpim,im";
 const SLACK_HTTP_TIMEOUT: Duration = Duration::from_secs(12);
+// Minimum spacing between Slack Web API requests. Slack rate-limits
+// `conversations.history`/`conversations.list` per method, so issuing one call
+// per conversation every few seconds trips HTTP 429s. Those 429s previously
+// surfaced as opaque transport errors and were retried into a storm. Pacing
+// every request keeps the aggregate rate under Slack's limits.
+const SLACK_MIN_REQUEST_SPACING: Duration = Duration::from_millis(1100);
+// How many times a rate-limited (HTTP 429) request is retried, honoring the
+// server's `Retry-After`, before giving up for this pass.
+const SLACK_RATE_LIMIT_MAX_RETRIES: usize = 4;
+// Backoff used when a 429 response omits a usable `Retry-After` header.
+const SLACK_RATE_LIMIT_DEFAULT_BACKOFF: Duration = Duration::from_secs(5);
 // Files at or below this size are cached eagerly in the background when a
 // message referencing them is rendered. Larger uploads are only fetched when
 // the user explicitly retrieves them from the media card, so a single huge
@@ -64,6 +75,13 @@ const SLACK_OAUTH_REDIRECT_URI: &str = "https://chat-cli.vpn.cafe/slack/oauth/ca
 const SLACK_OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const SLACK_SOCKET_MODE_IDLE_DIAGNOSTIC_AFTER: Duration = Duration::from_secs(60);
 const SLACK_HISTORY_POLL_INTERVAL: Duration = Duration::from_secs(20);
+// Direct/group-direct conversations are polled on a tighter interval than the
+// channel history fallback. Socket Mode never delivers a user's own
+// human-to-human DMs (realtime events are bot-scoped), so this user-token poll
+// is the only path that surfaces them; keeping it brisk avoids noticeable DM
+// latency. The set of im/mpim conversations is tiny, so the extra calls are
+// cheap, and channels stay instant on realtime.
+const SLACK_DM_POLL_INTERVAL: Duration = Duration::from_secs(8);
 // Fetch a small window (not just the single newest message) per conversation
 // each poll so a burst of messages arriving between polls is not collapsed to
 // only the last one. The dedup set plus the `started_at` timestamp gate in
@@ -164,6 +182,7 @@ pub struct SlackProvider {
     connected: AtomicBool,
     realtime_task: RwLock<Option<JoinHandle<()>>>,
     history_poll_task: RwLock<Option<JoinHandle<()>>>,
+    dm_poll_task: RwLock<Option<JoinHandle<()>>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -1610,18 +1629,20 @@ async fn list_web_api_conversations(credential: SlackCredential) -> Result<Vec<S
         let mut cursor: Option<String> = None;
 
         loop {
-            let mut request = slack_http_agent()
-                .get("https://slack.com/api/conversations.list")
-                .header("Authorization", format!("Bearer {token}"))
-                .query("types", SLACK_CONVERSATION_TYPES)
-                .query("exclude_archived", "true")
-                .query("limit", "200");
+            let mut response = slack_get_with_retry("calling Slack conversations.list", || {
+                let mut request = slack_http_agent()
+                    .get("https://slack.com/api/conversations.list")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .query("types", SLACK_CONVERSATION_TYPES)
+                    .query("exclude_archived", "true")
+                    .query("limit", "200");
 
-            if let Some(cursor) = cursor.as_deref().filter(|cursor| !cursor.is_empty()) {
-                request = request.query("cursor", cursor);
-            }
+                if let Some(cursor) = cursor.as_deref().filter(|cursor| !cursor.is_empty()) {
+                    request = request.query("cursor", cursor);
+                }
 
-            let mut response = request.call().context("calling Slack conversations.list")?;
+                request.call()
+            })?;
             let listed: SlackConversationsListResponse = response
                 .body_mut()
                 .read_json()
@@ -1903,20 +1924,20 @@ async fn list_web_api_history(
     let limit = limit.clamp(1, 200).to_string();
 
     tokio::task::spawn_blocking(move || {
-        let mut request = slack_http_agent()
-            .get("https://slack.com/api/conversations.history")
-            .header("Authorization", format!("Bearer {token}"))
-            .query("channel", &chat_id)
-            .query("limit", &limit)
-            .query("inclusive", "false");
+        let mut response = slack_get_with_retry("calling Slack conversations.history", || {
+            let mut request = slack_http_agent()
+                .get("https://slack.com/api/conversations.history")
+                .header("Authorization", format!("Bearer {token}"))
+                .query("channel", &chat_id)
+                .query("limit", &limit)
+                .query("inclusive", "false");
 
-        if let Some(latest) = latest.as_deref() {
-            request = request.query("latest", latest);
-        }
+            if let Some(latest) = latest.as_deref() {
+                request = request.query("latest", latest);
+            }
 
-        let mut response = request
-            .call()
-            .context("calling Slack conversations.history")?;
+            request.call()
+        })?;
         let history: SlackConversationsHistoryResponse = response
             .body_mut()
             .read_json()
@@ -2545,6 +2566,18 @@ impl SlackConnectionState {
         }
     }
 
+    /// User-token credential only, or `None` for bot-only connections. A
+    /// user's own (human-to-human) direct messages live in their personal IM
+    /// channels, which Socket Mode never surfaces because realtime events are
+    /// bot-scoped. Only the user token can read those via `conversations.history`,
+    /// so the dedicated DM poll requires this credential and skips itself when
+    /// no user token is present.
+    fn user_credential(&self) -> Option<SlackCredential> {
+        self.user_token
+            .as_ref()
+            .map(|token| SlackCredential::new(SlackCredentialKind::UserToken, token.clone()))
+    }
+
     fn web_api_credentials(&self) -> Vec<SlackCredential> {
         let mut credentials = Vec::new();
         if let Some(token) = &self.user_token {
@@ -2618,6 +2651,7 @@ impl SlackProvider {
             connected: AtomicBool::new(false),
             realtime_task: RwLock::new(None),
             history_poll_task: RwLock::new(None),
+            dm_poll_task: RwLock::new(None),
         })
     }
 
@@ -2697,6 +2731,7 @@ impl SlackProvider {
                 self.events.send(ProviderEvent::SyncComplete);
                 if validated.capabilities.can_realtime {
                     self.start_realtime();
+                    self.start_dm_polling();
                 } else if validated.capabilities.can_read_history {
                     self.start_history_polling();
                 } else if supports_realtime {
@@ -3538,6 +3573,48 @@ impl SlackProvider {
         }
     }
 
+    /// Start the always-on DM poll alongside realtime. Realtime (Socket Mode)
+    /// is bot-scoped and never delivers the user's own human-to-human DMs, so
+    /// this user-token poll over `im`/`mpim` conversations is the only path
+    /// that surfaces them. Bot-only connections have no user token and cannot
+    /// see those DMs at all, so the poll skips itself. It is not started when
+    /// the full history poll is running, because that already covers DMs.
+    fn start_dm_polling(&self) {
+        let connection = read_lock(&self.connection).clone();
+        let Some(credential) = connection.user_credential() else {
+            slack_diagnostic_log(
+                "slack.dm_poll.skip",
+                format!("account={} reason=no_user_token", self.id),
+            );
+            return;
+        };
+        self.stop_dm_polling();
+        let api_client = self.api_client.clone();
+        let events = self.events.clone();
+        let account = self.id.clone();
+        let current_user_id = connection.user_id.clone();
+        let users = Arc::clone(&self.users);
+        let handle = tokio::spawn(async move {
+            run_dm_poll_loop(
+                api_client,
+                events,
+                account,
+                credential,
+                current_user_id,
+                users,
+                Utc::now(),
+            )
+            .await;
+        });
+        *write_lock(&self.dm_poll_task) = Some(handle);
+    }
+
+    fn stop_dm_polling(&self) {
+        if let Some(handle) = write_lock(&self.dm_poll_task).take() {
+            handle.abort();
+        }
+    }
+
     fn unsupported(&self, action: &str) -> anyhow::Error {
         let options = self.options();
         anyhow!(
@@ -3975,6 +4052,7 @@ impl Provider for SlackProvider {
                 );
                 if capabilities.can_realtime {
                     self.start_realtime();
+                    self.start_dm_polling();
                 } else if capabilities.can_read_history {
                     self.start_history_polling();
                 } else if options.auth_mode.supports_realtime() && capabilities.has_non_realtime() {
@@ -3997,6 +4075,7 @@ impl Provider for SlackProvider {
     async fn disconnect(&self) -> Result<()> {
         self.stop_realtime();
         self.stop_history_polling();
+        self.stop_dm_polling();
         self.connected.store(false, Ordering::Release);
         *write_lock(&self.connection) = SlackConnectionState::default();
         *write_lock(&self.chats) = Vec::new();
@@ -4667,6 +4746,19 @@ fn chat_from_slack_conversation(
     })
 }
 
+/// Per-conversation activity snapshot used to skip polling conversations that
+/// have not changed since the previous pass. Both fields are reported cheaply by
+/// `conversations.list` in a single call, so comparing them lets the poller
+/// avoid a `conversations.history` request — and the UI-waking `ChatUpdated`
+/// event it triggers — for every quiet conversation. A new message bumps
+/// `updated` and/or the unread counter, so an unchanged snapshot reliably means
+/// there is nothing new to fetch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ConversationPollState {
+    updated: Option<i64>,
+    unread_count: u32,
+}
+
 async fn run_history_poll_loop(
     api_client: Arc<dyn SlackApiClient>,
     events: EventBus,
@@ -4694,6 +4786,17 @@ async fn run_history_poll_loop(
     // alerts the user only on hard evidence of missed realtime messages (see
     // `should_alert_undelivered_realtime_messages`).
     let mut seen_message_ids = HashSet::new();
+    // Conversations whose history can never be polled (for example the bot is
+    // not a member, or the channel was archived/deleted). Slack returns the
+    // same hard error for these on every pass, so without remembering them the
+    // fallback re-issues dozens of doomed `conversations.history` calls each
+    // cycle. Because those calls have real latency, a pass over a large
+    // sidebar never finishes before the next one is due, turning a 20s safety
+    // net into a continuous stream of failing requests (and the per-call
+    // network-activity/chat-updated events that wake the UI). Skipping them
+    // keeps the fallback bounded without losing any deliverable message.
+    let mut inaccessible_conversations = HashSet::new();
+    let mut conversation_activity = HashMap::new();
     let mut alerted_missing_realtime = false;
     loop {
         if let Some(flag) = &realtime_events_seen
@@ -4715,6 +4818,9 @@ async fn run_history_poll_loop(
             &users,
             started_at,
             &mut seen_message_ids,
+            &mut inaccessible_conversations,
+            &mut conversation_activity,
+            realtime_events_seen.as_deref(),
         )
         .await;
 
@@ -4761,6 +4867,78 @@ fn should_alert_undelivered_realtime_messages(
     delivered_live_message && realtime_events_seen == Some(false) && !already_alerted
 }
 
+/// Returns whether a `conversations.history` error means the conversation can
+/// never be polled successfully, so it should be dropped from future poll
+/// passes instead of retried forever. These are membership/existence errors:
+/// retrying them only wastes API calls and wakes the UI with network-activity
+/// events. Accessible channels stay covered by realtime and the periodic poll.
+fn slack_error_is_permanently_inaccessible(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    [
+        "channel_not_found",
+        "not_in_channel",
+        "is_archived",
+        "method_not_supported_for_channel_type",
+    ]
+    .iter()
+    .any(|code| message.contains(code))
+}
+
+/// Always-on poll over the user's own direct and group-direct conversations,
+/// using the user token, that runs concurrently with realtime.
+///
+/// Socket Mode / the Events API is bot-scoped: it only delivers events for
+/// conversations the app is a member of, so a user's personal
+/// (human-to-human) DMs never arrive over realtime. `conversations.history`
+/// with the user token is the only Slack API that surfaces them, so this loop
+/// keeps polling the `im`/`mpim` conversations regardless of whether realtime
+/// is healthy. Channels stay instant on realtime and are deliberately excluded
+/// here so this poll stays small.
+///
+/// Liveness gating mirrors the channel fallback: a private per-loop dedup set
+/// plus the `started_at` anchor mean already-seen or pre-startup messages are
+/// never re-surfaced as live. Delivering a message that realtime also delivers
+/// is harmless because storage upserts messages idempotently by id.
+async fn run_dm_poll_loop(
+    api_client: Arc<dyn SlackApiClient>,
+    events: EventBus,
+    account: ProviderId,
+    credential: SlackCredential,
+    current_user_id: Option<String>,
+    users: Arc<RwLock<HashMap<String, SlackUser>>>,
+    started_at: Timestamp,
+) {
+    slack_diagnostic_log(
+        "slack.dm_poll.start",
+        format!(
+            "account={account} interval_s={}",
+            SLACK_DM_POLL_INTERVAL.as_secs()
+        ),
+    );
+    let mut seen_message_ids = HashSet::new();
+    let mut inaccessible_conversations = HashSet::new();
+    let mut conversation_activity = HashMap::new();
+    loop {
+        run_conversation_poll_pass(
+            &api_client,
+            &events,
+            &account,
+            &credential,
+            current_user_id.as_deref(),
+            &users,
+            started_at,
+            &mut seen_message_ids,
+            &mut inaccessible_conversations,
+            &mut conversation_activity,
+            None,
+            |conversation| conversation.is_im || conversation.is_mpim,
+        )
+        .await;
+
+        tokio::time::sleep(SLACK_DM_POLL_INTERVAL).await;
+    }
+}
+
 /// One full poll over every sidebar conversation. Returns whether at least one
 /// live (notify-worthy) message was delivered during this pass.
 async fn run_history_poll_pass(
@@ -4772,6 +4950,48 @@ async fn run_history_poll_pass(
     users: &Arc<RwLock<HashMap<String, SlackUser>>>,
     started_at: Timestamp,
     seen_message_ids: &mut HashSet<String>,
+    inaccessible: &mut HashSet<String>,
+    activity: &mut HashMap<String, ConversationPollState>,
+    stop_signal: Option<&AtomicBool>,
+) -> bool {
+    run_conversation_poll_pass(
+        api_client,
+        events,
+        account,
+        credential,
+        current_user_id,
+        users,
+        started_at,
+        seen_message_ids,
+        inaccessible,
+        activity,
+        stop_signal,
+        include_conversation_in_sidebar,
+    )
+    .await
+}
+
+/// Shared body for the conversation polling loops. Polls every conversation
+/// the `include` predicate accepts, emits `ChatUpdated` for each, and surfaces
+/// any newly observed message that is also newer than `started_at`. Returns
+/// whether at least one live (notify-worthy) message was delivered.
+///
+/// The predicate is what separates the two pollers: the channel history
+/// fallback includes the full sidebar, while the always-on DM poll narrows to
+/// `im`/`mpim` conversations that Socket Mode cannot deliver.
+async fn run_conversation_poll_pass(
+    api_client: &Arc<dyn SlackApiClient>,
+    events: &EventBus,
+    account: &ProviderId,
+    credential: &SlackCredential,
+    current_user_id: Option<&str>,
+    users: &Arc<RwLock<HashMap<String, SlackUser>>>,
+    started_at: Timestamp,
+    seen_message_ids: &mut HashSet<String>,
+    inaccessible: &mut HashSet<String>,
+    activity: &mut HashMap<String, ConversationPollState>,
+    stop_signal: Option<&AtomicBool>,
+    include: impl Fn(&SlackConversation) -> bool,
 ) -> bool {
     let mut delivered_live_message = false;
     match api_client.list_conversations(credential.clone()).await {
@@ -4780,10 +5000,39 @@ async fn run_history_poll_pass(
                 direction: NetworkActivityDirection::Rx,
                 kind: NetworkActivityKind::History,
             });
-            for conversation in conversations
+            let pollable: Vec<SlackConversation> = conversations
                 .into_iter()
-                .filter(|conversation| include_conversation_in_sidebar(conversation))
-            {
+                .filter(|conversation| {
+                    include(conversation) && !inaccessible.contains(&conversation.id)
+                })
+                .collect();
+            for conversation in pollable {
+                if let Some(stop) = stop_signal
+                    && stop.load(Ordering::Acquire)
+                {
+                    // Realtime began delivering events mid-pass. Abandon the
+                    // rest of this safety-net pass immediately instead of
+                    // issuing dozens of now-redundant history calls.
+                    break;
+                }
+
+                let snapshot = ConversationPollState {
+                    updated: conversation.updated,
+                    unread_count: conversation.unread_count,
+                };
+                // Skip conversations that have not changed since the previous
+                // pass. A new message bumps `updated` and/or the unread
+                // counter, so an unchanged snapshot means there is nothing new
+                // to fetch. This collapses steady-state polling from "every
+                // conversation every pass" to "only conversations with new
+                // activity", which is the dominant idle-CPU cost in a connected
+                // but silent workspace. Newly observed conversations have no
+                // prior snapshot and are always polled once to establish a
+                // baseline (and surface any startup backlog).
+                if activity.get(&conversation.id).copied() == Some(snapshot) {
+                    continue;
+                }
+
                 let Some(mut chat) = chat_from_slack_conversation(account, &conversation) else {
                     continue;
                 };
@@ -4807,6 +5056,10 @@ async fn run_history_poll_pass(
                     .await
                 {
                     Ok(messages) => {
+                        // Commit the baseline only after a successful fetch so a
+                        // transient error is retried on the next pass instead of
+                        // being silently skipped until the next activity bump.
+                        activity.insert(conversation.id.clone(), snapshot);
                         for message in messages {
                             let first_seen = seen_message_ids
                                 .insert(format!("{}:{}", message.chat_id, message.id));
@@ -4826,10 +5079,33 @@ async fn run_history_poll_pass(
                             }
                         }
                     }
-                    Err(error) => slack_diagnostic_log(
-                        "slack.history_poll.history_failed",
-                        sanitize_slack_error(&error),
-                    ),
+                    Err(error) => {
+                        if slack_error_is_permanently_inaccessible(&error) {
+                            // Drop the conversation from future passes: it can
+                            // never deliver history, and retrying it every cycle
+                            // is what keeps the fallback (and the UI) busy.
+                            inaccessible.insert(conversation.id.clone());
+                            // Record a baseline too, so that if it ever becomes
+                            // accessible again only genuinely new activity
+                            // re-triggers a fetch.
+                            activity.insert(conversation.id.clone(), snapshot);
+                            slack_diagnostic_log(
+                                "slack.history_poll.skip_inaccessible",
+                                format!(
+                                    "conversation={} {}",
+                                    conversation.id,
+                                    sanitize_slack_error(&error)
+                                ),
+                            );
+                        } else {
+                            // Transient failure: leave the baseline untouched so
+                            // the conversation is retried on the next pass.
+                            slack_diagnostic_log(
+                                "slack.history_poll.history_failed",
+                                sanitize_slack_error(&error),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -7200,10 +7476,80 @@ fn slack_chat_sort_bucket(chat: &Chat) -> u8 {
 }
 
 fn slack_http_agent() -> ureq::Agent {
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(SLACK_HTTP_TIMEOUT))
-        .build();
-    ureq::Agent::new_with_config(config)
+    // A single pooled agent is reused for every request so kept-alive
+    // connections (and their TLS handshakes) are shared across calls. Building
+    // a fresh agent per request, as this used to, forced a new TLS handshake
+    // for every poll and was a major source of background CPU.
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            let config = ureq::Agent::config_builder()
+                .timeout_global(Some(SLACK_HTTP_TIMEOUT))
+                // Surface 4xx/5xx as ordinary responses so callers can inspect
+                // the status (notably 429) and honor Retry-After instead of
+                // collapsing it into an opaque transport error.
+                .http_status_as_error(false)
+                .build();
+            ureq::Agent::new_with_config(config)
+        })
+        .clone()
+}
+
+/// Paces Slack Web API requests to a global minimum spacing so concurrent poll
+/// loops never burst past Slack's per-method rate limits. Each caller reserves
+/// the next slot and sleeps (on its blocking worker thread) until then.
+fn slack_throttle_web_api() {
+    static NEXT_ALLOWED: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = Instant::now();
+    let proceed_at = {
+        let mut guard = NEXT_ALLOWED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let at = guard.filter(|next| *next > now).unwrap_or(now);
+        *guard = Some(at + SLACK_MIN_REQUEST_SPACING);
+        at
+    };
+    if let Some(wait) = proceed_at.checked_duration_since(now) {
+        std::thread::sleep(wait);
+    }
+}
+
+/// Sends a throttled Slack GET, retrying on HTTP 429 while honoring the
+/// server's `Retry-After`. `send` is re-invoked per attempt because each ureq
+/// request builder is consumed by `.call()`. Must run on a blocking thread.
+fn slack_get_with_retry(
+    context_label: &'static str,
+    send: impl Fn() -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let mut attempt = 0;
+    loop {
+        slack_throttle_web_api();
+        let response = send().context(context_label)?;
+        if response.status().as_u16() == 429 && attempt < SLACK_RATE_LIMIT_MAX_RETRIES {
+            attempt += 1;
+            let backoff = slack_retry_after(&response).unwrap_or(SLACK_RATE_LIMIT_DEFAULT_BACKOFF);
+            slack_diagnostic_log(
+                "slack.web_api.rate_limited",
+                format!(
+                    "context={context_label} retry_after_s={} attempt={attempt}",
+                    backoff.as_secs()
+                ),
+            );
+            std::thread::sleep(backoff);
+            continue;
+        }
+        return Ok(response);
+    }
+}
+
+fn slack_retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
+    let seconds = response
+        .headers()
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds.clamp(1, 60)))
 }
 
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
@@ -7658,6 +8004,11 @@ mod tests {
                 before,
                 limit,
             ));
+            // Simulate a conversation the caller can never read so tests can
+            // assert the poller stops retrying it.
+            if chat_id.as_ref().contains("NOTFOUND") {
+                bail!("Slack conversations.history failed: channel_not_found");
+            }
             let mut messages = self
                 .history_messages
                 .lock()
@@ -8056,6 +8407,18 @@ mod tests {
         }
     }
 
+    /// Simulates new activity in a conversation by advancing the `updated`
+    /// marker the activity-gated poller compares against, so a test can force
+    /// the conversation to be re-polled on the next pass.
+    fn bump_conversation_updated(client: &FakeSlackApiClient, id: &str, updated: i64) {
+        let mut conversations = client.conversations.lock().unwrap();
+        for conversation in conversations.iter_mut() {
+            if conversation.id == id {
+                conversation.updated = Some(updated);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn history_poll_pass_reports_live_deliveries_and_dedupes_repeats() {
         let client = Arc::new(FakeSlackApiClient::default());
@@ -8080,9 +8443,12 @@ mod tests {
             SlackCredential::new(SlackCredentialKind::UserToken, "xoxp-test".to_owned());
         let users = Arc::new(RwLock::new(HashMap::new()));
         let mut seen_message_ids = HashSet::new();
+        let mut inaccessible = HashSet::new();
+        let mut activity = HashMap::new();
 
-        // Backlog-only pass: nothing is delivered live, so the idle fallback
-        // has no evidence of missed realtime messages and must not alert.
+        // Backlog-only pass: the conversation is observed for the first time, so
+        // it is polled, but nothing is delivered live and the idle fallback has
+        // no evidence of missed realtime messages and must not alert.
         assert!(
             !run_history_poll_pass(
                 &api_client,
@@ -8093,17 +8459,21 @@ mod tests {
                 &users,
                 started_at,
                 &mut seen_message_ids,
+                &mut inaccessible,
+                &mut activity,
+                None,
             )
             .await
         );
 
-        // A genuinely new message is reported as a live delivery exactly
-        // once; re-observing it on the next pass is not new evidence.
+        // A genuinely new message, surfaced after the conversation's activity
+        // markers advance, is reported as a live delivery exactly once.
         client
             .history_messages
             .lock()
             .unwrap()
             .push(poll_history_message("C123", "1710000010.000200", live));
+        bump_conversation_updated(&client, "C123", 1_710_000_100);
         assert!(
             run_history_poll_pass(
                 &api_client,
@@ -8114,9 +8484,16 @@ mod tests {
                 &users,
                 started_at,
                 &mut seen_message_ids,
+                &mut inaccessible,
+                &mut activity,
+                None,
             )
             .await
         );
+
+        // Re-observing the same message on a later pass — even when activity
+        // advances again so the conversation is re-polled — is not new evidence.
+        bump_conversation_updated(&client, "C123", 1_710_000_200);
         assert!(
             !run_history_poll_pass(
                 &api_client,
@@ -8127,9 +8504,281 @@ mod tests {
                 &users,
                 started_at,
                 &mut seen_message_ids,
+                &mut inaccessible,
+                &mut activity,
+                None,
             )
             .await
         );
+    }
+
+    #[tokio::test]
+    async fn poll_pass_skips_unchanged_conversations() {
+        // The activity gate must not re-poll a conversation whose activity
+        // markers are unchanged since the previous pass. This is what stops the
+        // safety-net poller from issuing a `conversations.history` call (and the
+        // UI-waking events it triggers) for every quiet conversation on every
+        // pass — the dominant idle-CPU cost in a connected but silent workspace.
+        let client = Arc::new(FakeSlackApiClient::default());
+        client
+            .conversations
+            .lock()
+            .unwrap()
+            .push(channel_conversation("C123", "general", 1_710_000_000));
+
+        let started_at = Utc::now();
+        let api_client: Arc<dyn SlackApiClient> = client.clone();
+        let events = EventBus::new();
+        let account = arc_str("slack:test");
+        let credential =
+            SlackCredential::new(SlackCredentialKind::UserToken, "xoxp-test".to_owned());
+        let users = Arc::new(RwLock::new(HashMap::new()));
+        let mut seen_message_ids = HashSet::new();
+        let mut inaccessible = HashSet::new();
+        let mut activity = HashMap::new();
+
+        for _ in 0..3 {
+            run_history_poll_pass(
+                &api_client,
+                &events,
+                &account,
+                &credential,
+                Some("U123"),
+                &users,
+                started_at,
+                &mut seen_message_ids,
+                &mut inaccessible,
+                &mut activity,
+                None,
+            )
+            .await;
+        }
+
+        let calls = client
+            .history_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, chat_id, _, _)| chat_id.as_ref() == "C123")
+            .count();
+        assert_eq!(
+            calls, 1,
+            "an unchanged conversation must be polled once to establish a baseline, then skipped"
+        );
+
+        // Once its activity markers advance (a new message bumps `updated`), it
+        // is polled again so the message can be delivered.
+        bump_conversation_updated(&client, "C123", 1_710_000_500);
+        run_history_poll_pass(
+            &api_client,
+            &events,
+            &account,
+            &credential,
+            Some("U123"),
+            &users,
+            started_at,
+            &mut seen_message_ids,
+            &mut inaccessible,
+            &mut activity,
+            None,
+        )
+        .await;
+
+        let calls_after_activity = client
+            .history_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, chat_id, _, _)| chat_id.as_ref() == "C123")
+            .count();
+        assert_eq!(
+            calls_after_activity, 2,
+            "a conversation with new activity must be re-polled"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_pass_stops_polling_inaccessible_conversations() {
+        // A conversation that always returns channel_not_found must be dropped
+        // from future passes instead of being retried forever, which is what
+        // otherwise keeps the fallback (and the UI) busy.
+        let client = Arc::new(FakeSlackApiClient::default());
+        {
+            let mut conversations = client.conversations.lock().unwrap();
+            conversations.push(channel_conversation("C-NOTFOUND", "ghost", 1_710_000_000));
+            conversations.push(channel_conversation("C123", "general", 1_710_000_000));
+        }
+
+        let started_at = Utc::now();
+        let api_client: Arc<dyn SlackApiClient> = client.clone();
+        let events = EventBus::new();
+        let account = arc_str("slack:test");
+        let credential =
+            SlackCredential::new(SlackCredentialKind::UserToken, "xoxp-test".to_owned());
+        let users = Arc::new(RwLock::new(HashMap::new()));
+        let mut seen_message_ids = HashSet::new();
+        let mut inaccessible = HashSet::new();
+        let mut activity = HashMap::new();
+
+        for pass in 0..3 {
+            // Advance activity each pass so the accessible conversation keeps
+            // qualifying for a poll; the inaccessible one is dropped via the
+            // `inaccessible` set regardless of its activity markers.
+            let updated = 1_710_000_001 + pass as i64;
+            bump_conversation_updated(&client, "C123", updated);
+            bump_conversation_updated(&client, "C-NOTFOUND", updated);
+            run_history_poll_pass(
+                &api_client,
+                &events,
+                &account,
+                &credential,
+                Some("U123"),
+                &users,
+                started_at,
+                &mut seen_message_ids,
+                &mut inaccessible,
+                &mut activity,
+                None,
+            )
+            .await;
+        }
+
+        assert!(
+            inaccessible.contains("C-NOTFOUND"),
+            "inaccessible conversation should be remembered"
+        );
+
+        let ghost_calls = client
+            .history_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, chat_id, _, _)| chat_id.as_ref() == "C-NOTFOUND")
+            .count();
+        assert_eq!(
+            ghost_calls, 1,
+            "inaccessible conversation must be polled at most once, not every pass"
+        );
+
+        let good_calls = client
+            .history_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, chat_id, _, _)| chat_id.as_ref() == "C123")
+            .count();
+        assert_eq!(
+            good_calls, 3,
+            "accessible conversation must keep being polled every pass"
+        );
+    }
+
+    fn collect_message_chat_ids(receiver: &mut broadcast::Receiver<ProviderEvent>) -> Vec<String> {
+        let mut chat_ids = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let ProviderEvent::Message { message, .. } = event {
+                chat_ids.push(message.chat_id.to_string());
+            }
+        }
+        chat_ids
+    }
+
+    #[tokio::test]
+    async fn dm_poll_pass_surfaces_dms_and_mpims_but_excludes_channels() {
+        // The DM poll runs concurrently with realtime. Realtime already
+        // delivers channel traffic, so the DM poll must only fetch the
+        // user's own im/mpim conversations (which Socket Mode never
+        // surfaces) and must leave channels alone.
+        let client = Arc::new(FakeSlackApiClient::default());
+        {
+            let mut conversations = client.conversations.lock().unwrap();
+            conversations.push(channel_conversation("C123", "general", 1_710_000_000));
+            conversations.push(dm_conversation("D456", "U999", 1_710_000_000));
+            conversations.push(mpim_conversation("G789", Some("mpdm-team"), 1_710_000_000));
+        }
+
+        let started_at = Utc::now();
+        let live = started_at + chrono::Duration::seconds(5);
+        {
+            let mut history = client.history_messages.lock().unwrap();
+            // A channel message that realtime would handle; the DM poll must
+            // never fetch or deliver it.
+            history.push(poll_history_message("C123", "1710000001.000100", live));
+            history.push(poll_history_message("D456", "1710000002.000200", live));
+            history.push(poll_history_message("G789", "1710000003.000300", live));
+        }
+
+        let api_client: Arc<dyn SlackApiClient> = client.clone();
+        let events = EventBus::new();
+        let mut receiver = events.subscribe();
+        let account = arc_str("slack:test");
+        let credential =
+            SlackCredential::new(SlackCredentialKind::UserToken, "xoxp-test".to_owned());
+        let users = Arc::new(RwLock::new(HashMap::new()));
+        let mut seen_message_ids = HashSet::new();
+        let mut activity = HashMap::new();
+
+        let dm_filter = |conversation: &SlackConversation| conversation.is_im || conversation.is_mpim;
+
+        // First pass: both DM-class messages are delivered live exactly once;
+        // the channel message is never delivered by the DM poll.
+        assert!(
+            run_conversation_poll_pass(
+                &api_client,
+                &events,
+                &account,
+                &credential,
+                Some("U123"),
+                &users,
+                started_at,
+                &mut seen_message_ids,
+                &mut HashSet::new(),
+                &mut activity,
+                None,
+                dm_filter,
+            )
+            .await
+        );
+        let mut delivered = collect_message_chat_ids(&mut receiver);
+        delivered.sort();
+        assert_eq!(delivered, vec!["D456".to_owned(), "G789".to_owned()]);
+
+        // The DM poll must only ever query im/mpim history, never channels.
+        let polled_channels: Vec<String> = client
+            .history_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, chat_id, _, _)| chat_id.to_string())
+            .collect();
+        assert!(polled_channels.contains(&"D456".to_owned()));
+        assert!(polled_channels.contains(&"G789".to_owned()));
+        assert!(
+            !polled_channels.contains(&"C123".to_owned()),
+            "DM poll must not fetch channel history, polled: {polled_channels:?}"
+        );
+
+        // Second pass: the conversations' activity markers are unchanged, so
+        // the gate skips them entirely — nothing is re-fetched or re-delivered
+        // even though realtime may also have delivered them.
+        assert!(
+            !run_conversation_poll_pass(
+                &api_client,
+                &events,
+                &account,
+                &credential,
+                Some("U123"),
+                &users,
+                started_at,
+                &mut seen_message_ids,
+                &mut HashSet::new(),
+                &mut activity,
+                None,
+                dm_filter,
+            )
+            .await
+        );
+        assert!(collect_message_chat_ids(&mut receiver).is_empty());
     }
 
     #[test]
@@ -8563,16 +9212,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_prefers_realtime_when_app_token_is_available() -> Result<()> {
+    async fn connect_prefers_realtime_for_channels_and_polls_dms_concurrently() -> Result<()> {
         let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
         options.user_token = Some("xoxp-user".to_owned());
         options.app_token = Some("xapp-realtime".to_owned());
         let client = Arc::new(FakeSlackApiClient::default());
         let provider = provider_with_fake_client(options, client.clone())?;
+        let mut events = provider.events();
 
         provider.connect().await?;
-        for _ in 0..20 {
-            if !client.opened_socket_modes.lock().unwrap().is_empty() {
+        // Realtime (Socket Mode) is the primary path for channels, and the
+        // user-token DM poll runs concurrently because Socket Mode cannot
+        // surface the user's own direct messages. Wait for both to start.
+        for _ in 0..50 {
+            if !client.opened_socket_modes.lock().unwrap().is_empty()
+                && !client.listed_conversations.lock().unwrap().is_empty()
+            {
                 break;
             }
             tokio::task::yield_now().await;
@@ -8593,10 +9248,24 @@ mod tests {
             vec![SlackCredentialKind::AppToken],
             "Socket Mode is the primary interactive chat path when an app token is configured"
         );
+        // The DM poll lists conversations with the user token (the only token
+        // that can read the user's personal DMs), concurrently with realtime.
         assert!(
-            client.listed_conversations.lock().unwrap().is_empty(),
-            "history polling should not start immediately when realtime is available"
+            client
+                .listed_conversations
+                .lock()
+                .unwrap()
+                .contains(&SlackCredentialKind::UserToken),
+            "the DM poll must list conversations with the user token while realtime handles channels"
         );
+        // It must not degrade to the "realtime unavailable" history fallback,
+        // which would emit a system notice.
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, ProviderEvent::AccountNotice { .. }),
+                "realtime-capable connect must not warn about realtime being unavailable"
+            );
+        }
         Ok(())
     }
 

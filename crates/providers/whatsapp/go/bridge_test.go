@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -103,7 +104,7 @@ func TestConversationActivityUsesNewestPayloadMessage(t *testing.T) {
 		historyTestMessage(newer, &waProto.Message{Conversation: proto.String("latest")}),
 	}
 
-	gotTs, gotPreview := conversationActivity(messages, 0)
+	gotTs, gotPreview := conversationActivity(nil, context.Background(), messages, 0)
 	if !gotTs.Equal(newer) {
 		t.Fatalf("expected newest message timestamp %s, got %s", newer, gotTs)
 	}
@@ -117,7 +118,7 @@ func TestConversationActivityFallsBackToConversationTimestamp(t *testing.T) {
 	// conversation's last-message timestamp must still mark the chat as
 	// recently active so it is not shown as never contacted.
 	last := time.Date(2026, 6, 8, 9, 0, 0, 0, time.UTC)
-	gotTs, gotPreview := conversationActivity(nil, uint64(last.Unix()))
+	gotTs, gotPreview := conversationActivity(nil, context.Background(), nil, uint64(last.Unix()))
 	if !gotTs.Equal(last) {
 		t.Fatalf("expected fallback timestamp %s, got %s", last, gotTs)
 	}
@@ -125,7 +126,7 @@ func TestConversationActivityFallsBackToConversationTimestamp(t *testing.T) {
 		t.Fatalf("expected no preview for metadata-only fallback, got %q", gotPreview)
 	}
 
-	gotTs, _ = conversationActivity(nil, 0)
+	gotTs, _ = conversationActivity(nil, context.Background(), nil, 0)
 	if !gotTs.IsZero() {
 		t.Fatalf("expected zero time when no activity is known, got %s", gotTs)
 	}
@@ -140,7 +141,7 @@ func TestConversationActivitySkipsNonDisplayableMessages(t *testing.T) {
 		historyTestMessage(newer, reaction),
 	}
 
-	gotTs, gotPreview := conversationActivity(messages, 0)
+	gotTs, gotPreview := conversationActivity(nil, context.Background(), messages, 0)
 	if !gotTs.Equal(older) {
 		t.Fatalf("expected reaction to be skipped in favour of %s, got %s", older, gotTs)
 	}
@@ -187,5 +188,37 @@ func TestDisplayableMessageUnwrapsViewOncePhoto(t *testing.T) {
 	}
 	if event.MediaID == "" {
 		t.Fatal("expected wrapped photo to receive a media id")
+	}
+}
+
+func TestRewriteMentionTokensReplacesUserPartsWithNames(t *testing.T) {
+	// WhatsApp carries the mention as the bare JID user-part in the body; the
+	// UI must show the contact name instead of the raw number.
+	text := "chiar @34819417346247 , care a fost root cause-ul?"
+	names := map[string]string{"34819417346247": "Razvan"}
+	got := rewriteMentionTokens(text, names)
+	want := "chiar @Razvan , care a fost root cause-ul?"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestRewriteMentionTokensAppliesLongestUserPartFirst(t *testing.T) {
+	// A shorter number that is a prefix of a longer one must not corrupt the
+	// longer mention, so replacement happens longest user-part first.
+	text := "@123 and @12345"
+	names := map[string]string{"123": "Ana", "12345": "Bob"}
+	got := rewriteMentionTokens(text, names)
+	want := "@Ana and @Bob"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestRewriteMentionTokensLeavesUnknownMentionsUnchanged(t *testing.T) {
+	// An unresolved JID is left as-is so the mention is never dropped.
+	text := "hi @999"
+	if got := rewriteMentionTokens(text, map[string]string{}); got != text {
+		t.Fatalf("expected text unchanged, got %q", got)
 	}
 }

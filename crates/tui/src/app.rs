@@ -2657,6 +2657,10 @@ pub struct App {
     forward_send_tx: mpsc::UnboundedSender<ForwardSendResult>,
     forward_send_rx: mpsc::UnboundedReceiver<ForwardSendResult>,
     message_layout_cache: message_list::MessageLayoutCache,
+    /// Monotonic counter identifying the current draw frame. Bumped once per
+    /// [`Self::draw`] so the message layout cache can memoize its validity
+    /// check across the multiple lookups performed within a single draw.
+    draw_frame_counter: u64,
     avatar_preview_cache: HashMap<AvatarPreviewKey, Result<AvatarPreviewData, String>>,
     pending_avatar_previews: HashSet<AvatarPreviewKey>,
     avatar_preview_tx: mpsc::UnboundedSender<AvatarPreviewFetchResult>,
@@ -2777,6 +2781,7 @@ impl App {
             forward_send_tx,
             forward_send_rx,
             message_layout_cache: message_list::MessageLayoutCache::default(),
+            draw_frame_counter: 0,
             avatar_preview_cache: HashMap::new(),
             pending_avatar_previews: HashSet::new(),
             avatar_preview_tx,
@@ -4170,6 +4175,11 @@ impl App {
 
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let draw_started = Instant::now();
+        // Open a draw frame so the message layout cache only hashes the whole
+        // history once per draw instead of on every internal lookup.
+        self.draw_frame_counter = self.draw_frame_counter.wrapping_add(1);
+        self.message_layout_cache
+            .begin_frame(self.draw_frame_counter);
         let layout_started = Instant::now();
         self.state.frame_area = frame.area();
         let compose_height = self.compose_height(frame.area());
@@ -4288,6 +4298,7 @@ impl App {
                 overlay_draw_details(self)
             ),
         );
+        self.message_layout_cache.end_frame();
     }
 
     fn visible_pane_areas(&self, layout: AppLayout) -> PaneAreas {
