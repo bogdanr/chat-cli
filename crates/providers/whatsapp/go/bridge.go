@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -48,6 +49,13 @@ type client struct {
 	logPath   string
 	wa        *whatsmeow.Client
 	cancel    context.CancelFunc
+	// offlineSync is true while the server is replaying events the client
+	// missed during downtime (between OfflineSyncPreview and
+	// OfflineSyncCompleted). Messages delivered in this window are catch-up
+	// backlog, not live arrivals: they must update history and unread state
+	// but must never raise an audio/desktop notification, because the user
+	// was already alerted on their phone (and may have already read them).
+	offlineSync atomic.Bool
 }
 
 type bridgeReaction struct {
@@ -1106,7 +1114,24 @@ func emitChatReadEvent(c *client, chatJID types.JID) {
 func handleWhatsAppEvent(c *client, evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
-		emitMessageEvent(c, v, "message")
+		// During offline-sync replay, tag the message as backlog so the
+		// consumer suppresses notifications while still recording history and
+		// unread counts. Live messages (steady-state) use "message".
+		eventType := "message"
+		if c != nil && c.offlineSync.Load() {
+			eventType = "offline"
+		}
+		emitMessageEvent(c, v, eventType)
+	case *events.OfflineSyncPreview:
+		if c != nil {
+			c.offlineSync.Store(true)
+			c.log("offline sync started: replaying %d missed messages", v.Messages)
+		}
+	case *events.OfflineSyncCompleted:
+		if c != nil {
+			c.offlineSync.Store(false)
+			c.log("offline sync completed after %d events", v.Count)
+		}
 	case *events.Mute:
 		emitMuteEvent(c, v)
 	case *events.HistorySync:

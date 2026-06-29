@@ -8924,6 +8924,15 @@ impl App {
                 self.state.status = format!("reaction updated from {provider_id}");
             }
             ProviderEvent::ChatMarkedRead { chat_id } => {
+                // The chat was read on another device. Any not-yet-delivered
+                // notification or voice summary for it is now stale: drop it so
+                // catch-up/offline-sync read receipts silence alerts for
+                // messages the user already read elsewhere.
+                self.cancel_pending_notifications_for_chat(
+                    &provider_id,
+                    &chat_id,
+                    "read_elsewhere",
+                );
                 let updated = self
                     .state
                     .chats
@@ -24093,6 +24102,60 @@ mod tests {
         for _ in 0..NOTIFICATION_TICKS {
             app.handle_event(AppEvent::Tick).await?;
         }
+        assert!(!app.state().notification_visible());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_marked_read_elsewhere_cancels_pending_notification() -> Result<()> {
+        // A message that arrived while a chat was in the background queues a
+        // delayed notification. If the chat is then marked read on another
+        // device (e.g. the phone, or an offline-sync read receipt replayed on
+        // reconnect), the still-pending notification is stale and must be
+        // cancelled so no audio/desktop alert fires for an already-read message.
+        let mut app = test_app().await?;
+        app.settings.notifications = NotificationMode::InApp;
+        let background_chat = app
+            .state()
+            .chats()
+            .iter()
+            .find(|chat| chat.name.as_ref() == "Alice Chen")
+            .unwrap()
+            .clone();
+        let message = test_incoming_message(
+            &background_chat,
+            "mock:msg:read-elsewhere:alice",
+            "Alice",
+            "Already read on the phone",
+        );
+
+        app.handle_event(AppEvent::Provider(
+            background_chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+        assert_eq!(app.state().pending_notification_count(), 1);
+
+        app.handle_event(AppEvent::Provider(
+            background_chat.account.clone(),
+            Box::new(ProviderEvent::ChatMarkedRead {
+                chat_id: background_chat.id.clone(),
+            }),
+        ))
+        .await?;
+
+        assert_eq!(
+            app.state().pending_notification_count(),
+            0,
+            "reading the chat elsewhere must cancel its pending notification"
+        );
+
+        // Draining ticks must therefore surface no notification overlay.
+        app.handle_event(AppEvent::Tick).await?;
         assert!(!app.state().notification_visible());
 
         Ok(())

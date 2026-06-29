@@ -222,3 +222,25 @@ func TestRewriteMentionTokensLeavesUnknownMentionsUnchanged(t *testing.T) {
 		t.Fatalf("expected text unchanged, got %q", got)
 	}
 }
+
+func TestOfflineSyncWindowTogglesBacklogFlag(t *testing.T) {
+	// The offline-sync window brackets the server's replay of events missed
+	// during downtime. While it is open, messages must be classified as
+	// backlog so consumers stay silent; once it closes, messages are live
+	// again. These events never touch the whatsmeow client, so a bare client
+	// value is enough to exercise the state machine.
+	c := &client{}
+	if c.offlineSync.Load() {
+		t.Fatal("offline sync flag must start cleared")
+	}
+
+	handleWhatsAppEvent(c, &events.OfflineSyncPreview{Messages: 3})
+	if !c.offlineSync.Load() {
+		t.Fatal("expected offline sync flag to be set after OfflineSyncPreview")
+	}
+
+	handleWhatsAppEvent(c, &events.OfflineSyncCompleted{Count: 3})
+	if c.offlineSync.Load() {
+		t.Fatal("expected offline sync flag to be cleared after OfflineSyncCompleted")
+	}
+}

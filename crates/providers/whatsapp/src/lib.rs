@@ -1284,13 +1284,16 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
             }
         }
         "message" => {
-            forward_message_event(context, event, false);
+            forward_message_event(context, event, MessageDelivery::Live);
         }
         "history" => {
-            forward_message_event(context, event, true);
+            forward_message_event(context, event, MessageDelivery::HistorySync);
+        }
+        "offline" => {
+            forward_message_event(context, event, MessageDelivery::OfflineBacklog);
         }
         "sent" => {
-            forward_message_event(context, event, false);
+            forward_message_event(context, event, MessageDelivery::Live);
         }
         "profile" => {
             forward_profile_event(
@@ -1339,11 +1342,49 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
     }
 }
 
+/// How an incoming bridge message should be treated by the rest of the app.
+///
+/// WhatsApp surfaces three distinct delivery situations that need different
+/// handling for notifications versus unread state:
+/// - [`MessageDelivery::Live`]: a message arriving in steady state. It both
+///   raises a notification and increments unread.
+/// - [`MessageDelivery::HistorySync`]: bulk history replay (initial sync /
+///   on-demand backfill). It is silent and does not affect unread, because it
+///   reflects already-seen conversation history.
+/// - [`MessageDelivery::OfflineBacklog`]: messages the client missed while it
+///   was disconnected, replayed by the server on reconnect. It must stay
+///   silent (the phone already alerted the user, who may have already read
+///   them) yet still increment unread so genuinely-unread messages keep their
+///   badge; matching read receipts replayed in the same batch clear the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageDelivery {
+    Live,
+    HistorySync,
+    OfflineBacklog,
+}
+
+impl MessageDelivery {
+    /// Whether the message is replayed (not a fresh live arrival). Replayed
+    /// messages never raise notifications.
+    fn is_historical(self) -> bool {
+        !matches!(self, MessageDelivery::Live)
+    }
+
+    /// Whether the message should contribute to the chat's unread count.
+    fn counts_toward_unread(self) -> bool {
+        matches!(
+            self,
+            MessageDelivery::Live | MessageDelivery::OfflineBacklog
+        )
+    }
+}
+
 fn forward_message_event(
     context: &BridgeForwardContext<'_>,
     event: BridgeEvent,
-    is_historical: bool,
+    delivery: MessageDelivery,
 ) {
+    let is_historical = delivery.is_historical();
     let chat_jid = event
         .chat_jid
         .clone()
@@ -1428,7 +1469,9 @@ fn forward_message_event(
             is_group: event.is_group,
             muted: event.muted,
             activity: (!is_placeholder_message).then_some((timestamp, preview)),
-            increment_unread: !event.from_me && !is_historical && !is_placeholder_message,
+            increment_unread: delivery.counts_toward_unread()
+                && !event.from_me
+                && !is_placeholder_message,
         },
     );
     context
@@ -2961,6 +3004,91 @@ mod tests {
             chat.last_message_preview.as_deref(),
             Some("see you tomorrow")
         );
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_offline_backlog_is_silent_but_keeps_unread() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:offline-backlog")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+
+        // A message replayed during offline-sync catch-up must be flagged
+        // historical so the UI never raises an audio/desktop notification for
+        // it (the phone already alerted the user)...
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"offline","id":"offline-1","chat_jid":"555@s.whatsapp.net","chat_name":"Backlog Chat","sender_jid":"555@s.whatsapp.net","sender_name":"Pat","text":"missed you","timestamp":"2026-06-05T12:00:00Z"}"#
+        )?);
+
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::Message {
+                    message,
+                    is_historical,
+                } if content_text(&message.content) == "missed you" => {
+                    assert!(
+                        is_historical,
+                        "offline backlog message must be historical (no notification)"
+                    );
+                    assert!(!message.is_from_me);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        // ...yet it must still increment unread so a genuinely-unread missed
+        // message keeps its badge (unlike bulk history sync, which does not).
+        let chat_id = arc_str("whatsapp:555@s.whatsapp.net");
+        let unread_chat = provider
+            .chats()
+            .await?
+            .into_iter()
+            .find(|chat| chat.id == chat_id)
+            .expect("backlog chat present");
+        assert_eq!(unread_chat.unread_count, 1);
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_history_sync_does_not_increment_unread() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:history-no-unread")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+
+        // Bulk history replay reflects already-seen conversation history, so it
+        // must neither notify nor inflate unread.
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"history","id":"hist-1","chat_jid":"777@s.whatsapp.net","chat_name":"History Chat","sender_jid":"777@s.whatsapp.net","sender_name":"Pat","text":"old line","timestamp":"2026-06-05T12:00:00Z"}"#
+        )?);
+
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::Message {
+                    message,
+                    is_historical,
+                } if content_text(&message.content) == "old line" => {
+                    assert!(is_historical, "history sync message must be historical");
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        let chat_id = arc_str("whatsapp:777@s.whatsapp.net");
+        let history_chat = provider
+            .chats()
+            .await?
+            .into_iter()
+            .find(|chat| chat.id == chat_id)
+            .expect("history chat present");
+        assert_eq!(history_chat.unread_count, 0);
 
         provider.disconnect().await?;
         Ok(())
