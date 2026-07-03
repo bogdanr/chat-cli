@@ -196,11 +196,15 @@ pub trait Provider: Send + Sync + 'static {
     }
 
     /// Send a message. Returns the sent message ID.
+    ///
+    /// `reply_to` is the full message being replied to (when any), so providers
+    /// that need more than the id — e.g. WhatsApp, which must include the quoted
+    /// sender and content in its reply `ContextInfo` — can build a native quote.
     async fn send(
         &self,
         chat_id: &ChatId,
         content: Content,
-        reply_to: Option<&MessageId>,
+        reply_to: Option<&Message>,
     ) -> anyhow::Result<MessageId>;
 
     /// Download media to a local cache path. Returns path to the file.

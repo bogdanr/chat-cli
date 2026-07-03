@@ -5,6 +5,17 @@ use std::{
 
 pub type ClientHandle = u64;
 
+/// Describes the message an outgoing send is replying to, so the bridge can
+/// attach a WhatsApp `ContextInfo` and have the recipient render a native
+/// quoted reply. `participant` is the quoted sender's JID (or "me"/empty for
+/// our own messages) and `quoted_text` is a plain-text fallback preview.
+#[derive(Clone, Debug, Default)]
+pub struct ReplyTarget {
+    pub id: String,
+    pub participant: String,
+    pub quoted_text: String,
+}
+
 type MessageCallback = unsafe extern "C" fn(message: *const c_char, user_data: *mut c_void);
 
 unsafe extern "C" {
@@ -15,7 +26,14 @@ unsafe extern "C" {
     ) -> u64;
     fn C_Connect(client_id: u64) -> u8;
     fn C_SetMessageCallback(cb: Option<MessageCallback>, user_data: *mut c_void);
-    fn C_SendText(client_id: u64, chat_jid: *const c_char, text: *const c_char) -> *mut c_char;
+    fn C_SendText(
+        client_id: u64,
+        chat_jid: *const c_char,
+        text: *const c_char,
+        reply_id: *const c_char,
+        reply_participant: *const c_char,
+        reply_text: *const c_char,
+    ) -> *mut c_char;
     fn C_RequestHistory(
         client_id: u64,
         chat_jid: *const c_char,
@@ -32,6 +50,9 @@ unsafe extern "C" {
         file_name: *const c_char,
         caption: *const c_char,
         content_type: *const c_char,
+        reply_id: *const c_char,
+        reply_participant: *const c_char,
+        reply_text: *const c_char,
     ) -> *mut c_char;
     fn C_SendReaction(
         client_id: u64,
@@ -96,10 +117,28 @@ pub unsafe fn clear_message_callback() {
     unsafe { C_SetMessageCallback(None, std::ptr::null_mut()) }
 }
 
-pub fn send_text(handle: ClientHandle, chat_jid: &str, text: &str) -> anyhow::Result<String> {
+pub fn send_text(
+    handle: ClientHandle,
+    chat_jid: &str,
+    text: &str,
+    reply: Option<&ReplyTarget>,
+) -> anyhow::Result<String> {
     let chat_jid = CString::new(chat_jid)?;
     let text = CString::new(text)?;
-    let response = unsafe { C_SendText(handle, chat_jid.as_ptr(), text.as_ptr()) };
+    let reply_id = CString::new(reply.map(|r| r.id.as_str()).unwrap_or_default())?;
+    let reply_participant =
+        CString::new(reply.map(|r| r.participant.as_str()).unwrap_or_default())?;
+    let reply_text = CString::new(reply.map(|r| r.quoted_text.as_str()).unwrap_or_default())?;
+    let response = unsafe {
+        C_SendText(
+            handle,
+            chat_jid.as_ptr(),
+            text.as_ptr(),
+            reply_id.as_ptr(),
+            reply_participant.as_ptr(),
+            reply_text.as_ptr(),
+        )
+    };
     take_c_string(response)
 }
 
@@ -127,6 +166,7 @@ pub fn request_history(
     take_c_string(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn send_media(
     handle: ClientHandle,
     chat_jid: &str,
@@ -135,6 +175,7 @@ pub fn send_media(
     file_name: &str,
     caption: &str,
     content_type: &str,
+    reply: Option<&ReplyTarget>,
 ) -> anyhow::Result<String> {
     let chat_jid = CString::new(chat_jid)?;
     let path = CString::new(path)?;
@@ -142,6 +183,10 @@ pub fn send_media(
     let file_name = CString::new(file_name)?;
     let caption = CString::new(caption)?;
     let content_type = CString::new(content_type)?;
+    let reply_id = CString::new(reply.map(|r| r.id.as_str()).unwrap_or_default())?;
+    let reply_participant =
+        CString::new(reply.map(|r| r.participant.as_str()).unwrap_or_default())?;
+    let reply_text = CString::new(reply.map(|r| r.quoted_text.as_str()).unwrap_or_default())?;
     let response = unsafe {
         C_SendMedia(
             handle,
@@ -151,6 +196,9 @@ pub fn send_media(
             file_name.as_ptr(),
             caption.as_ptr(),
             content_type.as_ptr(),
+            reply_id.as_ptr(),
+            reply_participant.as_ptr(),
+            reply_text.as_ptr(),
         )
     };
     take_c_string(response)

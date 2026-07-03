@@ -4148,8 +4148,9 @@ impl Provider for SlackProvider {
         &self,
         chat_id: &ChatId,
         content: Content,
-        reply_to: Option<&MessageId>,
+        reply_to: Option<&Message>,
     ) -> Result<MessageId> {
+        let reply_to = reply_to.map(|message| &message.id);
         match content {
             Content::Text(text) => self.send_text_message(chat_id, text, reply_to).await,
             Content::Image(media)
@@ -9524,7 +9525,7 @@ mod tests {
             .send(
                 &arc_str("C123"),
                 Content::Text(arc_str("hello from user")),
-                Some(&arc_str("1710000000.000001")),
+                Some(&poll_history_message("C123", "1710000000.000001", Utc::now())),
             )
             .await?;
 
@@ -9578,11 +9579,13 @@ mod tests {
         let provider = provider_with_fake_client(options, client.clone())?;
         provider.connect().await?;
 
+        let reply_target =
+            poll_history_message("ignored-channel", "ignored-thread", Utc::now());
         let message_id = provider
             .send(
                 &arc_str("ignored-channel"),
                 Content::Text(arc_str("hello webhook")),
-                Some(&arc_str("ignored-thread")),
+                Some(&reply_target),
             )
             .await?;
 
@@ -9791,7 +9794,11 @@ mod tests {
                     local_path: Some(PathBuf::from("/tmp/fono-snixembed.log")),
                     ..Media::default()
                 }),
-                Some(&arc_str("1710000000.000001")),
+                Some(&poll_history_message(
+                    "ignored-channel",
+                    "1710000000.000001",
+                    Utc::now(),
+                )),
             )
             .await?;
 

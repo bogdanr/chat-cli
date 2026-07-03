@@ -145,7 +145,7 @@ impl Provider for MockProvider {
         &self,
         chat_id: &ChatId,
         content: Content,
-        reply_to: Option<&MessageId>,
+        reply_to: Option<&Message>,
     ) -> Result<MessageId> {
         let id = arc_str(format!("mock:sent:{}", Utc::now().timestamp_millis()));
         let message = Message {
@@ -160,7 +160,7 @@ impl Provider for MockProvider {
             timestamp: Utc::now(),
             edited_at: None,
             content,
-            reply_to: reply_to.cloned(),
+            reply_to: reply_to.map(|message| message.id.clone()),
             thread_id: None,
             reactions: Vec::new(),
             receipts: Vec::new(),

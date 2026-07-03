@@ -16,9 +16,21 @@ fn main() {
     assert!(status.success(), "go build failed");
 
     println!("cargo:rerun-if-changed=go/go.mod");
+    println!("cargo:rerun-if-changed=go/go.sum");
     println!("cargo:rerun-if-changed=go/bridge.go");
     println!("cargo:rerun-if-changed=go/main.go");
     println!("cargo:rerun-if-changed=go/lib.go");
+    println!("cargo:rerun-if-changed=go/passkey.go");
+    println!("cargo:rerun-if-changed=go/cable_qr.go");
+    println!("cargo:rerun-if-changed=go/cable_const.go");
+    println!("cargo:rerun-if-changed=go/cable_config.go");
+    println!("cargo:rerun-if-changed=go/cable_eid.go");
+    println!("cargo:rerun-if-changed=go/cable_tunnel.go");
+    println!("cargo:rerun-if-changed=go/cable_noise.go");
+    println!("cargo:rerun-if-changed=go/cable_ctap.go");
+    println!("cargo:rerun-if-changed=go/cable_session.go");
+    println!("cargo:rerun-if-changed=go/cable_ble_linux.go");
+    println!("cargo:rerun-if-changed=go/cable_ble_other.go");
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=whatsapp_bridge");
 

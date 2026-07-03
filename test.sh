@@ -18,6 +18,12 @@ if [ -z "${CHAT_CLI_SLACK_APP_TOKEN:-}" ]; then
   echo "warning: CHAT_CLI_SLACK_APP_TOKEN is not set — Slack realtime will fall back to periodic history checks." >&2
 fi
 
+# Surface whatsmeow's own connection/pairing logs in tmp/debug.log so WhatsApp
+# link failures can be diagnosed. Unset this (or set to "") to silence it again.
+export CHATCLI_WHATSAPP_LOG="${CHATCLI_WHATSAPP_LOG:-debug}"
+export CHATCLI_WHATSAPP_CABLE_DUMP=1
+
+
 ./target/debug/chat-cli \
   --log-file tmp/debug.log \
   --db tmp/chat-cli.sqlite \

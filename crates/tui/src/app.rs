@@ -1162,6 +1162,10 @@ struct HelpOverlay {
 struct AuthOverlay {
     provider_id: ProviderId,
     challenge: AuthChallenge,
+    /// Full-size QR rendered to a PNG on disk. The inline terminal QR is only
+    /// scannable on large terminals; this lets the user open and scan the image
+    /// regardless of terminal size.
+    image_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7205,9 +7209,22 @@ impl App {
                     Line::from("Open WhatsApp > Linked devices > Link a device, then scan below."),
                 ]);
 
+                let image_hint = overlay.image_path.as_ref().map(|path| {
+                    Line::from(Span::styled(
+                        format!("Too small to scan? Open and scan this image: {}", path.display()),
+                        self.theme.muted(),
+                    ))
+                });
+
                 match render_qr_lines(code.as_ref(), modal.width.saturating_sub(4) as usize) {
-                    Some(qr_lines) if qr_lines.len() + lines.len() + 4 <= inner_height => {
+                    Some(qr_lines)
+                        if qr_lines.len() + lines.len() + 4 + usize::from(image_hint.is_some())
+                            <= inner_height =>
+                    {
                         lines.extend(qr_lines);
+                        if let Some(hint) = image_hint {
+                            lines.push(hint);
+                        }
                         lines.push(Line::from(Span::styled(
                             "Esc, Enter, q, or click outside hides this prompt.",
                             self.theme.muted(),
@@ -7217,21 +7234,39 @@ impl App {
                         lines.extend(qr_lines);
                     }
                     _ => {
-                        lines.extend([
-                            Line::from(Span::styled(
-                                "QR is too large for this terminal; enlarge the window or use the payload below.",
-                                self.theme.status_key(),
-                            )),
-                            Line::from(Span::styled("QR payload", self.theme.status_key())),
-                            Line::from(truncate_chars(
-                                code.as_ref(),
-                                modal.width.saturating_sub(6) as usize,
-                            )),
-                            Line::from(Span::styled(
-                                "Esc, Enter, q, or click outside hides this prompt.",
-                                self.theme.muted(),
-                            )),
-                        ]);
+                        if let Some(path) = &overlay.image_path {
+                            lines.extend([
+                                Line::from(Span::styled(
+                                    "QR is too large for this terminal. Open and scan this image:",
+                                    self.theme.status_key(),
+                                )),
+                                Line::from(path.display().to_string()),
+                                Line::from(Span::styled(
+                                    "Or enlarge the window so the QR can be drawn here.",
+                                    self.theme.muted(),
+                                )),
+                                Line::from(Span::styled(
+                                    "Esc, Enter, q, or click outside hides this prompt.",
+                                    self.theme.muted(),
+                                )),
+                            ]);
+                        } else {
+                            lines.extend([
+                                Line::from(Span::styled(
+                                    "QR is too large for this terminal; enlarge the window or use the payload below.",
+                                    self.theme.status_key(),
+                                )),
+                                Line::from(Span::styled("QR payload", self.theme.status_key())),
+                                Line::from(truncate_chars(
+                                    code.as_ref(),
+                                    modal.width.saturating_sub(6) as usize,
+                                )),
+                                Line::from(Span::styled(
+                                    "Esc, Enter, q, or click outside hides this prompt.",
+                                    self.theme.muted(),
+                                )),
+                            ]);
+                        }
                     }
                 }
             }
@@ -8804,9 +8839,14 @@ impl App {
                 } else if self.account_platform(&provider_id) == Some(Platform::Slack) {
                     self.open_slack_setup_for_provider(&provider_id, Some(&challenge), None);
                 } else {
+                    let image_path = match &challenge {
+                        AuthChallenge::QrCode(code) => write_qr_png(&provider_id, code.as_ref()),
+                        _ => None,
+                    };
                     self.state.auth_overlay = Some(AuthOverlay {
                         provider_id: provider_id.clone(),
                         challenge,
+                        image_path,
                     });
                     self.state.status = format!("authentication required for {provider_id}");
                 }
@@ -9291,6 +9331,16 @@ impl App {
         Ok(())
     }
 
+    /// True when the user is actively typing into a text input, so single
+    /// character shortcuts (like `?` for help) must be treated as literal input
+    /// rather than commands. This covers the main compose box as well as the
+    /// "Reply in thread" composer, which lives in the details pane while a
+    /// thread root is open.
+    fn is_typing_in_text_input(&self) -> bool {
+        self.state.focus == FocusPane::Compose
+            || (self.state.focus == FocusPane::Details && self.state.thread_root.is_some())
+    }
+
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if is_ctrl_char(key, 'q') || is_ctrl_char(key, 'c') {
             self.state.should_quit = true;
@@ -9359,7 +9409,7 @@ impl App {
         }
 
         if matches!(key.code, KeyCode::F(1))
-            || (self.state.focus != FocusPane::Compose
+            || (!self.is_typing_in_text_input()
                 && matches!(key.code, KeyCode::Char('?'))
                 && !key
                     .modifiers
@@ -11278,8 +11328,9 @@ impl App {
         let account = provider.account_info();
         let content = Content::Text(Arc::from(text.as_str()));
         let preview = content_send_preview(&content);
+        let reply_message = self.message_by_id(&thread_root).cloned();
         let message_id = provider
-            .send(&chat.id, content.clone(), Some(&thread_root))
+            .send(&chat.id, content.clone(), reply_message.as_ref())
             .await?;
         let timestamp = Utc::now();
         let message = Message {
@@ -11378,8 +11429,11 @@ impl App {
                 .clone()
                 .filter(|_| self.state.focus == FocusPane::Details)
         });
+        let reply_message = effective_reply_to
+            .as_ref()
+            .and_then(|id| self.message_by_id(id).cloned());
         let message_id = provider
-            .send(&chat.id, content.clone(), effective_reply_to.as_ref())
+            .send(&chat.id, content.clone(), reply_message.as_ref())
             .await?;
         let timestamp = Utc::now();
         let message = Message {
@@ -19238,6 +19292,36 @@ fn remove_reaction(message: &mut Message, emoji: &str, sender: &Arc<str>) {
         .retain(|reaction| !reaction.senders.is_empty());
 }
 
+/// Renders the linking QR to a PNG on disk so it can be scanned at full size
+/// from any image viewer.
+///
+/// The inline terminal QR is only scannable when the terminal is large enough
+/// to draw every module; WhatsApp's `https://wa.me/settings/linked_devices#…`
+/// payload is long enough to need a high-version (large) symbol that does not
+/// fit shorter terminals, leaving the user with no scannable code. Writing the
+/// same payload to an image gives a reliable, size-independent fallback.
+///
+/// Returns the written path, or `None` if encoding or writing failed. The file
+/// name is keyed by provider so concurrent logins do not clobber each other,
+/// and is reused across QR rotations so an already-open viewer refreshes.
+fn write_qr_png(provider_id: &str, payload: &str) -> Option<PathBuf> {
+    let qr = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L).ok()?;
+    let image = qr
+        .render::<image::Luma<u8>>()
+        .quiet_zone(true)
+        .module_dimensions(10, 10)
+        .build();
+    let dir = std::env::temp_dir().join("chat-cli-whatsapp-qr");
+    fs::create_dir_all(&dir).ok()?;
+    let safe_id: String = provider_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("qr-{safe_id}.png"));
+    image.save(&path).ok()?;
+    Some(path)
+}
+
 fn render_qr_lines(payload: &str, max_width: usize) -> Option<Vec<Line<'static>>> {
     let qr = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L).ok()?;
     let symbol_width = qr.width().saturating_add(QR_QUIET_ZONE.saturating_mul(2));
@@ -22127,6 +22211,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_keeps_question_mark_as_thread_reply_text() -> Result<()> {
+        let mut app = test_app().await?;
+
+        // Open a thread so the "Reply in thread" composer (details pane) is
+        // focused, mirroring the state after selecting a thread.
+        app.open_thread(Arc::from("thread-root"));
+        assert_eq!(app.state().focus(), FocusPane::Details);
+
+        // Typing `?` in the thread composer must insert the character rather
+        // than opening the help overlay.
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('?'), KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().help_overlay_open());
+        assert_eq!(app.state.thread_compose_text, "?");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_closes_help_overlay_when_clicking_outside() -> Result<()> {
         let mut app = test_app().await?;
         let mut terminal = Terminal::new(TestBackend::new(120, 36))?;
@@ -23515,6 +23618,41 @@ mod tests {
         assert!(content.contains("Open WhatsApp > Linked devices"));
         assert!(!content.contains("QR is too large"));
         assert!(content.contains("█") || content.contains("▀") || content.contains("▄"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn write_qr_png_produces_a_decodable_image() {
+        let payload = realistic_whatsapp_qr_payload();
+        let path = write_qr_png("whatsapp:bridge", &payload).expect("qr png is written");
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("png"));
+        let decoded = image::open(&path).expect("written qr png decodes");
+        assert!(decoded.width() > 0 && decoded.height() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn app_offers_scannable_qr_image_when_terminal_too_small() -> Result<()> {
+        let mut app = test_app().await?;
+        let provider_id = app.state().provider_for_selected_chat().unwrap().clone();
+        let payload = realistic_whatsapp_qr_payload();
+
+        app.handle_event(AppEvent::Provider(
+            provider_id,
+            Box::new(ProviderEvent::AuthRequired(AuthChallenge::QrCode(
+                Arc::from(payload.as_str()),
+            ))),
+        ))
+        .await?;
+
+        // A typical terminal is too short to draw the high-version WhatsApp QR,
+        // so the overlay must point the user at the full-size scannable image.
+        let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let content = buffer_text(terminal.backend().buffer());
+        assert!(content.contains("Open and scan this image"));
+        assert!(content.contains("chat-cli-whatsapp-qr"));
 
         Ok(())
     }
@@ -26112,7 +26250,7 @@ mod tests {
             &self,
             _chat_id: &Arc<str>,
             _content: Content,
-            _reply_to: Option<&Arc<str>>,
+            _reply_to: Option<&Message>,
         ) -> Result<Arc<str>> {
             Ok(Arc::from("static:test:sent"))
         }

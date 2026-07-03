@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -10,6 +13,46 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestWaLoggerWritesWhatsmeowLogsToFile(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "debug.log")
+	t.Setenv("CHATCLI_WHATSAPP_LOG", "info")
+	c := &client{logPath: logPath}
+
+	logger := c.waLogger()
+	logger.Sub("Client").Infof("connected to %s", "whatsapp")
+	logger.Sub("Client").Debugf("verbose %d", 1)
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("reading log file: %v", err)
+	}
+	contents := string(data)
+	if !strings.Contains(contents, "whatsmeow logging enabled at level=INFO") {
+		t.Fatalf("expected logger to announce it is enabled, got:\n%s", contents)
+	}
+	if !strings.Contains(contents, "whatsmeow [whatsmeow/Client INFO] connected to whatsapp") {
+		t.Fatalf("expected info log to be forwarded, got:\n%s", contents)
+	}
+	if strings.Contains(contents, "verbose 1") {
+		t.Fatalf("debug log must be suppressed below the info threshold, got:\n%s", contents)
+	}
+}
+
+func TestWaLoggerDisabledWithoutEnv(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "debug.log")
+	t.Setenv("CHATCLI_WHATSAPP_LOG", "")
+	c := &client{logPath: logPath}
+
+	if logger := c.waLogger(); logger == nil {
+		t.Fatal("waLogger must always return a usable logger")
+	}
+
+	data, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(data), "whatsmeow logging disabled") {
+		t.Fatalf("expected disabled diagnostic, got:\n%s", string(data))
+	}
+}
 
 func TestChooseCanonicalJIDPrefersPhoneNumberJID(t *testing.T) {
 	phone := types.NewJID("40712345678", types.DefaultUserServer)

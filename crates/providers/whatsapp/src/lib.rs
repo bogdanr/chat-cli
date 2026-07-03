@@ -213,6 +213,7 @@ impl WhatsAppProvider {
         chat_jid: &str,
         media: &Media,
         content_type: &str,
+        reply: Option<&bridge::ReplyTarget>,
     ) -> Result<String> {
         let local_path = media
             .local_path
@@ -238,6 +239,7 @@ impl WhatsAppProvider {
                 file_name,
                 caption,
                 content_type,
+                reply,
             )
         })
     }
@@ -431,7 +433,7 @@ impl Provider for WhatsAppProvider {
         &self,
         chat_id: &ChatId,
         content: Content,
-        reply_to: Option<&MessageId>,
+        reply_to: Option<&Message>,
     ) -> Result<MessageId> {
         let chat_jid = whatsapp_jid_from_chat_id(chat_id);
         if chat_jid.is_empty() {
@@ -444,18 +446,23 @@ impl Provider for WhatsAppProvider {
         // Group JIDs have no device part, so this is a no-op for them.
         let chat_jid = normalize_whatsapp_jid(&chat_jid);
 
+        let reply = reply_to.map(whatsapp_reply_target);
+        let reply = reply.as_ref();
+
         let raw_response = match &content {
             Content::Text(text) => self.bridge_call(NetworkActivityKind::Send, || {
-                bridge::send_text(self.handle, &chat_jid, text)
+                bridge::send_text(self.handle, &chat_jid, text, reply)
             })?,
             Content::Image(media) if media.mime_type.as_ref() == "image/gif" => {
-                self.send_media_to_bridge(&chat_jid, media, "gif")?
+                self.send_media_to_bridge(&chat_jid, media, "gif", reply)?
             }
-            Content::Image(media) => self.send_media_to_bridge(&chat_jid, media, "image")?,
-            Content::Video(media) => self.send_media_to_bridge(&chat_jid, media, "video")?,
-            Content::Audio(media) => self.send_media_to_bridge(&chat_jid, media, "audio")?,
-            Content::File(media) => self.send_media_to_bridge(&chat_jid, media, "file")?,
-            Content::Sticker(media) => self.send_media_to_bridge(&chat_jid, media, "sticker")?,
+            Content::Image(media) => self.send_media_to_bridge(&chat_jid, media, "image", reply)?,
+            Content::Video(media) => self.send_media_to_bridge(&chat_jid, media, "video", reply)?,
+            Content::Audio(media) => self.send_media_to_bridge(&chat_jid, media, "audio", reply)?,
+            Content::File(media) => self.send_media_to_bridge(&chat_jid, media, "file", reply)?,
+            Content::Sticker(media) => {
+                self.send_media_to_bridge(&chat_jid, media, "sticker", reply)?
+            }
             Content::LinkPreview(_) | Content::Cards(_) => {
                 bail!("WhatsApp link preview/card sending should be sent as plain text first")
             }
@@ -497,7 +504,7 @@ impl Provider for WhatsAppProvider {
             timestamp,
             edited_at: None,
             content: content.clone(),
-            reply_to: reply_to.cloned(),
+            reply_to: reply_to.map(|message| message.id.clone()),
             thread_id: None,
             reactions: Vec::new(),
             receipts: Vec::new(),
@@ -1252,13 +1259,73 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         }
         "login" => {
             let detail = event.event.unwrap_or_else(|| "waiting".to_owned());
+            // The passkey hybrid/caBLE ceremony emits a second QR (`FIDO:/…`)
+            // that the user must scan with their phone's *camera* to authorise
+            // the link over Bluetooth. It arrives as a `login` event rather than
+            // a top-level `qr` event, so route its `code` through the same
+            // AuthRequired(QrCode) path the primary WhatsApp QR uses; otherwise
+            // it renders as an unscannable text blob and the link can never
+            // complete.
+            if detail == "passkey-cable-qr" {
+                if let Some(code) = event.code.filter(|code| !code.is_empty()) {
+                    context
+                        .events
+                        .send(ProviderEvent::AuthRequired(AuthChallenge::QrCode(arc_str(
+                            &code,
+                        ))));
+                    emit_bridge_status_message(
+                        &context_account_id(context),
+                        context.inbox_chat,
+                        context.messages,
+                        context.events,
+                        context.next_message,
+                        "WhatsApp passkey: scan this QR with your phone's camera \
+                         (not WhatsApp) and approve with your fingerprint/PIN to \
+                         finish linking over Bluetooth.",
+                    );
+                }
+                return;
+            }
+            // The passkey pairing verification code (whatsmeow's
+            // PairPasskeyConfirmation). WhatsApp shows this code on the phone
+            // and asks the user to check it matches the linking device. Surface
+            // it as a PairingCode challenge so it renders in the auth modal;
+            // linking auto-confirms on our side, so the modal is dismissed a few
+            // seconds later by AuthSucceeded/SyncProgress once pairing completes.
+            if detail == "passkey-confirmation" {
+                if let Some(code) = event.code.filter(|code| !code.is_empty()) {
+                    context
+                        .events
+                        .send(ProviderEvent::AuthRequired(AuthChallenge::PairingCode(
+                            arc_str(&code),
+                        )));
+                    emit_bridge_status_message(
+                        &context_account_id(context),
+                        context.inbox_chat,
+                        context.messages,
+                        context.events,
+                        context.next_message,
+                        format!(
+                            "WhatsApp passkey: verify this code matches the one on your \
+                             phone: {code}. Linking confirms automatically in a few seconds."
+                        ),
+                    );
+                }
+                return;
+            }
+            let message = match event.code {
+                Some(code) if !code.is_empty() => {
+                    format!("WhatsApp login: {detail} (verification code: {code})")
+                }
+                _ => format!("WhatsApp login: {detail}"),
+            };
             emit_bridge_status_message(
                 &context_account_id(context),
                 context.inbox_chat,
                 context.messages,
                 context.events,
                 context.next_message,
-                format!("WhatsApp login: {detail}"),
+                message,
             );
         }
         "connected" => {
@@ -2074,6 +2141,45 @@ fn whatsapp_jid_from_chat_id(chat_id: &ChatId) -> String {
         .to_owned()
 }
 
+/// Builds the reply target the bridge needs to attach a WhatsApp reply
+/// `ContextInfo`: the quoted message's stanza id, the quoted sender's JID
+/// (passed through as-is; "me"/empty is resolved to our own JID inside the
+/// bridge), and a plain-text fallback preview of the quoted content.
+fn whatsapp_reply_target(message: &Message) -> bridge::ReplyTarget {
+    bridge::ReplyTarget {
+        id: message.id.to_string(),
+        participant: message.sender.platform_id.to_string(),
+        quoted_text: whatsapp_quoted_preview(&message.content),
+    }
+}
+
+/// A short plain-text preview of quoted content, used only as the reply's
+/// fallback quote. Recipients resolve the real message by stanza id, so a
+/// simple label is sufficient for non-text content.
+fn whatsapp_quoted_preview(content: &Content) -> String {
+    match content {
+        Content::Text(text) => text.to_string(),
+        Content::Image(media) => quoted_media_preview(media, "Photo"),
+        Content::Video(media) => quoted_media_preview(media, "Video"),
+        Content::Audio(_) => "Audio".to_owned(),
+        Content::File(media) => quoted_media_preview(media, "Document"),
+        Content::Sticker(_) => "Sticker".to_owned(),
+        Content::LinkPreview(_) | Content::Cards(_) => String::new(),
+        Content::Poll(_) => "Poll".to_owned(),
+        Content::Deleted => String::new(),
+        Content::Unsupported(_) => String::new(),
+    }
+}
+
+fn quoted_media_preview(media: &Media, label: &str) -> String {
+    media
+        .caption
+        .as_deref()
+        .filter(|caption| !caption.trim().is_empty())
+        .map(|caption| caption.to_owned())
+        .unwrap_or_else(|| label.to_owned())
+}
+
 fn whatsapp_chat_matches_query(chat: &Chat, query: &str) -> bool {
     chat.name.to_lowercase().contains(query)
         || chat
@@ -2568,6 +2674,20 @@ mod tests {
         let qr = BridgeEvent::decode(r#"{"type":"qr","code":"2@test"}"#)?;
         assert_eq!(qr.kind, "qr");
         assert_eq!(qr.code.as_deref(), Some("2@test"));
+
+        // Passkey device-linking (whatsmeow PR #1186): the bridge reports the
+        // authentication phase and, when the server requires it, a pairing
+        // verification code carried on the login event's `code` field.
+        let authenticating =
+            BridgeEvent::decode(r#"{"type":"login","event":"passkey-authenticating"}"#)?;
+        assert_eq!(authenticating.kind, "login");
+        assert_eq!(authenticating.event.as_deref(), Some("passkey-authenticating"));
+
+        let confirmation = BridgeEvent::decode(
+            r#"{"type":"login","event":"passkey-confirmation","code":"ABCD-EF"}"#,
+        )?;
+        assert_eq!(confirmation.event.as_deref(), Some("passkey-confirmation"));
+        assert_eq!(confirmation.code.as_deref(), Some("ABCD-EF"));
 
         let message = BridgeEvent::decode(
             r#"{"type":"message","id":"abc","chat_jid":"123@s.whatsapp.net","chat_name":"Ada Lovelace","sender_jid":"123@s.whatsapp.net","sender_name":"Ada","avatar_path":"/tmp/ada.jpg","text":"hello","timestamp":"2026-06-05T12:00:00Z"}"#,
@@ -3205,6 +3325,76 @@ mod tests {
             history
                 .iter()
                 .any(|message| content_text(&message.content).contains("2@test-qr-payload"))
+        );
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_renders_passkey_cable_qr_as_scannable_challenge() -> Result<()> {
+        // The passkey hybrid/caBLE second QR arrives as a `login` event, not a
+        // top-level `qr` event. It must still surface as an AuthRequired(QrCode)
+        // so the TUI renders it scannably; otherwise the user only ever sees the
+        // primary WhatsApp QR and the passkey link can never complete.
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:cable-qr")?;
+        provider.connect().await?;
+        let mut events = provider.events();
+
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"login","event":"passkey-cable-qr","code":"FIDO:/12345"}"#
+        )?);
+
+        let mut saw_auth = false;
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::AuthRequired(AuthChallenge::QrCode(code))
+                    if code.as_ref() == "FIDO:/12345" =>
+                {
+                    saw_auth = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_auth, "caBLE QR must be routed as a scannable QrCode");
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_surfaces_passkey_confirmation_code() -> Result<()> {
+        // WhatsApp's passkey linking shows a verification code on the phone and
+        // asks the user to confirm it matches the linking device. It arrives as a
+        // `passkey-confirmation` login event and must surface as a PairingCode
+        // challenge so the user actually sees it (previously invisible on the
+        // SkipHandoffUX auto-confirm path).
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:passkey-confirm")?;
+        provider.connect().await?;
+        let mut events = provider.events();
+
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"login","event":"passkey-confirmation","code":"AB12-CD34"}"#
+        )?);
+
+        let mut saw_code = false;
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::AuthRequired(AuthChallenge::PairingCode(code))
+                    if code.as_ref() == "AB12-CD34" =>
+                {
+                    saw_code = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_code,
+            "passkey confirmation code must surface as a PairingCode challenge"
         );
         provider.disconnect().await?;
         Ok(())

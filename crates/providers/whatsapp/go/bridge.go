@@ -34,6 +34,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -56,6 +57,57 @@ type client struct {
 	// but must never raise an audio/desktop notification, because the user
 	// was already alerted on their phone (and may have already read them).
 	offlineSync atomic.Bool
+}
+
+// whatsmeowLogLevels mirrors waLog's internal level ranking so the bridge can
+// honor a configured minimum level.
+var whatsmeowLogLevels = map[string]int{"": -1, "DEBUG": 0, "INFO": 1, "WARN": 2, "ERROR": 3}
+
+// bridgeLogger adapts whatsmeow's waLog.Logger onto the bridge's file logger so
+// the actual connection/pairing handshake (otherwise silent) lands in the same
+// debug log as the bridge's own events. This is the only way to diagnose why a
+// link attempt rotates QR codes and then times out, since whatsmeow swallows
+// all detail when given waLog.Noop.
+type bridgeLogger struct {
+	c      *client
+	module string
+	min    int
+}
+
+func (l *bridgeLogger) outputf(level, msg string, args ...interface{}) {
+	if whatsmeowLogLevels[level] < l.min {
+		return
+	}
+	l.c.log("whatsmeow [%s %s] %s", l.module, level, fmt.Sprintf(msg, args...))
+}
+
+func (l *bridgeLogger) Errorf(msg string, args ...interface{}) { l.outputf("ERROR", msg, args...) }
+func (l *bridgeLogger) Warnf(msg string, args ...interface{})  { l.outputf("WARN", msg, args...) }
+func (l *bridgeLogger) Infof(msg string, args ...interface{})  { l.outputf("INFO", msg, args...) }
+func (l *bridgeLogger) Debugf(msg string, args ...interface{}) { l.outputf("DEBUG", msg, args...) }
+func (l *bridgeLogger) Sub(module string) waLog.Logger {
+	return &bridgeLogger{c: l.c, module: l.module + "/" + module, min: l.min}
+}
+
+// waLogger returns a whatsmeow logger that writes into the bridge debug log.
+//
+// It is opt-in via CHATCLI_WHATSAPP_LOG (e.g. "info", "debug") so normal runs
+// keep the log small; when unset, or when no log path is configured, whatsmeow
+// stays silent (Noop) exactly as before. An unrecognized level defaults to INFO,
+// which surfaces connect failures, stream errors, and pairing outcomes without
+// the full DEBUG node dump.
+func (c *client) waLogger() waLog.Logger {
+	level := strings.ToUpper(strings.TrimSpace(os.Getenv("CHATCLI_WHATSAPP_LOG")))
+	if level == "" || strings.TrimSpace(c.logPath) == "" {
+		c.log("whatsmeow logging disabled (CHATCLI_WHATSAPP_LOG=%q has_log_path=%t)", level, strings.TrimSpace(c.logPath) != "")
+		return waLog.Noop
+	}
+	min, ok := whatsmeowLogLevels[level]
+	if !ok {
+		min = whatsmeowLogLevels["INFO"]
+	}
+	c.log("whatsmeow logging enabled at level=%s", level)
+	return &bridgeLogger{c: c, module: "whatsmeow", min: min}
 }
 
 type bridgeReaction struct {
@@ -187,7 +239,16 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	container, err := sqlstore.New(ctx, "sqlite3", sqliteDSN(c.dbPath), waLog.Noop)
+	logger := c.waLogger()
+	// Present as a browser companion. WhatsApp's passkey-protected linking is a
+	// web.whatsapp.com feature; the platform type feeds the final
+	// encrypted_pairing_request key-derivation salt ("Companion Pairing <type>
+	// with ref …", whatsmeow pair-passkey.go) and rides inside the committed
+	// CompanionEphemeralIdentity. The stock UNKNOWN/"whatsmeow" identity is an
+	// implausible companion for that flow, so advertise Chrome/Linux instead.
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CHROME.Enum()
+	store.DeviceProps.Os = proto.String("Chrome")
+	container, err := sqlstore.New(ctx, "sqlite3", sqliteDSN(c.dbPath), logger.Sub("Database"))
 	if err != nil {
 		cancel()
 		emit(bridgeEvent{Type: "error", Message: fmt.Sprintf("open WhatsApp store: %v", err)})
@@ -201,7 +262,7 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 		return 0
 	}
 
-	wa := whatsmeow.NewClient(device, waLog.Noop)
+	wa := whatsmeow.NewClient(device, logger.Sub("Client"))
 	wa.AddEventHandler(func(evt interface{}) {
 		handleWhatsAppEvent(c, evt)
 	})
@@ -218,9 +279,20 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 
 		go func() {
 			for evt := range qrChan {
-				if evt.Event == "code" {
+				switch evt.Event {
+				case whatsmeow.QRChannelEventCode:
 					emit(bridgeEvent{Type: "qr", Code: evt.Code})
-				} else {
+				case whatsmeow.QRChannelEventPasskeyRequest:
+					c.handlePasskeyRequest(ctx, evt.PasskeyRequest)
+				case whatsmeow.QRChannelEventPasskeyResponse:
+					c.handlePasskeyConfirmation(ctx, evt.PasskeyConfirmation)
+				case whatsmeow.QRChannelEventError:
+					msg := "WhatsApp pairing error"
+					if evt.Error != nil {
+						msg = evt.Error.Error()
+					}
+					emit(bridgeEvent{Type: "error", Message: msg})
+				default:
 					emit(bridgeEvent{Type: "login", Event: evt.Event})
 				}
 			}
@@ -331,7 +403,7 @@ func C_RequestHistory(clientID C.uint64_t, chatJID *C.char, oldestMsgID *C.char,
 }
 
 //export C_SendText
-func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char) *C.char {
+func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char, replyID *C.char, replyParticipant *C.char, replyText *C.char) *C.char {
 	mu.Lock()
 	c, ok := clients[uint64(clientID)]
 	mu.Unlock()
@@ -340,6 +412,9 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char) *C.char {
 	}
 
 	body := C.GoString(text)
+	replyIDRaw := C.GoString(replyID)
+	replyParticipantRaw := C.GoString(replyParticipant)
+	replyTextRaw := C.GoString(replyText)
 	if strings.HasPrefix(c.dbPath, "test:") {
 		chat := C.GoString(chatJID)
 		return cJSON(bridgeEvent{
@@ -362,9 +437,7 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char) *C.char {
 		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
 	}
 
-	resp, err := c.wa.SendMessage(context.Background(), jid, &waProto.Message{
-		Conversation: proto.String(body),
-	})
+	resp, err := c.wa.SendMessage(context.Background(), jid, buildTextMessage(c, body, replyIDRaw, replyParticipantRaw, replyTextRaw))
 	if err != nil {
 		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp message: %v", err)})
 	}
@@ -387,7 +460,7 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char) *C.char {
 }
 
 //export C_SendMedia
-func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C.char, fileName *C.char, caption *C.char, contentType *C.char) *C.char {
+func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C.char, fileName *C.char, caption *C.char, contentType *C.char, replyID *C.char, replyParticipant *C.char, replyText *C.char) *C.char {
 	mu.Lock()
 	c, ok := clients[uint64(clientID)]
 	mu.Unlock()
@@ -400,6 +473,9 @@ func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C
 	mimeRaw := firstNonEmpty(C.GoString(mimeType), mime.TypeByExtension(filepath.Ext(pathRaw)), "application/octet-stream")
 	fileNameRaw := firstNonEmpty(C.GoString(fileName), filepath.Base(pathRaw), "upload")
 	captionRaw := C.GoString(caption)
+	replyIDRaw := C.GoString(replyID)
+	replyParticipantRaw := C.GoString(replyParticipant)
+	replyTextRaw := C.GoString(replyText)
 	contentRaw := strings.ToLower(strings.TrimSpace(C.GoString(contentType)))
 	contentRaw = normalizeOutboundContentType(contentRaw, mimeRaw)
 	if contentRaw == "" {
@@ -467,6 +543,9 @@ func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C
 	message := outboundMediaMessage(messageContentType, upload, messageMime, fileNameRaw, captionRaw)
 	if message == nil {
 		return cJSON(bridgeEvent{Type: "error", Message: "unsupported WhatsApp media type"})
+	}
+	if ctx := c.buildReplyContext(replyIDRaw, replyParticipantRaw, replyTextRaw); ctx != nil {
+		attachContextInfo(message, ctx)
 	}
 	resp, err := c.wa.SendMessage(context.Background(), jid, message)
 	if err != nil {
@@ -962,6 +1041,68 @@ func (c *client) ownJID() string {
 	return ""
 }
 
+// buildReplyContext constructs a WhatsApp ContextInfo that links an outgoing
+// message to the message it replies to, so recipients render it as a native
+// quoted reply. replyID is the quoted message's stanza ID; participant is the
+// quoted sender's JID (empty or "me" resolves to our own JID); quotedText is a
+// plain-text fallback shown when the recipient cannot resolve the original
+// message locally. Returns nil when there is no reply target.
+func (c *client) buildReplyContext(replyID, participant, quotedText string) *waProto.ContextInfo {
+	replyID = strings.TrimSpace(replyID)
+	if replyID == "" {
+		return nil
+	}
+	ctx := &waProto.ContextInfo{StanzaID: proto.String(replyID)}
+
+	participant = strings.TrimSpace(participant)
+	if participant == "" || participant == "me" {
+		participant = c.ownJID()
+	}
+	if participant != "" {
+		if jid, err := types.ParseJID(participant); err == nil {
+			ctx.Participant = proto.String(jid.String())
+		}
+	}
+
+	ctx.QuotedMessage = &waProto.Message{Conversation: proto.String(quotedText)}
+	return ctx
+}
+
+// buildTextMessage returns the outgoing text message body, upgrading a plain
+// conversation to an ExtendedTextMessage when a reply context is present so the
+// quote survives to the recipient.
+func buildTextMessage(c *client, body, replyID, participant, quotedText string) *waProto.Message {
+	if ctx := c.buildReplyContext(replyID, participant, quotedText); ctx != nil {
+		return &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text:        proto.String(body),
+			ContextInfo: ctx,
+		}}
+	}
+	return &waProto.Message{Conversation: proto.String(body)}
+}
+
+// attachContextInfo sets the reply ContextInfo on whichever media/text payload
+// the outgoing message carries.
+func attachContextInfo(message *waProto.Message, ctx *waProto.ContextInfo) {
+	if message == nil || ctx == nil {
+		return
+	}
+	switch {
+	case message.ImageMessage != nil:
+		message.ImageMessage.ContextInfo = ctx
+	case message.VideoMessage != nil:
+		message.VideoMessage.ContextInfo = ctx
+	case message.AudioMessage != nil:
+		message.AudioMessage.ContextInfo = ctx
+	case message.DocumentMessage != nil:
+		message.DocumentMessage.ContextInfo = ctx
+	case message.StickerMessage != nil:
+		message.StickerMessage.ContextInfo = ctx
+	case message.ExtendedTextMessage != nil:
+		message.ExtendedTextMessage.ContextInfo = ctx
+	}
+}
+
 func boolPtr(value bool) *bool {
 	return &value
 }
@@ -1155,6 +1296,19 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 		emitSelfReadReceipt(c, v)
 	case *events.MarkChatAsRead:
 		emitMarkChatAsRead(c, v)
+	case *events.PairPasskeyConfirmation:
+		// Surface the pairing verification code so the user can confirm it
+		// matches the code shown on their phone. whatsmeow dispatches this
+		// event to every registered handler, so it fires even on the
+		// SkipHandoffUX auto-confirm path, where the QR channel consumes it
+		// internally (qrchan.go) and never forwards it to the QR loop — which
+		// is why the code was previously invisible in chat-cli. Display only:
+		// the actual SendPasskeyConfirmation is performed by the QR channel
+		// (auto-confirm) or by handlePasskeyConfirmation (manual path).
+		if v != nil {
+			c.log("passkey confirmation code=%s skipHandoffUX=%t", v.Code, v.SkipHandoffUX)
+			emit(bridgeEvent{Type: "login", Event: "passkey-confirmation", Code: v.Code})
+		}
 	case *events.Connected:
 		emit(bridgeEvent{Type: "connected"})
 	case *events.LoggedOut:
