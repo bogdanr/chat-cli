@@ -44,6 +44,11 @@ fn main() {
     {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Security");
+        // The Go runtime's cgo-based resolver (used transitively by the
+        // caBLE tunnel's networking code) references res_9_* symbols that
+        // live in libresolv, not libSystem. Without this the release build
+        // fails to link with "symbol(s) not found for architecture arm64".
+        println!("cargo:rustc-link-lib=resolv");
     }
 
     // System libraries required by the Go runtime when linking a cgo
