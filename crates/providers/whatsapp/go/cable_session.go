@@ -14,6 +14,7 @@ package main
 //	CHATCLI_WHATSAPP_CABLE_TUNNEL_DOMAIN  force the tunnel server hostname
 //	CHATCLI_WHATSAPP_CABLE_BLE_ADAPTER    hciN adapter (default hci0)
 //	CHATCLI_WHATSAPP_CABLE_TIMEOUT        ceremony timeout in seconds
+//	CHATCLI_WHATSAPP_CABLE_LINGER         post-assertion tunnel hold-open seconds (0 = close immediately)
 //	CHATCLI_WHATSAPP_CABLE_DUMP           hex-dump frames to the debug log
 //	CHATCLI_WHATSAPP_PASSKEY_ORIGIN       WebAuthn origin in clientDataJSON
 //
@@ -23,14 +24,19 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"go.mau.fi/whatsmeow/types"
 )
 
 // caBLE post-handshake message type byte. Transport frames carry a leading
-// MessageType byte (Chromium v2_constants.h: kCTAP=1); the phone rejects the
-// frame if this is wrong.
-const cableMsgTypeCTAP = 0x01
+// MessageType byte (Chromium v2_constants.h: kShutdown=0, kCTAP=1, kUpdate=2);
+// the phone rejects the frame if this is wrong.
+const (
+	cableMsgTypeShutdown = 0x00
+	cableMsgTypeCTAP     = 0x01
+	cableMsgTypeUpdate   = 0x02
+)
 
 // runCableCeremony performs the full hybrid ceremony and returns a WebAuthn
 // assertion signed by the phone's real passkey.
@@ -84,7 +90,15 @@ func (c *client) runCableCeremony(ctx context.Context, pub *types.WebAuthnPublic
 		emit(bridgeEvent{Type: "error", Message: fmt.Sprintf("caBLE tunnel dial failed: %v", err)})
 		return nil, err
 	}
-	defer conn.close()
+	// On any error path the tunnel is closed here; on success ownership is
+	// handed to startCableLinger, which keeps it open so the phone can finish
+	// its side of the ceremony and close the connection itself (Task 6.3).
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			conn.close()
+		}
+	}()
 	emit(bridgeEvent{Type: "login", Event: "passkey-cable-tunnel-connected"})
 
 	// 4. Noise KNpsk0 handshake.
@@ -184,5 +198,72 @@ func (c *client) runCableCeremony(ctx context.Context, pub *types.WebAuthnPublic
 	}
 	emit(bridgeEvent{Type: "login", Event: "passkey-cable-assertion-received"})
 
+	// Post-assertion tunnel handling. Default: close immediately — the
+	// behaviour of both successful 2026-07-03 pairings. Lingering (holding
+	// the tunnel open for the phone to close, Chromium-style) was trialled on
+	// 2026-07-04 and made things WORSE: the phone waited ~27s, dropped the
+	// tunnel with an abrupt EOF, and never sent the pairing continuation, so
+	// the immediate close appears to be the completion signal the phone's
+	// caBLE stack keys on. CHATCLI_WHATSAPP_CABLE_LINGER re-enables the
+	// experiment; frames observed by the linger are logged as evidence.
+	if cfg.Linger > 0 {
+		handedOff = true
+		c.startCableLinger(conn, ni.recvCS, cfg)
+	}
+
 	return assertion.toWebAuthnResponse(clientDataJSON), nil
+}
+
+// startCableLinger takes ownership of the post-assertion tunnel: it keeps
+// reading (and logging) frames until the phone closes the WebSocket, the
+// linger budget expires, or the session is torn down via the client's stored
+// cancel hook (C_Disconnect / LoggedOut — Task 6.4). Every frame observed here
+// is evidence for diagnosing incomplete phone-side linking, so frame types and
+// (with CHATCLI_WHATSAPP_CABLE_DUMP) payloads are logged.
+func (c *client) startCableLinger(conn *tunnelConn, recv *cipherState, cfg cableConfig) {
+	lingerCtx, cancel := context.WithTimeout(context.Background(), cfg.Linger)
+	c.setCableCancel(cancel)
+	c.log("cable: lingering on tunnel for up to %s (waiting for phone to close)", cfg.Linger)
+	go func() {
+		defer conn.close()
+		defer cancel()
+		start := time.Now()
+		frames := 0
+		for {
+			cipherFrame, err := conn.read(lingerCtx)
+			if err != nil {
+				// Normal closure by the phone, linger timeout, or teardown.
+				c.log("cable: linger ended after %s (%d post-assertion frames): %v",
+					time.Since(start).Round(time.Millisecond), frames, err)
+				return
+			}
+			frames++
+			plain, derr := recv.decrypt(nil, cipherFrame)
+			if derr != nil {
+				c.log("cable: linger frame %d decrypt failed (%d bytes): %v", frames, len(cipherFrame), derr)
+				continue
+			}
+			msgType := "empty"
+			if len(plain) > 0 {
+				switch plain[0] {
+				case cableMsgTypeShutdown:
+					msgType = "shutdown"
+				case cableMsgTypeCTAP:
+					msgType = "ctap"
+				case cableMsgTypeUpdate:
+					msgType = "update"
+				default:
+					msgType = fmt.Sprintf("unknown(%#x)", plain[0])
+				}
+			}
+			c.log("cable: post-assertion frame %d type=%s len=%d", frames, msgType, len(plain))
+			if cfg.Dump {
+				c.log("cable: post-assertion frame %d payload=%x", frames, plain)
+			}
+			if len(plain) > 0 && plain[0] == cableMsgTypeShutdown {
+				c.log("cable: phone requested shutdown; closing tunnel")
+				return
+			}
+		}
+	}()
 }

@@ -11103,7 +11103,14 @@ impl App {
             {
                 self.apply_compose_edit_input(textarea_input(TextAreaKey::Enter, key.modifiers));
             }
-            KeyCode::Enter => self.send_composed_message().await?,
+            KeyCode::Enter => {
+                // A failed send (network drop, session logged out, provider
+                // error) must surface in the status bar, never crash the app
+                // by bubbling out of the event loop.
+                if let Err(err) = self.send_composed_message().await {
+                    self.state.status = format!("send failed: {err:#}");
+                }
+            }
             KeyCode::Backspace => {
                 self.apply_compose_edit_input(textarea_input(
                     TextAreaKey::Backspace,
@@ -13527,9 +13534,15 @@ impl App {
             .find(|provider| provider.id().as_ref() == chat.account.as_ref())
             .cloned()
         {
-            provider
+            // Same crash class as send/react: surface provider errors in the
+            // status bar and keep the local poll state untouched.
+            if let Err(err) = provider
                 .vote_poll(&chat.id, &target_message, &selected_options)
-                .await?;
+                .await
+            {
+                self.state.status = format!("poll vote failed: {err:#}");
+                return Ok(());
+            }
         } else {
             self.state.status = format!("no provider registered for {}", chat.account);
             return Ok(());
@@ -13572,7 +13585,13 @@ impl App {
             .find(|provider| provider.id().as_ref() == chat.account.as_ref())
             .cloned()
         {
-            provider.react(&chat.id, &target_message, emoji).await?;
+            // Provider failures (network drop, logged-out session) must land
+            // in the status bar, not crash the app; skip the optimistic local
+            // update so the UI stays truthful.
+            if let Err(err) = provider.react(&chat.id, &target_message, emoji).await {
+                self.state.status = format!("reaction failed: {err:#}");
+                return Ok(());
+            }
         }
 
         let Some(message) = self.message_by_id_mut(&message_id) else {
@@ -23009,6 +23028,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_surfaces_send_failure_in_status_instead_of_crashing() -> Result<()> {
+        // Regression: a provider send error (e.g. WhatsApp's "the store
+        // doesn't contain a device JID" after the phone removed the linked
+        // device) used to bubble out of the event loop and abort the app.
+        let mock = MockProvider::new();
+        let provider =
+            StaticTestProvider::from_mock("send:fail", "Send Fail", &mock, "send:fail:")?
+                .with_send_error("send WhatsApp message: the store doesn't contain a device JID");
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        for value in "hello".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        assert!(app.state().status().contains("send failed"));
+        assert!(
+            app.state()
+                .status()
+                .contains("the store doesn't contain a device JID")
+        );
+        // The failed message is neither echoed locally nor cleared from the
+        // compose box, so the user can retry once the session is restored.
+        assert!(!app.state().messages().iter().any(|message| {
+            message.is_from_me
+                && matches!(&message.content, Content::Text(text) if text.as_ref() == "hello")
+        }));
+        assert_eq!(app.state().compose_text(), "hello");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_sends_sticker_attachment() -> Result<()> {
         let mut app = test_app().await?;
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
@@ -26051,6 +26107,7 @@ mod tests {
         events: EventBus,
         auth_submissions: Arc<Mutex<Vec<AuthSubmission>>>,
         submit_error: Option<Arc<str>>,
+        send_error: Option<Arc<str>>,
         outbound_capabilities: OutboundCapabilities,
         contact_info: HashMap<PlatformId, Sender>,
         require_auth_until_submit: bool,
@@ -26101,6 +26158,7 @@ mod tests {
                 events: EventBus::new(),
                 auth_submissions: Arc::new(Mutex::new(Vec::new())),
                 submit_error: None,
+                send_error: None,
                 outbound_capabilities,
                 contact_info: HashMap::new(),
                 require_auth_until_submit: false,
@@ -26159,6 +26217,7 @@ mod tests {
                 events: EventBus::new(),
                 auth_submissions: Arc::new(Mutex::new(Vec::new())),
                 submit_error: None,
+                send_error: None,
                 outbound_capabilities: OutboundCapabilities::all(),
                 contact_info: HashMap::new(),
                 require_auth_until_submit: false,
@@ -26169,6 +26228,11 @@ mod tests {
 
         fn with_submit_error(mut self, error: &str) -> Self {
             self.submit_error = Some(Arc::from(error));
+            self
+        }
+
+        fn with_send_error(mut self, error: &str) -> Self {
+            self.send_error = Some(Arc::from(error));
             self
         }
 
@@ -26287,6 +26351,9 @@ mod tests {
             _content: Content,
             _reply_to: Option<&Message>,
         ) -> Result<Arc<str>> {
+            if let Some(error) = &self.send_error {
+                return Err(anyhow!(error.to_string()));
+            }
             Ok(Arc::from("static:test:sent"))
         }
 

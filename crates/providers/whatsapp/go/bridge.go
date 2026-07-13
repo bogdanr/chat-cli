@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -57,6 +58,30 @@ type client struct {
 	// but must never raise an audio/desktop notification, because the user
 	// was already alerted on their phone (and may have already read them).
 	offlineSync atomic.Bool
+	// cableMu guards cableCancel: the cancel/close hook for a live caBLE
+	// post-assertion linger session (tunnel WebSocket kept open so the phone
+	// can finish its side of the hybrid ceremony; see startCableLinger).
+	// Stored on the client so disconnect/logout tears the tunnel down
+	// deterministically instead of relying on ctx propagation alone.
+	cableMu     sync.Mutex
+	cableCancel func()
+}
+
+// setCableCancel stores (or clears, with nil) the teardown hook for the active
+// caBLE linger session, cancelling any previous one first.
+func (c *client) setCableCancel(cancel func()) {
+	c.cableMu.Lock()
+	prev := c.cableCancel
+	c.cableCancel = cancel
+	c.cableMu.Unlock()
+	if prev != nil {
+		prev()
+	}
+}
+
+// cancelCableSession tears down any live caBLE linger session.
+func (c *client) cancelCableSession() {
+	c.setCableCancel(nil)
 }
 
 // whatsmeowLogLevels mirrors waLog's internal level ranking so the bridge can
@@ -408,6 +433,23 @@ func C_RequestHistory(clientID C.uint64_t, chatJID *C.char, oldestMsgID *C.char,
 	return cJSON(bridgeEvent{Type: "history_request", ChatJID: canonicalChat.String(), ID: messageID})
 }
 
+// describeSendError rewrites whatsmeow's cryptic internal-state errors into
+// actionable text for the status bar. The most common case is a session that
+// the phone/server revoked (stream error <conflict type="device_removed"/>):
+// whatsmeow deletes the local device, so every later send fails with
+// ErrNotLoggedIn ("the store doesn't contain a device JID"), which tells the
+// user nothing about how to recover.
+func describeSendError(err error) string {
+	switch {
+	case errors.Is(err, whatsmeow.ErrNotLoggedIn):
+		return "WhatsApp session was logged out (device removed); restart chat-cli and scan the QR code to re-link"
+	case errors.Is(err, whatsmeow.ErrNotConnected):
+		return "WhatsApp is not connected; waiting for the connection to come back"
+	default:
+		return err.Error()
+	}
+}
+
 //export C_SendText
 func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char, replyID *C.char, replyParticipant *C.char, replyText *C.char) *C.char {
 	mu.Lock()
@@ -445,7 +487,7 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char, replyID *C.c
 
 	resp, err := c.wa.SendMessage(context.Background(), jid, buildTextMessage(c, body, replyIDRaw, replyParticipantRaw, replyTextRaw))
 	if err != nil {
-		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp message: %v", err)})
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp message: %s", describeSendError(err))})
 	}
 
 	id := resp.ID
@@ -556,7 +598,7 @@ func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C
 	resp, err := c.wa.SendMessage(context.Background(), jid, message)
 	if err != nil {
 		c.log("send WhatsApp media failed chat=%s path=%s mime=%s content_type=%s: %v", chatRaw, dataPath, messageMime, messageContentType, err)
-		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp media: %v", err)})
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp media: %s", describeSendError(err))})
 	}
 	id := resp.ID
 	if id == "" {
@@ -629,7 +671,7 @@ func C_SendReaction(clientID C.uint64_t, chatJID *C.char, senderJID *C.char, mes
 
 	resp, err := c.wa.SendMessage(context.Background(), chat, c.wa.BuildReaction(chat, sender, targetID, reaction))
 	if err != nil {
-		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp reaction: %v", err)})
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp reaction: %s", describeSendError(err))})
 	}
 	id := resp.ID
 	if id == "" {
@@ -709,7 +751,7 @@ func C_SendPollVote(clientID C.uint64_t, chatJID *C.char, senderJID *C.char, mes
 	}
 	resp, err := c.wa.SendMessage(context.Background(), chat, pollVote)
 	if err != nil {
-		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp poll vote: %v", err)})
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp poll vote: %s", describeSendError(err))})
 	}
 	id := resp.ID
 	if id == "" {
@@ -1031,6 +1073,7 @@ func C_Disconnect(clientID C.uint64_t) {
 	if !ok {
 		return
 	}
+	c.cancelCableSession()
 	if c.cancel != nil {
 		c.cancel()
 	}
@@ -1344,13 +1387,43 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 			emit(bridgeEvent{Type: "login", Event: "passkey-confirmation", Code: v.Code})
 		}
 	case *events.Connected:
+		// Announce availability like the official web client does right
+		// after login. Without this the companion never sends <presence/>,
+		// so the primary phone sees a device that authenticated but never
+		// "showed up" — a plausible input to its decision to purge the
+		// device later (observed as device_removed hours after pairing).
+		// It is also required for the phone to display last-active state
+		// in the Linked Devices list. Side effect (same as WhatsApp Web
+		// being open): contacts may see the account as online while
+		// chat-cli runs; CHATCLI_WHATSAPP_NO_PRESENCE opts out.
+		if c != nil && c.wa != nil && os.Getenv("CHATCLI_WHATSAPP_NO_PRESENCE") == "" {
+			go func() {
+				if err := c.wa.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+					c.log("send available presence failed: %v", err)
+				} else {
+					c.log("announced available presence")
+				}
+			}()
+		}
 		emit(bridgeEvent{Type: "connected"})
 	case *events.LoggedOut:
+		// A revoked session makes any in-flight caBLE ceremony moot.
+		if c != nil {
+			c.cancelCableSession()
+		}
 		emit(bridgeEvent{Type: "disconnected", Reason: "logged out"})
 	case *events.Disconnected:
 		emit(bridgeEvent{Type: "disconnected"})
 	case *events.StreamReplaced:
 		emit(bridgeEvent{Type: "disconnected", Reason: "stream replaced"})
+	default:
+		// Diagnostic only (gated behind the same env as whatsmeow logging):
+		// surface event types the bridge ignores. The phone-side "Logging
+		// in…" hang after passkey pairing suggests the server may push a
+		// finalization step we silently drop; this makes such a push visible.
+		if c != nil && os.Getenv("CHATCLI_WHATSAPP_LOG") != "" {
+			c.log("unhandled whatsmeow event %T", evt)
+		}
 	}
 }
 
