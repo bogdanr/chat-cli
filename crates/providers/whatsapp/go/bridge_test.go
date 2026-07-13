@@ -9,6 +9,7 @@ import (
 	"time"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
@@ -136,6 +137,42 @@ func historyTestMessage(ts time.Time, message *waProto.Message) *events.Message 
 	return &events.Message{
 		Info:    types.MessageInfo{MessageSource: types.MessageSource{}, Timestamp: ts},
 		Message: message,
+	}
+}
+
+func TestConversationUnreadCountHonorsMarkedAsUnread(t *testing.T) {
+	// A genuine unread count is reported verbatim.
+	withCount := &waHistorySync.Conversation{UnreadCount: proto.Uint32(4)}
+	if got := conversationUnreadCount(withCount); got != 4 {
+		t.Fatalf("expected reported unread count 4, got %d", got)
+	}
+
+	// A manual "mark as unread" with no unread messages still shows as unread.
+	markedOnly := &waHistorySync.Conversation{
+		UnreadCount:    proto.Uint32(0),
+		MarkedAsUnread: proto.Bool(true),
+	}
+	if got := conversationUnreadCount(markedOnly); got != 1 {
+		t.Fatalf("expected marked-as-unread chat to report 1, got %d", got)
+	}
+
+	// A genuine count is not overridden by the manual flag.
+	both := &waHistorySync.Conversation{
+		UnreadCount:    proto.Uint32(3),
+		MarkedAsUnread: proto.Bool(true),
+	}
+	if got := conversationUnreadCount(both); got != 3 {
+		t.Fatalf("expected real unread count 3 to win, got %d", got)
+	}
+
+	// A fully-read chat reports zero.
+	read := &waHistorySync.Conversation{UnreadCount: proto.Uint32(0)}
+	if got := conversationUnreadCount(read); got != 0 {
+		t.Fatalf("expected read chat to report 0, got %d", got)
+	}
+
+	if got := conversationUnreadCount(nil); got != 0 {
+		t.Fatalf("expected nil conversation to report 0, got %d", got)
 	}
 }
 

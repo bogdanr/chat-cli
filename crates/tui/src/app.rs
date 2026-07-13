@@ -8990,6 +8990,40 @@ impl App {
                     self.state.status = format!("chat read on another client of {provider_id}");
                 }
             }
+            ProviderEvent::ChatUnreadSynced {
+                chat_id,
+                unread_count,
+            } => {
+                // The provider reported the phone's authoritative unread count
+                // for this chat (WhatsApp history-sync `Conversation.UnreadCount`).
+                // It overrides the locally-accumulated count in both directions,
+                // correcting drift such as an offline reconnect that re-counted
+                // messages already read on the phone. Persisted via `upsert_chat`
+                // so it overwrites the stored count rather than max-merging it.
+                if unread_count == 0 {
+                    self.cancel_pending_notifications_for_chat(
+                        &provider_id,
+                        &chat_id,
+                        "read_elsewhere",
+                    );
+                }
+                let updated = self
+                    .state
+                    .chats
+                    .iter_mut()
+                    .find(|chat| chat.account == provider_id && chat.id == chat_id)
+                    .filter(|chat| chat.unread_count != unread_count)
+                    .map(|chat| {
+                        chat.unread_count = unread_count;
+                        chat.clone()
+                    });
+                if let Some(updated) = updated {
+                    self.store.upsert_chat(&updated).await?;
+                    self.sort_chats_preserving_selection();
+                    self.apply_filter();
+                    self.state.status = format!("chat unread synced from {provider_id}");
+                }
+            }
             ProviderEvent::MessageDeleted { .. } | ProviderEvent::Receipt { .. } => {
                 self.state.status = format!("event received from {provider_id}");
             }
@@ -17006,6 +17040,7 @@ fn provider_event_label(event: &ProviderEvent) -> &'static str {
         ProviderEvent::Receipt { .. } => "receipt",
         ProviderEvent::ChatUpdated(_) => "chat_updated",
         ProviderEvent::ChatMarkedRead { .. } => "chat_marked_read",
+        ProviderEvent::ChatUnreadSynced { .. } => "chat_unread_synced",
         ProviderEvent::ChatMerged { .. } => "chat_merged",
         ProviderEvent::AuthRequired(_) => "auth_required",
         ProviderEvent::AuthSucceeded => "auth_succeeded",

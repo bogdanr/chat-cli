@@ -1081,6 +1081,7 @@ struct BridgeEvent {
     is_group: bool,
     muted: Option<bool>,
     progress: Option<u8>,
+    unread_count: Option<u32>,
     last_message_at: Option<String>,
     last_message_preview: Option<String>,
     content_type: Option<String>,
@@ -1147,6 +1148,7 @@ impl BridgeEvent {
                 is_group: false,
                 muted: None,
                 progress: None,
+                unread_count: None,
                 last_message_at: None,
                 last_message_preview: None,
                 content_type: None,
@@ -1381,6 +1383,9 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         "read" => {
             forward_read_event(context, event);
         }
+        "chat_unread" => {
+            forward_chat_unread_event(context, event);
+        }
         "disconnected" => {
             context
                 .events
@@ -1570,6 +1575,31 @@ fn forward_read_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
     context
         .events
         .send(ProviderEvent::ChatMarkedRead { chat_id });
+}
+
+/// Handles a bridge "chat_unread" event: WhatsApp reported the phone's
+/// authoritative unread count for a conversation (history-sync
+/// `Conversation.UnreadCount`). This is the source of truth for the chat's
+/// read state, so it overwrites the provider's cached count outright — it may
+/// raise *or lower* it — and is surfaced as [`ProviderEvent::ChatUnreadSynced`]
+/// so the app reconciles any locally-accumulated count that drifted (for
+/// example when an offline reconnect re-counted messages the user had already
+/// read on their phone).
+fn forward_chat_unread_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
+    let Some(chat_jid) = event.chat_jid.as_deref().filter(|jid| !jid.is_empty()) else {
+        return;
+    };
+    let Some(unread_count) = event.unread_count else {
+        return;
+    };
+    let chat_id = chat_id_from_jid(chat_jid);
+    if let Some(chat) = lock_rw_write(context.chats).get_mut(&chat_id) {
+        chat.unread_count = unread_count;
+    }
+    context.events.send(ProviderEvent::ChatUnreadSynced {
+        chat_id,
+        unread_count,
+    });
 }
 
 fn emit_bridge_status_message(
@@ -3044,6 +3074,70 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(cached.display_name.as_ref(), "Katherine Johnson");
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_chat_unread_sync_overrides_local_count() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:chat-unread-sync")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+
+        // Two live arrivals inflate the locally-accumulated unread count, as an
+        // offline-backlog replay of already-read messages would.
+        for id in ["m1", "m2"] {
+            assert!(bridge::fire_synthetic_message(&format!(
+                r#"{{"type":"message","id":"{id}","chat_jid":"555@s.whatsapp.net","chat_name":"Alan","sender_jid":"555@s.whatsapp.net","sender_name":"Alan","text":"hi {id}","timestamp":"2026-07-13T12:00:00Z"}}"#
+            ))?);
+        }
+        let chat_id = arc_str("whatsapp:555@s.whatsapp.net");
+        loop {
+            let chats = provider.chats().await?;
+            if let Some(chat) = chats.iter().find(|chat| chat.id == chat_id) {
+                if chat.unread_count == 2 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The phone reports its authoritative unread count of 1; it must lower
+        // (not max-merge with) the inflated local count.
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"chat_unread","chat_jid":"555@s.whatsapp.net","unread_count":1}"#
+        )?);
+        let synced = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::ChatUnreadSynced {
+                    chat_id: id,
+                    unread_count,
+                } if id == chat_id => break unread_count,
+                _ => continue,
+            }
+        };
+        assert_eq!(synced, 1);
+
+        let chats = provider.chats().await?;
+        let chat = chats.iter().find(|chat| chat.id == chat_id).unwrap();
+        assert_eq!(chat.unread_count, 1);
+
+        // A zero count clears it entirely.
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"chat_unread","chat_jid":"555@s.whatsapp.net","unread_count":0}"#
+        )?);
+        let cleared = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::ChatUnreadSynced {
+                    chat_id: id,
+                    unread_count,
+                } if id == chat_id => break unread_count,
+                _ => continue,
+            }
+        };
+        assert_eq!(cleared, 0);
 
         provider.disconnect().await?;
         Ok(())

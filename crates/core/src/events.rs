@@ -56,6 +56,19 @@ pub enum ProviderEvent {
     ChatMarkedRead {
         chat_id: ChatId,
     },
+    /// Authoritative unread count for a chat, reported by the provider from the
+    /// platform's own conversation metadata (e.g. WhatsApp history-sync
+    /// `Conversation.UnreadCount`). Unlike [`ProviderEvent::ChatUpdated`], whose
+    /// snapshot is merged so it can never regress sidebar activity, this event
+    /// is explicitly allowed to *lower* the stored unread count: it reflects the
+    /// source-of-truth read state on the user's own device rather than
+    /// locally-accumulated arrivals, so it corrects counts that drifted high
+    /// (for example after an offline reconnect re-counted already-read
+    /// messages).
+    ChatUnreadSynced {
+        chat_id: ChatId,
+        unread_count: u32,
+    },
     ChatMerged {
         from_chat_id: ChatId,
         to_chat_id: ChatId,

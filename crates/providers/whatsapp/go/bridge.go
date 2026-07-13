@@ -154,6 +154,12 @@ type bridgeEvent struct {
 	Muted        *bool  `json:"muted,omitempty"`
 	Progress     uint8  `json:"progress,omitempty"`
 
+	// UnreadCount is the authoritative unread count for a conversation as
+	// tracked by WhatsApp itself (history-sync Conversation.UnreadCount). It is
+	// a pointer so "0 unread" (an explicit read state) is distinguishable from
+	// "not reported" on events that never carry it.
+	UnreadCount *uint32 `json:"unread_count,omitempty"`
+
 	LastMessageAt      string `json:"last_message_at,omitempty"`
 	LastMessagePreview string `json:"last_message_preview,omitempty"`
 
@@ -178,12 +184,12 @@ type bridgeEvent struct {
 	Contacts              []bridgeContact  `json:"contacts,omitempty"`
 	Members               []bridgeMember   `json:"members,omitempty"`
 
-	GroupTopic                string `json:"group_topic,omitempty"`
-	GroupOwner                string `json:"group_owner,omitempty"`
-	GroupCreated              string `json:"group_created,omitempty"`
-	GroupOnlyAdminsSend       bool   `json:"group_only_admins_send,omitempty"`
-	GroupOnlyAdminsEdit       bool   `json:"group_only_admins_edit,omitempty"`
-	GroupDisappearingSeconds  uint32 `json:"group_disappearing_seconds,omitempty"`
+	GroupTopic               string `json:"group_topic,omitempty"`
+	GroupOwner               string `json:"group_owner,omitempty"`
+	GroupCreated             string `json:"group_created,omitempty"`
+	GroupOnlyAdminsSend      bool   `json:"group_only_admins_send,omitempty"`
+	GroupOnlyAdminsEdit      bool   `json:"group_only_admins_edit,omitempty"`
+	GroupDisappearingSeconds uint32 `json:"group_disappearing_seconds,omitempty"`
 }
 
 var (
@@ -1252,6 +1258,34 @@ func emitChatReadEvent(c *client, chatJID types.JID) {
 	emit(bridgeEvent{Type: "read", ChatJID: canonical.String()})
 }
 
+// conversationUnreadCount resolves the unread badge a conversation should show
+// from WhatsApp's authoritative history-sync metadata. It uses the reported
+// UnreadCount, but also honors a manual "mark as unread" (MarkedAsUnread) even
+// when no messages are genuinely unread, treating it as a single unread item so
+// chats the user deliberately flagged on their phone stay flagged here too.
+func conversationUnreadCount(conv *waHistorySync.Conversation) uint32 {
+	if conv == nil {
+		return 0
+	}
+	count := conv.GetUnreadCount()
+	if count == 0 && conv.GetMarkedAsUnread() {
+		return 1
+	}
+	return count
+}
+
+// emitChatUnread reports the authoritative unread count for a conversation as
+// tracked by WhatsApp itself (history-sync Conversation.UnreadCount). Unlike
+// live/offline message arrivals, which the consumer accumulates locally, this
+// is the phone's source-of-truth read state and is allowed to lower an
+// inflated count (e.g. after an offline reconnect replays messages the user
+// had already read on their phone).
+func emitChatUnread(c *client, ctx context.Context, chatJID types.JID, count uint32) {
+	canonical := canonicalJID(c, ctx, chatJID)
+	unread := count
+	emit(bridgeEvent{Type: "chat_unread", ChatJID: canonical.String(), UnreadCount: &unread})
+}
+
 func handleWhatsAppEvent(c *client, evt interface{}) {
 	switch v := evt.(type) {
 	case *events.Message:
@@ -1373,6 +1407,10 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 		// contacted chats never show up as "No messages yet".
 		lastMessageAt, lastMessagePreview := conversationActivity(c, ctx, parsedMessages, conv.GetLastMsgTimestamp())
 		emitProfileEventWithActivity(c, ctx, chatJID, chatName, "", isGroup, &chatMuted, lastMessageAt, lastMessagePreview)
+		// Report the phone's authoritative unread count so the consumer can
+		// reconcile any locally-accumulated count (e.g. offline-backlog replay
+		// that re-counted messages the user had already read on their phone).
+		emitChatUnread(c, ctx, chatJID, conversationUnreadCount(conv))
 		go c.fetchAndEmitProfile(ctx, chatJID, chatName, isGroup)
 
 		for _, message := range parsedMessages {
