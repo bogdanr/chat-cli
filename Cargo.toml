@@ -30,7 +30,7 @@ crossterm = "0.28"
 directories = "6"
 flate2 = "1"
 libc = "0.2"
-image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 notify-rust = "4"
 open = "5"
 ratatui = "0.30"
