@@ -974,7 +974,10 @@ fn chat_item(
                 .map(message_list::slack_emoji_shortcodes_to_display)
         })
         .unwrap_or_else(|| sidebar_preview_placeholder(chat).to_owned());
-    let second_prefix_width = CHAT_AVATAR_WIDTH as usize + 1;
+    // The preview line must reserve the same account-badge column the name
+    // line uses, otherwise the preview renders shifted left underneath the
+    // name (badge is only drawn on the first line).
+    let second_prefix_width = CHAT_AVATAR_WIDTH as usize + 1 + badge_width;
     let thread_marker = thread_marker_text(thread_unread, thread_unread_other, thread_marker_scope);
     let thread_marker_dim = thread_marker_scope == ThreadMarkerScope::Participating
         && thread_unread == 0
@@ -1014,6 +1017,7 @@ fn chat_item(
         Line::from({
             let mut spans = second_avatar_line;
             spans.push(selection_separator(selected, theme));
+            spans.push(styled_raw(" ".repeat(badge_width), selected_bg));
             if !thread_marker.is_empty() {
                 let marker_style = if thread_marker_dim {
                     Style::default().fg(theme.muted)

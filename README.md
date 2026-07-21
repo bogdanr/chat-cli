@@ -13,6 +13,13 @@ WhatsApp and Slack in one tidy inbox — no browser tabs, no clutter, no waiting
 [![Crates.io](https://img.shields.io/crates/v/chat-cli)](https://crates.io/crates/chat-cli)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-lightgrey)
 
+<br>
+<br>
+
+![chat-cli showing a WhatsApp group conversation with inline photos and reactions](assets/inbox-conversation.png)
+
+<sub>One inbox, three panes: chats on the left, the conversation in the middle, details on the right.</sub>
+
 </div>
 
 ---
@@ -30,6 +37,32 @@ If you live in the terminal, it should feel like it belongs there.
 - **Yours.** History lives locally in SQLite — no cloud round-trip to read your own messages.
 
 > It does a lot more than this page lets on. We'd rather you find that out by using it.
+
+---
+
+## See it in action
+
+**Everyday conversations, with the whole thread in view.**
+
+The screenshot above is a WhatsApp group ("Family Weekend") open in the center pane.
+The **Chats** pane on the left is sorted activity-first, with avatars, unread badges,
+and the accounts they belong to. The **Messages** pane shows the live conversation —
+inline photos rendered right in the terminal, emoji reactions under a message, and a
+poll at the top of the thread. The **Details** pane on the right summarizes the chat:
+type, membership, last activity, description, member list with roles, and even the
+disappearing-message timer. The compose box and a context-aware shortcut bar sit along
+the bottom.
+
+**Work chat, threads, and rich app messages too.**
+
+![Slack channel in chat-cli showing a thread reply and a Deploy Bot deployment card with action buttons](assets/channel-thread.png)
+
+This is a Slack-style public channel (`#project-chat-cli`). You can see a **threaded
+reply** at the top and a **rich app message** from Deploy Bot below — a formatted
+deployment card with fields (environment, duration, commit), action buttons like
+`View run` and `Rollback`, and a linked GitHub Actions run. The Details pane reflects
+the channel context: public channel, workspace, topic, and members. Same three-pane
+layout, same keyboard flow — whether it's family photos or a production deploy.
 
 ---
 
