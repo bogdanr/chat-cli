@@ -1,6 +1,6 @@
 use crate::{
     Account, Card, CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatDetails,
-    ChatId, ChatKind, ChatMember, ChatMemberRole, ChatMembership, Content, ContactProfile,
+    ChatId, ChatKind, ChatMember, ChatMemberRole, ChatMembership, ContactProfile, Content,
     EventBus, LinkPreview, Media, Message, MessageId, Platform, PlatformData, PlatformId, Poll,
     PollOption, PollVote, Provider, ProviderEvent, ProviderId, Reaction, Receipt, ReceiptKind,
     Sender, Timestamp,
@@ -288,12 +288,13 @@ impl Provider for MockProvider {
         if let Some(profile) = mock_contact_profile(platform_id.as_ref()) {
             return Ok(Some(profile));
         }
-        Ok(self.contact_info(platform_id).await?.map(|sender| {
-            ContactProfile {
+        Ok(self
+            .contact_info(platform_id)
+            .await?
+            .map(|sender| ContactProfile {
                 display_name: Some(sender.display_name),
                 ..ContactProfile::default()
-            }
-        }))
+            }))
     }
 }
 
@@ -1192,11 +1193,7 @@ fn mock_media_message(account: &ProviderId, seed: MediaMessageSeed<'_>) -> Messa
 
 /// A text message that quotes another message in the same chat (a WhatsApp/
 /// Slack reply, distinct from a Slack thread reply).
-fn mock_reply_message(
-    account: &ProviderId,
-    seed: TextMessageSeed<'_>,
-    reply_to: &str,
-) -> Message {
+fn mock_reply_message(account: &ProviderId, seed: TextMessageSeed<'_>, reply_to: &str) -> Message {
     message(
         account,
         MessageSeed {
@@ -1599,7 +1596,9 @@ fn mock_contact_profile(platform_id: &str) -> Option<ContactProfile> {
         }),
         "alex" => Some(ContactProfile {
             display_name: Some(arc_str("Alex Rivera")),
-            about: Some(arc_str("On a hiking trip this week 🥾 Replies may be slow.")),
+            about: Some(arc_str(
+                "On a hiking trip this week 🥾 Replies may be slow.",
+            )),
             phone: Some(arc_str("+1 555-0102")),
             timezone: Some(arc_str("Europe/Lisbon")),
             is_business: true,
@@ -1670,36 +1669,128 @@ fn avatar_path(name: &str) -> Option<PathBuf> {
     Some(mock_asset_path(format!("avatar-{name}.png")))
 }
 
+/// Thumbnail dimensions used for the small media previews shown before a
+/// full-resolution decode is ready.
+const MOCK_THUMB_WIDTH: u32 = 64;
+const MOCK_THUMB_HEIGHT: u32 = 40;
+
 fn ensure_mock_assets() -> Result<()> {
     let dir = mock_asset_dir();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     for spec in mock_image_specs() {
-        ensure_mock_png(spec)?;
-        ensure_mock_png(ImageSpec {
-            file_name: thumbnail_name(spec.file_name),
-            width: 64,
-            height: 40,
-            title: spec.title,
-            kind: spec.kind,
-            primary: spec.primary,
-            secondary: spec.secondary,
-        })?;
+        if let Some(bytes) = embedded_media_photo(spec.file_name) {
+            // Bundled, higher-resolution real photo for the chat window.
+            write_mock_photo_png(bytes, &mock_asset_path(spec.file_name), None)?;
+            write_mock_photo_png(
+                bytes,
+                &mock_asset_path(thumbnail_name(spec.file_name)),
+                Some((MOCK_THUMB_WIDTH, MOCK_THUMB_HEIGHT)),
+            )?;
+        } else {
+            // Stylised, procedurally drawn placeholder (screenshot, card, sticker).
+            ensure_mock_png(spec)?;
+            ensure_mock_png(ImageSpec {
+                file_name: thumbnail_name(spec.file_name),
+                width: MOCK_THUMB_WIDTH,
+                height: MOCK_THUMB_HEIGHT,
+                title: spec.title,
+                kind: spec.kind,
+                primary: spec.primary,
+                secondary: spec.secondary,
+            })?;
+        }
     }
 
     for name in mock_avatar_names() {
-        ensure_mock_png(ImageSpec {
-            file_name: format!("avatar-{name}.png"),
-            width: 96,
-            height: 96,
-            title: name,
-            kind: MockImageKind::Avatar,
-            primary: color_from_name(name, 0),
-            secondary: color_from_name(name, 85),
-        })?;
+        let path = mock_asset_path(format!("avatar-{name}.png"));
+        if let Some(bytes) = embedded_avatar_photo(name) {
+            // Bundled, higher-resolution real portrait/scene avatar.
+            write_mock_photo_png(bytes, &path, None)?;
+        } else {
+            ensure_mock_png(ImageSpec {
+                file_name: format!("avatar-{name}.png"),
+                width: 96,
+                height: 96,
+                title: name,
+                kind: MockImageKind::Avatar,
+                primary: color_from_name(name, 0),
+                secondary: color_from_name(name, 85),
+            })?;
+        }
     }
 
     Ok(())
+}
+
+/// Decodes a bundled real photo (JPEG) and installs it as a PNG at `path`,
+/// optionally resizing it to `resize` first (used for small thumbnails). The
+/// PNG extension is preserved because the TUI decodes avatars with
+/// `image::open`, which relies on the file extension for format detection.
+fn write_mock_photo_png(bytes: &[u8], path: &Path, resize: Option<(u32, u32)>) -> Result<()> {
+    let mut image = image::load_from_memory(bytes)
+        .with_context(|| format!("decoding bundled mock photo for {}", path.display()))?;
+    if let Some((width, height)) = resize {
+        image = image.resize_to_fill(width, height, image::imageops::FilterType::Lanczos3);
+    }
+
+    let generation = MOCK_ASSET_GENERATION.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = mock_asset_tmp_path(path, generation);
+    image
+        .save_with_format(&tmp_path, ImageFormat::Png)
+        .with_context(|| format!("writing mock photo {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "installing mock photo {} from {}",
+            path.display(),
+            tmp_path.display()
+        )
+    })
+}
+
+/// Bundled real portrait/scene photos for chat avatars, keyed by avatar name.
+/// People use real face portraits; groups, rooms, and bots use real scene
+/// photos. All are 256×256 so they stay crisp when scaled in the sidebar.
+fn embedded_avatar_photo(name: &str) -> Option<&'static [u8]> {
+    let bytes: &'static [u8] = match name {
+        "me" => include_bytes!("../assets/mock/avatar-me.jpg"),
+        "alice" => include_bytes!("../assets/mock/avatar-alice.jpg"),
+        "alex" => include_bytes!("../assets/mock/avatar-alex.jpg"),
+        "maya" => include_bytes!("../assets/mock/avatar-maya.jpg"),
+        "dad" => include_bytes!("../assets/mock/avatar-dad.jpg"),
+        "mom" => include_bytes!("../assets/mock/avatar-mom.jpg"),
+        "leo" => include_bytes!("../assets/mock/avatar-leo.jpg"),
+        "sam" => include_bytes!("../assets/mock/avatar-sam.jpg"),
+        "priya" => include_bytes!("../assets/mock/avatar-priya.jpg"),
+        "designer" => include_bytes!("../assets/mock/avatar-designer.jpg"),
+        "nora" => include_bytes!("../assets/mock/avatar-nora.jpg"),
+        "sofia" => include_bytes!("../assets/mock/avatar-sofia.jpg"),
+        "emma" => include_bytes!("../assets/mock/avatar-emma.jpg"),
+        "family-weekend" => include_bytes!("../assets/mock/avatar-family-weekend.jpg"),
+        "project-chat-cli" => include_bytes!("../assets/mock/avatar-project-chat-cli.jpg"),
+        "design-review" => include_bytes!("../assets/mock/avatar-design-review.jpg"),
+        "media-samples" => include_bytes!("../assets/mock/avatar-media-samples.jpg"),
+        "ops-room" => include_bytes!("../assets/mock/avatar-ops-room.jpg"),
+        "lisbon-trip" => include_bytes!("../assets/mock/avatar-lisbon-trip.jpg"),
+        "book-club" => include_bytes!("../assets/mock/avatar-book-club.jpg"),
+        "release-bot" => include_bytes!("../assets/mock/avatar-release-bot.jpg"),
+        "ci-bot" => include_bytes!("../assets/mock/avatar-ci-bot.jpg"),
+        "deploy-bot" => include_bytes!("../assets/mock/avatar-deploy-bot.jpg"),
+        "statuspage" => include_bytes!("../assets/mock/avatar-statuspage.jpg"),
+        _ => return None,
+    };
+    Some(bytes)
+}
+
+/// Bundled high-resolution real photos shown inside the conversation, keyed by
+/// their mock media file name.
+fn embedded_media_photo(file_name: &str) -> Option<&'static [u8]> {
+    let bytes: &'static [u8] = match file_name {
+        "family-picnic.png" => include_bytes!("../assets/mock/family-picnic.jpg"),
+        "mock-screenshot.png" => include_bytes!("../assets/mock/mock-screenshot.jpg"),
+        _ => return None,
+    };
+    Some(bytes)
 }
 
 #[derive(Clone, Copy)]
@@ -2705,35 +2796,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mock_provider_generates_caption_matching_mock_images() -> Result<()> {
+    async fn mock_provider_installs_real_photos_for_avatars_and_chat_window() -> Result<()> {
         let provider = MockProvider::new();
         provider.ensure_mock_assets()?;
 
+        // The chat-window photos are bundled high-resolution real images rather
+        // than procedurally drawn placeholders.
         let family = image::ImageReader::open(mock_asset_path("family-picnic.png"))?
             .decode()?
             .to_rgba8();
-        assert_pixel_near(&family, 83, 18, [255, 219, 95], "family picnic sun");
-        assert_pixel_near(&family, 50, 76, [137, 91, 43], "family picnic basket");
-        assert!(unique_color_count(&family) > 12);
+        assert_eq!(family.dimensions(), (960, 640), "family picnic photo size");
+        assert!(
+            unique_color_count(&family) > 40,
+            "family picnic should be a photographic image"
+        );
 
         let screenshot = image::ImageReader::open(mock_asset_path("mock-screenshot.png"))?
             .decode()?
             .to_rgba8();
-        assert_pixel_near(
-            &screenshot,
-            50,
-            50,
-            [26, 30, 48],
-            "terminal screenshot body",
+        assert_eq!(
+            screenshot.dimensions(),
+            (960, 600),
+            "shared photo attachment size"
         );
-        assert_pixel_near(
-            &screenshot,
-            13,
-            17,
-            [255, 95, 87],
-            "terminal screenshot window controls",
+        assert!(
+            unique_color_count(&screenshot) > 40,
+            "shared attachment should be a photographic image"
         );
-        assert!(unique_color_count(&screenshot) > 10);
+
+        // People avatars are real 256×256 portraits.
+        let avatar = image::ImageReader::open(mock_asset_path("avatar-alice.png"))?
+            .decode()?
+            .to_rgba8();
+        assert_eq!(avatar.dimensions(), (256, 256), "avatar size");
+        assert!(
+            unique_color_count(&avatar) > 30,
+            "avatar should be a photographic portrait"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mock_provider_generates_stylised_placeholder_images() -> Result<()> {
+        let provider = MockProvider::new();
+        provider.ensure_mock_assets()?;
 
         let design = image::ImageReader::open(mock_asset_path("design-review-card.png"))?
             .decode()?

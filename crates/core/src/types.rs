@@ -89,6 +89,7 @@ impl ThreadSummary {
 pub enum Platform {
     WhatsApp,
     Slack,
+    ClickUp,
     Discord,
     Unknown(String),
 }
@@ -543,6 +544,7 @@ pub enum ReceiptKind {
 pub struct PlatformData {
     pub whatsapp: Option<WhatsAppData>,
     pub slack: Option<SlackData>,
+    pub clickup: Option<ClickUpData>,
     pub cards: Vec<Card>,
 }
 
@@ -556,6 +558,22 @@ pub struct SlackData {
     pub ts: Arc<str>,
     pub thread_ts: Option<Arc<str>>,
     pub channel: Arc<str>,
+}
+
+/// Raw ClickUp identifiers needed to act on a message after it has been
+/// converted into the domain model. Every ClickUp Chat endpoint is
+/// workspace-scoped, so the workspace id must travel with the message rather
+/// than being re-derived from provider state.
+#[derive(Clone, Debug)]
+pub struct ClickUpData {
+    /// The workspace ("team") id that owns the channel.
+    pub workspace_id: Arc<str>,
+    /// The channel id the message belongs to.
+    pub channel_id: Arc<str>,
+    /// The ClickUp message id.
+    pub message_id: Arc<str>,
+    /// Id of the message this one replies to, for thread-aware actions.
+    pub parent_message_id: Option<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]

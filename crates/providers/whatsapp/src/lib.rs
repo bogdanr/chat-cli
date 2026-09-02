@@ -515,6 +515,7 @@ impl Provider for WhatsAppProvider {
                     jid: arc_str(chat_jid),
                 }),
                 slack: None,
+                clickup: None,
                 cards: Vec::new(),
             },
         };
@@ -907,12 +908,8 @@ impl Provider for WhatsAppProvider {
             } else {
                 member.name.clone()
             };
-            let sender = upsert_profile(
-                &self.profiles,
-                member.jid,
-                display_name,
-                member.avatar_path,
-            );
+            let sender =
+                upsert_profile(&self.profiles, member.jid, display_name, member.avatar_path);
             let role = if member.is_super_admin {
                 ChatMemberRole::Owner
             } else if member.is_admin {
@@ -996,10 +993,7 @@ impl Provider for WhatsAppProvider {
         })
     }
 
-    async fn contact_profile(
-        &self,
-        platform_id: &PlatformId,
-    ) -> Result<Option<ContactProfile>> {
+    async fn contact_profile(&self, platform_id: &PlatformId) -> Result<Option<ContactProfile>> {
         let display_name = lock_rw_read(&self.profiles)
             .get(platform_id)
             .map(|sender| sender.display_name.clone())
@@ -1521,6 +1515,7 @@ fn forward_message_event(
                     jid: arc_str(chat_jid),
                 }),
                 slack: None,
+                clickup: None,
                 cards: Vec::new(),
             },
         };
@@ -1638,6 +1633,7 @@ fn emit_bridge_status_message(
                 jid: arc_str(BRIDGE_SENDER_ID),
             }),
             slack: None,
+            clickup: None,
             cards: Vec::new(),
         },
     };
@@ -2711,7 +2707,10 @@ mod tests {
         let authenticating =
             BridgeEvent::decode(r#"{"type":"login","event":"passkey-authenticating"}"#)?;
         assert_eq!(authenticating.kind, "login");
-        assert_eq!(authenticating.event.as_deref(), Some("passkey-authenticating"));
+        assert_eq!(
+            authenticating.event.as_deref(),
+            Some("passkey-authenticating")
+        );
 
         let confirmation = BridgeEvent::decode(
             r#"{"type":"login","event":"passkey-confirmation","code":"ABCD-EF"}"#,

@@ -1418,6 +1418,12 @@ pub fn account_badge_placeholder(account: &Account, _theme: Theme) -> AvatarRows
             Color::Rgb(236, 178, 46),
             Color::Rgb(224, 30, 90),
         ),
+        Platform::ClickUp => two_cell_icon(
+            Color::Rgb(253, 113, 175),
+            Color::Rgb(123, 104, 238),
+            Color::Rgb(123, 104, 238),
+            Color::Rgb(73, 204, 249),
+        ),
         Platform::Discord => two_cell_icon(
             Color::Rgb(88, 101, 242),
             Color::Rgb(88, 101, 242),
@@ -1523,7 +1529,7 @@ fn is_slack_group_direct_message(chat: &Chat) -> bool {
 fn slack_channel_avatar_placeholder(chat: &Chat, bg: Option<Color>) -> [Vec<Span<'static>>; 2] {
     let blank_style = style_with_optional_bg(Style::default(), bg);
     let hashtag_style = style_with_optional_bg(
-        Style::default().fg(slack_channel_workspace_tint(&chat.account)),
+        Style::default().fg(workspace_channel_tint(&chat.account)),
         bg,
     );
 
@@ -1540,7 +1546,7 @@ fn slack_channel_avatar_placeholder(chat: &Chat, bg: Option<Color>) -> [Vec<Span
 fn slack_group_dm_avatar_placeholder(chat: &Chat, bg: Option<Color>) -> [Vec<Span<'static>>; 2] {
     let blank_style = style_with_optional_bg(Style::default(), bg);
     let marker_style = style_with_optional_bg(
-        Style::default().fg(slack_channel_workspace_tint(&chat.account)),
+        Style::default().fg(workspace_channel_tint(&chat.account)),
         bg,
     );
 
@@ -1558,7 +1564,7 @@ fn slack_group_dm_avatar_placeholder(chat: &Chat, bg: Option<Color>) -> [Vec<Spa
     ]
 }
 
-fn slack_channel_workspace_tint(account: &ProviderId) -> Color {
+fn workspace_channel_tint(account: &ProviderId) -> Color {
     const PALETTE: [Color; 8] = [
         Color::Rgb(95, 125, 116),
         Color::Rgb(87, 116, 140),
@@ -1580,7 +1586,8 @@ fn slack_channel_workspace_tint(account: &ProviderId) -> Color {
 fn avatar_color(chat: &Chat) -> Color {
     match chat.platform {
         Platform::WhatsApp => Color::Rgb(18, 140, 126),
-        Platform::Slack => slack_channel_workspace_tint(&chat.account),
+        Platform::Slack => workspace_channel_tint(&chat.account),
+        Platform::ClickUp => workspace_channel_tint(&chat.account),
         Platform::Discord => Color::Blue,
         Platform::Unknown(_) => Color::DarkGray,
     }
@@ -1689,6 +1696,7 @@ fn platform_badge(platform: &Platform) -> &'static str {
     match platform {
         Platform::WhatsApp => "[WA]",
         Platform::Slack => "[SL]",
+        Platform::ClickUp => "[CU]",
         Platform::Discord => "[DI]",
         Platform::Unknown(_) => "[--]",
     }
@@ -1698,6 +1706,7 @@ fn platform_name(platform: &Platform) -> &str {
     match platform {
         Platform::WhatsApp => "whatsapp",
         Platform::Slack => "slack",
+        Platform::ClickUp => "clickup",
         Platform::Discord => "discord",
         Platform::Unknown(value) => value,
     }
@@ -1783,6 +1792,7 @@ fn platform_style(platform: &Platform) -> Style {
     match platform {
         Platform::WhatsApp => Style::default().fg(Color::Green),
         Platform::Slack => Style::default().fg(Color::Magenta),
+        Platform::ClickUp => Style::default().fg(Color::LightMagenta),
         Platform::Discord => Style::default().fg(Color::Blue),
         Platform::Unknown(_) => Style::default().fg(Color::Cyan),
     }
@@ -2453,7 +2463,7 @@ mod tests {
         assert_eq!(placeholder[1][2].style.bg, None);
         assert_eq!(
             placeholder[1][1].style.fg,
-            Some(slack_channel_workspace_tint(&chats[3].account))
+            Some(workspace_channel_tint(&chats[3].account))
         );
         assert_ne!(placeholder[1][1].style.fg, Some(Color::Magenta));
     }
@@ -2488,12 +2498,28 @@ mod tests {
     #[test]
     fn whatsapp_avatar_placeholder_inherits_selected_row_background() {
         let chats = sample_chats();
-        let placeholder = avatar_placeholder(&chats[0], Theme::default(), Some(Theme::default().selection_bg));
+        let placeholder = avatar_placeholder(
+            &chats[0],
+            Theme::default(),
+            Some(Theme::default().selection_bg),
+        );
 
-        assert_eq!(placeholder[0][0].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][0].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][1].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][2].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(
+            placeholder[0][0].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][0].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][1].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][2].style.bg,
+            Some(Theme::default().selection_bg)
+        );
         assert_eq!(placeholder[1][1].style.fg, Some(avatar_color(&chats[0])));
     }
 
@@ -2521,7 +2547,7 @@ mod tests {
         assert_eq!(placeholder[1][1].style.bg, None);
         assert_eq!(
             placeholder[1][1].style.fg,
-            Some(slack_channel_workspace_tint(&chats[1].account))
+            Some(workspace_channel_tint(&chats[1].account))
         );
         assert_ne!(placeholder[1][1].style.fg, Some(Color::Magenta));
     }
@@ -2529,12 +2555,28 @@ mod tests {
     #[test]
     fn slack_channel_avatar_placeholder_inherits_selected_row_background() {
         let chats = sample_chats();
-        let placeholder = avatar_placeholder(&chats[1], Theme::default(), Some(Theme::default().selection_bg));
+        let placeholder = avatar_placeholder(
+            &chats[1],
+            Theme::default(),
+            Some(Theme::default().selection_bg),
+        );
 
-        assert_eq!(placeholder[0][0].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][0].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][1].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][2].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(
+            placeholder[0][0].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][0].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][1].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][2].style.bg,
+            Some(Theme::default().selection_bg)
+        );
     }
 
     #[test]
@@ -2566,11 +2608,11 @@ mod tests {
         assert_eq!(placeholder[1][1].style.bg, None);
         assert_eq!(
             placeholder[0][1].style.fg,
-            Some(slack_channel_workspace_tint(&chat.account))
+            Some(workspace_channel_tint(&chat.account))
         );
         assert_eq!(
             placeholder[1][1].style.fg,
-            Some(slack_channel_workspace_tint(&chat.account))
+            Some(workspace_channel_tint(&chat.account))
         );
         assert_ne!(placeholder[0][1].style.fg, Some(Color::Magenta));
     }
@@ -2582,14 +2624,33 @@ mod tests {
         chat.is_group = true;
         chat.kind = ChatKind::GroupDirectMessage;
 
-        let placeholder = avatar_placeholder(&chat, Theme::default(), Some(Theme::default().selection_bg));
+        let placeholder =
+            avatar_placeholder(&chat, Theme::default(), Some(Theme::default().selection_bg));
 
-        assert_eq!(placeholder[0][0].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[0][1].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[0][2].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][0].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][1].style.bg, Some(Theme::default().selection_bg));
-        assert_eq!(placeholder[1][2].style.bg, Some(Theme::default().selection_bg));
+        assert_eq!(
+            placeholder[0][0].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[0][1].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[0][2].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][0].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][1].style.bg,
+            Some(Theme::default().selection_bg)
+        );
+        assert_eq!(
+            placeholder[1][2].style.bg,
+            Some(Theme::default().selection_bg)
+        );
     }
 
     #[test]

@@ -4470,10 +4470,7 @@ impl Provider for SlackProvider {
         })
     }
 
-    async fn contact_profile(
-        &self,
-        platform_id: &PlatformId,
-    ) -> Result<Option<ContactProfile>> {
+    async fn contact_profile(&self, platform_id: &PlatformId) -> Result<Option<ContactProfile>> {
         if !self.capabilities().can_read_history {
             return Ok(None);
         }
@@ -7503,7 +7500,9 @@ fn slack_throttle_web_api() {
     static NEXT_ALLOWED: Mutex<Option<Instant>> = Mutex::new(None);
     let now = Instant::now();
     let proceed_at = {
-        let mut guard = NEXT_ALLOWED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = NEXT_ALLOWED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let at = guard.filter(|next| *next > now).unwrap_or(now);
         *guard = Some(at + SLACK_MIN_REQUEST_SPACING);
         at
@@ -8719,7 +8718,8 @@ mod tests {
         let mut seen_message_ids = HashSet::new();
         let mut activity = HashMap::new();
 
-        let dm_filter = |conversation: &SlackConversation| conversation.is_im || conversation.is_mpim;
+        let dm_filter =
+            |conversation: &SlackConversation| conversation.is_im || conversation.is_mpim;
 
         // First pass: both DM-class messages are delivered live exactly once;
         // the channel message is never delivered by the DM poll.
@@ -9525,7 +9525,11 @@ mod tests {
             .send(
                 &arc_str("C123"),
                 Content::Text(arc_str("hello from user")),
-                Some(&poll_history_message("C123", "1710000000.000001", Utc::now())),
+                Some(&poll_history_message(
+                    "C123",
+                    "1710000000.000001",
+                    Utc::now(),
+                )),
             )
             .await?;
 
@@ -9579,8 +9583,7 @@ mod tests {
         let provider = provider_with_fake_client(options, client.clone())?;
         provider.connect().await?;
 
-        let reply_target =
-            poll_history_message("ignored-channel", "ignored-thread", Utc::now());
+        let reply_target = poll_history_message("ignored-channel", "ignored-thread", Utc::now());
         let message_id = provider
             .send(
                 &arc_str("ignored-channel"),

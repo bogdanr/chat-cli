@@ -15,8 +15,7 @@ use arboard::SetExtLinux;
 use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
     CardKind, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMembership, ContactProfile,
-    Content,
-    DiscoveryAction, DiscoveryResult, Media, Message, MessageId, NetworkActivityDirection,
+    Content, DiscoveryAction, DiscoveryResult, Media, Message, MessageId, NetworkActivityDirection,
     OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, Provider, ProviderEvent,
     ProviderId, Reaction, Sender, ThreadId, ThreadParticipation, Timestamp,
 };
@@ -658,16 +657,18 @@ pub type ProviderBox = Arc<dyn Provider>;
 pub enum AccountProviderKind {
     Slack,
     WhatsApp,
+    ClickUp,
     Demo,
 }
 
 impl AccountProviderKind {
-    const ALL: [Self; 3] = [Self::Slack, Self::WhatsApp, Self::Demo];
+    const ALL: [Self; 4] = [Self::Slack, Self::WhatsApp, Self::ClickUp, Self::Demo];
 
     fn label(self) -> &'static str {
         match self {
             Self::Slack => "Slack",
             Self::WhatsApp => "WhatsApp",
+            Self::ClickUp => "ClickUp",
             Self::Demo => "Demo",
         }
     }
@@ -676,6 +677,7 @@ impl AccountProviderKind {
         match self {
             Self::Slack => "Workspaces, channels, DMs",
             Self::WhatsApp => "Personal and group chats",
+            Self::ClickUp => "Workspace chat channels and DMs",
             Self::Demo => "Explore without connecting accounts",
         }
     }
@@ -687,6 +689,9 @@ impl AccountProviderKind {
             }
             Self::WhatsApp => {
                 "Starts WhatsApp pairing. Scan the QR code from WhatsApp > Linked devices > Link a device."
+            }
+            Self::ClickUp => {
+                "Paste a ClickUp personal API token (Settings > Apps > API Token). ClickUp has no realtime chat feed, so messages arrive by periodic checks."
             }
             Self::Demo => {
                 "Loads local sample chats so users can try the UI before connecting real accounts."
@@ -741,7 +746,11 @@ fn draw_startup_screen(frame: &mut Frame<'_>) {
         Line::from("Connecting accounts and loading cached chats."),
         Line::from("Slack names and member details continue loading in the background."),
     ])
-    .block(Block::default().title(padded_title("Starting")).borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(padded_title("Starting"))
+            .borders(Borders::ALL),
+    )
     .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -1166,6 +1175,90 @@ struct AuthOverlay {
     /// scannable on large terminals; this lets the user open and scan the image
     /// regardless of terminal size.
     image_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClickUpSetupField {
+    Token,
+    Workspace,
+}
+
+impl ClickUpSetupField {
+    const ALL: [Self; 2] = [Self::Token, Self::Workspace];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Token => "Personal API token",
+            Self::Workspace => "Workspace id (optional)",
+        }
+    }
+
+    /// Tokens never expire, so they are masked in the UI exactly like Slack's.
+    fn is_secret(self) -> bool {
+        matches!(self, Self::Token)
+    }
+}
+
+/// Credential entry for a ClickUp account.
+///
+/// ClickUp needs far less than Slack: one personal API token, plus a workspace
+/// id only when the token can reach several workspaces. A dedicated overlay
+/// keeps that simplicity instead of forcing ClickUp through Slack's auth-mode
+/// and OAuth machinery.
+#[derive(Clone, Debug)]
+struct ClickUpSetupOverlay {
+    provider_id: ProviderId,
+    token: String,
+    workspace: String,
+    selected_field: usize,
+    status: Option<String>,
+    /// True once a submission is in flight, so the UI can say so and Enter
+    /// cannot queue a second validation.
+    submitting: bool,
+    failed: bool,
+}
+
+impl ClickUpSetupOverlay {
+    fn new(provider_id: ProviderId) -> Self {
+        Self {
+            provider_id,
+            token: String::new(),
+            workspace: String::new(),
+            selected_field: 0,
+            status: Some(
+                "Paste a personal API token from ClickUp Settings > Apps > API Token.".to_owned(),
+            ),
+            submitting: false,
+            failed: false,
+        }
+    }
+
+    fn field(&self) -> ClickUpSetupField {
+        ClickUpSetupField::ALL[self.selected_field.min(ClickUpSetupField::ALL.len() - 1)]
+    }
+
+    fn value_mut(&mut self) -> &mut String {
+        match self.field() {
+            ClickUpSetupField::Token => &mut self.token,
+            ClickUpSetupField::Workspace => &mut self.workspace,
+        }
+    }
+
+    fn value(&self, field: ClickUpSetupField) -> &str {
+        match field {
+            ClickUpSetupField::Token => &self.token,
+            ClickUpSetupField::Workspace => &self.workspace,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.selected_field = (self.selected_field + 1) % ClickUpSetupField::ALL.len();
+    }
+
+    fn previous_field(&mut self) {
+        self.selected_field =
+            (self.selected_field + ClickUpSetupField::ALL.len() - 1) % ClickUpSetupField::ALL.len();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2289,6 +2382,7 @@ pub struct AppState {
     auth_overlay: Option<AuthOverlay>,
     account_setup: Option<AccountSetupOverlay>,
     slack_setup: Option<SlackSetupOverlay>,
+    clickup_setup: Option<ClickUpSetupOverlay>,
     // Slack provider whose browser OAuth login was dispatched as a background
     // task. When its sync completes we run the post-auth chat load that the
     // inline submission path would otherwise perform synchronously.
@@ -2400,6 +2494,7 @@ impl Default for AppState {
             auth_overlay: None,
             account_setup: None,
             slack_setup: None,
+            clickup_setup: None,
             pending_slack_setup_load: None,
             account_switcher: None,
             threads_inbox: None,
@@ -2581,6 +2676,10 @@ impl AppState {
 
     pub fn slack_setup_open(&self) -> bool {
         self.slack_setup.is_some()
+    }
+
+    pub fn clickup_setup_open(&self) -> bool {
+        self.clickup_setup.is_some()
     }
 
     pub fn slack_setup_phase_label(&self) -> Option<&'static str> {
@@ -4280,6 +4379,7 @@ impl App {
             app.draw_auth_overlay(frame, area);
             app.draw_account_setup_overlay(frame, area);
             app.draw_slack_setup_overlay(frame, area);
+            app.draw_clickup_setup_overlay(frame, area);
             app.draw_help_overlay(frame, area);
             app.draw_action_menu(frame, area);
             app.draw_forward_picker(frame, area);
@@ -4668,7 +4768,7 @@ impl App {
 
         let icon_bytes = match account.platform {
             Platform::WhatsApp => Some(EMBEDDED_WHATSAPP_ICON_PNG),
-            Platform::Slack | Platform::Unknown(_) | Platform::Discord => None,
+            Platform::Slack | Platform::ClickUp | Platform::Unknown(_) | Platform::Discord => None,
         }?;
         let path = static_account_icon_path(provider_id, account.platform.clone());
         self.queue_static_account_icon_preview(
@@ -4715,11 +4815,7 @@ impl App {
                 }
                 (Err(error), _) => Err(error),
             };
-            let _ = tx.send(AvatarPreviewFetchResult::generated(
-                key,
-                result,
-                persisted,
-            ));
+            let _ = tx.send(AvatarPreviewFetchResult::generated(key, result, persisted));
         });
     }
 
@@ -4763,11 +4859,7 @@ impl App {
                 };
                 let stale = avatar_thumbnail_record_is_stale(&key, &record);
                 let rows = avatar_thumbnail_record_to_rows(&key, record);
-                let _ = tx.send(AvatarPreviewFetchResult::sqlite_hit(
-                    key,
-                    rows,
-                    stale,
-                ));
+                let _ = tx.send(AvatarPreviewFetchResult::sqlite_hit(key, rows, stale));
             }
         });
     }
@@ -4794,11 +4886,7 @@ impl App {
                 }
                 Err(error) => Err(error),
             };
-            let _ = tx.send(AvatarPreviewFetchResult::generated(
-                key,
-                result,
-                persisted,
-            ));
+            let _ = tx.send(AvatarPreviewFetchResult::generated(key, result, persisted));
         });
     }
 
@@ -4827,7 +4915,7 @@ impl App {
         };
         match self.settings.conversation_presentation {
             ConversationPresentationSetting::ProviderNative => match chat.platform {
-                Platform::Slack => ConversationPresentationSetting::Slack,
+                Platform::Slack | Platform::ClickUp => ConversationPresentationSetting::Slack,
                 _ => ConversationPresentationSetting::WhatsApp,
             },
             style => style,
@@ -5001,7 +5089,8 @@ impl App {
         let thread_open = self.state.thread_root.is_some();
         let compose_rect = AppLayout::for_area(area, 3, thread_open).compose;
         let inner_width = compose_rect.width.saturating_sub(2).max(1) as usize;
-        let wrapped_rows = compose_wrapped_row_count(self.state.compose.lines(), inner_width) as u16;
+        let wrapped_rows =
+            compose_wrapped_row_count(self.state.compose.lines(), inner_width) as u16;
         (wrapped_rows + reply_extra + attachment_extra + 2).clamp(3, 8)
     }
 
@@ -5604,7 +5693,10 @@ impl App {
             )));
         }
         for (label, value) in &detail.facts {
-            for (index, line) in message_list::wrap_text(value, wrap_width).into_iter().enumerate() {
+            for (index, line) in message_list::wrap_text(value, wrap_width)
+                .into_iter()
+                .enumerate()
+            {
                 if index == 0 {
                     details.push(Line::from(format!("  {label}: {line}")));
                 } else {
@@ -5683,7 +5775,10 @@ impl App {
             details.push(Line::from(format!("  {flag}")));
         }
         for (label, value) in &profile.facts {
-            for (index, line) in message_list::wrap_text(value, wrap_width).into_iter().enumerate() {
+            for (index, line) in message_list::wrap_text(value, wrap_width)
+                .into_iter()
+                .enumerate()
+            {
                 if index == 0 {
                     details.push(Line::from(format!("  {label}: {line}")));
                 } else {
@@ -5697,7 +5792,11 @@ impl App {
     /// member has an on-disk avatar file. Reuses the chat-avatar dimensions so
     /// thumbnails are shared with the sidebar cache.
     fn member_avatar_preview_key(&self, member: &ChatMember) -> Option<AvatarPreviewKey> {
-        let path = member.sender.avatar.as_deref().filter(|path| path.exists())?;
+        let path = member
+            .sender
+            .avatar
+            .as_deref()
+            .filter(|path| path.exists())?;
         Some(AvatarPreviewKey {
             path: path.to_path_buf(),
             width: chat_list::CHAT_AVATAR_WIDTH,
@@ -5755,9 +5854,7 @@ impl App {
         let mut names = reaction_sender_names(&self.state.messages);
         if let Some(chat) = self.state.selected_chat() {
             for ((account, platform_id), sender) in &self.state.sender_cache {
-                if account.as_ref() != chat.account.as_ref()
-                    || !sender_has_resolved_info(sender)
-                {
+                if account.as_ref() != chat.account.as_ref() || !sender_has_resolved_info(sender) {
                     continue;
                 }
                 match names.get_mut(platform_id.as_ref()) {
@@ -5890,9 +5987,7 @@ impl App {
         if let Some(avatar_rows) = avatar_rows {
             lines.extend(avatar_rows.into_iter().map(Line::from));
             lines.push(Line::from(""));
-        } else if hd_avatar
-            && let Some(path) = avatar_path.clone()
-        {
+        } else if hd_avatar && let Some(path) = avatar_path.clone() {
             // Reserve blank lines so the overlaid HD image (drawn after the
             // paragraph) does not collide with surrounding text and scrolls with
             // the rest of the details content.
@@ -6706,8 +6801,9 @@ impl App {
             let row = scroll_offset + window_row;
             let (value, label) = COMPOSE_EMOTICON_OPTIONS[option_index];
             let selected = row == picker.selected;
-            let reacted = message
-                .is_some_and(|message| message_reacted_by_sender(message, value, LOCAL_REACTION_SENDER));
+            let reacted = message.is_some_and(|message| {
+                message_reacted_by_sender(message, value, LOCAL_REACTION_SENDER)
+            });
             let prefix = if selected { "› " } else { "  " };
             let marker = if reacted { "● " } else { "  " };
             let style = match (selected, reacted) {
@@ -7188,6 +7284,76 @@ impl App {
         frame.render_widget(paragraph, modal);
     }
 
+    fn draw_clickup_setup_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(setup) = &self.state.clickup_setup else {
+            return;
+        };
+        if area.width < 44 || area.height < 12 {
+            return;
+        }
+
+        let modal = self.clickup_setup_overlay_rect(area);
+        let mut lines = vec![
+            Line::from(Span::styled("ClickUp sign-in", self.theme.pane_title())),
+            Line::from(format!("Provider: {}", setup.provider_id)),
+            Line::from(""),
+        ];
+
+        for (index, field) in ClickUpSetupField::ALL.iter().enumerate() {
+            let selected = index == setup.selected_field;
+            let marker = if selected { ">" } else { " " };
+            let display_value = slack_setup_display_value(setup.value(*field), field.is_secret());
+            let style = if selected {
+                self.theme.status_key()
+            } else {
+                self.theme.muted()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{marker} {}: ", field.label()), style),
+                Span::raw(display_value),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "The workspace id is only needed when the token reaches several workspaces.",
+            self.theme.muted(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "ClickUp has no realtime chat feed, so messages arrive by periodic checks.",
+            self.theme.muted(),
+        )));
+
+        if let Some(status) = &setup.status
+            && !status.is_empty()
+        {
+            lines.push(Line::from(""));
+            let style = if setup.failed {
+                self.theme.status_key()
+            } else {
+                self.theme.muted()
+            };
+            lines.push(Line::from(Span::styled(status.clone(), style)));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "↑/↓ or Tab fields · Enter connect · Esc hide",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(padded_title("ClickUp setup"))
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.overlay_border()),
+            )
+            .wrap(Wrap { trim: true });
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
     fn draw_auth_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
         let Some(overlay) = &self.state.auth_overlay else {
             return;
@@ -7211,7 +7377,10 @@ impl App {
 
                 let image_hint = overlay.image_path.as_ref().map(|path| {
                     Line::from(Span::styled(
-                        format!("Too small to scan? Open and scan this image: {}", path.display()),
+                        format!(
+                            "Too small to scan? Open and scan this image: {}",
+                            path.display()
+                        ),
                         self.theme.muted(),
                     ))
                 });
@@ -8389,6 +8558,10 @@ impl App {
                 self.open_slack_setup_for_account(&account, Some(detail));
                 return Ok(());
             }
+            if account.platform == Platform::ClickUp {
+                self.open_clickup_setup_for_provider(&account.id, Some(detail));
+                return Ok(());
+            }
             if account.platform == Platform::WhatsApp {
                 return Ok(());
             }
@@ -8412,6 +8585,18 @@ impl App {
                 Some("complete Slack setup".to_owned()),
             );
             self.open_slack_setup_for_account(&account, None);
+            return Ok(());
+        }
+
+        if refreshed_account.platform == Platform::ClickUp
+            && !self.providers[provider_index].is_connected()
+        {
+            self.set_account_status(
+                &account.id,
+                AccountConnection::NeedsAuth,
+                Some("add a ClickUp API token".to_owned()),
+            );
+            self.open_clickup_setup_for_provider(&account.id, None);
             return Ok(());
         }
 
@@ -8838,6 +9023,12 @@ impl App {
                     }
                 } else if self.account_platform(&provider_id) == Some(Platform::Slack) {
                     self.open_slack_setup_for_provider(&provider_id, Some(&challenge), None);
+                } else if self.account_platform(&provider_id) == Some(Platform::ClickUp) {
+                    // ClickUp only ever challenges for a personal API token, so
+                    // reuse the credential overlay instead of the generic
+                    // QR/code auth overlay.
+                    self.open_clickup_setup_for_provider(&provider_id, None);
+                    self.state.status = format!("ClickUp token required for {provider_id}");
                 } else {
                     let image_path = match &challenge {
                         AuthChallenge::QrCode(code) => write_qr_png(&provider_id, code.as_ref()),
@@ -8891,7 +9082,7 @@ impl App {
                     .await?;
                 if self.state.pending_slack_setup_load.as_ref() == Some(&provider_id) {
                     self.state.pending_slack_setup_load = None;
-                    self.load_slack_setup_account(&provider_id).await?;
+                    self.load_setup_account(&provider_id).await?;
                 }
                 self.state.status = format!("sync complete for {provider_id}");
             }
@@ -8915,8 +9106,14 @@ impl App {
                 if self.state.pending_slack_setup_load.as_ref() == Some(&provider_id) {
                     self.state.pending_slack_setup_load = None;
                 }
-                if self.account_platform(&provider_id) == Some(Platform::Slack) {
-                    self.open_slack_setup_for_provider(&provider_id, None, detail.clone());
+                match self.account_platform(&provider_id) {
+                    Some(Platform::Slack) => {
+                        self.open_slack_setup_for_provider(&provider_id, None, detail.clone());
+                    }
+                    Some(Platform::ClickUp) => {
+                        self.open_clickup_setup_for_provider(&provider_id, detail.clone());
+                    }
+                    _ => {}
                 }
                 self.set_account_status(&provider_id, AccountConnection::Offline, detail.clone());
                 self.state.status = detail
@@ -9180,9 +9377,7 @@ impl App {
                     picker.refresh_matches();
                 }
             }
-            KeyCode::Char(value)
-                if value.is_alphanumeric() || matches!(value, '_' | '-' | '+') =>
-            {
+            KeyCode::Char(value) if value.is_alphanumeric() || matches!(value, '_' | '-' | '+') => {
                 if let Some(picker) = &mut self.state.reaction_picker {
                     picker.query.push(value.to_ascii_lowercase());
                     picker.refresh_matches();
@@ -9190,10 +9385,9 @@ impl App {
             }
             KeyCode::Enter => {
                 let chosen = self.state.reaction_picker.as_ref().and_then(|picker| {
-                    picker
-                        .matches
-                        .get(picker.selected)
-                        .map(|&index| (picker.message_id.clone(), COMPOSE_EMOTICON_OPTIONS[index].0))
+                    picker.matches.get(picker.selected).map(|&index| {
+                        (picker.message_id.clone(), COMPOSE_EMOTICON_OPTIONS[index].0)
+                    })
                 });
                 if let Some((message_id, emoji)) = chosen {
                     self.state.reaction_picker = None;
@@ -9404,6 +9598,10 @@ impl App {
 
         if self.state.slack_setup.is_some() {
             return self.handle_slack_setup_key(key).await;
+        }
+
+        if self.state.clickup_setup.is_some() {
+            return self.handle_clickup_setup_key(key).await;
         }
 
         if self.state.help_overlay.is_some() {
@@ -9639,6 +9837,128 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    async fn handle_clickup_setup_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(setup) = &mut self.state.clickup_setup else {
+            return Ok(false);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.clickup_setup = None;
+                self.state.status = "ClickUp setup hidden".to_owned();
+            }
+            KeyCode::Up => setup.previous_field(),
+            KeyCode::Down | KeyCode::Tab => setup.next_field(),
+            KeyCode::BackTab => setup.previous_field(),
+            KeyCode::Backspace => {
+                setup.value_mut().pop();
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                setup.value_mut().push(character);
+            }
+            // A submission already in flight must not be duplicated: each one
+            // spends part of the token's rate budget.
+            KeyCode::Enter if !setup.submitting => {
+                self.submit_current_clickup_setup().await?;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Validates the entered ClickUp credentials and, on success, loads the
+    /// account's chats.
+    ///
+    /// Validation is a network round trip, so it is dispatched to the provider
+    /// and awaited here rather than on the draw path; the overlay shows a
+    /// "connecting" status meanwhile.
+    async fn submit_current_clickup_setup(&mut self) -> Result<()> {
+        let Some(setup) = self.state.clickup_setup.clone() else {
+            return Ok(());
+        };
+        let Some(token) = trimmed_option(&setup.token) else {
+            if let Some(current) = &mut self.state.clickup_setup {
+                current.failed = true;
+                current.status =
+                    Some("Enter a ClickUp personal API token (it starts with pk_).".to_owned());
+            }
+            return Ok(());
+        };
+
+        if let Some(current) = &mut self.state.clickup_setup {
+            current.submitting = true;
+            current.failed = false;
+            current.status = Some("Validating the token with ClickUp...".to_owned());
+        }
+
+        let submission = AuthSubmission {
+            workspace_label: trimmed_option(&setup.workspace),
+            mode: Some(AuthSubmissionMode::ImportedToken),
+            user_token: Some(token),
+            ..AuthSubmission::default()
+        };
+
+        let result = if let Some(provider) = self.provider_for_id(&setup.provider_id) {
+            provider.submit_auth(submission).await
+        } else {
+            Err(anyhow!(
+                "ClickUp provider {} is not available",
+                setup.provider_id
+            ))
+        };
+
+        match result {
+            Ok(()) => {
+                self.state.clickup_setup = None;
+                self.load_setup_account(&setup.provider_id).await?;
+                self.state.status = format!("connected ClickUp account {}", setup.provider_id);
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                self.set_account_status(
+                    &setup.provider_id,
+                    AccountConnection::Offline,
+                    Some(detail.clone()),
+                );
+                if let Some(current) = &mut self.state.clickup_setup
+                    && current.provider_id == setup.provider_id
+                {
+                    current.submitting = false;
+                    current.failed = true;
+                    current.status = Some(detail.clone());
+                }
+                self.state.status = format!("ClickUp setup failed: {detail}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the ClickUp credential overlay for an account that still needs a
+    /// token, preserving anything already typed for the same provider.
+    fn open_clickup_setup_for_provider(
+        &mut self,
+        provider_id: &ProviderId,
+        failure: Option<String>,
+    ) {
+        if let Some(current) = &mut self.state.clickup_setup
+            && current.provider_id == *provider_id
+        {
+            current.submitting = false;
+            if let Some(failure) = failure {
+                current.failed = true;
+                current.status = Some(failure);
+            }
+            return;
+        }
+
+        let mut overlay = ClickUpSetupOverlay::new(provider_id.clone());
+        if let Some(failure) = failure {
+            overlay.failed = true;
+            overlay.status = Some(failure);
+        }
+        self.state.clickup_setup = Some(overlay);
     }
 
     async fn handle_slack_setup_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -10000,8 +10320,7 @@ impl App {
     /// Adjusts the settings overlay scroll so the selected item stays inside
     /// the list viewport.
     fn ensure_settings_selection_visible(&mut self) {
-        let metrics =
-            settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
+        let metrics = settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
         let Some(overlay) = &mut self.state.settings_overlay else {
             return;
         };
@@ -10017,8 +10336,7 @@ impl App {
 
     /// Scrolls the settings list by `delta` rows without moving the selection.
     fn scroll_settings_overlay(&mut self, delta: isize) {
-        let metrics =
-            settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
+        let metrics = settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
         let Some(overlay) = &mut self.state.settings_overlay else {
             return;
         };
@@ -10035,8 +10353,7 @@ impl App {
     /// Maps a mouse position to the settings list item rendered on that row.
     fn settings_item_at(&self, column: u16, row: u16) -> Option<usize> {
         let overlay = self.state.settings_overlay.as_ref()?;
-        let metrics =
-            settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
+        let metrics = settings_overlay_metrics(self.settings_overlay_rect(self.state.frame_area));
         if !rect_contains(metrics.list, column, row) {
             return None;
         }
@@ -10632,8 +10949,7 @@ impl App {
             .saturating_sub(hit.track.y)
             .min(hit.track.height.saturating_sub(1)) as f64;
         let ratio = (offset / span).clamp(0.0, 1.0);
-        let position = (((ratio * hit.max_position as f64).round()) as usize)
-            .min(hit.max_position);
+        let position = (((ratio * hit.max_position as f64).round()) as usize).min(hit.max_position);
 
         match hit.target {
             ScrollbarTarget::ChatList => {
@@ -10641,8 +10957,8 @@ impl App {
                 if selectable == 0 {
                     return false;
                 }
-                let target = (((ratio * (selectable - 1) as f64).round()) as usize)
-                    .min(selectable - 1);
+                let target =
+                    (((ratio * (selectable - 1) as f64).round()) as usize).min(selectable - 1);
                 let current = self.selected_visible_position().unwrap_or(0);
                 self.move_chat_selection(target as isize - current as isize)
             }
@@ -13275,14 +13591,10 @@ impl App {
         let task_target = target;
         tokio::spawn(async move {
             let started = Instant::now();
-            let result = forward_send_content(
-                provider,
-                source_provider,
-                &task_target.chat_id,
-                content,
-            )
-            .await
-            .map_err(|error| format!("{error:#}"));
+            let result =
+                forward_send_content(provider, source_provider, &task_target.chat_id, content)
+                    .await
+                    .map_err(|error| format!("{error:#}"));
             let _ = tx.send(ForwardSendResult {
                 target: task_target,
                 result,
@@ -13871,7 +14183,7 @@ impl App {
                     &setup.provider_id,
                     SlackSetupPhase::CapabilityReview,
                 );
-                self.load_slack_setup_account(&setup.provider_id).await?;
+                self.load_setup_account(&setup.provider_id).await?;
                 self.state.status = format!("Slack setup submitted for {}", setup.provider_id);
             }
             Err(error) => {
@@ -13893,10 +14205,11 @@ impl App {
         Ok(())
     }
 
-    /// Load chats and select the first conversation for a Slack account whose
-    /// authentication just succeeded. Shared by the inline submission path and
-    /// the background browser-OAuth path (driven by `SyncComplete`).
-    async fn load_slack_setup_account(&mut self, provider_id: &ProviderId) -> Result<()> {
+    /// Load chats and select the first conversation for an account whose
+    /// authentication just succeeded. Shared by the inline Slack submission
+    /// path, the background browser-OAuth path (driven by `SyncComplete`), and
+    /// ClickUp token submission.
+    async fn load_setup_account(&mut self, provider_id: &ProviderId) -> Result<()> {
         if let Some(provider_index) = self.provider_index_for_id(provider_id) {
             let provider = self.providers[provider_index].as_ref();
             let account = provider.account_info();
@@ -14144,22 +14457,22 @@ impl App {
         // only sees the trimmed notification preview. Messages the user sent
         // themselves never produce a voice summary, even when
         // `notify_self_messages` lets them raise a visual notification.
-        let voice_payload = if self.settings.voice_summaries && !message.is_from_me && !is_low_intent
-        {
-            let account_label = self
-                .account_for_provider(&message.account)
-                .map(|account| account.display_name.to_string())
-                .unwrap_or_else(|| message.account.to_string());
-            Some(voice_summary::payload_for_message(
-                chat,
-                &account_label,
-                message,
-                content_copy_text(&message.content),
-                is_slack_thread_reply(message),
-            ))
-        } else {
-            None
-        };
+        let voice_payload =
+            if self.settings.voice_summaries && !message.is_from_me && !is_low_intent {
+                let account_label = self
+                    .account_for_provider(&message.account)
+                    .map(|account| account.display_name.to_string())
+                    .unwrap_or_else(|| message.account.to_string());
+                Some(voice_summary::payload_for_message(
+                    chat,
+                    &account_label,
+                    message,
+                    content_copy_text(&message.content),
+                    is_slack_thread_reply(message),
+                ))
+            } else {
+                None
+            };
         let deliver_at = Instant::now() + NOTIFICATION_DELIVERY_DELAY;
         if let Some(pending) = self
             .state
@@ -14888,7 +15201,7 @@ impl App {
             provider_id: None,
             label: "Add account".to_owned(),
             summary: if self.provider_factory.is_some() {
-                "Connect Slack, WhatsApp, or demo".to_owned()
+                "Connect Slack, WhatsApp, ClickUp, or demo".to_owned()
             } else {
                 "Runtime setup unavailable".to_owned()
             },
@@ -15080,6 +15393,17 @@ impl App {
             .saturating_div(100)
             .clamp(14, 28)
             .min(area.height.saturating_sub(2).max(1));
+        centered_fixed_rect(area, width, height)
+    }
+
+    fn clickup_setup_overlay_rect(&self, area: Rect) -> Rect {
+        let width = area
+            .width
+            .saturating_mul(70)
+            .saturating_div(100)
+            .clamp(46, 82)
+            .min(area.width.saturating_sub(2).max(1));
+        let height = 16.min(area.height.saturating_sub(2).max(1));
         centered_fixed_rect(area, width, height)
     }
 
@@ -17254,10 +17578,11 @@ fn format_duration_label(seconds: u32) -> String {
 }
 
 /// Whether the chat is a multi-party conversation whose participant list the
-/// provider can enumerate: Slack channels/group DMs and WhatsApp groups.
+/// provider can enumerate: Slack channels/group DMs, ClickUp Channels/group
+/// DMs, and WhatsApp groups.
 fn chat_supports_member_listing(chat: &Chat) -> bool {
     match chat.platform {
-        Platform::Slack => !matches!(chat.kind, ChatKind::Direct),
+        Platform::Slack | Platform::ClickUp => !matches!(chat.kind, ChatKind::Direct),
         Platform::WhatsApp => matches!(chat.kind, ChatKind::Group),
         _ => false,
     }
@@ -17522,6 +17847,7 @@ fn network_activity_account_color(platform: Platform, index: usize) -> Color {
     match platform {
         Platform::WhatsApp => Color::Green,
         Platform::Slack => Color::Magenta,
+        Platform::ClickUp => Color::LightMagenta,
         Platform::Discord => Color::Blue,
         Platform::Unknown(_) => fallback_network_activity_account_color(index),
     }
@@ -17791,9 +18117,9 @@ fn settings_overlay_metrics(modal: Rect) -> SettingsOverlayMetrics {
         .height
         .saturating_sub(SETTINGS_OVERLAY_HEADER_ROWS + footer_rows)
         .max(1);
-    let list_y = inner.y.saturating_add(
-        SETTINGS_OVERLAY_HEADER_ROWS.min(inner.height.saturating_sub(list_height)),
-    );
+    let list_y = inner
+        .y
+        .saturating_add(SETTINGS_OVERLAY_HEADER_ROWS.min(inner.height.saturating_sub(list_height)));
     let list = Rect::new(inner.x, list_y, inner.width, list_height);
     let description_y = list.y.saturating_add(list.height).saturating_add(1);
     let description_height = inner
@@ -18414,6 +18740,7 @@ fn platform_label(platform: &Platform) -> &'static str {
     match platform {
         Platform::WhatsApp => "WhatsApp",
         Platform::Slack => "Slack",
+        Platform::ClickUp => "ClickUp",
         Platform::Discord => "Discord",
         Platform::Unknown(_) => "Unknown",
     }
@@ -18719,6 +19046,7 @@ fn is_whatsapp_direct_avatar_chat(chat: &Chat) -> bool {
 fn static_account_icon_path(provider_id: &ProviderId, platform: Platform) -> PathBuf {
     let prefix = match platform {
         Platform::Slack => "slack",
+        Platform::ClickUp => "clickup",
         Platform::WhatsApp => "whatsapp",
         Platform::Unknown(_) | Platform::Discord => "unknown",
     };
@@ -22134,6 +22462,10 @@ mod tests {
                 "whatsapp:runtime",
                 "Runtime WhatsApp",
             )) as ProviderBox),
+            AccountProviderKind::ClickUp => Ok(Arc::new(StaticTestProvider::slack_setup(
+                "clickup:runtime",
+                "Runtime ClickUp",
+            )) as ProviderBox),
             AccountProviderKind::Demo => Ok(Arc::new(MockProvider::new()) as ProviderBox),
         });
         let mut app = test_app_with_factory(Vec::new(), factory).await?;
@@ -22616,8 +22948,8 @@ mod tests {
 
         // Backdate the last interaction beyond the inactivity window; the tick
         // handler should then auto-clear the lingering filter.
-        app.state.filter_last_interaction = Instant::now()
-            .checked_sub(FILTER_INACTIVITY_TIMEOUT + Duration::from_secs(1));
+        app.state.filter_last_interaction =
+            Instant::now().checked_sub(FILTER_INACTIVITY_TIMEOUT + Duration::from_secs(1));
         app.handle_event(AppEvent::Tick).await?;
 
         assert_eq!(app.state().filter(), "");
@@ -22646,8 +22978,8 @@ mod tests {
         drain_async_app_work(&mut app).await?;
         assert_eq!(app.state().filter(), "media");
 
-        app.state.filter_last_interaction = Instant::now()
-            .checked_sub(FILTER_INACTIVITY_TIMEOUT + Duration::from_secs(1));
+        app.state.filter_last_interaction =
+            Instant::now().checked_sub(FILTER_INACTIVITY_TIMEOUT + Duration::from_secs(1));
         app.handle_event(AppEvent::Tick).await?;
 
         // With auto-reset disabled the filter stays applied.
@@ -23494,9 +23826,11 @@ mod tests {
         assert!(everything.len() > standard_only.len());
         assert!(kaomoji_present(&everything));
         assert!(!kaomoji_present(&standard_only));
-        assert!(standard_only
-            .iter()
-            .all(|&index| reaction_entry_is_standard(COMPOSE_EMOTICON_OPTIONS[index].1)));
+        assert!(
+            standard_only
+                .iter()
+                .all(|&index| reaction_entry_is_standard(COMPOSE_EMOTICON_OPTIONS[index].1))
+        );
     }
 
     #[test]
@@ -23529,11 +23863,13 @@ mod tests {
             .collect();
         assert_eq!(me_reactions, vec!["❤️"]);
         // Another user's reaction on a different emoji is untouched.
-        assert!(message
-            .reactions
-            .iter()
-            .any(|reaction| reaction.emoji.as_ref() == "👍"
-                && reaction.senders.iter().any(|s| s.as_ref() == "alice")));
+        assert!(
+            message
+                .reactions
+                .iter()
+                .any(|reaction| reaction.emoji.as_ref() == "👍"
+                    && reaction.senders.iter().any(|s| s.as_ref() == "alice"))
+        );
     }
 
     #[tokio::test]
@@ -23576,10 +23912,12 @@ mod tests {
         assert!(!app.state().reaction_picker_open());
 
         let reacted = app.message_by_id(&message_id).unwrap();
-        assert!(reacted
-            .reactions
-            .iter()
-            .any(|reaction| reaction.emoji.as_ref() == chosen));
+        assert!(
+            reacted
+                .reactions
+                .iter()
+                .any(|reaction| reaction.emoji.as_ref() == chosen)
+        );
         Ok(())
     }
 
@@ -24798,12 +25136,9 @@ mod tests {
                 if !visible_lines.contains(&body_line_hit.line) {
                     return None;
                 }
-                if app
-                    .state
-                    .media_hits
-                    .iter()
-                    .any(|media| body_line_hit.line >= media.start_line && body_line_hit.line <= media.end_line)
-                {
+                if app.state.media_hits.iter().any(|media| {
+                    body_line_hit.line >= media.start_line && body_line_hit.line <= media.end_line
+                }) {
                     return None;
                 }
                 Some((hit.clone(), body_line_hit.clone()))
@@ -25614,7 +25949,9 @@ mod tests {
             other => panic!("expected promoted image content, got {other:?}"),
         }
         // A text-only destination cannot accept the promoted image.
-        assert!(forward_content_for_capabilities(&cards, &OutboundCapabilities::default()).is_none());
+        assert!(
+            forward_content_for_capabilities(&cards, &OutboundCapabilities::default()).is_none()
+        );
     }
 
     #[test]
@@ -25685,9 +26022,9 @@ mod tests {
     #[tokio::test]
     async fn forwarding_media_shows_progress_then_delivers_after_drain() -> Result<()> {
         let account: ProviderId = Arc::from("wa");
-        let mut app = test_app_with_providers(vec![Arc::new(
-            StaticTestProvider::whatsapp_setup("wa", "WhatsApp"),
-        )])
+        let mut app = test_app_with_providers(vec![Arc::new(StaticTestProvider::whatsapp_setup(
+            "wa", "WhatsApp",
+        ))])
         .await?;
 
         let path = std::env::temp_dir().join("chat-cli-test-forward-media.png");
@@ -25721,7 +26058,8 @@ mod tests {
         };
 
         // Phase 1: dispatch reports progress and does not block on the upload.
-        app.forward_message_to_target(source.id.clone(), target).await?;
+        app.forward_message_to_target(source.id.clone(), target)
+            .await?;
         assert_eq!(app.state().status(), "forwarding to Dest…");
 
         // Phase 2: draining the background completion delivers the message.
@@ -26837,7 +27175,10 @@ mod tests {
                 .any(|line| line.contains("Members: 11 · 2 admins"))
         );
         assert!(text.iter().any(|line| line.contains("Workspace: Acme")));
-        assert!(text.iter().any(|line| line.contains("Only admins can send")));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Only admins can send"))
+        );
         assert!(
             text.iter()
                 .any(|line| line.contains("Disappearing messages: 7 days"))

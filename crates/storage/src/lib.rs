@@ -277,8 +277,7 @@ impl<'de> Deserialize<'de> for AppSettings {
                     notification_scope: defaults.notification_scope,
                     notify_self_messages: defaults.notify_self_messages,
                     voice_summaries: defaults.voice_summaries,
-                    suppress_low_intent_notifications: defaults
-                        .suppress_low_intent_notifications,
+                    suppress_low_intent_notifications: defaults.suppress_low_intent_notifications,
                     chat_inbox_style: defaults.chat_inbox_style,
                     ui_theme: defaults.ui_theme,
                     conversation_presentation: defaults.conversation_presentation,
@@ -442,6 +441,105 @@ impl Store {
             params![id.as_ref()],
         )?;
         transaction.execute("DELETE FROM accounts WHERE id = ?1", params![id.as_ref()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Folds every row owned by a superseded account id into the canonical
+    /// one, then drops the superseded account.
+    ///
+    /// A provider id is derived from its options, so it can legitimately
+    /// change once setup resolves the authoritative identity — a ClickUp
+    /// account first started without a workspace id keys on its label, then
+    /// re-keys on the workspace id the moment `validate` persists it. Without
+    /// this fold the old id keeps every chat and message while the new id
+    /// starts empty, so the sidebar shows stale, permanently un-updatable rows
+    /// beside the live ones.
+    ///
+    /// Conflicts resolve in favour of the target: rows already present under
+    /// the canonical id win, since they were written by the provider that is
+    /// actually running. Activity and preview are carried across only when the
+    /// superseded row is genuinely newer, so ordering never regresses.
+    ///
+    /// Idempotent: merging an already-merged (or unknown) id is a no-op.
+    pub async fn merge_account(&self, from: &ProviderId, to: &ProviderId) -> Result<()> {
+        if from.as_ref() == to.as_ref() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().await;
+        let transaction = conn.unchecked_transaction()?;
+        let from = from.as_ref();
+        let to = to.as_ref();
+
+        // Both sides must exist. Folding into an id that has no `accounts`
+        // row would delete the only account owning these chats and leave them
+        // dangling against the `chats -> accounts` reference, which is worse
+        // than the duplication being repaired. The canonical row appears as
+        // soon as its provider connects, so a skipped fold is retried on the
+        // next start.
+        let present: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM accounts WHERE id IN (?1, ?2)",
+            params![from, to],
+            |row| row.get(0),
+        )?;
+        if present < 2 {
+            return Ok(());
+        }
+
+        // Carry activity onto rows that already exist under the canonical id,
+        // but only when the superseded row is newer, so ordering cannot
+        // regress. This must run before the rows are moved or deleted.
+        transaction.execute(
+            "UPDATE chats
+                SET last_msg_at  = (SELECT o.last_msg_at  FROM chats o
+                                     WHERE o.id = chats.id AND o.account_id = ?1),
+                    last_preview = (SELECT o.last_preview FROM chats o
+                                     WHERE o.id = chats.id AND o.account_id = ?1),
+                    unread_count = (SELECT o.unread_count FROM chats o
+                                     WHERE o.id = chats.id AND o.account_id = ?1)
+              WHERE account_id = ?2
+                AND EXISTS (SELECT 1 FROM chats o
+                             WHERE o.id = chats.id AND o.account_id = ?1
+                               AND COALESCE(o.last_msg_at, 0) > COALESCE(chats.last_msg_at, 0))",
+            params![from, to],
+        )?;
+
+        // Move rows the canonical id does not already have. `OR IGNORE` keeps
+        // the target's own row on a primary-key clash; the leftovers are then
+        // dropped. Doing it this way avoids naming every column, so the fold
+        // keeps working as the schema grows.
+        for (table, key) in [
+            ("chats", "id"),
+            ("messages", "id"),
+            ("reactions", "message_id"),
+            ("receipts", "message_id"),
+            ("thread_reads", "thread_id"),
+            ("handles", "platform_id"),
+        ] {
+            transaction.execute(
+                &format!(
+                    "UPDATE OR IGNORE {table} SET account_id = ?2 WHERE account_id = ?1"
+                ),
+                params![from, to],
+            )?;
+            // Anything still on the old id collided with an existing target
+            // row and is therefore redundant.
+            transaction.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE account_id = ?1
+                      AND EXISTS (SELECT 1 FROM {table} t
+                                   WHERE t.{key} = {table}.{key} AND t.account_id = ?2)"
+                ),
+                params![from, to],
+            )?;
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE account_id = ?1"),
+                params![from],
+            )?;
+        }
+
+        transaction.execute("DELETE FROM accounts WHERE id = ?1", params![from])?;
         transaction.commit()?;
         Ok(())
     }
@@ -1615,9 +1713,12 @@ fn chat_sort_bucket(chat: &Chat) -> u8 {
         return 5;
     }
     match (&chat.platform, chat.kind) {
-        (Platform::Slack, ChatKind::PublicChannel | ChatKind::PrivateChannel) => 0,
-        (Platform::Slack, ChatKind::Direct) => 1,
-        (Platform::Slack, ChatKind::GroupDirectMessage) => 2,
+        (
+            Platform::Slack | Platform::ClickUp,
+            ChatKind::PublicChannel | ChatKind::PrivateChannel,
+        ) => 0,
+        (Platform::Slack | Platform::ClickUp, ChatKind::Direct) => 1,
+        (Platform::Slack | Platform::ClickUp, ChatKind::GroupDirectMessage) => 2,
         _ if chat.is_group => 3,
         _ => 4,
     }
@@ -1958,6 +2059,7 @@ fn platform_to_str(platform: &Platform) -> String {
     match platform {
         Platform::WhatsApp => "WhatsApp".to_owned(),
         Platform::Slack => "Slack".to_owned(),
+        Platform::ClickUp => "ClickUp".to_owned(),
         Platform::Discord => "Discord".to_owned(),
         Platform::Unknown(value) => format!("Unknown:{value}"),
     }
@@ -1967,6 +2069,7 @@ fn platform_from_str(value: &str) -> Platform {
     match value {
         "WhatsApp" => Platform::WhatsApp,
         "Slack" => Platform::Slack,
+        "ClickUp" => Platform::ClickUp,
         "Discord" => Platform::Discord,
         other => Platform::Unknown(other.strip_prefix("Unknown:").unwrap_or(other).to_owned()),
     }
@@ -2030,6 +2133,12 @@ fn platform_data_to_json(data: &PlatformData) -> Result<String> {
             "thread_ts": slack.thread_ts.as_deref(),
             "channel": slack.channel.as_ref(),
         })),
+        "clickup": data.clickup.as_ref().map(|clickup| serde_json::json!({
+            "workspace_id": clickup.workspace_id.as_ref(),
+            "channel_id": clickup.channel_id.as_ref(),
+            "message_id": clickup.message_id.as_ref(),
+            "parent_message_id": clickup.parent_message_id.as_deref(),
+        })),
         "cards": StoredCards::from_cards(&data.cards),
     });
     Ok(serde_json::to_string(&value)?)
@@ -2059,6 +2168,18 @@ fn platform_data_from_json(json: Option<&str>) -> PlatformData {
         })
     });
 
+    let clickup = value.get("clickup").and_then(|clickup| {
+        Some(ClickUpData {
+            workspace_id: arc_str(clickup.get("workspace_id")?.as_str()?.to_owned()),
+            channel_id: arc_str(clickup.get("channel_id")?.as_str()?.to_owned()),
+            message_id: arc_str(clickup.get("message_id")?.as_str()?.to_owned()),
+            parent_message_id: clickup
+                .get("parent_message_id")
+                .and_then(|value| value.as_str())
+                .map(|value| arc_str(value.to_owned())),
+        })
+    });
+
     let cards = value
         .get("cards")
         .cloned()
@@ -2069,6 +2190,7 @@ fn platform_data_from_json(json: Option<&str>) -> PlatformData {
     PlatformData {
         whatsapp,
         slack,
+        clickup,
         cards,
     }
 }
@@ -2394,6 +2516,70 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn every_platform_survives_a_string_round_trip() {
+        // The platform column is a plain string, so a variant that is written
+        // but not read back would silently reclassify a stored row - a
+        // ClickUp account, for instance, would come back as `Unknown` and
+        // vanish from the startup provider list.
+        for platform in [
+            Platform::WhatsApp,
+            Platform::Slack,
+            Platform::ClickUp,
+            Platform::Discord,
+            Platform::Unknown("matrix".to_owned()),
+        ] {
+            let stored = platform_to_str(&platform);
+            assert_eq!(platform_from_str(&stored), platform, "stored as {stored}");
+        }
+    }
+
+    #[test]
+    fn clickup_platform_data_round_trips_through_json() -> Result<()> {
+        let data = PlatformData {
+            clickup: Some(ClickUpData {
+                workspace_id: arc_str("900".to_owned()),
+                channel_id: arc_str("c-1".to_owned()),
+                message_id: arc_str("m-1".to_owned()),
+                parent_message_id: Some(arc_str("m-root".to_owned())),
+            }),
+            ..PlatformData::default()
+        };
+
+        let restored = platform_data_from_json(Some(&platform_data_to_json(&data)?));
+        let clickup = restored.clickup.expect("clickup data survives storage");
+        assert_eq!(clickup.workspace_id.as_ref(), "900");
+        assert_eq!(clickup.channel_id.as_ref(), "c-1");
+        assert_eq!(clickup.message_id.as_ref(), "m-1");
+        assert_eq!(clickup.parent_message_id.as_deref(), Some("m-root"));
+
+        // A top-level message has no thread root; the absent field must not
+        // resurrect as an empty string.
+        let root_only = PlatformData {
+            clickup: Some(ClickUpData {
+                parent_message_id: None,
+                ..clickup
+            }),
+            ..PlatformData::default()
+        };
+        let restored = platform_data_from_json(Some(&platform_data_to_json(&root_only)?));
+        assert!(
+            restored
+                .clickup
+                .expect("clickup data survives storage")
+                .parent_message_id
+                .is_none()
+        );
+
+        // Rows written before ClickUp existed carry no `clickup` key.
+        assert!(
+            platform_data_from_json(Some(r#"{"whatsapp":null}"#))
+                .clickup
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn normalize_message_sender_ids_strips_device_suffix_once() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(schema::V1)?;
@@ -2412,15 +2598,17 @@ mod tests {
 
         normalize_message_sender_ids(&conn)?;
 
-        let razvan: String =
-            conn.query_row("SELECT sender_id FROM messages WHERE id = 'm1'", [], |row| {
-                row.get(0)
-            })?;
+        let razvan: String = conn.query_row(
+            "SELECT sender_id FROM messages WHERE id = 'm1'",
+            [],
+            |row| row.get(0),
+        )?;
         assert_eq!(razvan, "40721274801@s.whatsapp.net");
-        let slack: String =
-            conn.query_row("SELECT sender_id FROM messages WHERE id = 'm2'", [], |row| {
-                row.get(0)
-            })?;
+        let slack: String = conn.query_row(
+            "SELECT sender_id FROM messages WHERE id = 'm2'",
+            [],
+            |row| row.get(0),
+        )?;
         assert_eq!(slack, "U123SLACK");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         assert_eq!(version, 1);
@@ -2433,10 +2621,11 @@ mod tests {
             [],
         )?;
         normalize_message_sender_ids(&conn)?;
-        let unchanged: String =
-            conn.query_row("SELECT sender_id FROM messages WHERE id = 'm1'", [], |row| {
-                row.get(0)
-            })?;
+        let unchanged: String = conn.query_row(
+            "SELECT sender_id FROM messages WHERE id = 'm1'",
+            [],
+            |row| row.get(0),
+        )?;
         assert_eq!(unchanged, "40700000000:5@s.whatsapp.net");
         Ok(())
     }
@@ -2562,6 +2751,36 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn clickup_account_config_round_trips_for_restart_restore() -> Result<()> {
+        // Restoring a ClickUp account after restart reads the platform and the
+        // opaque provider config back out of this table, so both have to
+        // survive the write untouched.
+        let store = Store::open_memory().await?;
+        let account_id = arc_str("clickup:acme".to_owned());
+        let config = r#"{"workspace":"Acme","workspace_id":"9001"}"#;
+        store
+            .upsert_account(
+                &Account {
+                    id: account_id.clone(),
+                    platform: Platform::ClickUp,
+                    display_name: arc_str("ClickUp - Acme".to_owned()),
+                    avatar: None,
+                },
+                config,
+            )
+            .await?;
+
+        let configs = store.get_account_configs().await?;
+        let restored = configs
+            .iter()
+            .find(|stored| stored.id.as_ref() == account_id.as_ref())
+            .expect("stored ClickUp account");
+        assert_eq!(restored.platform, Platform::ClickUp);
+        assert_eq!(restored.config_json, config);
+        Ok(())
+    }
+
     #[test]
     fn notify_self_messages_defaults_on_and_roundtrips() -> Result<()> {
         // Legacy settings without the field migrate to the enabled default, so
@@ -2622,6 +2841,151 @@ mod tests {
         let resumed = store.notification_pause_state().await?;
         assert_eq!(resumed.paused_until, None);
         assert!(!resumed.is_paused_at(Utc::now()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merging_a_superseded_account_folds_its_history_forward() -> Result<()> {
+        // Reproduces the real ClickUp case: the account first keyed on its
+        // label owns all the history under a stale name, while the account
+        // re-keyed on the workspace id has the resolved name and avatar but no
+        // messages at all.
+        let dir = tempdir()?;
+        let store = Store::open(&dir.path().join("test.db")).await?;
+        let legacy = arc_str("clickup:clickup-1".to_owned());
+        let canonical = arc_str("clickup:900".to_owned());
+
+        for id in [&legacy, &canonical] {
+            store
+                .upsert_account(
+                    &Account {
+                        id: id.clone(),
+                        platform: Platform::ClickUp,
+                        display_name: arc_str("TitleCapture".to_owned()),
+                        avatar: None,
+                    },
+                    "{}",
+                )
+                .await?;
+        }
+
+        let chat_id = arc_str("a1hmz-12794".to_owned());
+        let activity = Utc::now();
+        let base_chat = Chat {
+            id: chat_id.clone(),
+            account: legacy.clone(),
+            platform: Platform::ClickUp,
+            name: arc_str("Direct message".to_owned()),
+            avatar: None,
+            is_group: false,
+            kind: ChatKind::Direct,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: 3,
+            muted: false,
+            pinned: false,
+            last_message_at: Some(activity),
+            last_message_preview: Some(arc_str("La prima vedere".to_owned())),
+            thread_id: None,
+        };
+        store.upsert_chat(&base_chat).await?;
+
+        // The live provider's row: resolved name and avatar, but no activity.
+        store
+            .upsert_chat(&Chat {
+                account: canonical.clone(),
+                name: arc_str("Vlad Bolota".to_owned()),
+                avatar: Some(std::path::PathBuf::from("/tmp/vlad.jpg")),
+                unread_count: 0,
+                last_message_at: None,
+                last_message_preview: None,
+                ..base_chat.clone()
+            })
+            .await?;
+
+        store
+            .upsert_message(&Message {
+                id: arc_str("msg-1".to_owned()),
+                chat_id: chat_id.clone(),
+                account: legacy.clone(),
+                sender: Sender {
+                    platform_id: arc_str("14764623".to_owned()),
+                    display_name: arc_str("Vlad Bolota".to_owned()),
+                    avatar: None,
+                },
+                timestamp: activity,
+                edited_at: None,
+                content: Content::Text(arc_str("ma ia cu capul".to_owned())),
+                reply_to: None,
+                thread_id: None,
+                reactions: Vec::new(),
+                receipts: Vec::new(),
+                is_from_me: false,
+                mentions_me: false,
+                platform_data: PlatformData::default(),
+            })
+            .await?;
+
+        store.merge_account(&legacy, &canonical).await?;
+
+        // The superseded account and its rows are gone.
+        let accounts = store.get_accounts().await?;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].id.as_ref(), "clickup:900");
+        assert!(store.get_chats(&legacy).await?.is_empty());
+
+        // The canonical row keeps the resolved identity and gains the history.
+        let chats = store.get_chats(&canonical).await?;
+        assert_eq!(chats.len(), 1, "the chat must not be duplicated");
+        assert_eq!(chats[0].name.as_ref(), "Vlad Bolota");
+        assert!(chats[0].avatar.is_some(), "the resolved avatar must survive");
+        assert_eq!(
+            chats[0].last_message_at.map(|at| at.timestamp_millis()),
+            Some(activity.timestamp_millis()),
+            "activity must carry over so ordering does not regress"
+        );
+        assert_eq!(chats[0].unread_count, 3);
+
+        let messages = store
+            .get_messages_for_chat(&canonical, &chat_id, None, 10)
+            .await?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id.as_ref(), "msg-1");
+
+        // Idempotent: repeating the fold changes nothing.
+        store.merge_account(&legacy, &canonical).await?;
+        assert_eq!(store.get_accounts().await?.len(), 1);
+        assert_eq!(store.get_chats(&canonical).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn merging_is_skipped_when_the_target_account_is_absent() -> Result<()> {
+        // Folding into an id with no account row would delete the only owner
+        // of these chats and leave them dangling, so the fold must wait until
+        // the canonical account exists.
+        let dir = tempdir()?;
+        let store = Store::open(&dir.path().join("test.db")).await?;
+        let legacy = arc_str("clickup:clickup-1".to_owned());
+        let canonical = arc_str("clickup:900".to_owned());
+
+        store
+            .upsert_account(
+                &Account {
+                    id: legacy.clone(),
+                    platform: Platform::ClickUp,
+                    display_name: arc_str("TitleCapture".to_owned()),
+                    avatar: None,
+                },
+                "{}",
+            )
+            .await?;
+
+        store.merge_account(&legacy, &canonical).await?;
+
+        let accounts = store.get_accounts().await?;
+        assert_eq!(accounts.len(), 1, "the only account must be left alone");
+        assert_eq!(accounts[0].id.as_ref(), "clickup:clickup-1");
         Ok(())
     }
 
@@ -2694,6 +3058,7 @@ mod tests {
                     jid: arc_str("alice@s.whatsapp.net".to_owned()),
                 }),
                 slack: None,
+                clickup: None,
                 cards: Vec::new(),
             },
         };

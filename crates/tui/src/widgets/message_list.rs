@@ -6948,7 +6948,9 @@ mod tests {
         let joined = rendered.join("\n");
 
         assert!(
-            rendered.iter().any(|line| line.contains("[message not loaded]")),
+            rendered
+                .iter()
+                .any(|line| line.contains("[message not loaded]")),
             "unloaded reply should render a placeholder snippet:\n{joined}"
         );
         assert!(

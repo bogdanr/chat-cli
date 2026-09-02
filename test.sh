@@ -22,9 +22,27 @@ fi
 # link failures can be diagnosed. Unset this (or set to "") to silence it again.
 export CHATCLI_WHATSAPP_LOG="${CHATCLI_WHATSAPP_LOG:-debug}"
 export CHATCLI_WHATSAPP_CABLE_DUMP=1
+export CHAT_CLI_PERF_LOG_FILE=/tmp/slack-diag.log
+
+# ClickUp is opt-in: it only starts when a token is configured here, in .env, or
+# previously added from the account screen. Personal tokens never expire, so keep
+# CHAT_CLI_CLICKUP_TOKEN in your local env or .env — never in git.
+#   export CHAT_CLI_CLICKUP_TOKEN='pk_...'
+# Set CHAT_CLI_CLICKUP_WORKSPACE_ID only if the token reaches several workspaces.
+clickup_args=()
+if [ -n "${CHAT_CLI_CLICKUP_TOKEN:-}" ]; then
+  # Naming any provider flag turns off the default-on providers, so re-enable
+  # Slack and WhatsApp explicitly to keep this script's behaviour unchanged.
+  clickup_args+=(--slack --whatsapp)
+  clickup_args+=(--clickup-token "$CHAT_CLI_CLICKUP_TOKEN")
+  if [ -n "${CHAT_CLI_CLICKUP_WORKSPACE_ID:-}" ]; then
+    clickup_args+=(--clickup-workspace-id "$CHAT_CLI_CLICKUP_WORKSPACE_ID")
+  fi
+fi
 
 
 ./target/debug/chat-cli \
   --log-file tmp/debug.log \
   --db tmp/chat-cli.sqlite \
-  --whatsapp-db tmp/whatsapp.db
+  --whatsapp-db tmp/whatsapp.db \
+  "${clickup_args[@]}"

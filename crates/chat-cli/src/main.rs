@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chat_core::{MockProvider, Provider};
 use chrono::{Duration as ChronoDuration, Utc};
 use clap::{Parser, Subcommand};
+use clickup::{ClickUpProvider, ClickUpProviderOptions};
 use serde::{Deserialize, Serialize};
 use slack::{SlackAuthMode, SlackProvider, SlackProviderOptions};
 use std::{
@@ -79,6 +80,22 @@ struct Args {
     #[arg(long, env = "CHAT_CLI_WHATSAPP")]
     whatsapp: bool,
 
+    /// Enable the ClickUp Chat provider.
+    #[arg(long, env = "CHAT_CLI_CLICKUP")]
+    clickup: bool,
+
+    /// ClickUp personal API token (starts with `pk_`). Redacted from debug output.
+    #[arg(long, env = "CHAT_CLI_CLICKUP_TOKEN")]
+    clickup_token: Option<String>,
+
+    /// ClickUp workspace ("team") id. Required only when the token reaches several workspaces.
+    #[arg(long, env = "CHAT_CLI_CLICKUP_WORKSPACE_ID")]
+    clickup_workspace_id: Option<String>,
+
+    /// Optional ClickUp workspace label shown in the account list.
+    #[arg(long, env = "CHAT_CLI_CLICKUP_WORKSPACE")]
+    clickup_workspace: Option<String>,
+
     /// Override the WhatsApp bridge database path.
     #[arg(
         long,
@@ -153,7 +170,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let persisted_accounts = store.get_account_configs().await?;
+    let mut persisted_accounts = store.get_account_configs().await?;
+    // An account whose provider id changed after setup resolved its real
+    // identity leaves its chats and messages behind on the old id. Fold them
+    // forward before any provider starts, so the sidebar never shows stale
+    // rows that no running provider owns.
+    if migrate_superseded_accounts(&store, &persisted_accounts).await? {
+        persisted_accounts = store.get_account_configs().await?;
+    }
     let providers = build_providers_with_persisted(&args, persisted_accounts)?;
     let existing_provider_ids = providers
         .iter()
@@ -267,8 +291,11 @@ fn build_account_provider_factory(
     let whatsapp_db = args.whatsapp_db.clone();
     let whatsapp_sync = args.whatsapp_sync.clone();
     let log_path = args.log_file.clone();
+    let clickup_token = args.clickup_token.clone();
+    let clickup_workspace_id = args.clickup_workspace_id.clone();
     let slack_counter = Arc::new(AtomicU64::new(1));
     let whatsapp_counter = Arc::new(AtomicU64::new(1));
+    let clickup_counter = Arc::new(AtomicU64::new(1));
     let used_slack_provider_ids = Arc::new(Mutex::new(
         existing_provider_ids
             .into_iter()
@@ -316,6 +343,20 @@ fn build_account_provider_factory(
                 })?) as ProviderBox,
             )
         }
+        AccountProviderKind::ClickUp => {
+            // Distinct labels keep runtime-added ClickUp accounts from
+            // colliding on the workspace-derived provider id before setup has
+            // resolved the real workspace name.
+            let ordinal = clickup_counter.fetch_add(1, Ordering::Relaxed);
+            Ok(
+                Arc::new(ClickUpProvider::with_options(ClickUpProviderOptions {
+                    workspace: Some(format!("ClickUp {ordinal}")),
+                    workspace_id: clickup_workspace_id.clone(),
+                    personal_token: clickup_token.clone(),
+                    ..ClickUpProviderOptions::default()
+                })?) as ProviderBox,
+            )
+        }
         AccountProviderKind::Demo => Ok(Arc::new(MockProvider::new()) as ProviderBox),
     })
 }
@@ -347,6 +388,18 @@ fn build_providers_with_persisted(
         providers.push(Arc::new(provider));
     }
 
+    for options in clickup_provider_options(args, &persisted_accounts)? {
+        let provider = ClickUpProvider::with_options(options)?;
+        let provider_id = provider.id().clone();
+        if providers
+            .iter()
+            .any(|existing| existing.id().as_ref() == provider_id.as_ref())
+        {
+            bail!("duplicate provider id configured: {}", provider_id);
+        }
+        providers.push(Arc::new(provider));
+    }
+
     if args.whatsapp || enable_default_providers {
         providers.push(Arc::new(WhatsAppProvider::with_options(
             WhatsAppProviderOptions {
@@ -359,10 +412,118 @@ fn build_providers_with_persisted(
     Ok(providers)
 }
 
+/// Collects the ClickUp accounts to start with: the one described by CLI flags
+/// (if any) plus every stored account, deduplicated by provider id.
+///
+/// Unlike Slack, ClickUp has no "default on" mode: it is only started when the
+/// user explicitly configured it or previously added it in the app. Restoring
+/// stored accounts here is what keeps a ClickUp account alive across restarts.
+fn clickup_provider_options(
+    args: &Args,
+    persisted_accounts: &[storage::StoredAccountConfig],
+) -> Result<Vec<ClickUpProviderOptions>> {
+    let mut options = Vec::new();
+    let mut seen = HashSet::<String>::new();
+
+    if args.clickup || args.clickup_token.is_some() {
+        options.push(ClickUpProviderOptions {
+            workspace: args.clickup_workspace.clone(),
+            workspace_id: args.clickup_workspace_id.clone(),
+            personal_token: args.clickup_token.clone(),
+            ..ClickUpProviderOptions::default()
+        });
+    }
+
+    for configured in &options {
+        seen.insert(clickup_provider_id_for_options(configured)?);
+    }
+
+    for account in persisted_accounts {
+        if account.platform != chat_core::Platform::ClickUp {
+            continue;
+        }
+        let stored: ClickUpProviderOptions = serde_json::from_str(&account.config_json)
+            .with_context(|| format!("parsing stored ClickUp account {}", account.id))?;
+        if seen.insert(clickup_provider_id_for_options(&stored)?) {
+            options.push(stored);
+        }
+    }
+
+    Ok(options)
+}
+
+fn clickup_provider_id_for_options(options: &ClickUpProviderOptions) -> Result<String> {
+    Ok(ClickUpProvider::with_options(options.clone())?
+        .id()
+        .to_string())
+}
+
+/// Canonical provider id for a stored account, recomputed from its config.
+///
+/// Returns `None` for platforms whose id does not depend on resolvable
+/// options, so they are never considered superseded.
+fn canonical_provider_id(account: &storage::StoredAccountConfig) -> Result<Option<String>> {
+    match account.platform {
+        chat_core::Platform::ClickUp => {
+            let options: ClickUpProviderOptions = serde_json::from_str(&account.config_json)
+                .with_context(|| format!("parsing stored ClickUp account {}", account.id))?;
+            clickup_provider_id_for_options(&options).map(Some)
+        }
+        chat_core::Platform::Slack => {
+            let options: SlackProviderOptions = serde_json::from_str(&account.config_json)
+                .with_context(|| format!("parsing stored Slack account {}", account.id))?;
+            slack_provider_id_for_options(&options).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Folds stored rows from superseded provider ids into the canonical id.
+///
+/// A provider id is derived from its options, so it changes when setup
+/// resolves the authoritative identity: a ClickUp account first started
+/// without a workspace id keys on its label, then re-keys on the workspace id
+/// once `validate` persists it. The old id keeps every chat and message while
+/// the new one starts empty, leaving stale rows in the sidebar that no running
+/// provider can ever rename or give an avatar to.
+///
+/// Reports whether anything moved, so the caller knows to reload configs.
+async fn migrate_superseded_accounts(
+    store: &Store,
+    persisted_accounts: &[storage::StoredAccountConfig],
+) -> Result<bool> {
+    // Only ids that still have an account row can be merge targets; the fold
+    // is skipped otherwise and retried on a later start.
+    let known: HashSet<&str> = persisted_accounts
+        .iter()
+        .map(|account| account.id.as_ref())
+        .collect();
+
+    let mut merged = false;
+    for account in persisted_accounts {
+        let Some(canonical) = canonical_provider_id(account)? else {
+            continue;
+        };
+        if canonical == account.id.as_ref() || !known.contains(canonical.as_str()) {
+            continue;
+        }
+        store
+            .merge_account(&account.id, &Arc::from(canonical.as_str()))
+            .await
+            .with_context(|| {
+                format!("merging superseded account {} into {canonical}", account.id)
+            })?;
+        merged = true;
+    }
+    Ok(merged)
+}
+
 fn provider_flags_specified(args: &Args) -> bool {
     args.mock_provider
         || args.slack
         || args.whatsapp
+        || args.clickup
+        || args.clickup_token.is_some()
         || args.slack_workspaces_file.is_some()
         || !args.slack_workspace_profiles.is_empty()
 }
@@ -607,6 +768,10 @@ mod tests {
             slack_workspaces_file: None,
             slack_workspace_profiles: Vec::new(),
             whatsapp: false,
+            clickup: false,
+            clickup_token: None,
+            clickup_workspace_id: None,
+            clickup_workspace: None,
             whatsapp_db: PathBuf::from(":memory:"),
             whatsapp_sync: "today".to_owned(),
             log_file: None,
@@ -632,6 +797,104 @@ mod tests {
             display_name: Arc::from(format!("Slack ({workspace})")),
             config_json: serde_json::to_string(&options)?,
         })
+    }
+
+    fn stored_clickup_account(
+        id: &str,
+        workspace: &str,
+        workspace_id: &str,
+    ) -> Result<storage::StoredAccountConfig> {
+        let options = ClickUpProviderOptions {
+            workspace: Some(workspace.to_owned()),
+            workspace_id: Some(workspace_id.to_owned()),
+            personal_token: Some("pk_1_stored".to_owned()),
+            ..ClickUpProviderOptions::default()
+        };
+        Ok(storage::StoredAccountConfig {
+            id: Arc::from(id),
+            platform: chat_core::Platform::ClickUp,
+            display_name: Arc::from(format!("ClickUp ({workspace})")),
+            config_json: serde_json::to_string(&options)?,
+        })
+    }
+
+    #[test]
+    fn clickup_stays_off_unless_asked_for() -> Result<()> {
+        // ClickUp has no realtime transport, so polling it by default would
+        // burn a stranger's rate budget. It only starts on request.
+        assert!(clickup_provider_options(&base_args(), &[])?.is_empty());
+        assert!(!provider_flags_specified(&base_args()));
+
+        let flagged = Args {
+            clickup: true,
+            ..base_args()
+        };
+        assert_eq!(clickup_provider_options(&flagged, &[])?.len(), 1);
+        assert!(provider_flags_specified(&flagged));
+        Ok(())
+    }
+
+    #[test]
+    fn clickup_accounts_are_restored_from_storage_and_deduplicated() -> Result<()> {
+        // A ClickUp account added inside the app lives only in storage, so the
+        // restore path is the only thing keeping it alive across restarts.
+        let stored = vec![
+            stored_clickup_account("clickup:acme", "Acme", "9001")?,
+            stored_clickup_account("clickup:acme-again", "Acme", "9001")?,
+            stored_clickup_account("clickup:globex", "Globex", "9002")?,
+            stored_slack_account("slack:acme", "acme", "xoxp-1")?,
+        ];
+
+        let restored = clickup_provider_options(&base_args(), &stored)?;
+        let ids = restored
+            .iter()
+            .map(clickup_provider_id_for_options)
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(ids.len(), 2, "duplicate workspace ids collapse: {ids:?}");
+        assert_eq!(
+            ids.iter().collect::<HashSet<_>>().len(),
+            2,
+            "restored ids must be unique: {ids:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_configured_clickup_workspace_is_not_restored_twice() -> Result<()> {
+        // Flags and storage can describe the same workspace; starting two
+        // providers for it would double the polling cost and duplicate events.
+        let args = Args {
+            clickup_token: Some("pk_1_flagged".to_owned()),
+            clickup_workspace_id: Some("9001".to_owned()),
+            ..base_args()
+        };
+        let stored = vec![stored_clickup_account("clickup:acme", "Acme", "9001")?];
+
+        assert_eq!(clickup_provider_options(&args, &stored)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn build_providers_starts_one_clickup_provider_per_workspace() -> Result<()> {
+        // Provider ids key storage rows and event routing, so the same
+        // workspace reached from both flags and storage must start once.
+        let args = Args {
+            clickup_token: Some("pk_1_a".to_owned()),
+            clickup_workspace_id: Some("9001".to_owned()),
+            ..base_args()
+        };
+        let providers = build_providers_with_persisted(
+            &args,
+            vec![stored_clickup_account("clickup:acme", "Acme", "9001")?],
+        )?;
+        assert_eq!(
+            providers
+                .iter()
+                .filter(|provider| provider.platform() == chat_core::Platform::ClickUp)
+                .count(),
+            1
+        );
+        Ok(())
     }
 
     #[test]

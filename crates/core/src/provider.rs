@@ -303,11 +303,12 @@ pub trait Provider: Send + Sync + 'static {
         &self,
         platform_id: &PlatformId,
     ) -> anyhow::Result<Option<ContactProfile>> {
-        Ok(self.contact_info(platform_id).await?.map(|sender| {
-            ContactProfile {
+        Ok(self
+            .contact_info(platform_id)
+            .await?
+            .map(|sender| ContactProfile {
                 display_name: Some(sender.display_name),
                 ..ContactProfile::default()
-            }
-        }))
+            }))
     }
 }

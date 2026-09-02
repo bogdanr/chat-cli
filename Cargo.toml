@@ -7,6 +7,7 @@ members = [
     "crates/storage",
     "crates/providers/whatsapp",
     "crates/providers/slack",
+    "crates/providers/clickup",
     "crates/mcp",
     "crates/notify",
 ]

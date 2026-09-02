@@ -12,11 +12,11 @@ name = "chat-cli"
 version = "0.0.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Your chats, in the terminal. A fast, keyboard-first TUI inbox for WhatsApp and Slack."
+description = "Your chats, in the terminal. A fast, keyboard-first TUI inbox for WhatsApp, Slack and ClickUp."
 repository = "https://github.com/bogdanr/chat-cli"
 homepage = "https://github.com/bogdanr/chat-cli"
 readme = "README.md"
-keywords = ["chat", "slack", "whatsapp", "tui", "messaging"]
+keywords = ["chat", "slack", "whatsapp", "clickup", "tui"]
 categories = ["command-line-utilities"]
 
 [[bin]]

@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Your chats, in the terminal. A fast, keyboard-first TUI inbox for WhatsApp and Slack."
+description = "Your chats, in the terminal. A fast, keyboard-first TUI inbox for WhatsApp, Slack and ClickUp."
 
 # NOTE: This crate is the real application and is NOT published to crates.io
 # (it has path dependencies). The crates.io entry that powers `cargo binstall`
@@ -23,6 +23,7 @@ storage = { path = "../storage" }
 tokio.workspace = true
 toml.workspace = true
 tui = { path = "../tui" }
+clickup = { path = "../providers/clickup" }
 slack = { path = "../providers/slack" }
 whatsapp = { path = "../providers/whatsapp" }
 

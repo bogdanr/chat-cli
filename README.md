@@ -4,7 +4,7 @@
 
 **Your chats, in the terminal. Fast, quiet, and keyboard-first.**
 
-WhatsApp and Slack in one tidy inbox — no browser tabs, no clutter, no waiting.
+WhatsApp, Slack and ClickUp in one tidy inbox — no browser tabs, no clutter, no waiting.
 
 <br>
 
@@ -98,6 +98,9 @@ connect an account from inside the app:
 chat-cli
 ```
 
+ClickUp is opt-in: because it has no realtime feed and must poll, it only starts
+once you add it from the account screen or pass a token.
+
 Want to look around before connecting anything? Use the demo data:
 
 ```bash
@@ -116,11 +119,16 @@ to enable a single provider:
 ```bash
 chat-cli --slack       # Slack only
 chat-cli --whatsapp    # WhatsApp only
+chat-cli --clickup     # ClickUp Chat only
 ```
 
 - **WhatsApp** pairs by scanning a QR code, just like WhatsApp Web.
 - **Slack** offers a guided setup with several auth options, from user OAuth to a
   simple incoming webhook.
+- **ClickUp** asks for a personal API token (the `pk_...` value from ClickUp's
+  *Settings → Apps*). ClickUp has no realtime feed for Chat, so new messages are
+  picked up by periodic checks rather than pushed instantly. Channels, direct
+  messages and group DMs all show up, named after the people in them.
 
 Most people never need a flag — the in-app account screen handles setup.
 
@@ -204,6 +212,18 @@ chat-cli --slack-workspaces-file slack-workspaces.toml
 chat-cli --whatsapp --whatsapp-sync today   # all | today | none
 ```
 
+**ClickUp with an explicit token and workspace:**
+
+```bash
+chat-cli \
+  --clickup-token pk_12345_ABCDEF \
+  --clickup-workspace-id 9013000000 \
+  --clickup-workspace 'Acme'
+```
+
+The workspace id is only required when the token can reach more than one
+workspace; with a single workspace it is detected automatically.
+
 **Other useful flags:**
 
 | Flag | Purpose |
@@ -245,6 +265,7 @@ crates/
   tui/                   Terminal UI, interaction model, rendering
   storage/               SQLite persistence and settings
   providers/slack/       Slack provider, auth modes, Web API, Socket Mode
+  providers/clickup/     ClickUp Chat provider (Public API v3, polling)
   providers/whatsapp/    WhatsApp bridge provider and Go bridge
   notify/                Desktop notifications
   mcp/                   MCP integration crate
