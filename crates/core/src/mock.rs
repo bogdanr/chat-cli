@@ -1,9 +1,9 @@
 use crate::{
     Account, Card, CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatDetails,
     ChatId, ChatKind, ChatMember, ChatMemberRole, ChatMembership, ContactProfile, Content,
-    EventBus, LinkPreview, Media, Message, MessageId, Platform, PlatformData, PlatformId, Poll,
-    PollOption, PollVote, Provider, ProviderEvent, ProviderId, Reaction, Receipt, ReceiptKind,
-    Sender, Timestamp,
+    EventBus, LinkPreview, Media, Mention, Message, MessageId, OutboundContent, OutboundMentions,
+    Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent,
+    ProviderId, Reaction, Receipt, ReceiptKind, Sender, Timestamp, resolve_mention_tokens,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ pub struct MockProvider {
     account: Account,
     chats: Arc<Vec<Chat>>,
     messages: Arc<RwLock<Vec<Message>>>,
+    sent_mentions: Arc<RwLock<Vec<Vec<Mention>>>>,
     events: EventBus,
 }
 
@@ -46,6 +47,7 @@ impl MockProvider {
             account,
             chats,
             messages,
+            sent_mentions: Arc::new(RwLock::new(Vec::new())),
             events: EventBus::new(),
         }
     }
@@ -56,6 +58,16 @@ impl MockProvider {
 
     pub fn seed_messages(&self) -> Vec<Message> {
         self.read_messages().clone()
+    }
+
+    /// Mentions attached to each message sent through this provider, in send
+    /// order. Used by tests and the `--mock-provider` demo to exercise the
+    /// outbound mention path.
+    pub fn sent_mentions(&self) -> Vec<Vec<Mention>> {
+        self.sent_mentions
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn ensure_mock_assets(&self) -> Result<()> {
@@ -97,6 +109,14 @@ impl Provider for MockProvider {
 
     fn outbound_capabilities(&self) -> crate::OutboundCapabilities {
         crate::OutboundCapabilities::all()
+    }
+
+    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
+        let resolved = resolve_mention_tokens(text, members);
+        OutboundMentions {
+            text: text.to_owned(),
+            mentioned: resolved.into_iter().map(|item| item.mention).collect(),
+        }
     }
 
     async fn connect(&self) -> Result<()> {
@@ -144,10 +164,22 @@ impl Provider for MockProvider {
     async fn send(
         &self,
         chat_id: &ChatId,
-        content: Content,
+        outbound: OutboundContent,
         reply_to: Option<&Message>,
     ) -> Result<MessageId> {
-        let id = arc_str(format!("mock:sent:{}", Utc::now().timestamp_millis()));
+        let OutboundContent { content, mentions } = outbound;
+        self.sent_mentions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(mentions);
+        // Sequence suffix keeps IDs unique when several items (an album) are
+        // sent within the same millisecond, as real providers' IDs are.
+        static SEND_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let sequence = SEND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let id = arc_str(format!(
+            "mock:sent:{}:{sequence}",
+            Utc::now().timestamp_millis()
+        ));
         let message = Message {
             id: id.clone(),
             chat_id: chat_id.clone(),
@@ -2578,7 +2610,11 @@ mod tests {
         assert_eq!(messages.len(), 4);
 
         let sent_id = provider
-            .send(&chat_id, Content::Text(arc_str("hello")), None)
+            .send(
+                &chat_id,
+                OutboundContent::new(Content::Text(arc_str("hello"))),
+                None,
+            )
             .await?;
         assert!(sent_id.starts_with("mock:sent:"));
         assert!(matches!(
@@ -2595,6 +2631,37 @@ mod tests {
                 && matches!(&message.content, Content::Text(text) if text.as_ref() == "hello")
         }));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mock_provider_records_outbound_mentions() -> Result<()> {
+        let provider = MockProvider::new();
+        provider.connect().await?;
+
+        let members = vec![ChatMember::new(Sender {
+            platform_id: arc_str("mock:user:bogdan"),
+            display_name: arc_str("Bogdan"),
+            avatar: None,
+        })];
+
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        assert_eq!(encoded.text, "hi @Bogdan");
+        assert_eq!(encoded.mentioned.len(), 1);
+        assert_eq!(
+            encoded.mentioned[0].platform_id.as_ref(),
+            "mock:user:bogdan"
+        );
+
+        let chat_id = arc_str("mock:chat:alice");
+        let mut outbound = OutboundContent::new(Content::Text(arc_str("hi @Bogdan")));
+        outbound.mentions = encoded.mentioned;
+        provider.send(&chat_id, outbound, None).await?;
+
+        let recorded = provider.sent_mentions();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].len(), 1);
+        assert_eq!(recorded[0][0].display_name.as_ref(), "Bogdan");
         Ok(())
     }
 

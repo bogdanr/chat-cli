@@ -8,5 +8,8 @@ pub use events::{
     ProviderEvent,
 };
 pub use mock::MockProvider;
-pub use provider::{AuthSubmission, AuthSubmissionMode, OutboundCapabilities, Provider};
+pub use provider::{
+    AuthSubmission, AuthSubmissionMode, OutboundCapabilities, OutboundContent, OutboundMentions,
+    Provider, ResolvedMention, resolve_mention_tokens, rewrite_mention_tokens,
+};
 pub use types::*;

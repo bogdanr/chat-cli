@@ -309,6 +309,19 @@ impl ChatMember {
     }
 }
 
+/// A resolved mention target: the identity a display token such as `@Bogdan`
+/// refers to. Produced when outbound text is scanned against a chat's member
+/// roster, and consumed by providers to encode the mention in the form the
+/// platform understands (Slack `<@U123>`, WhatsApp `@<phone>` + `MentionedJID`,
+/// ClickUp `@Display Name`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mention {
+    /// The platform-specific identity of the mentioned user.
+    pub platform_id: PlatformId,
+    /// The human-readable name the user picked, kept for fallback/debugging.
+    pub display_name: Arc<str>,
+}
+
 /// Optional, provider-sourced metadata about a conversation used to enrich the
 /// details pane. Every field is optional so each provider populates only what
 /// it can supply; unknown fields render nothing. Loaded on demand (per chat

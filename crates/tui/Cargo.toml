@@ -33,6 +33,11 @@ unicode-width.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Desktop file-chooser portal (already in the tree through notify-rust).
+[target.'cfg(target_os = "linux")'.dependencies]
+futures-util = { version = "0.3", default-features = false }
+zbus = "5"
+
 [dev-dependencies]
 async-trait.workspace = true
 chrono.workspace = true

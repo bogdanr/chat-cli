@@ -17,8 +17,13 @@ use std::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::video::{self, VideoInfo};
+
 const MEDIA_PREVIEW_MAX_WIDTH: u16 = 48;
 const MEDIA_PREVIEW_ROWS: u16 = 8;
+/// Videos get a taller preview than generic media: a 16:9 poster at 12 rows
+/// fills most of the 48-cell card instead of a postage stamp.
+const VIDEO_PREVIEW_ROWS: u16 = 12;
 const ROUNDED_THUMBNAIL_CORNER_RADIUS_RATIO: f32 = 10.0 / 32.0;
 const ROUNDED_THUMBNAIL_MASK_SAMPLES: u32 = 4;
 const LINK_PREVIEW_CARD_WIDTH: u16 = 42;
@@ -86,6 +91,20 @@ pub struct MediaHit {
     /// on demand: activating the hit should trigger a provider download of
     /// this media instead of opening the (missing) file.
     pub retrieve: Option<chat_core::Media>,
+    /// When set, the hit is a locally cached video: activating it should hand
+    /// the file to the system video player instead of the image viewer.
+    pub play: Option<PathBuf>,
+    /// Rows at the top of the hit (from `start_line`) that belong to the card
+    /// chrome rather than the image, e.g. a clickable title row. HD overlays
+    /// start below them so they never cover text.
+    pub preview_skip_rows: usize,
+    /// Draw a play badge over the preview. The halfblock rows already carry
+    /// one; HD overlays must redraw it on top of the terminal image.
+    pub play_badge: bool,
+    /// When set, the hit is a locally cached document or voice note: the
+    /// file is handed to the system app (PDF viewer, player, …) the way the
+    /// native apps open attachments. Such hits carry no inline image.
+    pub open: Option<PathBuf>,
 }
 
 /// True when this media is too large for automatic caching and its bytes are
@@ -157,9 +176,69 @@ pub struct MediaPreviewRequest {
 #[derive(Debug, Default)]
 pub struct MediaPreviewCache {
     previews: HashMap<MediaPreviewKey, Result<Vec<Vec<Span<'static>>>, String>>,
+    /// Probed video metadata/poster keyed by the local video path. Filled by
+    /// background ffprobe/ffmpeg workers; draw code only reads it.
+    videos: HashMap<PathBuf, Result<Arc<VideoInfo>, String>>,
+    /// Local video paths the draw pass saw without cached info. The app drains
+    /// this queue after drawing and spawns blocking probe workers.
+    video_probe_queue: Vec<PathBuf>,
+    /// Shared animation clock for the current draw, in milliseconds. Set by
+    /// the app before each draw so frame selection is a pure cache lookup.
+    animation_clock_ms: u64,
+    /// Whether the last draw showed a running animation, i.e. whether the app
+    /// should schedule another draw for the next frame.
+    animation_active: bool,
 }
 
 impl MediaPreviewCache {
+    pub fn video_info(&self, path: &Path) -> Option<&Result<Arc<VideoInfo>, String>> {
+        self.videos.get(path)
+    }
+
+    pub fn insert_video_info(&mut self, path: PathBuf, result: Result<VideoInfo, String>) {
+        self.videos.insert(path, result.map(Arc::new));
+    }
+
+    /// Starts a draw at `clock_ms` on the shared animation clock.
+    pub fn begin_animation_frame(&mut self, clock_ms: u64) {
+        self.animation_clock_ms = clock_ms;
+        self.animation_active = false;
+    }
+
+    pub fn animation_clock_ms(&self) -> u64 {
+        self.animation_clock_ms
+    }
+
+    /// True when the most recent draw rendered at least one animated frame.
+    pub fn animation_active(&self) -> bool {
+        self.animation_active
+    }
+
+    /// Marks that a frame of a running animation is on screen (used by the
+    /// terminal-graphics overlay, which picks frames outside this module).
+    pub fn mark_animation_active(&mut self) {
+        self.animation_active = true;
+    }
+
+    /// Probed info for a looping GIF-style animation at `path`, if ready.
+    pub fn gif_animation(&self, path: &Path) -> Option<Arc<VideoInfo>> {
+        match self.videos.get(path) {
+            Some(Ok(info)) if info.is_gif_like() && info.animation.is_some() => Some(info.clone()),
+            _ => None,
+        }
+    }
+
+    fn request_video_probe(&mut self, path: PathBuf) {
+        if !self.video_probe_queue.contains(&path) {
+            self.video_probe_queue.push(path);
+        }
+    }
+
+    /// Takes the video probe requests queued by draw passes since the last call.
+    pub fn take_video_probe_requests(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.video_probe_queue)
+    }
+
     pub fn get(&self, key: &MediaPreviewKey) -> Option<&Result<Vec<Vec<Span<'static>>>, String>> {
         self.previews.get(key)
     }
@@ -1708,9 +1787,10 @@ fn content_lines(
         Content::Image(media) => media_card_lines(
             "Photo", media, accent, context, start_line, is_from_me, true,
         ),
-        Content::Video(media) => media_card_lines(
-            "Video", media, accent, context, start_line, is_from_me, false,
-        ),
+        Content::Video(media) => video_card_lines(media, accent, context, start_line, is_from_me),
+        Content::Audio(media) if uses_document_card(media, context.presentation) => {
+            document_card_lines(true, media, accent, context, start_line, is_from_me)
+        }
         Content::Audio(media) => media_card_lines(
             "Voice note",
             media,
@@ -1720,6 +1800,9 @@ fn content_lines(
             is_from_me,
             false,
         ),
+        Content::File(media) if uses_document_card(media, context.presentation) => {
+            document_card_lines(false, media, accent, context, start_line, is_from_me)
+        }
         Content::File(media) => media_card_lines(
             "File", media, accent, context, start_line, is_from_me, false,
         ),
@@ -2095,6 +2178,10 @@ fn inline_image_grid_lines(
                         .to_owned(),
                     caption: card.body.as_deref().map(str::to_owned),
                     retrieve,
+                    play: None,
+                    preview_skip_rows: 0,
+                    play_badge: false,
+                    open: None,
                 });
             }
             column_rows.push(preview_rows);
@@ -2193,6 +2280,10 @@ fn flat_card_lines(
                     .to_owned(),
                 caption: card.body.as_deref().map(str::to_owned),
                 retrieve,
+                play: None,
+                preview_skip_rows: 0,
+                play_badge: false,
+                open: None,
             });
         }
         lines.extend(
@@ -2318,6 +2409,10 @@ fn generic_card_lines(
                     .to_owned(),
                 caption: card.body.as_deref().map(str::to_owned),
                 retrieve,
+                play: None,
+                preview_skip_rows: 0,
+                play_badge: false,
+                open: None,
             });
         }
         lines.extend(
@@ -2520,6 +2615,10 @@ fn link_preview_card_lines(
                     .unwrap_or_else(|| "Link preview image".to_owned()),
                 caption: clean_link_preview_text(link.description.as_deref()),
                 retrieve: None,
+                play: None,
+                preview_skip_rows: 0,
+                play_badge: false,
+                open: None,
             });
         }
 
@@ -2591,6 +2690,10 @@ fn flat_link_preview_card_lines(
                     .unwrap_or_else(|| "Link preview image".to_owned()),
                 caption: clean_link_preview_text(link.description.as_deref()),
                 retrieve: None,
+                play: None,
+                preview_skip_rows: 0,
+                play_badge: false,
+                open: None,
             });
         }
 
@@ -2781,6 +2884,10 @@ fn link_image_card_lines(
         title: media.file_name.to_string(),
         caption: media.caption.as_deref().map(str::to_owned),
         retrieve: None,
+        play: None,
+        preview_skip_rows: 0,
+        play_badge: false,
+        open: None,
     });
 
     lines.extend(
@@ -2885,6 +2992,10 @@ fn media_card_lines(
             title: media.file_name.to_string(),
             caption: caption.map(str::to_owned),
             retrieve,
+            play: None,
+            preview_skip_rows: 0,
+            play_badge: false,
+            open: None,
         });
     }
 
@@ -2933,6 +3044,206 @@ fn media_card_lines(
 
     lines.push(card_border_line('╰', '─', '╯', card_width, accent));
     lines
+}
+
+/// Documents and voice notes that are not images get a compact native-style
+/// card (type badge, name, size, open action) instead of an empty preview box.
+/// Image files sent as documents keep the preview card.
+fn uses_document_card(media: &chat_core::Media, presentation: ConversationPresentation) -> bool {
+    presentation == ConversationPresentation::Bubbles && !media.mime_type.starts_with("image/")
+}
+
+const DOCUMENT_CARD_MIN_WIDTH: u16 = 24;
+const DOCUMENT_CARD_MAX_WIDTH: u16 = 48;
+/// Badge column: up to five badge characters, padding, and a gap.
+const DOCUMENT_BADGE_WIDTH: usize = 8;
+
+/// Width of a document card. Depends only on the message data and the
+/// content width so drawing and line counting always agree.
+fn document_card_width(voice: bool, media: &chat_core::Media, content_width: u16) -> u16 {
+    let text = UnicodeWidthStr::width(media.file_name.as_ref()).max(UnicodeWidthStr::width(
+        document_detail(voice, media).as_str(),
+    ));
+    let wanted = (text + DOCUMENT_BADGE_WIDTH) as u16;
+    let max = media_card_width(content_width).min(DOCUMENT_CARD_MAX_WIDTH);
+    wanted.clamp(DOCUMENT_CARD_MIN_WIDTH.min(max), max).max(1)
+}
+
+fn document_badge(voice: bool, media: &chat_core::Media) -> String {
+    if voice {
+        "♪".to_owned()
+    } else {
+        crate::attach::file_type_badge(&media.file_name, &media.mime_type)
+    }
+}
+
+fn document_detail(voice: bool, media: &chat_core::Media) -> String {
+    let kind = if voice {
+        "Voice note".to_owned()
+    } else {
+        crate::attach::file_type_badge(&media.file_name, &media.mime_type)
+    };
+    match media.size_bytes {
+        Some(size) => format!("{kind} · {}", crate::attach::format_byte_size(size)),
+        None => kind,
+    }
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + char_width + 1 > width {
+            break;
+        }
+        used += char_width;
+        out.push(character);
+    }
+    out.push('…');
+    out
+}
+
+/// Native-style document / voice note bubble:
+///
+/// ```text
+/// ╭──────────────────────────╮
+/// │  PDF   report-q3.pdf      │
+/// │        PDF · 1.2 MB       │
+/// │        Open ↗             │
+/// ╰──────────────────────────╯
+/// ```
+///
+/// Clicking opens the cached file in the system app, or retrieves it first
+/// when it was too large to download automatically. Draw only stats the
+/// cached path; nothing is read or decoded here.
+fn document_card_lines(
+    voice: bool,
+    media: &chat_core::Media,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    let accent = media_card_accent(accent);
+    let card_width = document_card_width(voice, media, context.content_width);
+    let text_width = (card_width as usize).saturating_sub(DOCUMENT_BADGE_WIDTH);
+    let badge_style = accent.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+    let badge: String = document_badge(voice, media).chars().take(5).collect();
+    let badge_pad = 5usize.saturating_sub(UnicodeWidthStr::width(badge.as_str()));
+    let badge_cell = format!(
+        " {}{badge}{} ",
+        " ".repeat(badge_pad / 2),
+        " ".repeat(badge_pad - badge_pad / 2)
+    );
+    let gutter = " ".repeat(DOCUMENT_BADGE_WIDTH);
+
+    let local = media
+        .local_path
+        .as_ref()
+        .filter(|path| path.exists())
+        .cloned();
+    let retrieve = local.is_none() && media_awaits_retrieve(media);
+    let (action, action_style) = if local.is_some() {
+        (
+            if voice { "Play ↗" } else { "Open ↗" }.to_owned(),
+            accent.add_modifier(Modifier::BOLD),
+        )
+    } else if retrieve {
+        (
+            format!("Retrieve{}", format_media_size(media)),
+            accent.add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "Not downloaded".to_owned(),
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let mut lines = vec![card_border_line('╭', '─', '╮', card_width, accent)];
+    let first_row = start_line + lines.len();
+    lines.push(card_spans_line(
+        accent,
+        vec![
+            Span::styled(badge_cell, badge_style),
+            Span::raw(" "),
+            Span::styled(
+                // badge cell (7) + gap (1) == DOCUMENT_BADGE_WIDTH
+                truncate_to_width(&media.file_name, text_width),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ],
+        card_width,
+    ));
+    lines.push(card_spans_line(
+        accent,
+        vec![
+            Span::raw(gutter.clone()),
+            Span::styled(
+                truncate_to_width(&document_detail(voice, media), text_width),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ],
+        card_width,
+    ));
+    lines.push(card_spans_line(
+        accent,
+        vec![Span::raw(gutter), Span::styled(action, action_style)],
+        card_width,
+    ));
+    let last_row = start_line + lines.len() - 1;
+
+    if local.is_some() || retrieve {
+        let hit_width = card_width.saturating_add(4).min(context.content_width);
+        let start_col = if is_from_me {
+            context.content_width.saturating_sub(hit_width)
+        } else {
+            0
+        };
+        let path = local
+            .clone()
+            .or_else(|| media.local_path.clone())
+            .unwrap_or_default();
+        context.media_hits.push(MediaHit {
+            start_line: first_row,
+            end_line: last_row,
+            start_col,
+            end_col: start_col.saturating_add(hit_width),
+            preview_start_col: start_col.saturating_add(2),
+            preview_end_col: start_col.saturating_add(2).saturating_add(card_width),
+            preview_path: path.clone(),
+            path,
+            title: media.file_name.to_string(),
+            caption: visible_media_caption(media).map(str::to_owned),
+            retrieve: retrieve.then(|| media.clone()),
+            play: None,
+            preview_skip_rows: 0,
+            play_badge: false,
+            open: local,
+        });
+    }
+
+    if let Some(caption) = visible_media_caption(media) {
+        for row in wrap_markdown_text(caption, card_width as usize) {
+            lines.push(card_spans_line(accent, row, card_width));
+        }
+    }
+    lines.push(card_border_line('╰', '─', '╯', card_width, accent));
+    lines
+}
+
+fn document_card_line_count(voice: bool, media: &chat_core::Media, content_width: u16) -> usize {
+    let caption = visible_media_caption(media)
+        .map(|caption| {
+            let width = document_card_width(voice, media, content_width);
+            wrap_markdown_text(caption, width as usize).len()
+        })
+        .unwrap_or_default();
+    5 + caption
 }
 
 /// Returns the media caption only when it carries real text, treating blank or
@@ -3014,6 +3325,10 @@ fn flat_media_card_lines(
             title: media.file_name.to_string(),
             caption: visible_media_caption(media).map(str::to_owned),
             retrieve,
+            play: None,
+            preview_skip_rows: 0,
+            play_badge: false,
+            open: None,
         });
     }
 
@@ -3054,23 +3369,360 @@ fn flat_media_card_lines(
     lines
 }
 
+/// Human-facing name for a video: the real file name when the provider kept
+/// one (Slack uploads, WhatsApp videos sent as documents), otherwise "Video"
+/// rather than a content-hash cache key.
+fn video_display_name(media: &chat_core::Media) -> &str {
+    if video::is_meaningful_file_name(&media.file_name) {
+        media.file_name.as_ref()
+    } else {
+        "Video"
+    }
+}
+
+/// Local video file eligible for poster/metadata probing.
+fn local_video_path(media: &chat_core::Media) -> Option<&PathBuf> {
+    media.local_path.as_ref().filter(|path| path.exists())
+}
+
+/// Cache-only lookup of probed video info. Queues a background probe for
+/// local videos that have not been probed yet; never runs ffprobe itself.
+fn video_info_for_render(
+    media: &chat_core::Media,
+    context: &mut MessageRenderContext<'_>,
+) -> Option<Arc<VideoInfo>> {
+    let path = local_video_path(media)?;
+    probed_info_for_render(path, context)
+}
+
+fn probed_info_for_render(
+    path: &Path,
+    context: &mut MessageRenderContext<'_>,
+) -> Option<Arc<VideoInfo>> {
+    match context.media_cache.video_info(path) {
+        Some(Ok(info)) => Some(info.clone()),
+        Some(Err(_)) => None,
+        None => {
+            context.media_cache.request_video_probe(path.to_path_buf());
+            None
+        }
+    }
+}
+
+/// Picks the frame of a looping animation to draw at the shared animation
+/// clock, for a `width`×`rows` preview. Draw-safe: reads caches only, queues
+/// background decodes for frames not decoded yet, and falls back to the most
+/// recent decoded frame so the loop never flashes a placeholder while frames
+/// stream in. Returns `None` until at least one frame is decoded.
+fn animated_frame_source(
+    info: &VideoInfo,
+    context: &mut MessageRenderContext<'_>,
+    width: u16,
+    rows: u16,
+) -> Option<PathBuf> {
+    let animation = info.animation.as_ref()?;
+    let count = animation.frames.len();
+    if count < 2 {
+        return None;
+    }
+    let desired = animation.frame_at(context.media_cache.animation_clock_ms());
+    let mut chosen = None;
+    for offset in 0..count {
+        let index = (desired + count - offset) % count;
+        let key = MediaPreviewKey {
+            path: animation.frames[index].clone(),
+            width,
+            rows,
+        };
+        match context.media_cache.get(&key) {
+            Some(Ok(_)) => {
+                if chosen.is_none() {
+                    chosen = Some(index);
+                }
+            }
+            Some(Err(_)) => {}
+            None => context
+                .media_preview_requests
+                .push(MediaPreviewRequest { key }),
+        }
+    }
+    let index = chosen?;
+    context.media_cache.mark_animation_active();
+    Some(animation.frames[index].clone())
+}
+
+/// Current animation frame for a local `.gif` image, queueing the one-off
+/// frame extraction the first time the file is seen.
+fn gif_image_frame_source(
+    media: &chat_core::Media,
+    context: &mut MessageRenderContext<'_>,
+    width: u16,
+    rows: u16,
+) -> Option<PathBuf> {
+    let path = media
+        .local_path
+        .as_ref()
+        .filter(|path| video::is_gif_file(path) && path.exists())?;
+    let info = probed_info_for_render(path, context)?;
+    animated_frame_source(&info, context, width, rows)
+}
+
+/// Preview image for a video: the extracted ffmpeg poster when available,
+/// else the provider's embedded thumbnail.
+fn video_preview_source(media: &chat_core::Media, info: Option<&VideoInfo>) -> Option<PathBuf> {
+    info.and_then(|info| info.poster.as_ref())
+        .filter(|poster| poster.exists())
+        .cloned()
+        .or_else(|| {
+            media
+                .thumbnail
+                .as_ref()
+                .filter(|path| path.exists())
+                .cloned()
+        })
+}
+
+/// Single-line summary shown above the video preview, for example
+/// `▶ Video · 0:42 · 1280×720 · 4.2 MB`, or `GIF · 200×200 · 121 KB` for
+/// looping GIF-style clips (no play glyph or duration: they play inline).
+fn video_title_text(media: &chat_core::Media, info: Option<&VideoInfo>) -> String {
+    let gif = info.is_some_and(VideoInfo::is_gif_like);
+    let mut parts = if gif {
+        vec![if video::is_meaningful_file_name(&media.file_name) {
+            format!("GIF · {}", media.file_name)
+        } else {
+            "GIF".to_owned()
+        }]
+    } else {
+        vec![format!("▶ {}", video_display_name(media))]
+    };
+    if !gif && let Some(duration_ms) = info.and_then(|info| info.duration_ms) {
+        parts.push(video::format_duration(duration_ms));
+    }
+    if let Some((width, height)) = info.and_then(|info| info.width.zip(info.height)) {
+        parts.push(format!("{width}×{height}"));
+    }
+    if let Some(size) = media.size_bytes {
+        parts.push(format_size(size).trim().trim_matches(['(', ')']).to_owned());
+    }
+    if media_awaits_retrieve(media) {
+        parts.push("click to retrieve".to_owned());
+    }
+    parts.join(" · ")
+}
+
+/// Overlays a centered play badge on decoded preview rows. Rows hold one span
+/// per terminal cell, so three center cells are swapped for ` ▶ `.
+fn overlay_play_badge(rows: &mut [Vec<Span<'static>>]) {
+    if rows.is_empty() {
+        return;
+    }
+    let middle = rows.len() / 2;
+    let row = &mut rows[middle];
+    if row.len() < 5 {
+        return;
+    }
+    let start = row.len() / 2 - 1;
+    let badge = Span::styled(
+        " ▶ ",
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    );
+    row.splice(start..start + 3, [badge]);
+}
+
+/// Resolves the click target for a video card: play locally cached files,
+/// retrieve large undownloaded ones, and otherwise fall back to viewing the
+/// preview image. Returns `None` when there is nothing to activate.
+fn video_hit_target(
+    media: &chat_core::Media,
+    preview: Option<&PathBuf>,
+) -> Option<(PathBuf, Option<chat_core::Media>, Option<PathBuf>)> {
+    let play = local_video_path(media).cloned();
+    let retrieve = media_awaits_retrieve(media).then(|| media.clone());
+    let anchor = preview
+        .cloned()
+        .or_else(|| play.clone())
+        .or_else(|| media.local_path.clone());
+    if play.is_none() && retrieve.is_none() && preview.is_none() {
+        return None;
+    }
+    Some((anchor.unwrap_or_default(), retrieve, play))
+}
+
+/// Video card. The layout is fixed (title row, [`VIDEO_PREVIEW_ROWS`] preview
+/// rows, wrapped caption) so late-arriving poster/metadata never changes the
+/// line count computed by [`video_card_line_count`]. GIF-style clips loop
+/// their frames inline instead of showing a play badge.
+fn video_card_lines(
+    media: &chat_core::Media,
+    accent: Style,
+    context: &mut MessageRenderContext<'_>,
+    start_line: usize,
+    is_from_me: bool,
+) -> Vec<Line<'static>> {
+    let info = video_info_for_render(media, context);
+    let gif = info.as_deref().is_some_and(VideoInfo::is_gif_like);
+    let flat = context.presentation == ConversationPresentation::Flat;
+    let accent = media_card_accent(accent);
+    let card_width = media_card_width(context.content_width);
+    let animated = match info.as_deref() {
+        Some(info) if gif => animated_frame_source(info, context, card_width, VIDEO_PREVIEW_ROWS),
+        _ => None,
+    };
+    let source = animated.or_else(|| video_preview_source(media, info.as_deref()));
+    let (rows, source, error, ready) = preview_rows_for_source(
+        source,
+        media_awaits_retrieve(media),
+        "no preview",
+        context,
+        card_width,
+        VIDEO_PREVIEW_ROWS,
+        accent.fg.unwrap_or(Color::DarkGray),
+    );
+    let has_image = ready && error.is_none() && source.is_some();
+    let mut rows: Vec<Vec<Span<'static>>> = rows.into_iter().map(strip_preview_padding).collect();
+    if has_image && !gif {
+        overlay_play_badge(&mut rows);
+    }
+
+    let title = video_title_text(media, info.as_deref());
+    let title_style = accent.add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+    if flat {
+        lines.push(flat_card_text_line(accent, &title, card_width, title_style));
+    } else {
+        lines.push(card_border_line('╭', '─', '╮', card_width, accent));
+        lines.push(card_text_line(accent, &title, card_width, title_style));
+    }
+
+    let preview = source.as_ref().filter(|_| error.is_none());
+    if let Some((path, retrieve, play)) = video_hit_target(media, preview) {
+        let (start_col, hit_width, preview_offset) = if flat {
+            (0, card_width, 0)
+        } else {
+            let hit_width = card_width.saturating_add(4).min(context.content_width);
+            let start_col = if is_from_me {
+                context.content_width.saturating_sub(hit_width)
+            } else {
+                0
+            };
+            (start_col, hit_width, 2)
+        };
+        // The title row is clickable too, so undownloaded videos without any
+        // preview image still have a target.
+        let first_line = start_line + lines.len() - 1;
+        context.media_hits.push(MediaHit {
+            start_line: first_line,
+            end_line: first_line + rows.len(),
+            start_col,
+            end_col: start_col.saturating_add(hit_width),
+            preview_start_col: start_col.saturating_add(preview_offset),
+            preview_end_col: start_col
+                .saturating_add(preview_offset)
+                .saturating_add(card_width),
+            preview_path: preview.cloned().unwrap_or_else(|| path.clone()),
+            path,
+            title: if gif {
+                "GIF".to_owned()
+            } else {
+                video_display_name(media).to_owned()
+            },
+            caption: visible_media_caption(media).map(str::to_owned),
+            retrieve,
+            play,
+            preview_skip_rows: 1,
+            play_badge: has_image && !gif,
+            open: None,
+        });
+    }
+
+    for row in rows {
+        let row = center_preview_row(row, card_width);
+        lines.push(if flat {
+            flat_card_preview_line(accent, row)
+        } else {
+            card_preview_line(accent, row, card_width)
+        });
+    }
+
+    if let Some(caption) = visible_media_caption(media) {
+        for row in wrap_markdown_text(caption, card_width as usize) {
+            lines.push(if flat {
+                flat_card_spans_line(accent, row)
+            } else {
+                card_spans_line(accent, row, card_width)
+            });
+        }
+    }
+    if !flat {
+        lines.push(card_border_line('╰', '─', '╯', card_width, accent));
+    }
+    lines
+}
+
+fn video_card_line_count(
+    media: &chat_core::Media,
+    content_width: u16,
+    presentation: ConversationPresentation,
+) -> usize {
+    let caption = visible_media_caption(media)
+        .map(|caption| wrap_markdown_text(caption, media_card_width(content_width) as usize).len())
+        .unwrap_or_default();
+    let chrome = match presentation {
+        // Top border, title row, bottom border.
+        ConversationPresentation::Bubbles => 3,
+        // Title row only.
+        ConversationPresentation::Flat => 1,
+    };
+    chrome + VIDEO_PREVIEW_ROWS as usize + caption
+}
+
+type PreviewRowsResult = (
+    Vec<Vec<Span<'static>>>,
+    Option<PathBuf>,
+    Option<String>,
+    bool,
+);
+
 fn media_preview_rows(
     media: &chat_core::Media,
     context: &mut MessageRenderContext<'_>,
     width: u16,
     rows: u16,
     accent: Color,
-) -> (
-    Vec<Vec<Span<'static>>>,
-    Option<PathBuf>,
-    Option<String>,
-    bool,
-) {
-    let Some(source) = media_preview_source(media) else {
-        let label = if media_awaits_retrieve(media) {
+) -> PreviewRowsResult {
+    let source =
+        gif_image_frame_source(media, context, width, rows).or_else(|| media_preview_source(media));
+    preview_rows_for_source(
+        source,
+        media_awaits_retrieve(media),
+        "no local image",
+        context,
+        width,
+        rows,
+        accent,
+    )
+}
+
+/// Cache-only preview lookup for an already resolved preview `source`. Queues
+/// a background decode and returns placeholder rows while it is missing.
+fn preview_rows_for_source(
+    source: Option<PathBuf>,
+    awaits_retrieve: bool,
+    missing_label: &str,
+    context: &mut MessageRenderContext<'_>,
+    width: u16,
+    rows: u16,
+    accent: Color,
+) -> PreviewRowsResult {
+    let Some(source) = source else {
+        let label = if awaits_retrieve {
             "not downloaded"
         } else {
-            "no local image"
+            missing_label
         };
         return (
             fallback_preview_rows(width, rows, accent, label),
@@ -3536,13 +4188,13 @@ fn markdown_inline_segments(text: &str) -> Vec<(String, Style)> {
     while !remaining.is_empty() {
         let Some((offset, marker)) = next_markdown_marker(remaining) else {
             if !remaining.is_empty() {
-                segments.push((remaining.to_owned(), style));
+                push_mention_segments(&mut segments, remaining, style);
             }
             break;
         };
 
         if offset > 0 {
-            segments.push((remaining[..offset].to_owned(), style));
+            push_mention_segments(&mut segments, &remaining[..offset], style);
             remaining = &remaining[offset..];
         }
 
@@ -3583,6 +4235,47 @@ fn markdown_inline_segments(text: &str) -> Vec<(String, Style)> {
         segments.push((String::new(), Style::default()));
     }
     segments
+}
+
+/// Push `text` into `segments`, splitting out `@token` mention runs and styling
+/// them with an underline so mentions stand out in the transcript. A mention
+/// starts with `@` at the beginning of the text or after whitespace, and runs to
+/// the next whitespace; `user@host` is therefore left untouched.
+fn push_mention_segments(segments: &mut Vec<(String, Style)>, text: &str, style: Style) {
+    if !text.contains('@') {
+        segments.push((text.to_owned(), style));
+        return;
+    }
+    let mention_style = toggle_modifier(style, Modifier::UNDERLINED);
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < chars.len() {
+        let starts_mention = chars[index].1 == '@'
+            && (index == 0 || chars[index - 1].1.is_whitespace())
+            && chars
+                .get(index + 1)
+                .is_some_and(|(_, ch)| ch.is_alphanumeric() || *ch == '_');
+        if starts_mention {
+            let mut end = index + 1;
+            while end < chars.len() && !chars[end].1.is_whitespace() {
+                end += 1;
+            }
+            let token_start = chars[index].0;
+            let token_end = chars.get(end).map_or(text.len(), |(byte, _)| *byte);
+            if token_start > start {
+                segments.push((text[start..token_start].to_owned(), style));
+            }
+            segments.push((text[token_start..token_end].to_owned(), mention_style));
+            start = token_end;
+            index = end;
+            continue;
+        }
+        index += 1;
+    }
+    if start < text.len() {
+        segments.push((text[start..].to_owned(), style));
+    }
 }
 
 fn next_markdown_marker(text: &str) -> Option<(usize, &'static str)> {
@@ -4424,8 +5117,11 @@ fn resolve_reply_preview(
 fn content_preview_text(content: &Content) -> String {
     match content {
         Content::Text(text) => text.to_string(),
+        // Video file names are usually provider cache hashes; never quote them.
+        Content::Video(media) => visible_media_caption(media)
+            .map(str::to_owned)
+            .unwrap_or_else(|| video_display_name(media).to_owned()),
         Content::Image(media)
-        | Content::Video(media)
         | Content::Audio(media)
         | Content::File(media)
         | Content::Sticker(media) => media
@@ -4535,7 +5231,14 @@ fn content_lines_len(
         Content::Image(media) | Content::Sticker(media) => {
             media_card_line_count(media, content_width, presentation, true)
         }
-        Content::Video(media) | Content::Audio(media) | Content::File(media) => {
+        Content::Video(media) => video_card_line_count(media, content_width, presentation),
+        Content::Audio(media) if uses_document_card(media, presentation) => {
+            document_card_line_count(true, media, content_width)
+        }
+        Content::File(media) if uses_document_card(media, presentation) => {
+            document_card_line_count(false, media, content_width)
+        }
+        Content::Audio(media) | Content::File(media) => {
             media_card_line_count(media, content_width, presentation, false)
         }
         Content::LinkPreview(link) => link_preview_card_line_count(link, presentation),
@@ -7099,5 +7802,393 @@ mod tests {
 
     fn arc_str(value: &str) -> Arc<str> {
         Arc::<str>::from(value)
+    }
+
+    fn write_test_jpeg(path: &Path, width: u32, height: u32) {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([200, 40, 40]));
+        image.save(path).expect("write test jpeg");
+    }
+
+    fn hashed_video_media(dir: &Path, caption: Option<&str>) -> chat_core::Media {
+        let hash = "3f9a0c1b2d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8";
+        let local = dir.join(format!("{hash}.mp4"));
+        std::fs::write(&local, b"not really a video").expect("write video");
+        let thumbnail = dir.join(format!("{hash}-thumb.jpg"));
+        write_test_jpeg(&thumbnail, 32, 18);
+        chat_core::Media {
+            id: arc_str(hash),
+            file_name: arc_str(&format!("{hash}.mp4")),
+            mime_type: arc_str("video/mp4"),
+            size_bytes: Some(4_200_000),
+            caption: caption.map(arc_str),
+            local_path: Some(local),
+            thumbnail: Some(thumbnail),
+        }
+    }
+
+    fn render_content(
+        content: &Content,
+        cache: &mut MediaPreviewCache,
+    ) -> (Vec<Line<'static>>, Vec<MediaHit>, Vec<MediaPreviewRequest>) {
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = MessageRenderContext {
+            content_width: 90,
+            media_cache: cache,
+            media_hits: &mut media_hits,
+            link_metadata: &link_metadata,
+            link_preview_requests: &mut link_preview_requests,
+            media_preview_requests: &mut media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation: ConversationPresentation::Bubbles,
+            reply_previews: &reply_previews,
+            thread_summaries: &thread_summaries,
+            thread_unread: &thread_unread,
+        };
+        let lines = content_lines(content, &mut context, 0, false, Style::default(), None);
+        (lines, media_hits, media_preview_requests)
+    }
+
+    fn document_media(
+        local_path: Option<PathBuf>,
+        size: u64,
+        caption: Option<&str>,
+    ) -> chat_core::Media {
+        chat_core::Media {
+            id: arc_str("doc-1"),
+            file_name: arc_str("quarterly-report.pdf"),
+            mime_type: arc_str("application/pdf"),
+            size_bytes: Some(size),
+            caption: caption.map(arc_str),
+            local_path,
+            thumbnail: None,
+        }
+    }
+
+    #[test]
+    fn document_card_shows_badge_name_size_and_opens_cached_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("quarterly-report.pdf");
+        std::fs::write(&local, b"%PDF-1.4").expect("write pdf");
+        let media = document_media(Some(local.clone()), 1_200_000, Some("numbers attached"));
+        let content = Content::File(media.clone());
+        let mut cache = MediaPreviewCache::default();
+
+        let (lines, hits, requests) = render_content(&content, &mut cache);
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(rendered.contains("PDF"), "{rendered}");
+        assert!(rendered.contains("quarterly-report.pdf"), "{rendered}");
+        assert!(rendered.contains("PDF · 1.2 MB"), "{rendered}");
+        assert!(rendered.contains("Open ↗"), "{rendered}");
+        assert!(rendered.contains("numbers attached"), "{rendered}");
+        assert!(!rendered.contains("Preview unavailable"), "{rendered}");
+        assert!(!rendered.contains("file: "), "{rendered}");
+        assert!(requests.is_empty(), "documents never queue image decodes");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].open.as_ref(), Some(&local));
+        assert!(hits[0].retrieve.is_none() && hits[0].play.is_none());
+        assert_eq!(
+            lines.len(),
+            content_lines_len(
+                &content,
+                90,
+                &LinkMetadataCache::default(),
+                ConversationPresentation::Bubbles
+            )
+        );
+    }
+
+    #[test]
+    fn document_card_offers_retrieve_for_large_uncached_file_and_voice_note_plays() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = document_media(
+            Some(dir.path().join("missing.pdf")),
+            chat_core::MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES + 1,
+            None,
+        );
+        let content = Content::File(big);
+        let mut cache = MediaPreviewCache::default();
+        let (lines, hits, _) = render_content(&content, &mut cache);
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(rendered.contains("Retrieve"), "{rendered}");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].retrieve.is_some() && hits[0].open.is_none());
+
+        let not_cached = Content::File(document_media(None, 10, None));
+        let (lines, hits, _) = render_content(&not_cached, &mut cache);
+        assert!(rendered_lines(&lines).join("\n").contains("Not downloaded"));
+        assert!(hits.is_empty());
+
+        let voice_path = dir.path().join("note.ogg");
+        std::fs::write(&voice_path, b"OggS").expect("write voice");
+        let voice = Content::Audio(chat_core::Media {
+            id: arc_str("voice-1"),
+            file_name: arc_str("note.ogg"),
+            mime_type: arc_str("audio/ogg"),
+            size_bytes: Some(34_000),
+            caption: None,
+            local_path: Some(voice_path.clone()),
+            thumbnail: None,
+        });
+        let (lines, hits, _) = render_content(&voice, &mut cache);
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(rendered.contains("♪"), "{rendered}");
+        assert!(rendered.contains("Voice note · 34 KB"), "{rendered}");
+        assert!(rendered.contains("Play ↗"), "{rendered}");
+        assert_eq!(hits[0].open.as_ref(), Some(&voice_path));
+        assert_eq!(
+            lines.len(),
+            content_lines_len(
+                &voice,
+                90,
+                &LinkMetadataCache::default(),
+                ConversationPresentation::Bubbles
+            )
+        );
+    }
+
+    #[test]
+    fn image_sent_as_document_keeps_preview_card() {
+        let media = chat_core::Media {
+            mime_type: arc_str("image/png"),
+            ..document_media(None, 10, None)
+        };
+        assert!(!uses_document_card(
+            &media,
+            ConversationPresentation::Bubbles
+        ));
+        assert!(!uses_document_card(
+            &document_media(None, 10, None),
+            ConversationPresentation::Flat
+        ));
+    }
+
+    fn render_video(
+        media: &chat_core::Media,
+        cache: &mut MediaPreviewCache,
+        presentation: ConversationPresentation,
+    ) -> (Vec<Line<'static>>, Vec<MediaHit>, Vec<MediaPreviewRequest>) {
+        let mut media_hits = Vec::new();
+        let mut link_preview_requests = Vec::new();
+        let mut media_preview_requests = Vec::new();
+        let reply_previews = HashMap::new();
+        let thread_summaries = HashMap::new();
+        let thread_unread = HashMap::new();
+        let link_metadata = LinkMetadataCache::default();
+        let mut context = MessageRenderContext {
+            content_width: 90,
+            media_cache: cache,
+            media_hits: &mut media_hits,
+            link_metadata: &link_metadata,
+            link_preview_requests: &mut link_preview_requests,
+            media_preview_requests: &mut media_preview_requests,
+            theme: Theme::default(),
+            previous_sender: None,
+            presentation,
+            reply_previews: &reply_previews,
+            thread_summaries: &thread_summaries,
+            thread_unread: &thread_unread,
+        };
+        let lines = video_card_lines(media, Style::default(), &mut context, 0, false);
+        (lines, media_hits, media_preview_requests)
+    }
+
+    /// Resolves every queued preview decode synchronously, mirroring what the
+    /// app's background workers do between draws.
+    fn complete_preview_requests(
+        cache: &mut MediaPreviewCache,
+        requests: Vec<MediaPreviewRequest>,
+    ) {
+        for request in requests {
+            let result = decode_image_preview_rows_for_key(&request.key);
+            cache.insert(request.key, result);
+        }
+    }
+
+    #[test]
+    fn video_card_hides_hash_name_and_queues_probe_then_shows_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = hashed_video_media(dir.path(), Some("look at this"));
+        let mut cache = MediaPreviewCache::default();
+
+        // Phase 1: nothing cached yet — placeholder preview, probe queued, and
+        // the hash never leaks into the card.
+        let (lines, hits, requests) =
+            render_video(&media, &mut cache, ConversationPresentation::Bubbles);
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(!rendered.contains("3f9a0c1b"), "hash leaked: {rendered}");
+        assert!(rendered.contains("▶ Video · 4.2 MB"), "{rendered}");
+        assert!(rendered.contains("loading image"), "{rendered}");
+        assert_eq!(
+            cache.take_video_probe_requests(),
+            vec![media.local_path.clone().expect("local path")]
+        );
+        assert_eq!(requests.len(), 1, "embedded thumbnail decode queued");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].play.as_ref(), media.local_path.as_ref());
+        assert_eq!(
+            lines.len(),
+            video_card_line_count(&media, 90, ConversationPresentation::Bubbles)
+        );
+
+        // Phase 2: probe finishes with a sharp poster; its decode completes.
+        let poster = dir.path().join("poster.jpg");
+        write_test_jpeg(&poster, 320, 180);
+        cache.insert_video_info(
+            media.local_path.clone().expect("local path"),
+            Ok(VideoInfo {
+                duration_ms: Some(42_480),
+                width: Some(1280),
+                height: Some(720),
+                has_audio: Some(true),
+                poster: Some(poster.clone()),
+                animation: None,
+            }),
+        );
+        let (_, _, requests) = render_video(&media, &mut cache, ConversationPresentation::Bubbles);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].key.path, poster,
+            "poster preferred over thumbnail"
+        );
+        complete_preview_requests(&mut cache, requests);
+
+        let (lines, hits, requests) =
+            render_video(&media, &mut cache, ConversationPresentation::Bubbles);
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(requests.is_empty());
+        assert!(
+            rendered.contains("▶ Video · 0:42 · 1280×720 · 4.2 MB"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(" ▶ "), "play badge overlay: {rendered}");
+        assert!(rendered.contains("look at this"));
+        assert!(!rendered.contains("loading image"));
+        assert!(cache.take_video_probe_requests().is_empty());
+        assert_eq!(hits[0].preview_path, poster);
+        assert_eq!(
+            lines.len(),
+            video_card_line_count(&media, 90, ConversationPresentation::Bubbles),
+            "late metadata must not change the line count"
+        );
+    }
+
+    #[test]
+    fn gif_style_video_loops_frames_inline_without_play_badge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = hashed_video_media(dir.path(), None);
+        let local = media.local_path.clone().expect("local path");
+        let frames_dir = dir.path().join("clip-frames");
+        std::fs::create_dir_all(&frames_dir).expect("frames dir");
+        let frames: Vec<PathBuf> = (0..2)
+            .map(|index| {
+                let frame = frames_dir.join(format!("frame-{index:03}.jpg"));
+                write_test_jpeg(&frame, 64, 64);
+                frame
+            })
+            .collect();
+        let mut cache = MediaPreviewCache::default();
+        cache.insert_video_info(
+            local,
+            Ok(VideoInfo {
+                duration_ms: Some(2_000),
+                width: Some(200),
+                height: Some(200),
+                has_audio: Some(false),
+                poster: Some(frames[0].clone()),
+                animation: Some(video::Animation {
+                    frames: frames.clone(),
+                    delays_ms: vec![100, 100],
+                }),
+            }),
+        );
+
+        // Phase 1: frames not decoded yet — every frame decode is queued and
+        // the loop is not reported as running, so the app stays idle.
+        cache.begin_animation_frame(0);
+        let (lines, _, requests) =
+            render_video(&media, &mut cache, ConversationPresentation::Bubbles);
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(rendered.contains("GIF · 200×200"), "{rendered}");
+        assert!(!rendered.contains("▶ Video"), "{rendered}");
+        // The poster fallback is frame 0, so its decode shares that key.
+        let queued: std::collections::HashSet<_> = requests
+            .iter()
+            .map(|request| request.key.path.clone())
+            .collect();
+        assert_eq!(
+            queued,
+            frames.iter().cloned().collect(),
+            "all frames queued"
+        );
+        assert!(!cache.animation_active());
+        complete_preview_requests(&mut cache, requests);
+
+        // Phase 2: frames cached — the clock picks the frame, the loop keeps
+        // the app ticking, and no play badge or HD badge is drawn.
+        cache.begin_animation_frame(0);
+        let (lines, hits, requests) =
+            render_video(&media, &mut cache, ConversationPresentation::Bubbles);
+        assert!(requests.is_empty());
+        assert!(cache.animation_active());
+        assert_eq!(hits[0].path, frames[0]);
+        assert!(!hits[0].play_badge);
+        assert_eq!(hits[0].preview_skip_rows, 1, "HD image stays below title");
+        assert!(video::is_animation_frame(&hits[0].path));
+        assert!(!rendered_lines(&lines).join("\n").contains(" ▶ "));
+
+        cache.begin_animation_frame(150);
+        let (later, hits, _) = render_video(&media, &mut cache, ConversationPresentation::Bubbles);
+        assert_eq!(hits[0].path, frames[1], "clock advanced to the next frame");
+        assert_eq!(later.len(), lines.len(), "frames never change the layout");
+    }
+
+    #[test]
+    fn flat_video_card_line_count_matches_render() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let media = hashed_video_media(dir.path(), Some("a caption"));
+        let mut cache = MediaPreviewCache::default();
+        let (lines, _, _) = render_video(&media, &mut cache, ConversationPresentation::Flat);
+        assert_eq!(
+            lines.len(),
+            video_card_line_count(&media, 90, ConversationPresentation::Flat)
+        );
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(rendered.starts_with("▶ Video"), "{rendered}");
+    }
+
+    #[test]
+    fn video_card_keeps_meaningful_file_names_and_offers_retrieve() {
+        let media = chat_core::Media {
+            id: arc_str("slack-video"),
+            file_name: arc_str("launch-demo.mp4"),
+            mime_type: arc_str("video/mp4"),
+            size_bytes: Some(chat_core::MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES + 1),
+            caption: None,
+            local_path: Some(PathBuf::from("/nonexistent/launch-demo.mp4")),
+            thumbnail: None,
+        };
+        let mut cache = MediaPreviewCache::default();
+        let (lines, hits, _) = render_video(&media, &mut cache, ConversationPresentation::Bubbles);
+        let rendered = rendered_lines(&lines).join("\n");
+        assert!(rendered.contains("▶ launch-demo.mp4"), "{rendered}");
+        assert!(rendered.contains("click to retrieve"), "{rendered}");
+        assert!(
+            cache.take_video_probe_requests().is_empty(),
+            "no local file to probe"
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].retrieve.is_some());
+        assert!(hits[0].play.is_none());
+        assert_eq!(
+            content_preview_text(&Content::Video(media.clone())),
+            "launch-demo.mp4"
+        );
     }
 }

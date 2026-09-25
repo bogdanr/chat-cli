@@ -303,6 +303,53 @@ func TestRewriteMentionTokensLeavesUnknownMentionsUnchanged(t *testing.T) {
 	}
 }
 
+func TestParseMentionedJIDsSplitsAndTrims(t *testing.T) {
+	// Rust passes a comma-separated list; empty entries are dropped so a
+	// trailing separator never produces a bogus JID.
+	got := parseMentionedJIDs(" 123@s.whatsapp.net , 456@s.whatsapp.net ,")
+	want := []string{"123@s.whatsapp.net", "456@s.whatsapp.net"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("expected %v, got %v", want, got)
+		}
+	}
+}
+
+func TestParseMentionedJIDsEmptyYieldsNil(t *testing.T) {
+	// An empty list must preserve the previous no-mention behavior.
+	if got := parseMentionedJIDs("   "); got != nil {
+		t.Fatalf("expected nil, got %v", got)
+	}
+}
+
+func TestBuildTextMessageSetsMentionedJID(t *testing.T) {
+	// A mention list upgrades a plain conversation to an ExtendedTextMessage
+	// so the MentionedJID metadata reaches the recipient.
+	mentioned := []string{"123@s.whatsapp.net"}
+	message := buildTextMessage(nil, "hi @123", "", "", "", mentioned)
+	if message.GetExtendedTextMessage() == nil {
+		t.Fatal("expected an extended text message when mentions are present")
+	}
+	got := message.GetExtendedTextMessage().GetContextInfo().GetMentionedJID()
+	if len(got) != 1 || got[0] != "123@s.whatsapp.net" {
+		t.Fatalf("expected mentioned JID to be set, got %v", got)
+	}
+}
+
+func TestBuildTextMessageWithoutMentionsStaysPlain(t *testing.T) {
+	// No reply and no mentions must keep the plain Conversation form.
+	message := buildTextMessage(nil, "hi", "", "", "", nil)
+	if message.GetConversation() != "hi" {
+		t.Fatalf("expected plain conversation, got %v", message)
+	}
+	if message.GetExtendedTextMessage() != nil {
+		t.Fatal("expected no extended text message without mentions")
+	}
+}
+
 func TestOfflineSyncWindowTogglesBacklogFlag(t *testing.T) {
 	// The offline-sync window brackets the server's replay of events missed
 	// during downtime. While it is open, messages must be classified as

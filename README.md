@@ -152,6 +152,7 @@ it into your workspace, then finish signing in from the account screen:
 | Settings | `Ctrl+S` |
 | Send a message | `Enter` in the compose box |
 | Insert emoji | Type `:name` and pick a suggestion |
+| Mention someone | Type `@name` and pick a suggestion |
 | Quit | `Ctrl+Q` |
 
 Mouse and touchpad work too — click to focus a pane, open a chat, or scroll a list.

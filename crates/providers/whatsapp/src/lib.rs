@@ -3,10 +3,11 @@ use async_trait::async_trait;
 use chat_core::{
     Account, AuthChallenge, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMemberRole,
     ChatMembership, ContactProfile, Content, DiscoveryAction, DiscoveryCapabilities,
-    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message, MessageId,
-    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform, PlatformData,
-    PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent, ProviderId, Reaction, Sender,
-    Timestamp, WhatsAppData,
+    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Mention, Message, MessageId,
+    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, OutboundContent,
+    OutboundMentions, Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider,
+    ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData, resolve_mention_tokens,
+    rewrite_mention_tokens,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -332,11 +333,31 @@ impl Provider for WhatsAppProvider {
             audio: true,
             file: true,
             sticker: true,
+            mentions: true,
             max_upload_size: None,
             media_note: Some(Arc::from(
                 "WhatsApp GIFs may be sent as documents depending on format",
             )),
         }
+    }
+
+    /// Rewrite `@DisplayName` tokens into WhatsApp's `@<jid-user>` form and
+    /// report the mentioned JIDs so `send` can attach them as `MentionedJID`.
+    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
+        let resolved = resolve_mention_tokens(text, members);
+        let mut mentioned: Vec<Mention> = Vec::new();
+        for item in &resolved {
+            if !mentioned
+                .iter()
+                .any(|existing| existing.platform_id == item.mention.platform_id)
+            {
+                mentioned.push(item.mention.clone());
+            }
+        }
+        let text = rewrite_mention_tokens(text, &resolved, |mention| {
+            format!("@{}", whatsapp_mention_token(&mention.platform_id))
+        });
+        OutboundMentions { text, mentioned }
     }
 
     fn discovery_capabilities(&self) -> DiscoveryCapabilities {
@@ -432,9 +453,10 @@ impl Provider for WhatsAppProvider {
     async fn send(
         &self,
         chat_id: &ChatId,
-        content: Content,
+        outbound: OutboundContent,
         reply_to: Option<&Message>,
     ) -> Result<MessageId> {
+        let OutboundContent { content, mentions } = outbound;
         let chat_jid = whatsapp_jid_from_chat_id(chat_id);
         if chat_jid.is_empty() {
             bail!("cannot send WhatsApp message to bridge/system chat")
@@ -449,9 +471,14 @@ impl Provider for WhatsAppProvider {
         let reply = reply_to.map(whatsapp_reply_target);
         let reply = reply.as_ref();
 
+        let mentioned_jids = mentions
+            .iter()
+            .map(|mention| normalize_whatsapp_jid(&mention.platform_id))
+            .collect::<Vec<_>>();
+
         let raw_response = match &content {
             Content::Text(text) => self.bridge_call(NetworkActivityKind::Send, || {
-                bridge::send_text(self.handle, &chat_jid, text, reply)
+                bridge::send_text(self.handle, &chat_jid, text, reply, &mentioned_jids)
             })?,
             Content::Image(media) if media.mime_type.as_ref() == "image/gif" => {
                 self.send_media_to_bridge(&chat_jid, media, "gif", reply)?
@@ -2285,6 +2312,18 @@ fn normalize_whatsapp_jid(jid: &str) -> String {
     format!("{user}@{server}")
 }
 
+/// The bare user-part token WhatsApp uses inside message text for a mention
+/// (e.g. `34819417346247` for `34819417346247@s.whatsapp.net`). Device/agent
+/// suffixes are stripped first so the token matches the JID sent alongside it.
+fn whatsapp_mention_token(jid: &str) -> String {
+    let normalized = normalize_whatsapp_jid(jid);
+    normalized
+        .split('@')
+        .next()
+        .unwrap_or(normalized.as_str())
+        .to_owned()
+}
+
 fn chat_id_to_name(chat_id: &ChatId) -> Arc<str> {
     arc_str(sender_name_from_jid(&whatsapp_jid_from_chat_id(chat_id)))
 }
@@ -3095,10 +3134,11 @@ mod tests {
         let chat_id = arc_str("whatsapp:555@s.whatsapp.net");
         loop {
             let chats = provider.chats().await?;
-            if let Some(chat) = chats.iter().find(|chat| chat.id == chat_id) {
-                if chat.unread_count == 2 {
-                    break;
-                }
+            if chats
+                .iter()
+                .any(|chat| chat.id == chat_id && chat.unread_count == 2)
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3501,13 +3541,68 @@ mod tests {
 
         let chat_id = arc_str("whatsapp:123@s.whatsapp.net");
         let sent_id = provider
-            .send(&chat_id, Content::Text(arc_str("hello back")), None)
+            .send(
+                &chat_id,
+                OutboundContent::new(Content::Text(arc_str("hello back"))),
+                None,
+            )
             .await?;
         assert!(sent_id.starts_with("test-sent-"));
         let history = provider.history(&chat_id, None, 1).await?;
         assert_eq!(history.len(), 1);
         assert!(history[0].is_from_me);
         assert_eq!(content_text(&history[0].content), "hello back");
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    fn mention_member(id: &str, name: &str) -> ChatMember {
+        ChatMember::new(Sender {
+            platform_id: arc_str(id),
+            display_name: arc_str(name),
+            avatar: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn whatsapp_encodes_mentions_as_phone_tokens_and_reports_jids() -> Result<()> {
+        // `new` creates a real bridge client; serialize with the other FFI
+        // tests so it cannot race their global synthetic-event hook.
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:mentions")?;
+        let members = vec![mention_member("40721274801@s.whatsapp.net", "Bogdan")];
+
+        // The body carries the bare phone number, and the resolved identity is
+        // reported so the send path can populate `MentionedJID`.
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        assert_eq!(encoded.text, "hi @40721274801");
+        assert_eq!(
+            encoded
+                .mentioned
+                .iter()
+                .map(|mention| mention.platform_id.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["40721274801@s.whatsapp.net"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_send_carries_mentioned_jids_through_bridge() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:send-mentions")?;
+        provider.connect().await?;
+
+        let chat_id = arc_str("whatsapp:123@s.whatsapp.net");
+        let mut outbound = OutboundContent::new(Content::Text(arc_str("hi @40721274801")));
+        outbound.mentions = vec![Mention {
+            platform_id: arc_str("40721274801:42@s.whatsapp.net"),
+            display_name: arc_str("Bogdan"),
+        }];
+
+        let sent_id = provider.send(&chat_id, outbound, None).await?;
+        assert!(sent_id.starts_with("test-sent-"));
 
         provider.disconnect().await?;
         Ok(())
@@ -3527,7 +3622,7 @@ mod tests {
         let sent_id = provider
             .send(
                 &chat_id,
-                Content::File(Media {
+                OutboundContent::new(Content::File(Media {
                     id: arc_str("file-1"),
                     file_name: arc_str("fono-snixembed.log"),
                     mime_type: arc_str("text/plain"),
@@ -3535,7 +3630,7 @@ mod tests {
                     caption: Some(arc_str("debug log")),
                     local_path: Some(file_path.clone()),
                     thumbnail: None,
-                }),
+                })),
                 None,
             )
             .await?;
@@ -3581,7 +3676,7 @@ mod tests {
         provider
             .send(
                 &chat_id,
-                Content::Image(Media {
+                OutboundContent::new(Content::Image(Media {
                     id: arc_str("img-1"),
                     file_name: arc_str("photo.png"),
                     mime_type: arc_str("image/png"),
@@ -3589,7 +3684,7 @@ mod tests {
                     caption: None,
                     local_path: Some(file_path.clone()),
                     thumbnail: None,
-                }),
+                })),
                 None,
             )
             .await?;
@@ -3620,7 +3715,7 @@ mod tests {
         let sent_id = provider
             .send(
                 &chat_id,
-                Content::Sticker(Media {
+                OutboundContent::new(Content::Sticker(Media {
                     id: arc_str("sticker-1"),
                     file_name: arc_str("shrug.webp"),
                     mime_type: arc_str("image/webp"),
@@ -3628,7 +3723,7 @@ mod tests {
                     caption: None,
                     local_path: Some(sticker_path.clone()),
                     thumbnail: None,
-                }),
+                })),
                 None,
             )
             .await?;
@@ -3649,12 +3744,12 @@ mod tests {
         let error = provider
             .send(
                 &arc_str("whatsapp:123@s.whatsapp.net"),
-                Content::File(Media {
+                OutboundContent::new(Content::File(Media {
                     id: arc_str("file-1"),
                     file_name: arc_str("missing.log"),
                     mime_type: arc_str("text/plain"),
                     ..Media::default()
-                }),
+                })),
                 None,
             )
             .await

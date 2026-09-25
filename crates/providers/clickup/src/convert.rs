@@ -152,7 +152,10 @@ pub fn avatar_for_user(user: &WireUser) -> Option<PathBuf> {
 /// here. The authenticated user is excluded, since a conversation is named
 /// after the *other* people in it. A DM with oneself keeps the self name
 /// rather than collapsing to an empty label.
-pub fn direct_chat_display_name(members: &[WireUser], self_user_id: Option<&str>) -> Option<String> {
+pub fn direct_chat_display_name(
+    members: &[WireUser],
+    self_user_id: Option<&str>,
+) -> Option<String> {
     let others: Vec<String> = members
         .iter()
         .filter(|member| {
@@ -185,10 +188,7 @@ pub fn apply_direct_chat_identity(
     members: &[WireUser],
     self_user_id: Option<&str>,
 ) -> bool {
-    if !matches!(
-        chat.kind,
-        ChatKind::Direct | ChatKind::GroupDirectMessage
-    ) {
+    if !matches!(chat.kind, ChatKind::Direct | ChatKind::GroupDirectMessage) {
         return false;
     }
 

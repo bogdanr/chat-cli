@@ -451,7 +451,7 @@ func describeSendError(err error) string {
 }
 
 //export C_SendText
-func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char, replyID *C.char, replyParticipant *C.char, replyText *C.char) *C.char {
+func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char, replyID *C.char, replyParticipant *C.char, replyText *C.char, mentionedJIDs *C.char) *C.char {
 	mu.Lock()
 	c, ok := clients[uint64(clientID)]
 	mu.Unlock()
@@ -463,6 +463,7 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char, replyID *C.c
 	replyIDRaw := C.GoString(replyID)
 	replyParticipantRaw := C.GoString(replyParticipant)
 	replyTextRaw := C.GoString(replyText)
+	mentioned := parseMentionedJIDs(C.GoString(mentionedJIDs))
 	if strings.HasPrefix(c.dbPath, "test:") {
 		chat := C.GoString(chatJID)
 		return cJSON(bridgeEvent{
@@ -485,7 +486,7 @@ func C_SendText(clientID C.uint64_t, chatJID *C.char, text *C.char, replyID *C.c
 		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
 	}
 
-	resp, err := c.wa.SendMessage(context.Background(), jid, buildTextMessage(c, body, replyIDRaw, replyParticipantRaw, replyTextRaw))
+	resp, err := c.wa.SendMessage(context.Background(), jid, buildTextMessage(c, body, replyIDRaw, replyParticipantRaw, replyTextRaw, mentioned))
 	if err != nil {
 		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("send WhatsApp message: %s", describeSendError(err))})
 	}
@@ -1117,11 +1118,39 @@ func (c *client) buildReplyContext(replyID, participant, quotedText string) *waP
 	return ctx
 }
 
+// parseMentionedJIDs splits the bridge's comma-separated mentioned-JID list
+// (as passed from Rust) into individual JIDs, dropping empty entries. An empty
+// input yields a nil slice, preserving the no-mention behavior.
+func parseMentionedJIDs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	jids := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			jids = append(jids, trimmed)
+		}
+	}
+	if len(jids) == 0 {
+		return nil
+	}
+	return jids
+}
+
 // buildTextMessage returns the outgoing text message body, upgrading a plain
-// conversation to an ExtendedTextMessage when a reply context is present so the
-// quote survives to the recipient.
-func buildTextMessage(c *client, body, replyID, participant, quotedText string) *waProto.Message {
-	if ctx := c.buildReplyContext(replyID, participant, quotedText); ctx != nil {
+// conversation to an ExtendedTextMessage when a reply context or mention list
+// is present so the quote and MentionedJID metadata survive to the recipient.
+func buildTextMessage(c *client, body, replyID, participant, quotedText string, mentionedJIDs []string) *waProto.Message {
+	ctx := c.buildReplyContext(replyID, participant, quotedText)
+	if len(mentionedJIDs) > 0 {
+		if ctx == nil {
+			ctx = &waProto.ContextInfo{}
+		}
+		ctx.MentionedJID = mentionedJIDs
+	}
+	if ctx != nil {
 		return &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
 			Text:        proto.String(body),
 			ContextInfo: ctx,

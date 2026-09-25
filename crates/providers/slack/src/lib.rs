@@ -13,9 +13,10 @@ use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
     CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatDetails, ChatId, ChatKind,
     ChatMember, ChatMembership, ContactProfile, Content, DiscoveryAction, DiscoveryCapabilities,
-    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Message, MessageId,
-    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, Platform, PlatformData,
-    PlatformId, Provider, ProviderEvent, ProviderId, Reaction, Sender, SlackData, Timestamp,
+    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Mention, Message, MessageId,
+    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, OutboundContent,
+    OutboundMentions, Platform, PlatformData, PlatformId, Provider, ProviderEvent, ProviderId,
+    Reaction, Sender, SlackData, Timestamp, resolve_mention_tokens, rewrite_mention_tokens,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -936,6 +937,25 @@ pub trait SlackApiClient: Send + Sync {
         credential: SlackCredential,
     ) -> Result<Vec<SlackConversation>>;
 
+    /// Conversations the authenticated user belongs to, limited to `scope`.
+    /// Sidebar loads and pollers only ever need these, so the real client
+    /// uses `users.conversations` instead of paging every public channel in
+    /// the workspace through `conversations.list` (slow at startup and the
+    /// main source of `conversations.list` 429s). The default filters
+    /// [`Self::list_conversations`] so fakes keep working unchanged.
+    async fn list_member_conversations(
+        &self,
+        credential: SlackCredential,
+        scope: SlackMemberScope,
+    ) -> Result<Vec<SlackConversation>> {
+        Ok(self
+            .list_conversations(credential)
+            .await?
+            .into_iter()
+            .filter(|conversation| scope.includes(conversation))
+            .collect())
+    }
+
     async fn user_info(
         &self,
         credential: SlackCredential,
@@ -1287,7 +1307,20 @@ impl SlackApiClient for SlackWebApiClient {
         &self,
         credential: SlackCredential,
     ) -> Result<Vec<SlackConversation>> {
-        list_web_api_conversations(credential).await
+        list_web_api_conversations(credential, SlackListingEndpoint::AllConversations).await
+    }
+
+    async fn list_member_conversations(
+        &self,
+        credential: SlackCredential,
+        scope: SlackMemberScope,
+    ) -> Result<Vec<SlackConversation>> {
+        let member =
+            list_web_api_conversations(credential.clone(), SlackListingEndpoint::Member(scope))
+                .await?;
+        let direct_messages =
+            list_web_api_conversations(credential, SlackListingEndpoint::DirectMessages).await?;
+        Ok(merge_member_listings(scope, member, direct_messages))
     }
 
     async fn user_info(
@@ -1613,29 +1646,138 @@ async fn upload_web_api_file(
     .context("joining Slack file upload task")?
 }
 
-async fn list_web_api_conversations(credential: SlackCredential) -> Result<Vec<SlackConversation>> {
+/// Which subset of conversations a member listing returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SlackMemberScope {
+    /// Everything the sidebar shows: joined channels, private channels, DMs
+    /// and group DMs.
+    Sidebar,
+    /// Only DMs and group DMs (what the always-on DM poll watches).
+    Direct,
+}
+
+impl SlackMemberScope {
+    #[cfg(test)]
+    fn types(self) -> &'static str {
+        match self {
+            Self::Sidebar => SLACK_CONVERSATION_TYPES,
+            Self::Direct => "im,mpim",
+        }
+    }
+
+    /// Types fetched through `users.conversations`. 1:1 DMs are excluded:
+    /// that endpoint omits IMs with bots, deactivated users and long-idle
+    /// DMs, which made them vanish from the sidebar. They are listed via
+    /// `conversations.list types=im` instead, which only returns the user's
+    /// own DMs (a single cheap page, unlike public channels).
+    fn member_types(self) -> &'static str {
+        match self {
+            Self::Sidebar => "public_channel,private_channel,mpim",
+            Self::Direct => "mpim",
+        }
+    }
+
+    fn includes(self, conversation: &SlackConversation) -> bool {
+        match self {
+            Self::Sidebar => include_conversation_in_sidebar(conversation),
+            Self::Direct => conversation.is_im || conversation.is_mpim,
+        }
+    }
+}
+
+/// Web API method backing a paginated conversation listing.
+#[derive(Clone, Copy, Debug)]
+enum SlackListingEndpoint {
+    /// `conversations.list`: every visible conversation, including public
+    /// channels the user never joined (needed for discovery only).
+    AllConversations,
+    /// `conversations.list types=im`: every 1:1 DM of the user.
+    DirectMessages,
+    /// `users.conversations`: only conversations the user is a member of
+    /// (without 1:1 DMs, see [`SlackMemberScope::member_types`]).
+    Member(SlackMemberScope),
+}
+
+impl SlackListingEndpoint {
+    fn method(self) -> &'static str {
+        match self {
+            Self::AllConversations | Self::DirectMessages => "conversations.list",
+            Self::Member(_) => "users.conversations",
+        }
+    }
+
+    fn context_label(self) -> &'static str {
+        match self {
+            Self::AllConversations | Self::DirectMessages => "calling Slack conversations.list",
+            Self::Member(_) => "calling Slack users.conversations",
+        }
+    }
+
+    fn types(self) -> &'static str {
+        match self {
+            Self::AllConversations => SLACK_CONVERSATION_TYPES,
+            Self::DirectMessages => "im",
+            Self::Member(scope) => scope.member_types(),
+        }
+    }
+
+    /// Page size. `users.conversations` accepts up to 1000, so a typical
+    /// account's joined conversations arrive in a single paced request.
+    fn page_limit(self) -> &'static str {
+        match self {
+            Self::AllConversations => "200",
+            Self::DirectMessages | Self::Member(_) => "999",
+        }
+    }
+}
+
+/// Combines the `users.conversations` listing with the separately listed 1:1
+/// DMs, dropping duplicates and anything outside `scope`.
+fn merge_member_listings(
+    scope: SlackMemberScope,
+    member: Vec<SlackConversation>,
+    direct_messages: Vec<SlackConversation>,
+) -> Vec<SlackConversation> {
+    let mut seen = HashSet::new();
+    member
+        .into_iter()
+        .chain(direct_messages)
+        .filter(|conversation| seen.insert(conversation.id.clone()))
+        .filter(|conversation| scope.includes(conversation))
+        .collect()
+}
+
+async fn list_web_api_conversations(
+    credential: SlackCredential,
+    endpoint: SlackListingEndpoint,
+) -> Result<Vec<SlackConversation>> {
+    let method = endpoint.method();
     if !matches!(
         credential.kind,
         SlackCredentialKind::UserToken
             | SlackCredentialKind::BotToken
             | SlackCredentialKind::Unknown
     ) {
-        bail!("Slack conversations.list requires a user or bot Web API token");
+        bail!("Slack {method} requires a user or bot Web API token");
     }
 
     let token = credential.value;
     tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
         let mut conversations = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        let url = format!("https://slack.com/api/{method}");
 
         loop {
-            let mut response = slack_get_with_retry("calling Slack conversations.list", || {
+            pages += 1;
+            let mut response = slack_get_with_retry(endpoint.context_label(), || {
                 let mut request = slack_http_agent()
-                    .get("https://slack.com/api/conversations.list")
+                    .get(&url)
                     .header("Authorization", format!("Bearer {token}"))
-                    .query("types", SLACK_CONVERSATION_TYPES)
+                    .query("types", endpoint.types())
                     .query("exclude_archived", "true")
-                    .query("limit", "200");
+                    .query("limit", endpoint.page_limit());
 
                 if let Some(cursor) = cursor.as_deref().filter(|cursor| !cursor.is_empty()) {
                     request = request.query("cursor", cursor);
@@ -1646,19 +1788,28 @@ async fn list_web_api_conversations(credential: SlackCredential) -> Result<Vec<S
             let listed: SlackConversationsListResponse = response
                 .body_mut()
                 .read_json()
-                .context("decoding Slack conversations.list response")?;
+                .with_context(|| format!("decoding Slack {method} response"))?;
             if !listed.ok {
                 bail!(
-                    "Slack conversations.list failed: {}",
+                    "Slack {method} failed: {}",
                     listed.error.unwrap_or_else(|| "unknown_error".to_owned())
                 );
             }
 
+            let member_listing = matches!(endpoint, SlackListingEndpoint::Member(_));
             conversations.extend(
                 listed
                     .channels
                     .into_iter()
-                    .filter_map(SlackConversation::from_response),
+                    .filter_map(SlackConversation::from_response)
+                    .map(|mut conversation| {
+                        // `users.conversations` only returns joined
+                        // conversations but may omit `is_member`.
+                        if member_listing {
+                            conversation.is_member.get_or_insert(true);
+                        }
+                        conversation
+                    }),
             );
 
             cursor = listed
@@ -1670,6 +1821,15 @@ async fn list_web_api_conversations(credential: SlackCredential) -> Result<Vec<S
             }
         }
 
+        slack_diagnostic_log(
+            "slack.web_api.list_conversations",
+            format!(
+                "method={method} types={} pages={pages} count={} elapsed_ms={:.1}",
+                endpoint.types(),
+                conversations.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+        );
         Ok(conversations)
     })
     .await
@@ -3179,7 +3339,8 @@ impl SlackProvider {
         let conversations = self
             .call_api(
                 NetworkActivityKind::History,
-                self.api_client.list_conversations(credential.clone()),
+                self.api_client
+                    .list_member_conversations(credential.clone(), SlackMemberScope::Sidebar),
             )
             .await
             .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
@@ -3977,6 +4138,7 @@ impl Provider for SlackProvider {
                 audio: true,
                 file: true,
                 sticker: false,
+                mentions: true,
                 max_upload_size: None,
                 media_note: Some(Arc::from(
                     "Slack uploads files for image, GIF, video, audio, and document content",
@@ -4144,12 +4306,39 @@ impl Provider for SlackProvider {
         }
     }
 
+    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
+        if !self.outbound_capabilities().mentions {
+            return OutboundMentions {
+                text: text.to_owned(),
+                mentioned: Vec::new(),
+            };
+        }
+        // Broadcast tokens first, so `@here`/`@channel`/`@everyone` become
+        // `<!here>` etc. before name resolution runs.
+        let text = rewrite_slack_broadcast_mentions(text);
+        let resolved = resolve_mention_tokens(&text, members);
+        let mut mentioned: Vec<Mention> = Vec::new();
+        for item in &resolved {
+            if !mentioned
+                .iter()
+                .any(|existing| existing.platform_id == item.mention.platform_id)
+            {
+                mentioned.push(item.mention.clone());
+            }
+        }
+        let text = rewrite_mention_tokens(&text, &resolved, |mention| {
+            format!("<@{}>", mention.platform_id)
+        });
+        OutboundMentions { text, mentioned }
+    }
+
     async fn send(
         &self,
         chat_id: &ChatId,
-        content: Content,
+        outbound: OutboundContent,
         reply_to: Option<&Message>,
     ) -> Result<MessageId> {
+        let OutboundContent { content, .. } = outbound;
         let reply_to = reply_to.map(|message| &message.id);
         match content {
             Content::Text(text) => self.send_text_message(chat_id, text, reply_to).await,
@@ -4929,7 +5118,7 @@ async fn run_dm_poll_loop(
             &mut inaccessible_conversations,
             &mut conversation_activity,
             None,
-            |conversation| conversation.is_im || conversation.is_mpim,
+            SlackMemberScope::Direct,
         )
         .await;
 
@@ -4964,7 +5153,7 @@ async fn run_history_poll_pass(
         inaccessible,
         activity,
         stop_signal,
-        include_conversation_in_sidebar,
+        SlackMemberScope::Sidebar,
     )
     .await
 }
@@ -4974,9 +5163,10 @@ async fn run_history_poll_pass(
 /// any newly observed message that is also newer than `started_at`. Returns
 /// whether at least one live (notify-worthy) message was delivered.
 ///
-/// The predicate is what separates the two pollers: the channel history
+/// The scope is what separates the two pollers: the channel history
 /// fallback includes the full sidebar, while the always-on DM poll narrows to
-/// `im`/`mpim` conversations that Socket Mode cannot deliver.
+/// `im`/`mpim` conversations that Socket Mode cannot deliver. Both list only
+/// joined conversations, never the whole workspace.
 async fn run_conversation_poll_pass(
     api_client: &Arc<dyn SlackApiClient>,
     events: &EventBus,
@@ -4989,10 +5179,14 @@ async fn run_conversation_poll_pass(
     inaccessible: &mut HashSet<String>,
     activity: &mut HashMap<String, ConversationPollState>,
     stop_signal: Option<&AtomicBool>,
-    include: impl Fn(&SlackConversation) -> bool,
+    scope: SlackMemberScope,
 ) -> bool {
+    let include = |conversation: &SlackConversation| scope.includes(conversation);
     let mut delivered_live_message = false;
-    match api_client.list_conversations(credential.clone()).await {
+    match api_client
+        .list_member_conversations(credential.clone(), scope)
+        .await
+    {
         Ok(conversations) => {
             events.send(ProviderEvent::NetworkActivity {
                 direction: NetworkActivityDirection::Rx,
@@ -6942,6 +7136,43 @@ fn slack_card_fallback_text(card: &Card) -> String {
     parts.join("\n")
 }
 
+/// Rewrite `@here`/`@channel`/`@everyone` tokens (at a word boundary) into
+/// Slack's native broadcast mention form (`<!here>` etc.) for outbound text.
+fn rewrite_slack_broadcast_mentions(text: &str) -> String {
+    if !text.contains('@') {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '@' && (index == 0 || !chars[index - 1].is_alphanumeric()) {
+            let rest: String = chars[index + 1..].iter().collect();
+            let lower = rest.to_lowercase();
+            let mut matched = None;
+            for keyword in ["everyone", "channel", "here"] {
+                if lower.starts_with(keyword) {
+                    let after = index + 1 + keyword.len();
+                    if after >= chars.len() || !chars[after].is_alphanumeric() {
+                        matched = Some(keyword);
+                        break;
+                    }
+                }
+            }
+            if let Some(keyword) = matched {
+                output.push_str("<!");
+                output.push_str(keyword);
+                output.push('>');
+                index += 1 + keyword.len();
+                continue;
+            }
+        }
+        output.push(chars[index]);
+        index += 1;
+    }
+    output
+}
+
 fn slack_user_ids_in_text(text: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let mut rest = text;
@@ -8078,6 +8309,68 @@ mod tests {
         SlackProvider::with_api_client(options, client)
     }
 
+    #[test]
+    fn member_scopes_request_only_what_each_caller_needs() {
+        // The DM poll must never page through channels, and the sidebar scope
+        // hides public channels the user has not joined.
+        assert_eq!(SlackMemberScope::Direct.types(), "im,mpim");
+        assert_eq!(SlackMemberScope::Sidebar.types(), SLACK_CONVERSATION_TYPES);
+        let joined = channel_conversation("C1", "general", 1);
+        let not_joined = SlackConversation {
+            is_member: Some(false),
+            ..channel_conversation("C2", "random", 1)
+        };
+        let dm = dm_conversation("D1", "U1", 1);
+        assert!(SlackMemberScope::Sidebar.includes(&joined));
+        assert!(!SlackMemberScope::Sidebar.includes(&not_joined));
+        assert!(SlackMemberScope::Sidebar.includes(&dm));
+        assert!(SlackMemberScope::Direct.includes(&dm));
+        assert!(!SlackMemberScope::Direct.includes(&joined));
+        assert_eq!(
+            SlackListingEndpoint::Member(SlackMemberScope::Direct).method(),
+            "users.conversations"
+        );
+        assert_eq!(
+            SlackListingEndpoint::AllConversations.method(),
+            "conversations.list"
+        );
+        // 1:1 DMs never go through `users.conversations`, which drops DMs
+        // with bots and deactivated users.
+        assert!(!SlackMemberScope::Sidebar.member_types().contains("im,"));
+        assert!(!SlackMemberScope::Sidebar.member_types().ends_with(",im"));
+        assert_eq!(SlackMemberScope::Direct.member_types(), "mpim");
+        assert_eq!(SlackListingEndpoint::DirectMessages.types(), "im");
+        assert_eq!(
+            SlackListingEndpoint::DirectMessages.method(),
+            "conversations.list"
+        );
+    }
+
+    #[test]
+    fn member_listing_merge_keeps_dms_missing_from_users_conversations() {
+        let channel = channel_conversation("C1", "general", 1);
+        let bot_dm = dm_conversation("D1", "UBOT", 1);
+        let shared_dm = dm_conversation("D2", "U2", 1);
+        let merged = merge_member_listings(
+            SlackMemberScope::Sidebar,
+            vec![channel, shared_dm.clone()],
+            vec![bot_dm, shared_dm],
+        );
+        let ids = merged
+            .iter()
+            .map(|conversation| conversation.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["C1", "D2", "D1"]);
+
+        let direct = merge_member_listings(
+            SlackMemberScope::Direct,
+            vec![channel_conversation("C1", "general", 1)],
+            vec![dm_conversation("D1", "U1", 1)],
+        );
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].id, "D1");
+    }
+
     fn channel_conversation(id: &str, name: &str, updated: i64) -> SlackConversation {
         SlackConversation {
             id: id.to_owned(),
@@ -8718,8 +9011,7 @@ mod tests {
         let mut seen_message_ids = HashSet::new();
         let mut activity = HashMap::new();
 
-        let dm_filter =
-            |conversation: &SlackConversation| conversation.is_im || conversation.is_mpim;
+        let dm_filter = SlackMemberScope::Direct;
 
         // First pass: both DM-class messages are delivered live exactly once;
         // the channel message is never delivered by the DM poll.
@@ -9524,7 +9816,7 @@ mod tests {
         let message_id = provider
             .send(
                 &arc_str("C123"),
-                Content::Text(arc_str("hello from user")),
+                OutboundContent::new(Content::Text(arc_str("hello from user"))),
                 Some(&poll_history_message(
                     "C123",
                     "1710000000.000001",
@@ -9547,6 +9839,86 @@ mod tests {
         Ok(())
     }
 
+    fn mention_member(id: &str, name: &str) -> ChatMember {
+        ChatMember::new(Sender {
+            platform_id: arc_str(id),
+            display_name: arc_str(name),
+            avatar: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn user_mode_encodes_mentions_as_slack_user_tokens() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client)?;
+        provider.connect().await?;
+
+        let members = vec![
+            mention_member("U123", "Bogdan"),
+            mention_member("U456", "Bogdan Adamut"),
+        ];
+
+        // Longest name wins, so `@Bogdan Adamut` is not split into `@Bogdan`.
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan Adamut and @Bogdan", &members);
+        assert_eq!(encoded.text, "hi <@U456> and <@U123>");
+        assert_eq!(
+            encoded
+                .mentioned
+                .iter()
+                .map(|mention| mention.platform_id.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["U456", "U123"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_mode_encodes_broadcast_mentions() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client)?;
+        provider.connect().await?;
+
+        let encoded = provider.encode_outbound_mentions("ping @here and @channel", &[]);
+        assert_eq!(encoded.text, "ping <!here> and <!channel>");
+        assert!(encoded.mentioned.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_mode_leaves_unresolved_mentions_as_plain_text() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client)?;
+        provider.connect().await?;
+
+        let members = vec![mention_member("U123", "Bogdan")];
+        let encoded = provider.encode_outbound_mentions("hi @Nobody and mail me@host", &members);
+        assert_eq!(encoded.text, "hi @Nobody and mail me@host");
+        assert!(encoded.mentioned.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_identity_does_not_support_mentions() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::Webhook);
+        options.webhook_url = Some("https://hooks.slack.com/services/T/B/X".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client)?;
+        provider.connect().await?;
+
+        assert!(!provider.outbound_capabilities().mentions);
+        let members = vec![mention_member("U123", "Bogdan")];
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        assert_eq!(encoded.text, "hi @Bogdan");
+        assert!(encoded.mentioned.is_empty());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bot_mode_sends_text_with_bot_token_only() -> Result<()> {
         let mut options = SlackProviderOptions::new(SlackAuthMode::BotToken);
@@ -9559,7 +9931,7 @@ mod tests {
         provider
             .send(
                 &arc_str("C123"),
-                Content::Text(arc_str("hello from bot")),
+                OutboundContent::new(Content::Text(arc_str("hello from bot"))),
                 None,
             )
             .await?;
@@ -9587,7 +9959,7 @@ mod tests {
         let message_id = provider
             .send(
                 &arc_str("ignored-channel"),
-                Content::Text(arc_str("hello webhook")),
+                OutboundContent::new(Content::Text(arc_str("hello webhook"))),
                 Some(&reply_target),
             )
             .await?;
@@ -9612,7 +9984,11 @@ mod tests {
         provider.connect().await?;
 
         let error = provider
-            .send(&arc_str("C123"), Content::Text(arc_str("blocked")), None)
+            .send(
+                &arc_str("C123"),
+                OutboundContent::new(Content::Text(arc_str("blocked"))),
+                None,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -9762,12 +10138,12 @@ mod tests {
         let error = provider
             .send(
                 &arc_str("C123"),
-                Content::File(Media {
+                OutboundContent::new(Content::File(Media {
                     id: arc_str("file-1"),
                     file_name: arc_str("report.pdf"),
                     mime_type: arc_str("application/pdf"),
                     ..Media::default()
-                }),
+                })),
                 None,
             )
             .await
@@ -9789,14 +10165,14 @@ mod tests {
         let message_id = provider
             .send(
                 &arc_str("C123"),
-                Content::File(Media {
+                OutboundContent::new(Content::File(Media {
                     id: arc_str("file-1"),
                     file_name: arc_str("fono-snixembed.log"),
                     mime_type: arc_str("text/plain"),
                     caption: Some(arc_str("log file")),
                     local_path: Some(PathBuf::from("/tmp/fono-snixembed.log")),
                     ..Media::default()
-                }),
+                })),
                 Some(&poll_history_message(
                     "ignored-channel",
                     "1710000000.000001",
@@ -9829,13 +10205,13 @@ mod tests {
         let error = provider
             .send(
                 &arc_str("C123"),
-                Content::File(Media {
+                OutboundContent::new(Content::File(Media {
                     id: arc_str("file-1"),
                     file_name: arc_str("report.pdf"),
                     mime_type: arc_str("application/pdf"),
                     local_path: Some(PathBuf::from("/tmp/report.pdf")),
                     ..Media::default()
-                }),
+                })),
                 None,
             )
             .await

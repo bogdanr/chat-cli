@@ -1,3 +1,5 @@
+use crate::attach::{self, format_byte_size};
+use crate::launch;
 use crate::{
     event::AppEvent,
     theme::Theme,
@@ -16,16 +18,17 @@ use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
     CardKind, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMembership, ContactProfile,
     Content, DiscoveryAction, DiscoveryResult, Media, Message, MessageId, NetworkActivityDirection,
-    OutboundCapabilities, Platform, PlatformData, PlatformId, Poll, Provider, ProviderEvent,
-    ProviderId, Reaction, Sender, ThreadId, ThreadParticipation, Timestamp,
+    OutboundCapabilities, OutboundContent, Platform, PlatformData, PlatformId, Poll, Provider,
+    ProviderEvent, ProviderId, Reaction, Sender, ThreadId, ThreadParticipation, Timestamp,
 };
 use chat_notify::{DesktopNotifier, MessageNotification};
 use chrono::{Duration as ChronoDuration, Utc};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
-        KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+        MouseButton, MouseEvent, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -80,6 +83,9 @@ const IDLE_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 /// a few tens of kilobytes of already-cached cells, rewritten in place so the
 /// repaint is invisible when the screen is intact.
 const FULL_REPAINT_INTERVAL: Duration = Duration::from_secs(10);
+/// Redraw cadence while an inline GIF loop is on screen. Frames are
+/// pre-decoded and cached, so each tick is a cache lookup plus a diffed draw.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 /// Settle window for rapid sidebar navigation: while the user is still
 /// scrolling through chats, follow-up work (message loads, member fetches,
 /// history sync) for intermediate chats is deferred until selection rests.
@@ -248,6 +254,10 @@ const COMPOSE_EMOTICON_OPTIONS: &[(&str, &str)] = &[
 ];
 const COMPOSE_EMOTICON_VISIBLE_ROWS: usize = 8;
 const COMPOSE_EMOTICON_MAX_MATCHES: usize = 50;
+/// Number of mention suggestion rows shown at once before the picker scrolls.
+const COMPOSE_MENTION_VISIBLE_ROWS: usize = 8;
+/// Upper bound on filtered mention matches kept for the picker.
+const COMPOSE_MENTION_MAX_MATCHES: usize = 50;
 const LOCAL_REACTION_SENDER: &str = "me";
 /// Number of reaction rows shown at once before the picker scrolls internally.
 const REACTION_PICKER_VISIBLE_ROWS: usize = 8;
@@ -373,6 +383,17 @@ struct MediaPreviewFetchResult {
     result: Result<Vec<Vec<Span<'static>>>, String>,
     elapsed: Duration,
 }
+
+#[derive(Debug)]
+struct VideoProbeResult {
+    path: PathBuf,
+    result: Result<crate::video::VideoInfo, String>,
+    elapsed: Duration,
+}
+
+/// Upper bound on concurrent ffprobe/ffmpeg workers so opening a chat full of
+/// videos cannot fork a process storm; excess requests wait for later ticks.
+const MAX_CONCURRENT_VIDEO_PROBES: usize = 2;
 
 #[derive(Debug)]
 struct MediaDownloadResult {
@@ -607,49 +628,162 @@ impl PendingAttachment {
     fn preview(&self) -> String {
         format!("{}: {}", self.kind.label(), self.media.file_name)
     }
+
+    /// Short type line for the compose tray, e.g. `Photo · 1.2 MB`.
+    fn tray_detail(&self) -> String {
+        let kind = match self.kind {
+            PendingAttachmentKind::Image if self.media.mime_type.as_ref() == "image/gif" => {
+                "GIF".to_owned()
+            }
+            PendingAttachmentKind::Image => "Photo".to_owned(),
+            PendingAttachmentKind::Video => "Video".to_owned(),
+            PendingAttachmentKind::Audio => "Audio".to_owned(),
+            PendingAttachmentKind::Sticker => "Sticker".to_owned(),
+            PendingAttachmentKind::File => {
+                attach::file_type_badge(&self.media.file_name, &self.media.mime_type)
+            }
+        };
+        match self.media.size_bytes {
+            Some(size) => format!("{kind} · {}", format_byte_size(size)),
+            None => kind,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttachCommandKind {
+    /// Infer the kind from the file type (typed or dropped paths).
     Auto,
-    Image,
+    /// Photos & videos: inline media; anything else falls back to a file.
+    Media,
+    /// Always a document, even for images (native "send as document").
+    Document,
     Sticker,
 }
 
+/// Entries of the attach sheet, modelled on the native apps' attach menu.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComposeAttachMenuItem {
-    Auto,
-    Image,
+    Media,
+    Document,
     Sticker,
     Cancel,
 }
 
 impl ComposeAttachMenuItem {
-    const ALL: [Self; 4] = [Self::Auto, Self::Image, Self::Sticker, Self::Cancel];
+    const ALL: [Self; 4] = [Self::Media, Self::Document, Self::Sticker, Self::Cancel];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Auto => "Attach file from typed path",
-            Self::Image => "Attach image/GIF from typed path",
-            Self::Sticker => "Attach sticker from typed path",
+            Self::Media => "Photos & videos",
+            Self::Document => "Document",
+            Self::Sticker => "Sticker",
             Self::Cancel => "Cancel",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Media => "▣",
+            Self::Document => "▤",
+            Self::Sticker => "☺",
+            Self::Cancel => "×",
+        }
+    }
+
+    fn shortcut(self) -> Option<char> {
+        match self {
+            Self::Media => Some('p'),
+            Self::Document => Some('d'),
+            Self::Sticker => Some('s'),
+            Self::Cancel => None,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Media => "sent inline with a preview",
+            Self::Document => "original file, any type",
+            Self::Sticker => "WebP/PNG sticker",
+            Self::Cancel => "",
         }
     }
 
     fn attach_command(self) -> Option<AttachCommandKind> {
         match self {
-            Self::Auto => Some(AttachCommandKind::Auto),
-            Self::Image => Some(AttachCommandKind::Image),
+            Self::Media => Some(AttachCommandKind::Media),
+            Self::Document => Some(AttachCommandKind::Document),
             Self::Sticker => Some(AttachCommandKind::Sticker),
             Self::Cancel => None,
         }
     }
+
+    fn picker_mode(self) -> Option<attach::PickerMode> {
+        match self {
+            Self::Media => Some(attach::PickerMode::Media),
+            Self::Document => Some(attach::PickerMode::Document),
+            Self::Sticker => Some(attach::PickerMode::Sticker),
+            Self::Cancel => None,
+        }
+    }
+
+    fn supported_by(self, capabilities: Option<&OutboundCapabilities>) -> bool {
+        let Some(capabilities) = capabilities else {
+            return true;
+        };
+        match self {
+            Self::Media => capabilities.image || capabilities.gif || capabilities.video,
+            Self::Document => capabilities.file,
+            Self::Sticker => capabilities.sticker,
+            Self::Cancel => true,
+        }
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct ComposeAttachMenu {
     selected: usize,
+    items: Vec<ComposeAttachMenuItem>,
+    /// The compose box holds a path: items attach it instead of opening the
+    /// native picker.
+    typed_path: bool,
 }
+
+/// A native file picker opened for a specific chat. Results for another
+/// chat or an older request are discarded.
+#[derive(Clone, Debug)]
+struct ActiveFilePicker {
+    token: u64,
+    account: ProviderId,
+    chat_id: ChatId,
+    command: AttachCommandKind,
+    started: Instant,
+}
+
+#[derive(Debug)]
+struct FilePickerResult {
+    token: u64,
+    result: Result<Vec<PathBuf>, attach::PickerError>,
+}
+
+/// Clickable regions of one compose tray tile.
+#[derive(Clone, Copy, Debug)]
+struct ComposeTrayHit {
+    index: usize,
+    tile: Rect,
+    remove: Rect,
+}
+
+/// Most attachments a single message draft holds, like the native apps'
+/// multi-select limit.
+const MAX_PENDING_ATTACHMENTS: usize = 10;
+/// Height of the compose attachment tray, in rows.
+const COMPOSE_TRAY_ROWS: u16 = 3;
+/// Width of one tray tile, in cells (thumbnail plus two text columns).
+const COMPOSE_TRAY_TILE_WIDTH: u16 = 24;
+/// Thumbnail width inside a tray tile, in cells.
+const COMPOSE_TRAY_THUMB_WIDTH: u16 = 6;
+const COMPOSE_ATTACH_BUTTON_LABEL: &str = " + Attach ";
 
 pub type ProviderBox = Arc<dyn Provider>;
 
@@ -718,7 +852,7 @@ pub async fn run_with_factory(
     let mut terminal = init_terminal()?;
     terminal.draw(draw_startup_screen)?;
 
-    let mut app = match App::new_with_factory(store, providers, provider_factory).await {
+    let mut app = match App::new_with_factory_deferred(store, providers, provider_factory).await {
         Ok(app) => app,
         Err(error) => {
             restore_terminal(&mut terminal)?;
@@ -727,8 +861,17 @@ pub async fn run_with_factory(
     };
     app.initialize_image_renderer();
     let result = run_app_loop(&mut terminal, &mut app).await;
+    // Exit phases are instrumented so a slow quit shows up in the perf log.
+    let restore_started = Instant::now();
     let restore_result = restore_terminal(&mut terminal);
     drop(stderr_redirect);
+    app.log_perf_duration("shutdown.restore_terminal", restore_started, "");
+    let drop_started = Instant::now();
+    let mut perf_log = app.perf_log.take();
+    drop(app);
+    if let Some(perf_log) = &mut perf_log {
+        perf_log.log("shutdown.drop_app", Some(drop_started.elapsed()), "");
+    }
     restore_result?;
     result
 }
@@ -743,8 +886,8 @@ fn draw_startup_screen(frame: &mut Frame<'_>) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("Connecting accounts and loading cached chats."),
-        Line::from("Slack names and member details continue loading in the background."),
+        Line::from("Loading cached chats."),
+        Line::from("Accounts connect in the background once the chat list appears."),
     ])
     .block(
         Block::default()
@@ -1036,6 +1179,8 @@ enum ActionMenuItem {
     VotePoll,
     CopyText,
     OpenImage,
+    PlayVideo,
+    OpenFile,
     Cancel,
 }
 
@@ -1052,6 +1197,8 @@ impl ActionMenuItem {
             Self::VotePoll => "Vote in poll",
             Self::CopyText => "Copy text",
             Self::OpenImage => "Open image",
+            Self::PlayVideo => "Play video",
+            Self::OpenFile => "Open file",
             Self::Cancel => "Cancel",
         }
     }
@@ -1153,6 +1300,49 @@ impl ComposeEmoticonPicker {
             .saturating_sub(COMPOSE_EMOTICON_VISIBLE_ROWS);
         self.scroll_offset = self.scroll_offset.min(max_offset);
     }
+}
+
+/// A `@`-triggered mention suggestion list shown above the compose box. The
+/// `matches` are indices into the cached candidate list for the selected chat
+/// ([`ComposeMentionCandidates`]); `loading` marks the placeholder state shown
+/// while the member roster is still being fetched in the background.
+#[derive(Clone, Debug, Default)]
+struct ComposeMentionPicker {
+    selected: usize,
+    scroll_offset: usize,
+    query: String,
+    matches: Vec<usize>,
+    token_char_len: usize,
+    loading: bool,
+}
+
+impl ComposeMentionPicker {
+    /// Adjust `scroll_offset` so `selected` stays inside the visible window of
+    /// `COMPOSE_MENTION_VISIBLE_ROWS` rows (scroll-on-edge), clamping the offset
+    /// so the final window never runs past the end of the match list.
+    fn keep_selected_visible(&mut self) {
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + COMPOSE_MENTION_VISIBLE_ROWS {
+            self.scroll_offset = self.selected + 1 - COMPOSE_MENTION_VISIBLE_ROWS;
+        }
+        let max_offset = self
+            .matches
+            .len()
+            .saturating_sub(COMPOSE_MENTION_VISIBLE_ROWS);
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+    }
+}
+
+/// Cached, bounded mention candidate names for a single chat. Rebuilt only when
+/// the underlying roster changes (detected by [`App::mention_roster_signature`])
+/// so the input path never rebuilds it from the raw roster per keystroke.
+#[derive(Clone, Debug)]
+struct ComposeMentionCandidates {
+    account: ProviderId,
+    chat_id: ChatId,
+    roster_len: usize,
+    names: Vec<Arc<str>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2376,6 +2566,10 @@ pub struct AppState {
     forward_picker: Option<ForwardPicker>,
     reaction_picker: Option<ReactionPicker>,
     compose_emoticon_picker: Option<ComposeEmoticonPicker>,
+    compose_mention_picker: Option<ComposeMentionPicker>,
+    /// Cached mention candidates for the currently selected chat (bounded to one
+    /// chat so memory does not grow with the number of visited chats).
+    compose_mention_candidates: Option<ComposeMentionCandidates>,
     compose_attach_menu: Option<ComposeAttachMenu>,
     poll_vote_picker: Option<PollVotePicker>,
     help_overlay: Option<HelpOverlay>,
@@ -2405,7 +2599,17 @@ pub struct AppState {
     network_activity: HashMap<ProviderId, AccountNetworkActivity>,
     typing_indicators: HashMap<(ProviderId, ChatId), Vec<TypingIndicator>>,
     reply_to: Option<MessageId>,
-    pending_attachment: Option<PendingAttachment>,
+    /// Attachments queued in the compose tray, in send order. The typed
+    /// compose text becomes the caption of the first one.
+    pending_attachments: Vec<PendingAttachment>,
+    /// Clickable "+ Attach" button on the compose border (last draw).
+    compose_attach_button: Option<Rect>,
+    /// Clickable tray tiles (last draw).
+    compose_tray_hits: Vec<ComposeTrayHit>,
+    /// Native file picker currently open, if any.
+    file_picker: Option<ActiveFilePicker>,
+    /// Folder of the last attached file; the next picker opens there.
+    last_attach_dir: Option<PathBuf>,
     thread_root: Option<MessageId>,
     /// Number of replies that were unread when the currently open thread was
     /// opened. Captured synchronously in `open_thread` (before the async
@@ -2488,6 +2692,8 @@ impl Default for AppState {
             forward_picker: None,
             reaction_picker: None,
             compose_emoticon_picker: None,
+            compose_mention_picker: None,
+            compose_mention_candidates: None,
             compose_attach_menu: None,
             poll_vote_picker: None,
             help_overlay: None,
@@ -2509,7 +2715,11 @@ impl Default for AppState {
             network_activity: HashMap::new(),
             typing_indicators: HashMap::new(),
             reply_to: None,
-            pending_attachment: None,
+            pending_attachments: Vec::new(),
+            compose_attach_button: None,
+            compose_tray_hits: Vec::new(),
+            file_picker: None,
+            last_attach_dir: None,
             thread_root: None,
             thread_open_unread: 0,
             pending_thread_read: None,
@@ -2596,8 +2806,9 @@ impl AppState {
         self.compose_cursor
     }
 
+    #[cfg(test)]
     fn pending_attachment(&self) -> Option<&PendingAttachment> {
-        self.pending_attachment.as_ref()
+        self.pending_attachments.first()
     }
 
     pub fn selected_chat_index(&self) -> usize {
@@ -2634,6 +2845,26 @@ impl AppState {
 
     pub fn compose_emoticon_picker_open(&self) -> bool {
         self.compose_emoticon_picker.is_some()
+    }
+
+    pub fn compose_mention_picker_open(&self) -> bool {
+        self.compose_mention_picker.is_some()
+    }
+
+    /// Number of filtered mention matches currently offered, or `None` when the
+    /// picker is closed. Used by tests to assert filtering without exposing the
+    /// internal candidate cache.
+    pub fn compose_mention_match_count(&self) -> Option<usize> {
+        self.compose_mention_picker
+            .as_ref()
+            .map(|picker| picker.matches.len())
+    }
+
+    /// Whether the mention picker is showing its "loading members" placeholder.
+    pub fn compose_mention_picker_loading(&self) -> bool {
+        self.compose_mention_picker
+            .as_ref()
+            .is_some_and(|picker| picker.loading)
     }
 
     pub fn compose_attach_menu_open(&self) -> bool {
@@ -2754,6 +2985,16 @@ pub struct App {
     pending_media_previews: HashSet<message_list::MediaPreviewKey>,
     media_preview_tx: mpsc::UnboundedSender<MediaPreviewFetchResult>,
     media_preview_rx: mpsc::UnboundedReceiver<MediaPreviewFetchResult>,
+    pending_video_probes: HashSet<PathBuf>,
+    /// Probe requests waiting for a free worker slot, oldest first.
+    queued_video_probes: VecDeque<PathBuf>,
+    video_probe_tx: mpsc::UnboundedSender<VideoProbeResult>,
+    video_probe_rx: mpsc::UnboundedReceiver<VideoProbeResult>,
+    /// Origin of the shared animation clock that drives inline GIF loops.
+    animation_epoch: Instant,
+    /// When the last draw that showed a running animation happened; the run
+    /// loop schedules the next frame relative to it.
+    last_animation_draw: Option<Instant>,
     pending_media_downloads: HashSet<Arc<str>>,
     media_download_tx: mpsc::UnboundedSender<MediaDownloadResult>,
     media_download_rx: mpsc::UnboundedReceiver<MediaDownloadResult>,
@@ -2766,6 +3007,9 @@ pub struct App {
     draw_frame_counter: u64,
     avatar_preview_cache: HashMap<AvatarPreviewKey, Result<AvatarPreviewData, String>>,
     pending_avatar_previews: HashSet<AvatarPreviewKey>,
+    /// Source file (mtime, size) observed when an avatar decode failed, so a
+    /// failure is retried only after the file changes.
+    failed_avatar_sources: HashMap<AvatarPreviewKey, (Option<i64>, Option<i64>)>,
     avatar_preview_tx: mpsc::UnboundedSender<AvatarPreviewFetchResult>,
     avatar_preview_rx: mpsc::UnboundedReceiver<AvatarPreviewFetchResult>,
     link_metadata_cache: message_list::LinkMetadataCache,
@@ -2804,12 +3048,43 @@ pub struct App {
     voice_summary_command: Vec<String>,
     voice_summary_tx: mpsc::UnboundedSender<VoiceSummaryOutcome>,
     voice_summary_rx: mpsc::UnboundedReceiver<VoiceSummaryOutcome>,
+    file_picker_tx: mpsc::UnboundedSender<FilePickerResult>,
+    file_picker_rx: mpsc::UnboundedReceiver<FilePickerResult>,
+    media_open_tx: mpsc::UnboundedSender<MediaOpenResult>,
+    media_open_rx: mpsc::UnboundedReceiver<MediaOpenResult>,
+    media_open_counter: u64,
+    /// Monotonic token for native picker requests.
+    file_picker_counter: u64,
+    /// Worker running the open picker; aborting it kills the dialog.
+    file_picker_task: Option<tokio::task::JoinHandle<()>>,
     sidebar_resort_pending: bool,
     deferred_navigation_load: Option<DeferredNavigationLoad>,
     last_navigation_load_at: Option<Instant>,
     provider_factory: Option<AccountProviderFactory>,
     theme: Theme,
     perf_log: Option<PerfLog>,
+    /// Account connects still running after a deferred startup.
+    pending_bootstrap: Option<PendingBootstrap>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootstrapMode {
+    Blocking,
+    Deferred,
+}
+
+/// Result of one background account connect: the connect itself, the chat
+/// list prefetched in the same task, and the time it took.
+type BootstrapConnectOutcome = (
+    anyhow::Result<()>,
+    Option<anyhow::Result<Vec<Chat>>>,
+    Duration,
+);
+
+struct PendingBootstrap {
+    started: Instant,
+    connects: Vec<(usize, tokio::task::JoinHandle<BootstrapConnectOutcome>)>,
+    failures: usize,
 }
 
 impl App {
@@ -2817,10 +3092,33 @@ impl App {
         Self::new_with_factory(store, providers, None).await
     }
 
+    /// Builds the app and waits for every account to connect and sync its
+    /// chat list before returning (used by tests and embedders that need a
+    /// fully synced state).
     pub async fn new_with_factory(
         store: Arc<Store>,
         providers: Vec<ProviderBox>,
         provider_factory: Option<AccountProviderFactory>,
+    ) -> Result<Self> {
+        Self::build(store, providers, provider_factory, BootstrapMode::Blocking).await
+    }
+
+    /// Builds the app from cached storage only; account connects keep running
+    /// in the background and are applied by the event loop as they finish, so
+    /// the UI appears without waiting for the slowest provider.
+    pub async fn new_with_factory_deferred(
+        store: Arc<Store>,
+        providers: Vec<ProviderBox>,
+        provider_factory: Option<AccountProviderFactory>,
+    ) -> Result<Self> {
+        Self::build(store, providers, provider_factory, BootstrapMode::Deferred).await
+    }
+
+    async fn build(
+        store: Arc<Store>,
+        providers: Vec<ProviderBox>,
+        provider_factory: Option<AccountProviderFactory>,
+        bootstrap_mode: BootstrapMode,
     ) -> Result<Self> {
         let app_started = Instant::now();
         let provider_receivers = providers
@@ -2829,6 +3127,7 @@ impl App {
             .collect();
         let (link_metadata_tx, link_metadata_rx) = mpsc::unbounded_channel();
         let (media_preview_tx, media_preview_rx) = mpsc::unbounded_channel();
+        let (video_probe_tx, video_probe_rx) = mpsc::unbounded_channel();
         let (media_download_tx, media_download_rx) = mpsc::unbounded_channel();
         let (forward_send_tx, forward_send_rx) = mpsc::unbounded_channel();
         let (avatar_preview_tx, avatar_preview_rx) = mpsc::unbounded_channel();
@@ -2841,6 +3140,8 @@ impl App {
         let (selected_messages_tx, selected_messages_rx) = mpsc::unbounded_channel();
         let (discovery_tx, discovery_rx) = mpsc::unbounded_channel();
         let (voice_summary_tx, voice_summary_rx) = mpsc::unbounded_channel();
+        let (file_picker_tx, file_picker_rx) = mpsc::unbounded_channel();
+        let (media_open_tx, media_open_rx) = mpsc::unbounded_channel();
         // Single-writer queue for chat row persistence. Hot paths (preview
         // refresh, unread bumps, provider chat snapshots) enqueue here instead
         // of awaiting sqlite on the event loop; the dedicated task applies the
@@ -2878,6 +3179,12 @@ impl App {
             pending_media_previews: HashSet::new(),
             media_preview_tx,
             media_preview_rx,
+            pending_video_probes: HashSet::new(),
+            queued_video_probes: VecDeque::new(),
+            video_probe_tx,
+            video_probe_rx,
+            animation_epoch: Instant::now(),
+            last_animation_draw: None,
             pending_media_downloads: HashSet::new(),
             media_download_tx,
             media_download_rx,
@@ -2887,6 +3194,7 @@ impl App {
             draw_frame_counter: 0,
             avatar_preview_cache: HashMap::new(),
             pending_avatar_previews: HashSet::new(),
+            failed_avatar_sources: HashMap::new(),
             avatar_preview_tx,
             avatar_preview_rx,
             link_metadata_cache: message_list::LinkMetadataCache::default(),
@@ -2922,15 +3230,26 @@ impl App {
             voice_summary_command: voice_summary::default_command(),
             voice_summary_tx,
             voice_summary_rx,
+            file_picker_tx,
+            file_picker_rx,
+            media_open_tx,
+            media_open_rx,
+            media_open_counter: 0,
+            file_picker_counter: 0,
+            file_picker_task: None,
             sidebar_resort_pending: false,
             deferred_navigation_load: None,
             last_navigation_load_at: None,
             provider_factory,
             theme,
             perf_log,
+            pending_bootstrap: None,
         };
         app.log_perf_duration("app.load_settings", settings_started, "");
-        app.bootstrap().await?;
+        match bootstrap_mode {
+            BootstrapMode::Blocking => app.bootstrap().await?,
+            BootstrapMode::Deferred => app.bootstrap_deferred().await?,
+        }
         app.log_perf_duration("app.new", app_started, "");
         Ok(app)
     }
@@ -3047,6 +3366,14 @@ impl App {
                         .await?;
                 }
                 self.flush_pending_thread_read().await?;
+            }
+            AppEvent::Paste(text) => {
+                self.dismiss_notification();
+                if self.handle_paste(text).await? {
+                    let mark_read_after_load = self.state.focus == FocusPane::Messages;
+                    self.schedule_navigation_load_debounced(true, mark_read_after_load)
+                        .await?;
+                }
             }
             AppEvent::Resize(width, height) => {
                 self.dismiss_notification();
@@ -3242,6 +3569,84 @@ impl App {
         }
     }
 
+    /// Spawns blocking ffprobe/ffmpeg workers for local videos the last draw
+    /// saw without cached metadata. Bounded by [`MAX_CONCURRENT_VIDEO_PROBES`].
+    fn queue_video_probes(&mut self) {
+        for path in self.media_preview_cache.take_video_probe_requests() {
+            if self.media_preview_cache.video_info(&path).is_some()
+                || self.pending_video_probes.contains(&path)
+                || self.queued_video_probes.contains(&path)
+            {
+                continue;
+            }
+            self.queued_video_probes.push_back(path);
+        }
+        while self.pending_video_probes.len() < MAX_CONCURRENT_VIDEO_PROBES
+            && let Some(path) = self.queued_video_probes.pop_front()
+        {
+            self.pending_video_probes.insert(path.clone());
+            let tx = self.video_probe_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = crate::video::load_or_probe(&path);
+                let _ = tx.send(VideoProbeResult {
+                    path,
+                    result,
+                    elapsed: started.elapsed(),
+                });
+            });
+        }
+    }
+
+    fn drain_video_probes(&mut self) -> bool {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        let mut errors = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.video_probe_rx.try_recv()
+        {
+            drained += 1;
+            self.pending_video_probes.remove(&result.path);
+            let result_failed = result.result.is_err();
+            if result_failed {
+                errors += 1;
+            }
+            let detail = match &result.result {
+                Ok(info) => format!(
+                    "ok duration_ms={:?} size={:?}x{:?} poster={}",
+                    info.duration_ms,
+                    info.width,
+                    info.height,
+                    info.poster.is_some()
+                ),
+                Err(error) => format!("err {error}"),
+            };
+            self.log_verbose_slow_or_forced_perf_elapsed(
+                "video_probe.run",
+                result.elapsed,
+                result_failed,
+                format!("path={} result={detail}", result.path.display()),
+            );
+            self.media_preview_cache
+                .insert_video_info(result.path, result.result);
+            changed = true;
+        }
+        if changed {
+            self.log_slow_perf_duration(
+                "video_probe.drain",
+                drain_started,
+                format!(
+                    "count={drained} errors={errors} pending={} queued={}",
+                    self.pending_video_probes.len(),
+                    self.queued_video_probes.len()
+                ),
+            );
+        }
+        changed
+    }
+
     fn drain_link_metadata_fetches(&mut self) -> bool {
         let drain_started = Instant::now();
         let mut changed = false;
@@ -3400,6 +3805,8 @@ impl App {
             // individual avatar actually failed, which the aggregate cannot
             // attribute to a specific path.
             if result.result.as_ref().is_some_and(Result::is_err) {
+                self.failed_avatar_sources
+                    .insert(result.key.clone(), avatar_source_metadata(&result.key.path));
                 self.log_perf_marker(
                     "avatar_preview.error",
                     format!(
@@ -3592,6 +3999,13 @@ impl App {
         self.deferred_navigation_load
             .as_ref()
             .map(|load| load.deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Time until the next inline animation frame is due, when the last draw
+    /// showed a running animation. `None` keeps the loop fully idle.
+    fn animation_wakeup_in(&self) -> Option<Duration> {
+        self.last_animation_draw
+            .map(|drawn| ANIMATION_FRAME_INTERVAL.saturating_sub(drawn.elapsed()))
     }
 
     /// Test-only: run a deferred navigation load immediately instead of
@@ -3888,6 +4302,13 @@ impl App {
                     drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
                 ),
             );
+            // A mention picker opened before the roster arrived is showing its
+            // loading placeholder; refresh it now that the members are cached so
+            // it populates without waiting for the next keystroke. The refresh
+            // only reads the bounded candidate cache, so it is safe here.
+            if self.state.compose_mention_picker.is_some() {
+                self.update_compose_mention_completion();
+            }
         }
         changed
     }
@@ -4201,6 +4622,7 @@ impl App {
         // A navigation load deferred by the settle debounce is scheduled here
         // once its deadline passes; this drain runs on every loop iteration.
         let navigation_load_flushed = self.flush_deferred_navigation_load().await?;
+        let bootstrap_changed = self.drain_bootstrap_connects().await?;
         let mut events = Vec::new();
         'receivers: for (provider_id, receiver) in &mut self.provider_receivers {
             loop {
@@ -4235,7 +4657,11 @@ impl App {
         self.try_open_pending_thread();
         let discovery_changed = self.drain_discovery_fetches();
         let media_preview_changed = self.drain_media_preview_fetches();
+        let video_probe_changed = self.drain_video_probes();
+        self.queue_video_probes();
         let media_download_changed = self.drain_media_downloads();
+        let file_picker_changed = self.drain_file_picker_results();
+        let media_open_changed = self.drain_media_open_results();
         let forward_send_changed = self.drain_forward_sends().await?;
         let image_protocol_changed = self.drain_image_protocol_fetches();
         let avatar_preview_changed = self.drain_avatar_preview_fetches();
@@ -4249,11 +4675,15 @@ impl App {
         let sidebar_resort_flushed = self.flush_pending_sidebar_resort();
         let changed = provider_draw_event_count > 0
             || navigation_load_flushed
+            || bootstrap_changed
             || sidebar_resort_flushed
             || selected_messages_changed
             || discovery_changed
             || media_preview_changed
+            || video_probe_changed
             || media_download_changed
+            || file_picker_changed
+            || media_open_changed
             || forward_send_changed
             || image_protocol_changed
             || avatar_preview_changed
@@ -4268,7 +4698,7 @@ impl App {
                 "event_drain.batch",
                 drain_started,
                 format!(
-                    "provider_events={provider_event_count} provider_draw_events={provider_draw_event_count} event_types={} history_changed={history_changed} selected_messages_changed={selected_messages_changed} discovery_changed={discovery_changed} media_preview_changed={media_preview_changed} media_download_changed={media_download_changed} image_protocol_changed={image_protocol_changed} avatar_preview_changed={avatar_preview_changed} link_metadata_changed={link_metadata_changed} chat_members_changed={chat_members_changed} sender_info_changed={sender_info_changed}",
+                    "provider_events={provider_event_count} provider_draw_events={provider_draw_event_count} event_types={} history_changed={history_changed} selected_messages_changed={selected_messages_changed} discovery_changed={discovery_changed} media_preview_changed={media_preview_changed} video_probe_changed={video_probe_changed} media_download_changed={media_download_changed} image_protocol_changed={image_protocol_changed} avatar_preview_changed={avatar_preview_changed} link_metadata_changed={link_metadata_changed} chat_members_changed={chat_members_changed} sender_info_changed={sender_info_changed}",
                     format_event_type_counts(&event_type_counts)
                 ),
             );
@@ -4283,6 +4713,10 @@ impl App {
         self.draw_frame_counter = self.draw_frame_counter.wrapping_add(1);
         self.message_layout_cache
             .begin_frame(self.draw_frame_counter);
+        // Every pane samples inline animations at the same instant, and any
+        // pane that shows a running one re-arms the animation wakeup below.
+        self.media_preview_cache
+            .begin_animation_frame(self.animation_epoch.elapsed().as_millis() as u64);
         let layout_started = Instant::now();
         self.state.frame_area = frame.area();
         let compose_height = self.compose_height(frame.area());
@@ -4386,6 +4820,7 @@ impl App {
             app.draw_reaction_picker(frame, area);
             app.draw_compose_attach_menu(frame, area);
             app.draw_compose_emoticon_picker(frame, area);
+            app.draw_compose_mention_picker(frame, area);
             app.draw_poll_vote_picker(frame, area);
         });
         self.log_slow_perf_duration(
@@ -4403,6 +4838,12 @@ impl App {
             ),
         );
         self.message_layout_cache.end_frame();
+        // Keep ticking only while a running animation is actually visible;
+        // scrolling it away or closing the chat lets the loop go idle again.
+        self.last_animation_draw = self
+            .media_preview_cache
+            .animation_active()
+            .then(Instant::now);
     }
 
     fn visible_pane_areas(&self, layout: AppLayout) -> PaneAreas {
@@ -4723,8 +5164,17 @@ impl App {
                     result.rows.insert(provider_id, avatar.rows.clone());
                 }
                 Some(Err(_)) => {
-                    if key.path.exists() {
+                    // Retry a failed badge only when its source file changed
+                    // since the failure (e.g. the provider re-downloaded it).
+                    // Retrying merely because the file exists re-queued an
+                    // undecodable avatar on every draw.
+                    let failed_source = self.failed_avatar_sources.get(&key).copied();
+                    let current_source = avatar_source_metadata(&key.path);
+                    let changed =
+                        current_source != (None, None) && failed_source != Some(current_source);
+                    if changed {
                         self.avatar_preview_cache.remove(&key);
+                        self.failed_avatar_sources.remove(&key);
                         if self.pending_avatar_previews.contains(&key) {
                             result.pending += 1;
                         } else {
@@ -5082,7 +5532,11 @@ impl App {
         }
 
         let reply_extra = u16::from(self.state.reply_to.is_some());
-        let attachment_extra = u16::from(self.state.pending_attachment.is_some());
+        let attachment_extra = if self.state.pending_attachments.is_empty() {
+            0
+        } else {
+            COMPOSE_TRAY_ROWS
+        };
         // The compose editor renders inside the middle column; derive its real
         // inner width from the same layout used during draw so the soft-wrapped
         // row count here matches what `draw_compose` actually renders.
@@ -5091,7 +5545,7 @@ impl App {
         let inner_width = compose_rect.width.saturating_sub(2).max(1) as usize;
         let wrapped_rows =
             compose_wrapped_row_count(self.state.compose.lines(), inner_width) as u16;
-        (wrapped_rows + reply_extra + attachment_extra + 2).clamp(3, 8)
+        (wrapped_rows + reply_extra + 2).clamp(3, 8) + attachment_extra
     }
 
     fn draw_compose(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -5114,14 +5568,17 @@ impl App {
             .border_style(self.theme.focus_border(is_focused));
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        self.draw_compose_attach_button(frame, area);
 
         let editor_area = {
             let mut constraints = Vec::new();
             if self.state.reply_to.is_some() {
                 constraints.push(Constraint::Length(1));
             }
-            if self.state.pending_attachment.is_some() {
-                constraints.push(Constraint::Length(1));
+            let tray_visible =
+                !self.state.pending_attachments.is_empty() && inner.height > COMPOSE_TRAY_ROWS;
+            if tray_visible {
+                constraints.push(Constraint::Length(COMPOSE_TRAY_ROWS));
             }
             constraints.push(Constraint::Min(0));
 
@@ -5148,16 +5605,9 @@ impl App {
                 area_index += 1;
             }
 
-            if let Some(attachment) = self.state.pending_attachment() {
-                frame.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled("Attached · ", self.theme.status_key()),
-                        Span::styled(attachment.preview(), self.theme.muted()),
-                        Span::raw("  "),
-                        Span::styled("Esc removes", self.theme.status_key()),
-                    ])),
-                    areas[area_index],
-                );
+            self.state.compose_tray_hits.clear();
+            if tray_visible {
+                self.draw_compose_tray(frame, areas[area_index]);
                 area_index += 1;
             }
 
@@ -5170,6 +5620,212 @@ impl App {
             is_focused,
             "Type a message...",
         );
+    }
+
+    /// Draws the `+ Attach` button on the compose border's right end and
+    /// records its rect for clicks. Hidden when the account cannot send media.
+    fn draw_compose_attach_button(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.state.compose_attach_button = None;
+        let media_supported = self
+            .selected_outbound_capabilities()
+            .is_none_or(|capabilities| outbound_media_supported(&capabilities));
+        if !media_supported || self.state.selected_chat().is_none() {
+            return;
+        }
+        let label = if self.state.file_picker.is_some() {
+            " … picking "
+        } else {
+            COMPOSE_ATTACH_BUTTON_LABEL
+        };
+        let width = label.chars().count() as u16;
+        // Leave room for the corner and at least a short title on the left.
+        if area.width < width + 16 || area.height < 3 {
+            return;
+        }
+        let rect = Rect::new(area.right() - width - 2, area.y, width, 1);
+        let style = if self.state.compose_attach_menu.is_some() {
+            self.theme.status_key().add_modifier(Modifier::REVERSED)
+        } else {
+            self.theme.status_key()
+        };
+        frame.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+        self.state.compose_attach_button = Some(rect);
+    }
+
+    /// Draws queued attachments as tiles: a thumbnail (decoded off-thread,
+    /// placeholder until ready) or a type badge, the name, the type and size,
+    /// and a `✕` to remove. Clicking a tile previews it.
+    fn draw_compose_tray(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if area.is_empty() {
+            return;
+        }
+        let tile_width = COMPOSE_TRAY_TILE_WIDTH.min(area.width);
+        let slots = (area.width / (tile_width + 1)).max(1) as usize;
+        let total = self.state.pending_attachments.len();
+        let shown = if total > slots {
+            slots.saturating_sub(1).max(1)
+        } else {
+            total
+        };
+        let mut requests = Vec::new();
+        let mut x = area.x;
+        for index in 0..shown {
+            let attachment = self.state.pending_attachments[index].clone();
+            let tile = Rect::new(x, area.y, tile_width, area.height).intersection(area);
+            if tile.is_empty() {
+                break;
+            }
+            let remove = self.draw_compose_tray_tile(frame, tile, &attachment, &mut requests);
+            self.state.compose_tray_hits.push(ComposeTrayHit {
+                index,
+                tile,
+                remove,
+            });
+            x = x.saturating_add(tile_width + 1);
+        }
+        if shown < total {
+            let more = Rect::new(x, area.y, area.right().saturating_sub(x), area.height)
+                .intersection(area);
+            if !more.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            format!("+{} more", total - shown),
+                            self.theme.status_key(),
+                        )),
+                        Line::from(Span::styled(format!("{total} files"), self.theme.muted())),
+                    ]),
+                    more,
+                );
+            }
+        }
+        if !requests.is_empty() {
+            self.queue_media_preview_fetches(requests);
+        }
+    }
+
+    fn draw_compose_tray_tile(
+        &self,
+        frame: &mut Frame<'_>,
+        tile: Rect,
+        attachment: &PendingAttachment,
+        requests: &mut Vec<message_list::MediaPreviewRequest>,
+    ) -> Rect {
+        let thumb_width = COMPOSE_TRAY_THUMB_WIDTH.min(tile.width);
+        let thumb = Rect::new(tile.x, tile.y, thumb_width, tile.height);
+        let text_x = tile.x + thumb_width + 1;
+        let text = Rect::new(
+            text_x,
+            tile.y,
+            tile.right().saturating_sub(text_x),
+            tile.height,
+        )
+        .intersection(tile);
+
+        let thumb_rows = compose_tray_thumbnail_source(attachment).and_then(|path| {
+            let key = message_list::MediaPreviewKey {
+                path,
+                width: thumb.width,
+                rows: thumb.height,
+            };
+            match self.media_preview_cache.get(&key) {
+                Some(Ok(rows)) => Some(rows.clone()),
+                Some(Err(_)) => None,
+                None => {
+                    requests.push(message_list::MediaPreviewRequest { key });
+                    None
+                }
+            }
+        });
+        let badge_style = Style::default()
+            .fg(self.theme.foreground)
+            .bg(self.theme.selection_bg);
+        match thumb_rows {
+            Some(rows) => {
+                let lines: Vec<Line<'static>> = rows.into_iter().map(Line::from).collect();
+                frame.render_widget(Paragraph::new(lines), thumb);
+            }
+            None => {
+                let badge = compose_tray_badge(attachment);
+                let width = thumb.width as usize;
+                let blank = " ".repeat(width);
+                let mut lines = vec![
+                    Line::from(Span::styled(blank.clone(), badge_style));
+                    thumb.height as usize
+                ];
+                if let Some(middle) = lines.get_mut(thumb.height as usize / 2) {
+                    let badge: String = badge.chars().take(width).collect();
+                    let pad = width.saturating_sub(badge.chars().count());
+                    let left = pad / 2;
+                    *middle = Line::from(Span::styled(
+                        format!("{}{badge}{}", " ".repeat(left), " ".repeat(pad - left)),
+                        badge_style,
+                    ));
+                }
+                frame.render_widget(Paragraph::new(lines), thumb);
+            }
+        }
+
+        let name_width = text.width.saturating_sub(2) as usize;
+        let name = truncate_middle(&attachment.media.file_name, name_width);
+        let mut lines = vec![Line::from(vec![Span::styled(
+            name,
+            Style::default().fg(self.theme.foreground),
+        )])];
+        lines.push(Line::from(Span::styled(
+            attachment.tray_detail(),
+            self.theme.muted(),
+        )));
+        if attachment.media.caption.is_none() && tile.height > 2 {
+            lines.push(Line::from(Span::styled(
+                "click to preview",
+                self.theme.muted(),
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines), text);
+
+        let remove = Rect::new(tile.right().saturating_sub(1), tile.y, 1, 1).intersection(tile);
+        if !remove.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Span::styled("✕", self.theme.status_key())),
+                remove,
+            );
+        }
+        remove
+    }
+
+    /// Handles a click on the compose attach button or tray. Returns true
+    /// when the click was consumed.
+    fn handle_compose_attachment_click(&mut self, column: u16, row: u16) -> bool {
+        if self
+            .state
+            .compose_attach_button
+            .is_some_and(|rect| rect_contains(rect, column, row))
+        {
+            self.state.focus = FocusPane::Compose;
+            if self.state.compose_attach_menu.take().is_some() {
+                self.state.status = "attach menu closed".to_owned();
+            } else {
+                self.open_compose_attach_menu();
+            }
+            return true;
+        }
+        let Some(hit) = self
+            .state
+            .compose_tray_hits
+            .iter()
+            .find(|hit| rect_contains(hit.tile, column, row))
+            .copied()
+        else {
+            return false;
+        };
+        self.state.focus = FocusPane::Compose;
+        if rect_contains(hit.remove, column, row) {
+            self.remove_pending_attachment(hit.index);
+        } else {
+            self.open_pending_attachment(hit.index);
+        }
+        true
     }
 
     /// Render a compose `TextArea`'s content soft-wrapped to `area`'s width.
@@ -5258,11 +5914,9 @@ impl App {
             return;
         }
 
-        let mut lines = vec![Line::from(Span::styled(
-            "Attach from typed path",
-            self.theme.pane_title(),
-        ))];
-        for (index, item) in ComposeAttachMenuItem::ALL.iter().enumerate() {
+        let inner_width = modal.width.saturating_sub(2) as usize;
+        let mut lines = Vec::with_capacity(menu.items.len() + 1);
+        for (index, item) in menu.items.iter().enumerate() {
             let selected = index == menu.selected;
             let prefix = if selected { "› " } else { "  " };
             let style = if selected {
@@ -5270,19 +5924,32 @@ impl App {
             } else {
                 self.theme.status_bar()
             };
-            lines.push(Line::from(Span::styled(
-                format!("{prefix}{}", item.label()),
-                style,
-            )));
+            let label = format!("{prefix}{} {}", item.icon(), item.label());
+            let hint = item.hint();
+            let gap = inner_width
+                .saturating_sub(label.chars().count() + hint.chars().count())
+                .max(1);
+            lines.push(Line::from(vec![
+                Span::styled(label, style),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(hint.to_owned(), self.theme.muted()),
+            ]));
         }
-        lines.push(Line::from(Span::styled(
-            "Type or paste a path in compose first · Enter selects · Esc cancels",
-            self.theme.muted(),
-        )));
+        let footer = if menu.typed_path {
+            "attaches the path typed in compose"
+        } else {
+            "↑↓ Enter · Esc · or drop files here"
+        };
+        lines.push(Line::from(Span::styled(footer, self.theme.muted())));
 
+        let title = if menu.typed_path {
+            "Attach typed path"
+        } else {
+            "Attach"
+        };
         let paragraph = Paragraph::new(lines).block(
             Block::default()
-                .title(padded_title("Attach"))
+                .title(padded_title(title))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
@@ -6523,6 +7190,7 @@ impl App {
             FocusPane::Compose => {
                 let mut hints = vec![
                     hint("type :emoji"),
+                    hint("type @name to mention"),
                     hint("paste a file path + Enter attaches"),
                     hint("Enter sends text otherwise"),
                     hint("F1 help"),
@@ -6904,6 +7572,88 @@ impl App {
         let paragraph = Paragraph::new(lines).block(
             Block::default()
                 .title(padded_title("Emoji"))
+                .borders(Borders::ALL)
+                .border_style(self.theme.overlay_border()),
+        );
+        frame.render_widget(Clear, modal);
+        frame.render_widget(paragraph, modal);
+    }
+
+    fn draw_compose_mention_picker(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(picker) = &self.state.compose_mention_picker else {
+            return;
+        };
+
+        let modal = self.compose_mention_picker_rect(area);
+        if modal.is_empty() {
+            return;
+        }
+
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Mention suggestions ", self.theme.pane_title()),
+            Span::styled(format!("@{}", picker.query), self.theme.status_key()),
+        ])];
+
+        if picker.loading {
+            lines.push(Line::from(Span::styled(
+                "  loading members…",
+                self.theme.muted(),
+            )));
+        } else {
+            let names = self
+                .state
+                .compose_mention_candidates
+                .as_ref()
+                .map(|cached| cached.names.as_slice())
+                .unwrap_or_default();
+            let total = picker.matches.len();
+            let scroll_offset = picker
+                .scroll_offset
+                .min(total.saturating_sub(COMPOSE_MENTION_VISIBLE_ROWS));
+            let window_end = (scroll_offset + COMPOSE_MENTION_VISIBLE_ROWS).min(total);
+
+            if scroll_offset > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("  ↑ {scroll_offset} more"),
+                    self.theme.muted(),
+                )));
+            }
+
+            for (window_row, candidate_index) in picker.matches[scroll_offset..window_end]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                let row = scroll_offset + window_row;
+                let Some(name) = names.get(candidate_index) else {
+                    continue;
+                };
+                let selected = row == picker.selected;
+                let prefix = if selected { "› " } else { "  " };
+                let style = if selected {
+                    self.theme.status_key()
+                } else {
+                    self.theme.status_bar()
+                };
+                lines.push(Line::from(Span::styled(format!("{prefix}@{name}"), style)));
+            }
+
+            if window_end < total {
+                lines.push(Line::from(Span::styled(
+                    format!("  ↓ {} more", total - window_end),
+                    self.theme.muted(),
+                )));
+            }
+        }
+
+        lines.push(Line::from(Span::styled(
+            "Enter/Tab inserts · Esc cancels · ↑↓ scrolls · keep typing to narrow",
+            self.theme.muted(),
+        )));
+
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .title(padded_title("Mention"))
                 .borders(Borders::ALL)
                 .border_style(self.theme.overlay_border()),
         );
@@ -7609,9 +8359,14 @@ impl App {
                 "  Enter: send text, or attach/send if compose is an existing local file path",
             ),
             Line::from("  Type :joy, :heart, etc. for emoji suggestions"),
+            Line::from("  Type @name to mention a chat member and pick a suggestion"),
+            Line::from("  Ctrl+U or click + Attach: photos & videos, documents, stickers"),
+            Line::from("  Drop or paste files onto the window to attach them"),
+            Line::from("  Up to 10 files per message; the caption goes with the first"),
+            Line::from("  Tray: click a file to preview it, click ✕ to remove it"),
             Line::from("  Paste a local file path and press Enter to send it as media/file"),
             Line::from("  Backspace/Delete: edit text"),
-            Line::from("  Esc: return to messages"),
+            Line::from("  Esc: remove the last attachment, then return to messages"),
             Line::from(""),
             Line::from(Span::styled("Popups", self.theme.status_key())),
             Line::from("  Arrow keys: move inside action, reaction, and account popups"),
@@ -8081,16 +8836,31 @@ impl App {
             return;
         }
 
+        // Kitty transmits each image once and then only re-places it, so
+        // cycling cached per-frame protocols is cheap. Other protocols resend
+        // the full image on every draw; there, animations stay on the
+        // halfblock rows underneath instead of flooding the terminal.
+        let hd_animation = self
+            .image_picker
+            .as_ref()
+            .is_some_and(|picker| picker.protocol_type() == ProtocolType::Kitty);
         let hits = self.state.media_hits.clone();
         for hit in hits {
-            // Media awaiting on-demand retrieval has no local bytes to decode.
-            if hit.retrieve.is_some() {
+            // Media awaiting on-demand retrieval has no local bytes to decode,
+            // and document cards have no inline image at all.
+            if hit.retrieve.is_some() || hit.open.is_some() {
                 continue;
             }
-            if hit.end_line < self.state.message_scroll {
+            if !hd_animation && crate::video::is_animation_frame(&hit.path) {
                 continue;
             }
-            let relative_start = hit.start_line.saturating_sub(self.state.message_scroll);
+            // Chrome rows (e.g. a video title) are part of the click target
+            // but must never be covered by the image.
+            let preview_start_line = hit.start_line.saturating_add(hit.preview_skip_rows);
+            if hit.end_line < self.state.message_scroll || preview_start_line > hit.end_line {
+                continue;
+            }
+            let relative_start = preview_start_line.saturating_sub(self.state.message_scroll);
             let top_padding = self.state.message_top_padding;
             if relative_start.saturating_add(top_padding) >= content_area.height as usize {
                 continue;
@@ -8145,6 +8915,9 @@ impl App {
                 let image_area = Rect::new(image_x, image_y, image_width, image_height);
                 let image = TerminalImage::new(&protocol).allow_clipping(true);
                 frame.render_widget(image, image_area);
+                if hit.play_badge {
+                    render_hd_play_badge(frame, image_area);
+                }
             }
         }
     }
@@ -8749,8 +9522,11 @@ impl App {
         Ok(())
     }
 
-    async fn bootstrap(&mut self) -> Result<()> {
-        let bootstrap_started = Instant::now();
+    /// Marks every account as connecting and starts all connects (each with
+    /// its chat-list prefetch) concurrently, so one slow provider never
+    /// delays the others.
+    async fn start_bootstrap_connects(&mut self) -> Result<PendingBootstrap> {
+        let started = Instant::now();
         self.log_perf_marker(
             "bootstrap.start",
             format!("providers={}", self.providers.len()),
@@ -8758,39 +9534,63 @@ impl App {
         for provider_index in 0..self.providers.len() {
             self.begin_provider_connect(provider_index).await?;
         }
-        // Connect all accounts concurrently and prefetch each account's chat
-        // list in the same task, so one slow provider no longer delays the
-        // others. Post-connect handling stays sequential because it mutates
-        // UI state (statuses, setup overlays, storage merge).
-        let mut connect_tasks = Vec::with_capacity(self.providers.len());
-        for provider in &self.providers {
-            let provider = Arc::clone(provider);
-            connect_tasks.push(tokio::spawn(async move {
-                let connect_started = Instant::now();
-                let connect_result = provider.connect().await;
-                let prefetched_chats = if connect_result.is_ok()
-                    && (provider.platform() != Platform::Slack || provider.is_connected())
-                {
-                    Some(provider.chats().await)
-                } else {
-                    None
-                };
-                (connect_result, prefetched_chats, connect_started.elapsed())
-            }));
-        }
-        for (provider_index, task) in connect_tasks.into_iter().enumerate() {
-            let provider_id = self.providers[provider_index].id().clone();
-            let (connect_result, prefetched_chats, connect_elapsed) = task
+        let connects = self
+            .providers
+            .iter()
+            .enumerate()
+            .map(|(provider_index, provider)| {
+                let provider = Arc::clone(provider);
+                let task = tokio::spawn(async move {
+                    let connect_started = Instant::now();
+                    let connect_result = provider.connect().await;
+                    let prefetched_chats = if connect_result.is_ok()
+                        && (provider.platform() != Platform::Slack || provider.is_connected())
+                    {
+                        Some(provider.chats().await)
+                    } else {
+                        None
+                    };
+                    (connect_result, prefetched_chats, connect_started.elapsed())
+                });
+                (provider_index, task)
+            })
+            .collect();
+        Ok(PendingBootstrap {
+            started,
+            connects,
+            failures: 0,
+        })
+    }
+
+    /// Post-connect handling for one account. Stays on the UI task because it
+    /// mutates UI state (statuses, setup overlays, storage merge).
+    async fn finish_bootstrap_connect(
+        &mut self,
+        provider_index: usize,
+        outcome: BootstrapConnectOutcome,
+    ) -> Result<()> {
+        let provider_id = self.providers[provider_index].id().clone();
+        let (connect_result, prefetched_chats, connect_elapsed) = outcome;
+        let finish_started = Instant::now();
+        self.finish_provider_connect(provider_index, connect_result, prefetched_chats)
+            .await?;
+        self.log_slow_perf_elapsed(
+            "bootstrap.connect_provider",
+            connect_elapsed + finish_started.elapsed(),
+            format!("provider={provider_id}"),
+        );
+        Ok(())
+    }
+
+    async fn bootstrap(&mut self) -> Result<()> {
+        let pending = self.start_bootstrap_connects().await?;
+        let bootstrap_started = pending.started;
+        for (provider_index, task) in pending.connects {
+            let outcome = task
                 .await
                 .map_err(|error| anyhow!("provider connect task failed: {error}"))?;
-            let finish_started = Instant::now();
-            self.finish_provider_connect(provider_index, connect_result, prefetched_chats)
+            self.finish_bootstrap_connect(provider_index, outcome)
                 .await?;
-            self.log_slow_perf_elapsed(
-                "bootstrap.connect_provider",
-                connect_elapsed + finish_started.elapsed(),
-                format!("provider={provider_id}"),
-            );
         }
 
         self.rebuild_sidebar_activity_from_messages().await?;
@@ -8817,6 +9617,120 @@ impl App {
             "bootstrap.done",
             bootstrap_started,
             format!("chats={}", self.state.chats.len()),
+        );
+        Ok(())
+    }
+
+    /// Startup that shows cached chats immediately. Connects run in the
+    /// background and are applied by [`Self::drain_bootstrap_connects`].
+    async fn bootstrap_deferred(&mut self) -> Result<()> {
+        let pending = self.start_bootstrap_connects().await?;
+        let cached_started = Instant::now();
+        self.reload_chats().await?;
+        self.reload_selected_messages().await?;
+        self.state.pending_scroll_to_latest = true;
+        self.state.status = if pending.connects.is_empty() {
+            "ready".to_owned()
+        } else {
+            format!("connecting {} account(s)…", pending.connects.len())
+        };
+        self.log_perf_duration(
+            "bootstrap.cached_ready",
+            cached_started,
+            format!(
+                "chats={} pending_connects={}",
+                self.state.chats.len(),
+                pending.connects.len()
+            ),
+        );
+        self.pending_bootstrap = Some(pending);
+        // With no providers there is nothing to wait for.
+        self.drain_bootstrap_connects().await?;
+        Ok(())
+    }
+
+    /// Applies at most one finished background account connect per call
+    /// (bounded UI-task work), then finalizes startup once all are done.
+    /// Failures only affect that account; they never tear down the app.
+    async fn drain_bootstrap_connects(&mut self) -> Result<bool> {
+        let Some(pending) = self.pending_bootstrap.as_mut() else {
+            return Ok(false);
+        };
+        if let Some(position) = pending
+            .connects
+            .iter()
+            .position(|(_, task)| task.is_finished())
+        {
+            let (provider_index, task) = pending.connects.remove(position);
+            let provider_id = self.providers[provider_index].id().clone();
+            let result = match task.await {
+                Ok(outcome) => self.finish_bootstrap_connect(provider_index, outcome).await,
+                Err(error) => Err(anyhow!("provider connect task failed: {error}")),
+            };
+            if let Err(error) = result {
+                if let Some(pending) = self.pending_bootstrap.as_mut() {
+                    pending.failures += 1;
+                }
+                self.set_account_status(
+                    &provider_id,
+                    AccountConnection::Offline,
+                    Some(error.to_string()),
+                );
+                self.state.status = format!("{provider_id} failed to connect: {error}");
+                self.log_perf_marker(
+                    "bootstrap.connect_error",
+                    format!("provider={provider_id} error={error}"),
+                );
+            }
+            // Surface the freshly synced chats; selection is preserved.
+            self.reload_chats().await?;
+        } else if !pending.connects.is_empty() {
+            return Ok(false);
+        }
+
+        let remaining = self
+            .pending_bootstrap
+            .as_ref()
+            .map_or(0, |pending| pending.connects.len());
+        if remaining > 0 {
+            if self.state.status.starts_with("connecting ") {
+                self.state.status = format!("connecting {remaining} account(s)…");
+            }
+            return Ok(true);
+        }
+        let Some(pending) = self.pending_bootstrap.take() else {
+            return Ok(true);
+        };
+        self.complete_deferred_bootstrap(pending).await?;
+        Ok(true)
+    }
+
+    /// Remaining startup work once every account connect has been applied.
+    /// Unlike the blocking path it keeps the user's scroll position: they may
+    /// already be reading a chat.
+    async fn complete_deferred_bootstrap(&mut self, pending: PendingBootstrap) -> Result<()> {
+        self.rebuild_sidebar_activity_from_messages().await?;
+        self.reload_chats().await?;
+        self.request_selected_chat_history_sync();
+        self.request_selected_chat_members();
+        if self.consume_pending_history_sync_for_selected_chat() {
+            self.sync_selected_chat_history().await?;
+        }
+        if self.state.status.starts_with("connecting ") {
+            self.state.status = if self.state.chats.is_empty() {
+                "ready - no chats loaded".to_owned()
+            } else {
+                "ready".to_owned()
+            };
+        }
+        self.log_perf_duration(
+            "bootstrap.done",
+            pending.started,
+            format!(
+                "chats={} failures={} deferred=true",
+                self.state.chats.len(),
+                pending.failures
+            ),
         );
         Ok(())
     }
@@ -9433,6 +10347,51 @@ impl App {
         }
     }
 
+    fn handle_compose_mention_picker_key(&mut self, key: KeyEvent) -> bool {
+        if self.state.compose_mention_picker.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.compose_mention_picker = None;
+                self.state.status = "mention suggestions closed".to_owned();
+                true
+            }
+            KeyCode::Up => {
+                if let Some(picker) = &mut self.state.compose_mention_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                    picker.keep_selected_visible();
+                }
+                true
+            }
+            KeyCode::Down => {
+                if let Some(picker) = &mut self.state.compose_mention_picker {
+                    let max = picker.matches.len().saturating_sub(1);
+                    picker.selected = picker.selected.saturating_add(1).min(max);
+                    picker.keep_selected_visible();
+                }
+                true
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                // While the roster is still loading there is nothing to insert;
+                // let Enter fall through so the message can still be sent.
+                let has_matches = self
+                    .state
+                    .compose_mention_picker
+                    .as_ref()
+                    .is_some_and(|picker| !picker.matches.is_empty());
+                if has_matches {
+                    self.insert_selected_compose_mention();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn handle_compose_attach_menu_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(menu) = &mut self.state.compose_attach_menu else {
             return Ok(false);
@@ -9450,12 +10409,26 @@ impl App {
                 menu.selected = menu
                     .selected
                     .saturating_add(1)
-                    .min(ComposeAttachMenuItem::ALL.len().saturating_sub(1));
+                    .min(menu.items.len().saturating_sub(1));
             }
             KeyCode::Enter => {
-                let item = ComposeAttachMenuItem::ALL[menu.selected];
+                let Some(item) = menu.items.get(menu.selected).copied() else {
+                    self.state.compose_attach_menu = None;
+                    return Ok(false);
+                };
                 self.state.compose_attach_menu = None;
                 self.perform_compose_attach_menu_item(item)?;
+            }
+            KeyCode::Char(shortcut) => {
+                if let Some(item) = menu
+                    .items
+                    .iter()
+                    .copied()
+                    .find(|item| item.shortcut() == Some(shortcut.to_ascii_lowercase()))
+                {
+                    self.state.compose_attach_menu = None;
+                    self.perform_compose_attach_menu_item(item)?;
+                }
             }
             _ => {}
         }
@@ -9550,6 +10523,16 @@ impl App {
             ActionMenuItem::OpenImage => {
                 if !self.open_message_image(&message_id) {
                     self.state.status = "selected message has no image preview".to_owned();
+                }
+            }
+            ActionMenuItem::PlayVideo => {
+                if !self.play_message_video(&message_id) {
+                    self.state.status = "selected video is not available locally".to_owned();
+                }
+            }
+            ActionMenuItem::OpenFile => {
+                if !self.open_message_file(&message_id) {
+                    self.state.status = "selected file is not available locally".to_owned();
                 }
             }
             ActionMenuItem::Cancel => {
@@ -10733,6 +11716,13 @@ impl App {
             return Ok(false);
         }
 
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.handle_compose_attachment_click(mouse.column, mouse.row)
+        {
+            self.attend_selected_chat("compose_attach_click");
+            return Ok(false);
+        }
+
         let Some(pane) = self.pane_at(mouse.column, mouse.row) else {
             return Ok(false);
         };
@@ -10879,7 +11869,14 @@ impl App {
         let Some(index) = self.compose_attach_menu_item_at(mouse.column, mouse.row) else {
             return false;
         };
-        let item = ComposeAttachMenuItem::ALL[index];
+        let Some(item) = self
+            .state
+            .compose_attach_menu
+            .as_ref()
+            .and_then(|menu| menu.items.get(index).copied())
+        else {
+            return false;
+        };
         self.state.compose_attach_menu = None;
         if let Err(error) = self.perform_compose_attach_menu_item(item) {
             self.state.status = error.to_string();
@@ -10990,8 +11987,9 @@ impl App {
     }
 
     fn open_compose_attach_menu(&mut self) {
-        if let Some(capabilities) = self.selected_outbound_capabilities()
-            && !outbound_media_supported(&capabilities)
+        let capabilities = self.selected_outbound_capabilities();
+        if let Some(capabilities) = &capabilities
+            && !outbound_media_supported(capabilities)
         {
             self.state.status = capabilities
                 .media_note
@@ -11000,17 +11998,389 @@ impl App {
                 .unwrap_or_else(|| "media sending is not available for this account".to_owned());
             return;
         }
-        self.state.compose_attach_menu = Some(ComposeAttachMenu::default());
-        self.state.status = "choose what to attach from the typed path".to_owned();
+        let items: Vec<ComposeAttachMenuItem> = ComposeAttachMenuItem::ALL
+            .into_iter()
+            .filter(|item| item.supported_by(capabilities.as_ref()))
+            .collect();
+        let typed_path = compose_text_is_single_line_path(&self.state.compose_text);
+        self.state.compose_attach_menu = Some(ComposeAttachMenu {
+            selected: 0,
+            items,
+            typed_path,
+        });
+        self.state.status = if typed_path {
+            "choose how to attach the typed path".to_owned()
+        } else {
+            "choose what to attach".to_owned()
+        };
     }
 
     fn perform_compose_attach_menu_item(&mut self, item: ComposeAttachMenuItem) -> Result<()> {
-        if let Some(command) = item.attach_command() {
-            self.attach_from_compose_text(command)?;
-        } else {
+        let Some(command) = item.attach_command() else {
             self.state.status = "attach cancelled".to_owned();
+            return Ok(());
+        };
+        if compose_text_is_single_line_path(&self.state.compose_text) {
+            return self.attach_from_compose_text(command);
+        }
+        if let Some(mode) = item.picker_mode() {
+            self.open_file_picker(mode, command);
         }
         Ok(())
+    }
+
+    /// Opens the platform's native file picker on a background task. The
+    /// result is applied by [`Self::drain_file_picker_results`] only if the
+    /// same chat is still selected.
+    fn open_file_picker(&mut self, mode: attach::PickerMode, command: AttachCommandKind) {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            self.state.status = "select a chat before attaching".to_owned();
+            return;
+        };
+        if self.state.pending_attachments.len() >= MAX_PENDING_ATTACHMENTS {
+            self.state.status =
+                format!("at most {MAX_PENDING_ATTACHMENTS} attachments per message");
+            return;
+        }
+        if let Some(active) = &self.state.file_picker {
+            if active.account == chat.account && active.chat_id == chat.id {
+                self.state.status = "a file picker is already open".to_owned();
+                return;
+            }
+            // Picker opened for another chat: close it and start over here.
+            self.cancel_file_picker();
+        }
+
+        self.file_picker_counter = self.file_picker_counter.wrapping_add(1);
+        let token = self.file_picker_counter;
+        self.state.file_picker = Some(ActiveFilePicker {
+            token,
+            account: chat.account.clone(),
+            chat_id: chat.id.clone(),
+            command,
+            started: Instant::now(),
+        });
+        self.state.focus = FocusPane::Compose;
+        self.state.status = format!("{}: choose files in the picker window…", mode.title());
+        self.log_perf_marker(
+            "file_picker.open",
+            format!("account={} chat={} mode={mode:?}", chat.account, chat.id),
+        );
+        self.file_picker_task = Some(spawn_file_picker(
+            token,
+            mode,
+            self.state.last_attach_dir.clone(),
+            self.file_picker_tx.clone(),
+        ));
+    }
+
+    fn cancel_file_picker(&mut self) {
+        if let Some(task) = self.file_picker_task.take() {
+            task.abort();
+        }
+        self.state.file_picker = None;
+    }
+
+    /// Applies finished picker selections. Bounded: at most a few results
+    /// per tick and at most [`attach::MAX_ATTACHMENTS_PER_PICK`] files each.
+    fn drain_file_picker_results(&mut self) -> bool {
+        let mut changed = false;
+        for _ in 0..4 {
+            let Ok(FilePickerResult { token, result }) = self.file_picker_rx.try_recv() else {
+                break;
+            };
+            let Some(active) = self
+                .state
+                .file_picker
+                .take_if(|active| active.token == token)
+            else {
+                self.log_perf_marker("file_picker.stale", format!("token={token} reason=token"));
+                continue;
+            };
+            self.file_picker_task = None;
+            changed = true;
+            let still_selected = self
+                .state
+                .selected_chat()
+                .is_some_and(|chat| chat.account == active.account && chat.id == active.chat_id);
+            if !still_selected {
+                self.log_perf_marker(
+                    "file_picker.stale",
+                    format!("token={token} reason=chat_changed chat={}", active.chat_id),
+                );
+                self.state.status =
+                    "attachment discarded: the chat changed while picking".to_owned();
+                continue;
+            }
+            match result {
+                Ok(paths) => {
+                    let count = paths.len();
+                    self.attach_paths(&paths, active.command);
+                    self.log_perf_duration(
+                        "file_picker.done",
+                        active.started,
+                        format!(
+                            "account={} chat={} files={count}",
+                            active.account, active.chat_id
+                        ),
+                    );
+                }
+                Err(attach::PickerError::Cancelled) => {
+                    self.state.status = "attach cancelled".to_owned();
+                }
+                Err(error @ attach::PickerError::Unavailable(_)) => {
+                    self.state.status =
+                        format!("{error}; type or paste a file path, or drop a file here");
+                    self.log_perf_marker("file_picker.error", format!("unavailable {error}"));
+                }
+                Err(error) => {
+                    self.state.status = format!("file picker failed: {error}");
+                    self.log_perf_marker("file_picker.error", format!("failed {error}"));
+                }
+            }
+        }
+        changed
+    }
+
+    /// Adds files to the compose tray, reporting how many were attached and
+    /// the first error. Stops at [`MAX_PENDING_ATTACHMENTS`].
+    fn attach_paths(&mut self, paths: &[PathBuf], command: AttachCommandKind) -> usize {
+        let mut attached = 0;
+        let mut first_error = None;
+        let mut skipped = 0;
+        for path in paths {
+            if self.state.pending_attachments.len() >= MAX_PENDING_ATTACHMENTS {
+                skipped += 1;
+                continue;
+            }
+            let raw = path.to_string_lossy();
+            match pending_attachment_from_path(&raw, command) {
+                Ok(attachment) => {
+                    if self
+                        .state
+                        .pending_attachments
+                        .iter()
+                        .any(|existing| existing.media.local_path == attachment.media.local_path)
+                    {
+                        continue;
+                    }
+                    if let Some(parent) = path.parent() {
+                        self.state.last_attach_dir = Some(parent.to_path_buf());
+                    }
+                    self.state.pending_attachments.push(attachment);
+                    attached += 1;
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| format!("{error:#}"));
+                }
+            }
+        }
+        if attached > 0 {
+            self.state.focus = FocusPane::Compose;
+        }
+        let total = self.state.pending_attachments.len();
+        self.state.status = match (attached, first_error) {
+            (0, Some(error)) => format!("could not attach: {error}"),
+            (0, None) if skipped > 0 => {
+                format!("at most {MAX_PENDING_ATTACHMENTS} attachments per message")
+            }
+            (0, None) => "nothing new to attach".to_owned(),
+            (_, error) => {
+                let mut status = if attached == 1 && total == 1 {
+                    let preview = self
+                        .state
+                        .pending_attachments
+                        .last()
+                        .map(PendingAttachment::preview)
+                        .unwrap_or_default();
+                    format!("attached {preview}")
+                } else {
+                    format!("attached {attached} file(s), {total} ready to send")
+                };
+                status.push_str("; add a caption and press Enter");
+                if let Some(error) = error {
+                    status.push_str(&format!(" (skipped: {error})"));
+                } else if skipped > 0 {
+                    status.push_str(&format!(" ({skipped} over the limit skipped)"));
+                }
+                status
+            }
+        };
+        attached
+    }
+
+    fn remove_pending_attachment(&mut self, index: usize) {
+        if index >= self.state.pending_attachments.len() {
+            return;
+        }
+        let removed = self.state.pending_attachments.remove(index);
+        let left = self.state.pending_attachments.len();
+        self.state.status = if left == 0 {
+            format!("removed {}", removed.media.file_name)
+        } else {
+            format!(
+                "removed {}; {left} attachment(s) left",
+                removed.media.file_name
+            )
+        };
+    }
+
+    /// Opens a queued attachment the way the native apps preview it: images
+    /// in the built-in viewer, everything else in the system default app.
+    fn open_pending_attachment(&mut self, index: usize) {
+        let Some(attachment) = self.state.pending_attachments.get(index) else {
+            return;
+        };
+        let Some(path) = attachment.media.local_path.clone() else {
+            return;
+        };
+        if matches!(
+            attachment.kind,
+            PendingAttachmentKind::Image | PendingAttachmentKind::Sticker
+        ) {
+            self.state.status = format!("viewing {}", path.display());
+            self.state.image_viewer = Some(ImageViewer { path });
+            return;
+        }
+        self.open_with_system_app(&path);
+    }
+
+    fn open_with_system_app(&mut self, path: &Path) {
+        let mime_type = infer_mime_type(path);
+        let kind = if mime_type.starts_with("video/") {
+            launch::OpenKind::Video
+        } else if mime_type.starts_with("audio/") {
+            launch::OpenKind::Audio
+        } else {
+            launch::OpenKind::Document
+        };
+        self.launch_media(path, mime_type, kind);
+    }
+
+    /// Opens `path` in a desktop app on a blocking worker. The worker picks
+    /// the default app, verifies it really starts and falls back to other
+    /// players/viewers; the result arrives in [`Self::drain_media_open_results`].
+    fn launch_media(&mut self, path: &Path, mime_type: String, kind: launch::OpenKind) {
+        self.media_open_counter = self.media_open_counter.wrapping_add(1);
+        let token = self.media_open_counter;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.state.status = format!("opening {name}…");
+        self.log_perf_marker(
+            "media_open.start",
+            format!("token={token} kind={kind:?} mime={mime_type}"),
+        );
+        spawn_media_open(
+            MediaOpenRequest {
+                token,
+                path: path.to_path_buf(),
+                name,
+                mime_type,
+                kind,
+                started: Instant::now(),
+            },
+            self.media_open_tx.clone(),
+        );
+    }
+
+    /// Reports finished launches. Only the latest launch may change the
+    /// status line; older ones are logged as stale.
+    fn drain_media_open_results(&mut self) -> bool {
+        let mut changed = false;
+        for _ in 0..4 {
+            let Ok(done) = self.media_open_rx.try_recv() else {
+                break;
+            };
+            let request = &done.request;
+            let outcome = match &done.result {
+                Ok(app) => format!("ok app={app}"),
+                Err(error) => format!("error {error}"),
+            };
+            self.log_perf_duration(
+                "media_open.done",
+                request.started,
+                format!("token={} kind={:?} {outcome}", request.token, request.kind),
+            );
+            if request.token != self.media_open_counter {
+                self.log_perf_marker("media_open.stale", format!("token={}", request.token));
+                continue;
+            }
+            self.state.status = match &done.result {
+                Ok(app) => format!("{} {} in {app}", request.kind.verb(), request.name),
+                Err(error) => format!("cannot open {}: {error}", request.name),
+            };
+            changed = true;
+        }
+        changed
+    }
+
+    /// Bracketed paste. In compose, dropped files become attachments and any
+    /// other text is inserted literally (newlines never send). Elsewhere the
+    /// paste is replayed as keystrokes so setup token fields keep working.
+    async fn handle_paste(&mut self, text: String) -> Result<bool> {
+        const MAX_PASTE_CHARS: usize = 64 * 1024;
+        let text: String = text.chars().take(MAX_PASTE_CHARS).collect();
+        let overlay_open = self.state.account_switcher.is_some()
+            || self.state.threads_inbox.is_some()
+            || self.state.account_setup.is_some()
+            || self.state.settings_overlay.is_some()
+            || self.state.slack_setup.is_some()
+            || self.state.clickup_setup.is_some()
+            || self.state.help_overlay.is_some()
+            || self.state.action_menu.is_some()
+            || self.state.forward_picker.is_some()
+            || self.state.reaction_picker.is_some()
+            || self.state.compose_attach_menu.is_some()
+            || self.state.poll_vote_picker.is_some()
+            || self.state.filter_mode;
+        let compose_target = !overlay_open
+            && matches!(self.state.focus, FocusPane::Compose | FocusPane::Messages)
+            && self.state.selected_chat().is_some();
+
+        if !compose_target {
+            let mut selection_changed = false;
+            for character in text.chars() {
+                let code = match character {
+                    '\r' => continue,
+                    '\n' => KeyCode::Enter,
+                    '\t' => KeyCode::Tab,
+                    other => KeyCode::Char(other),
+                };
+                selection_changed |= self
+                    .handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+                    .await?;
+            }
+            return Ok(selection_changed);
+        }
+
+        self.state.focus = FocusPane::Compose;
+        self.attend_selected_chat("compose_paste");
+        let media_supported = self
+            .selected_outbound_capabilities()
+            .is_none_or(|capabilities| outbound_media_supported(&capabilities));
+        if media_supported && let Some(paths) = attach::parse_dropped_paths(&text) {
+            self.attach_paths(&paths, AttachCommandKind::Auto);
+            return Ok(false);
+        }
+
+        for character in text.chars() {
+            let key = match character {
+                '\r' => continue,
+                '\n' => TextAreaKey::Enter,
+                '\t' => TextAreaKey::Tab,
+                other => TextAreaKey::Char(other),
+            };
+            self.apply_compose_edit_input_without_completion(textarea_input(
+                key,
+                KeyModifiers::NONE,
+            ));
+        }
+        self.update_compose_emoticon_completion();
+        self.update_compose_mention_completion();
+        self.state.status = "pasted text".to_owned();
+        Ok(false)
     }
 
     fn handle_left_click(&mut self, pane: FocusPane, mouse: MouseEvent) -> bool {
@@ -11397,14 +12767,26 @@ impl App {
 
     async fn handle_compose_key(&mut self, key: KeyEvent) -> Result<bool> {
         self.attend_selected_chat("compose_key");
+        if self.handle_compose_mention_picker_key(key) {
+            return Ok(false);
+        }
         if self.handle_compose_emoticon_picker_key(key) {
+            return Ok(false);
+        }
+
+        if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.open_compose_attach_menu();
             return Ok(false);
         }
 
         match key.code {
             KeyCode::Esc => {
-                if self.state.pending_attachment.take().is_some() {
-                    self.state.status = "attachment cancelled".to_owned();
+                if self.state.file_picker.is_some() {
+                    self.cancel_file_picker();
+                    self.state.status = "file picker closed".to_owned();
+                } else if !self.state.pending_attachments.is_empty() {
+                    let last = self.state.pending_attachments.len() - 1;
+                    self.remove_pending_attachment(last);
                 } else if self.state.reply_to.take().is_some() {
                     self.state.status = "reply cancelled".to_owned();
                 } else {
@@ -11510,29 +12892,32 @@ impl App {
     }
 
     fn attach_from_compose_text(&mut self, command: AttachCommandKind) -> Result<()> {
-        let raw_path = self.state.compose_text.trim();
+        let raw_path = self.state.compose_text.trim().to_owned();
         if raw_path.is_empty() {
-            self.state.status = match command {
-                AttachCommandKind::Auto => {
-                    "type or paste a file path, then choose [+ Attach]".to_owned()
-                }
-                AttachCommandKind::Image => {
-                    "type or paste an image/GIF path, then choose [+ Attach]".to_owned()
-                }
-                AttachCommandKind::Sticker => {
-                    "type or paste a sticker path, then choose [+ Attach]".to_owned()
-                }
-            };
+            self.state.status = "type or paste a file path, then choose + Attach".to_owned();
             return Ok(());
         }
         if raw_path.lines().count() > 1 {
             self.state.status = "attachment path must be on one line".to_owned();
             return Ok(());
         }
+        if self.state.pending_attachments.len() >= MAX_PENDING_ATTACHMENTS {
+            self.state.status =
+                format!("at most {MAX_PENDING_ATTACHMENTS} attachments per message");
+            return Ok(());
+        }
 
-        let attachment = pending_attachment_from_path(raw_path, command)?;
+        let attachment = pending_attachment_from_path(&raw_path, command)?;
+        if let Some(parent) = attachment
+            .media
+            .local_path
+            .as_deref()
+            .and_then(Path::parent)
+        {
+            self.state.last_attach_dir = Some(parent.to_path_buf());
+        }
         let preview = attachment.preview();
-        self.state.pending_attachment = Some(attachment);
+        self.state.pending_attachments.push(attachment);
         self.state.compose = new_compose_textarea();
         self.state.sync_compose_cache();
         self.state.status = format!("attached {preview}; type an optional caption and press Enter");
@@ -11623,7 +13008,232 @@ impl App {
     fn apply_compose_edit_input(&mut self, input: TextAreaInput) -> bool {
         let modified = self.apply_compose_edit_input_without_completion(input);
         self.update_compose_emoticon_completion();
+        self.update_compose_mention_completion();
         modified
+    }
+
+    /// The member roster used for mention resolution: the selected chat's cached
+    /// roster when present, otherwise a synthesized single-member roster for a
+    /// direct-message chat whose peer is known (so DM mentions can resolve).
+    fn mention_members_for_chat(&self, chat: &Chat) -> Vec<ChatMember> {
+        let key = (chat.account.clone(), chat.id.clone());
+        if let Some(members) = self.state.chat_members.get(&key)
+            && !members.is_empty()
+        {
+            return members.clone();
+        }
+        if let Some(platform_id) = self.dm_peer_platform_id(chat) {
+            return vec![ChatMember::new(Sender {
+                platform_id,
+                display_name: chat.name.clone(),
+                avatar: chat.avatar.clone(),
+            })];
+        }
+        Vec::new()
+    }
+
+    /// Cheap roster signature used to decide whether the cached mention
+    /// candidates are stale. Avoids cloning the roster on the input path.
+    fn mention_roster_signature(&self, chat: &Chat) -> usize {
+        let key = (chat.account.clone(), chat.id.clone());
+        if let Some(members) = self.state.chat_members.get(&key)
+            && !members.is_empty()
+        {
+            return members.len();
+        }
+        usize::from(self.dm_peer_platform_id(chat).is_some())
+    }
+
+    /// The platform identity of a direct-message chat's peer, derived from the
+    /// most recent inbound message. `None` for groups/channels or before any
+    /// inbound message identifies the peer.
+    fn dm_peer_platform_id(&self, chat: &Chat) -> Option<PlatformId> {
+        if chat.is_group || chat.kind != ChatKind::Direct {
+            return None;
+        }
+        self.state
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                !message.is_from_me
+                    && message.account == chat.account
+                    && message.chat_id.as_ref() == chat.id.as_ref()
+            })
+            .map(|message| message.sender.platform_id.clone())
+    }
+
+    /// Whether the selected chat's account can deliver outbound mentions.
+    fn account_supports_mentions(&self, chat: &Chat) -> bool {
+        self.providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == chat.account.as_ref())
+            .map(|provider| provider.outbound_capabilities().mentions)
+            .unwrap_or(false)
+    }
+
+    /// Rebuild the cached mention candidate names for `chat` when the roster has
+    /// changed. Candidate names are deduplicated case-insensitively and sorted
+    /// for stable display; broadcast keywords are appended for channels.
+    fn ensure_compose_mention_candidates(&mut self, chat: &Chat) {
+        let signature = self.mention_roster_signature(chat);
+        if let Some(cached) = &self.state.compose_mention_candidates
+            && cached.account == chat.account
+            && cached.chat_id == chat.id
+            && cached.roster_len == signature
+        {
+            return;
+        }
+
+        let members = self.mention_members_for_chat(chat);
+        let mut names: Vec<Arc<str>> = Vec::with_capacity(members.len() + 4);
+        let mut seen: HashSet<String> = HashSet::new();
+        for member in &members {
+            let name = &member.sender.display_name;
+            if name.is_empty() {
+                continue;
+            }
+            if seen.insert(name.to_lowercase()) {
+                names.push(name.clone());
+            }
+        }
+        for keyword in mention_broadcast_keywords(chat) {
+            if seen.insert(keyword.to_lowercase()) {
+                names.push(Arc::from(*keyword));
+            }
+        }
+        names.sort_by_key(|name| name.to_lowercase());
+
+        self.state.compose_mention_candidates = Some(ComposeMentionCandidates {
+            account: chat.account.clone(),
+            chat_id: chat.id.clone(),
+            roster_len: signature,
+            names,
+        });
+    }
+
+    /// Refresh the mention picker for the current compose text/cursor. Mirrors
+    /// [`Self::update_compose_emoticon_completion`]: opens on a `@` token
+    /// boundary, filters the cached candidates, and closes when nothing matches.
+    /// When the roster is not loaded yet it shows a loading placeholder and
+    /// kicks off a bounded background fetch instead of blocking.
+    fn update_compose_mention_completion(&mut self) {
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            self.state.compose_mention_picker = None;
+            return;
+        };
+        if !self.account_supports_mentions(&chat) {
+            self.state.compose_mention_picker = None;
+            return;
+        }
+        let Some((query, token_char_len)) =
+            compose_mention_query(&self.state.compose_text, self.state.compose_cursor)
+        else {
+            self.state.compose_mention_picker = None;
+            return;
+        };
+
+        let key = (chat.account.clone(), chat.id.clone());
+        let roster_ready = self
+            .state
+            .chat_members
+            .get(&key)
+            .is_some_and(|m| !m.is_empty())
+            || self.dm_peer_platform_id(&chat).is_some();
+        if !roster_ready {
+            if chat_supports_member_listing(&chat) {
+                self.request_selected_chat_members();
+            }
+            self.state.compose_mention_picker = Some(ComposeMentionPicker {
+                selected: 0,
+                scroll_offset: 0,
+                query,
+                matches: Vec::new(),
+                token_char_len,
+                loading: true,
+            });
+            return;
+        }
+
+        self.ensure_compose_mention_candidates(&chat);
+        let matches = match &self.state.compose_mention_candidates {
+            Some(cached) if cached.account == chat.account && cached.chat_id == chat.id => {
+                let query_lower = query.to_lowercase();
+                cached
+                    .names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, name)| {
+                        let name_lower = name.to_lowercase();
+                        (name_lower.starts_with(&query_lower)
+                            || name_lower
+                                .split_whitespace()
+                                .any(|word| word.starts_with(&query_lower))
+                            || name_lower.contains(&query_lower))
+                        .then_some(index)
+                    })
+                    .take(COMPOSE_MENTION_MAX_MATCHES)
+                    .collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+
+        if matches.is_empty() {
+            self.state.compose_mention_picker = None;
+            return;
+        }
+
+        let selected = self
+            .state
+            .compose_mention_picker
+            .as_ref()
+            .map(|picker| picker.selected.min(matches.len().saturating_sub(1)))
+            .unwrap_or_default();
+        let mut picker = ComposeMentionPicker {
+            selected,
+            scroll_offset: 0,
+            query,
+            matches,
+            token_char_len,
+            loading: false,
+        };
+        picker.keep_selected_visible();
+        self.state.compose_mention_picker = Some(picker);
+    }
+
+    fn insert_selected_compose_mention(&mut self) {
+        let Some(picker) = self.state.compose_mention_picker.take() else {
+            return;
+        };
+        let Some(chat) = self.state.selected_chat().cloned() else {
+            return;
+        };
+        let name = self
+            .state
+            .compose_mention_candidates
+            .as_ref()
+            .filter(|cached| cached.account == chat.account && cached.chat_id == chat.id)
+            .and_then(|cached| {
+                picker
+                    .matches
+                    .get(picker.selected)
+                    .and_then(|index| cached.names.get(*index))
+            })
+            .cloned();
+        let Some(name) = name else {
+            return;
+        };
+        for _ in 0..picker.token_char_len {
+            self.apply_compose_edit_input_without_completion(textarea_input(
+                TextAreaKey::Backspace,
+                KeyModifiers::NONE,
+            ));
+        }
+        self.insert_compose_text(&format!("@{name} "));
+        // The trailing space terminates the token, but inserting character by
+        // character may briefly reopen the picker; force it closed.
+        self.state.compose_mention_picker = None;
+        self.state.status = format!("mentioned @{name}");
     }
 
     fn apply_thread_compose_edit_input(&mut self, input: TextAreaInput) -> bool {
@@ -11683,11 +13293,20 @@ impl App {
             .cloned()
             .ok_or_else(|| anyhow!("no provider registered for {}", chat.account))?;
         let account = provider.account_info();
+        let members = self.mention_members_for_chat(&chat);
+        let encoded = provider.encode_outbound_mentions(&text, &members);
         let content = Content::Text(Arc::from(text.as_str()));
         let preview = content_send_preview(&content);
         let reply_message = self.message_by_id(&thread_root).cloned();
         let message_id = provider
-            .send(&chat.id, content.clone(), reply_message.as_ref())
+            .send(
+                &chat.id,
+                OutboundContent::with_mentions(
+                    Content::Text(Arc::from(encoded.text.as_str())),
+                    encoded.mentioned,
+                ),
+                reply_message.as_ref(),
+            )
             .await?;
         let timestamp = Utc::now();
         let message = Message {
@@ -11724,16 +13343,16 @@ impl App {
 
     async fn send_composed_message(&mut self) -> Result<()> {
         let text = self.state.compose_text.trim_end().to_owned();
-        let auto_attachment = if self.state.pending_attachment.is_none() {
+        let auto_attachment = if self.state.pending_attachments.is_empty() {
             self.auto_attachment_from_compose_text(&text)?
         } else {
             None
         };
         if text.trim().is_empty()
-            && self.state.pending_attachment.is_none()
+            && self.state.pending_attachments.is_empty()
             && auto_attachment.is_none()
         {
-            self.state.status = "type a message or paste a file path before sending".to_owned();
+            self.state.status = "type a message or attach a file before sending".to_owned();
             return Ok(());
         }
 
@@ -11748,38 +13367,77 @@ impl App {
             .cloned()
             .ok_or_else(|| anyhow!("no provider registered for {}", chat.account))?;
         let account = provider.account_info();
-        let content = if let Some(attachment) = self
-            .state
-            .pending_attachment
-            .as_ref()
-            .or(auto_attachment.as_ref())
-        {
-            let caption = (self.state.pending_attachment.is_some() && !text.trim().is_empty())
-                .then(|| Arc::from(text.as_str()));
-            attachment.to_content(caption)
+        let members = self.mention_members_for_chat(&chat);
+        let encoded = provider.encode_outbound_mentions(&text, &members);
+        let capabilities = provider.outbound_capabilities();
+
+        // A typed path that is the whole draft is sent as the file itself,
+        // without the path as a caption.
+        let queued_from_tray = !self.state.pending_attachments.is_empty();
+        let attachments: Vec<PendingAttachment> = if queued_from_tray {
+            self.state.pending_attachments.clone()
         } else {
-            Content::Text(Arc::from(text.as_str()))
+            auto_attachment.into_iter().collect()
         };
-        if let Some(reason) = provider
-            .outbound_capabilities()
-            .unsupported_reason(&content)
-        {
-            if self.state.pending_attachment.is_none()
-                && let Some(attachment) = auto_attachment
-            {
+        let has_caption = queued_from_tray && !text.trim().is_empty();
+
+        // Build every outgoing item first and validate all of them, so an
+        // unsupported file never leaves a half-sent album behind. As in the
+        // native apps, the caption (and its mentions) rides on the first item.
+        let mut items: Vec<(Content, OutboundContent)> = Vec::new();
+        if attachments.is_empty() {
+            items.push((
+                Content::Text(Arc::from(text.as_str())),
+                OutboundContent::with_mentions(
+                    Content::Text(Arc::from(encoded.text.as_str())),
+                    encoded.mentioned.clone(),
+                ),
+            ));
+        } else {
+            for (index, attachment) in attachments.iter().enumerate() {
+                let first = index == 0;
+                let caption = (first && has_caption).then(|| Arc::from(text.as_str()));
+                let outbound_caption = (first && has_caption && !encoded.text.trim().is_empty())
+                    .then(|| Arc::from(encoded.text.as_str()));
+                let mentioned = if first && has_caption {
+                    encoded.mentioned.clone()
+                } else {
+                    Default::default()
+                };
+                items.push((
+                    attachment.to_content(caption),
+                    OutboundContent::with_mentions(
+                        attachment.to_content(outbound_caption),
+                        mentioned,
+                    ),
+                ));
+            }
+        }
+        for (index, (_, outbound)) in items.iter().enumerate() {
+            let Some(reason) = capabilities.unsupported_reason(&outbound.content) else {
+                continue;
+            };
+            if !queued_from_tray && let Some(attachment) = attachments.first().cloned() {
                 let preview = attachment.preview();
-                self.state.pending_attachment = Some(attachment);
+                self.state.pending_attachments.push(attachment);
                 self.state.compose = new_compose_textarea();
                 self.state.sync_compose_cache();
                 self.state.status =
                     format!("{preview} attached, but this account cannot send it yet");
                 return Ok(());
             }
-
-            self.state.status = format!("{reason}; attachment kept, press Esc to remove it");
+            let name = attachments
+                .get(index)
+                .map(|attachment| attachment.media.file_name.to_string())
+                .unwrap_or_default();
+            self.state.status = if name.is_empty() {
+                reason.to_string()
+            } else {
+                format!("{name}: {reason}; remove it from the tray to send the rest")
+            };
             return Ok(());
         }
-        let preview = content_send_preview(&content);
+
         let effective_reply_to = self.state.reply_to.clone().or_else(|| {
             self.state
                 .thread_root
@@ -11789,45 +13447,92 @@ impl App {
         let reply_message = effective_reply_to
             .as_ref()
             .and_then(|id| self.message_by_id(id).cloned());
-        let message_id = provider
-            .send(&chat.id, content.clone(), reply_message.as_ref())
-            .await?;
-        let timestamp = Utc::now();
-        let message = Message {
-            id: message_id,
-            chat_id: chat.id.clone(),
-            account: chat.account.clone(),
-            sender: Sender {
-                platform_id: Arc::from("me"),
-                display_name: account.display_name,
-                avatar: account.avatar,
-            },
-            timestamp,
-            edited_at: None,
-            content,
-            reply_to: effective_reply_to.clone(),
-            thread_id: effective_reply_to,
-            reactions: Vec::new(),
-            receipts: Vec::new(),
-            is_from_me: true,
-            mentions_me: false,
-            platform_data: PlatformData::default(),
-        };
+        let total = items.len();
+        let mut sent = 0usize;
+        let mut last_preview = String::new();
+        let mut last_timestamp = None;
+        let mut failure = None;
+        for (index, (content, outbound)) in items.into_iter().enumerate() {
+            // Only the first item quotes the reply target.
+            let reply = if index == 0 {
+                reply_message.as_ref()
+            } else {
+                None
+            };
+            let message_id = match provider.send(&chat.id, outbound, reply).await {
+                Ok(id) => id,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+            let timestamp = Utc::now();
+            last_preview = content_send_preview(&content);
+            let reply_to = if index == 0 {
+                effective_reply_to.clone()
+            } else {
+                None
+            };
+            let thread_id = effective_reply_to.clone();
+            let message = Message {
+                id: message_id,
+                chat_id: chat.id.clone(),
+                account: chat.account.clone(),
+                sender: Sender {
+                    platform_id: Arc::from("me"),
+                    display_name: account.display_name.clone(),
+                    avatar: account.avatar.clone(),
+                },
+                timestamp,
+                edited_at: None,
+                content,
+                reply_to,
+                thread_id,
+                reactions: Vec::new(),
+                receipts: Vec::new(),
+                is_from_me: true,
+                mentions_me: false,
+                platform_data: PlatformData::default(),
+            };
+            self.store.upsert_message(&message).await?;
+            last_timestamp = Some(timestamp);
+            sent += 1;
+        }
 
-        self.store.upsert_message(&message).await?;
-        self.update_chat_after_send(&chat, timestamp, &preview)
-            .await?;
-        self.state.compose = new_compose_textarea();
-        self.state.pending_attachment = None;
-        self.state.reply_to = None;
+        if let Some(timestamp) = last_timestamp {
+            self.update_chat_after_send(&chat, timestamp, &last_preview)
+                .await?;
+        }
+        if sent > 0 {
+            // The caption went out with the first item; clear it either way.
+            self.state.compose = new_compose_textarea();
+            self.state.reply_to = None;
+            if queued_from_tray {
+                self.state
+                    .pending_attachments
+                    .drain(..sent.min(attachments.len()));
+            }
+            self.state.sync_compose_cache();
+        }
         let sent_in_thread =
             self.state.thread_root.is_some() && self.state.focus == FocusPane::Details;
-        self.state.sync_compose_cache();
-        self.reload_chats().await?;
-        self.reload_selected_messages().await?;
-        self.scroll_messages_to_bottom();
+        if sent > 0 {
+            self.reload_chats().await?;
+            self.reload_selected_messages().await?;
+            self.scroll_messages_to_bottom();
+        }
+        if let Some(error) = failure {
+            if sent == 0 {
+                return Err(error);
+            }
+            self.state.status =
+                format!("sent {sent} of {total}; the rest stay attached ({error:#})");
+            return Ok(());
+        }
         self.state.status = if sent_in_thread {
             "sent thread reply".to_owned()
+        } else if total > 1 {
+            format!("sent {total} attachments to {}", chat.name)
         } else {
             format!("sent message to {}", chat.name)
         };
@@ -11843,7 +13548,14 @@ impl App {
             return Ok(None);
         }
 
-        let path = PathBuf::from(expand_home_path(raw_path));
+        let path = if raw_path.starts_with("file://") {
+            match attach::dropped_token_path(raw_path) {
+                Some(path) => path,
+                None => return Ok(None),
+            }
+        } else {
+            PathBuf::from(expand_home_path(raw_path))
+        };
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
                 pending_attachment_from_path(raw_path, AttachCommandKind::Auto).map(Some)
@@ -12696,19 +14408,7 @@ impl App {
     /// message is loaded yet.
     fn selected_dm_peer_platform_id(&self) -> Option<PlatformId> {
         let chat = self.state.selected_chat()?;
-        if chat.is_group || chat.kind != ChatKind::Direct {
-            return None;
-        }
-        self.state
-            .messages
-            .iter()
-            .rev()
-            .find(|message| {
-                !message.is_from_me
-                    && message.account == chat.account
-                    && message.chat_id.as_ref() == chat.id.as_ref()
-            })
-            .map(|message| message.sender.platform_id.clone())
+        self.dm_peer_platform_id(chat)
     }
 
     /// Loads an enriched [`ContactProfile`] for the selected direct-message
@@ -13057,6 +14757,14 @@ impl App {
         self.state.reaction_picker = None;
         if let Some(media) = hit.retrieve {
             self.start_media_download(media);
+            return true;
+        }
+        if let Some(video) = hit.play {
+            self.play_video(&video);
+            return true;
+        }
+        if let Some(document) = hit.open {
+            self.open_with_system_app(&document);
             return true;
         }
         self.state.status = format!("viewing image {}", hit.path.display());
@@ -13951,6 +15659,58 @@ impl App {
                 self.state.status = format!("clipboard unavailable; text: {text} ({error})");
             }
         }
+    }
+
+    /// Hands a cached video to the system's default player. Spawning is
+    /// detached, so the event loop never waits on the player.
+    fn play_video(&mut self, path: &Path) {
+        let mime_type = infer_mime_type(path);
+        let mime_type = if mime_type.starts_with("video/") {
+            mime_type
+        } else {
+            "video/mp4".to_owned()
+        };
+        self.launch_media(path, mime_type, launch::OpenKind::Video);
+    }
+
+    fn play_message_video(&mut self, message_id: &MessageId) -> bool {
+        let Some(message) = self.message_by_id(message_id) else {
+            return false;
+        };
+        let Content::Video(media) = &message.content else {
+            return false;
+        };
+        if let Some(path) = message_video_local_path(&message.content) {
+            self.play_video(&path);
+            return true;
+        }
+        if message_list::media_awaits_retrieve(media) {
+            let media = media.clone();
+            self.start_media_download(media);
+            return true;
+        }
+        false
+    }
+
+    /// Opens a received document or voice note in the system app, fetching it
+    /// first when it was too large to download automatically.
+    fn open_message_file(&mut self, message_id: &MessageId) -> bool {
+        let Some(message) = self.message_by_id(message_id) else {
+            return false;
+        };
+        let (Content::File(media) | Content::Audio(media)) = &message.content else {
+            return false;
+        };
+        if let Some(path) = message_file_local_path(&message.content) {
+            self.open_with_system_app(&path);
+            return true;
+        }
+        if message_list::media_awaits_retrieve(media) {
+            let media = media.clone();
+            self.start_media_download(media);
+            return true;
+        }
+        false
     }
 
     fn open_message_image(&mut self, message_id: &MessageId) -> bool {
@@ -15257,18 +17017,43 @@ impl App {
             .map(|provider| provider.outbound_capabilities())
     }
 
+    /// The attach sheet pops up above the compose `+ Attach` button, like
+    /// the native apps' paperclip menu; it is centred when there is no button.
     fn compose_attach_menu_rect(&self, area: Rect) -> Rect {
-        centered_fixed_rect(area, 44, ComposeAttachMenuItem::ALL.len() as u16 + 4)
+        let items = self
+            .state
+            .compose_attach_menu
+            .as_ref()
+            .map_or(ComposeAttachMenuItem::ALL.len(), |menu| menu.items.len());
+        let height = items as u16 + 3;
+        let width = 44u16;
+        let Some(button) = self.state.compose_attach_button else {
+            return centered_fixed_rect(area, width, height);
+        };
+        let width = width.min(area.width);
+        let height = height.min(area.height);
+        let right = button.x.saturating_add(button.width).min(area.right());
+        let x = right.saturating_sub(width).max(area.x);
+        let y = if button.y.saturating_sub(area.y) >= height {
+            button.y - height
+        } else {
+            button
+                .y
+                .saturating_add(1)
+                .min(area.bottom().saturating_sub(height))
+        };
+        Rect::new(x, y, width, height).intersection(area)
     }
 
     fn compose_attach_menu_item_at(&self, column: u16, row: u16) -> Option<usize> {
+        let menu = self.state.compose_attach_menu.as_ref()?;
         let modal = self.compose_attach_menu_rect(self.state.frame_area);
         if !rect_contains(modal, column, row) {
             return None;
         }
-        let first_item_row = modal.y.saturating_add(2);
+        let first_item_row = modal.y.saturating_add(1);
         let index = row.checked_sub(first_item_row)? as usize;
-        (index < ComposeAttachMenuItem::ALL.len()).then_some(index)
+        (index < menu.items.len()).then_some(index)
     }
 
     fn action_menu_rect(&self, area: Rect, menu: &ActionMenu) -> Rect {
@@ -15330,6 +17115,30 @@ impl App {
         // the user scrolls. Chrome = title + hint + 2 borders.
         let visible = suggestion_count.min(COMPOSE_EMOTICON_VISIBLE_ROWS);
         let indicator_rows = if suggestion_count > COMPOSE_EMOTICON_VISIBLE_ROWS {
+            2
+        } else {
+            0
+        };
+        let height = (visible + indicator_rows + 4).clamp(4, 14) as u16;
+        let width = area.width.saturating_sub(4).clamp(36, 64);
+        let compose_area = self.state.pane_areas.compose;
+        let x = compose_area.x.min(area.width.saturating_sub(width));
+        let fallback_y = area.height.saturating_sub(height.saturating_add(2));
+        let y = compose_area.y.saturating_sub(height).max(1).min(fallback_y);
+        Rect::new(x, y, width.min(area.width), height.min(area.height))
+    }
+
+    fn compose_mention_picker_rect(&self, area: Rect) -> Rect {
+        let suggestion_count = self
+            .state
+            .compose_mention_picker
+            .as_ref()
+            .map(|picker| picker.matches.len().max(usize::from(picker.loading)))
+            .unwrap_or_default();
+        // Same fixed-viewport geometry as the emoji picker: longer lists scroll
+        // internally and both scroll indicators are reserved when overflowing.
+        let visible = suggestion_count.min(COMPOSE_MENTION_VISIBLE_ROWS);
+        let indicator_rows = if suggestion_count > COMPOSE_MENTION_VISIBLE_ROWS {
             2
         } else {
             0
@@ -16822,7 +18631,12 @@ fn pending_attachment_from_path(
     raw_path: &str,
     command: AttachCommandKind,
 ) -> Result<PendingAttachment> {
-    let path = PathBuf::from(expand_home_path(raw_path));
+    let path = if raw_path.starts_with("file://") {
+        attach::dropped_token_path(raw_path)
+            .ok_or_else(|| anyhow!("not a local file URI: {raw_path}"))?
+    } else {
+        PathBuf::from(expand_home_path(raw_path))
+    };
     let metadata =
         fs::metadata(&path).with_context(|| format!("reading attachment {}", path.display()))?;
     if !metadata.is_file() {
@@ -16844,11 +18658,14 @@ fn pending_attachment_from_path(
     let mime_type = infer_mime_type(&path);
     let kind = match command {
         AttachCommandKind::Sticker => PendingAttachmentKind::Sticker,
-        AttachCommandKind::Image => {
+        AttachCommandKind::Document => PendingAttachmentKind::File,
+        AttachCommandKind::Media => {
             if mime_type.starts_with("image/") {
                 PendingAttachmentKind::Image
+            } else if mime_type.starts_with("video/") {
+                PendingAttachmentKind::Video
             } else {
-                anyhow::bail!("expected an image file, got {mime_type}");
+                infer_attachment_kind(&mime_type)
             }
         }
         AttachCommandKind::Auto => infer_attachment_kind(&mime_type),
@@ -16865,6 +18682,88 @@ fn pending_attachment_from_path(
     };
 
     Ok(PendingAttachment { kind, media })
+}
+
+/// True when the compose box holds what looks like one file path (pure text
+/// check, no filesystem access), so attach actions use it instead of opening
+/// the native picker.
+fn compose_text_is_single_line_path(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty()
+        && !text.contains('\n')
+        && (text.starts_with('/') || text.starts_with("~/") || text.starts_with("file://"))
+}
+
+/// Local image to thumbnail in the compose tray, if any: the file itself
+/// for photos/stickers, or a cached poster frame for videos.
+fn compose_tray_thumbnail_source(attachment: &PendingAttachment) -> Option<PathBuf> {
+    let path = attachment.media.local_path.as_ref()?;
+    match attachment.kind {
+        PendingAttachmentKind::Image | PendingAttachmentKind::Sticker => Some(path.clone()),
+        PendingAttachmentKind::File if attachment.media.mime_type.starts_with("image/") => {
+            Some(path.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Short glyph shown in place of a thumbnail.
+fn compose_tray_badge(attachment: &PendingAttachment) -> String {
+    match attachment.kind {
+        PendingAttachmentKind::Video => "▶".to_owned(),
+        PendingAttachmentKind::Audio => "♪".to_owned(),
+        PendingAttachmentKind::Image | PendingAttachmentKind::Sticker => "…".to_owned(),
+        PendingAttachmentKind::File => {
+            attach::file_type_badge(&attachment.media.file_name, &attachment.media.mime_type)
+        }
+    }
+}
+
+/// Shortens `text` to `width` columns, keeping the start and the extension.
+fn truncate_middle(text: &str, width: usize) -> String {
+    let count = text.chars().count();
+    if count <= width {
+        return text.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    // Keep the extension (".pdf") visible when it fits in half the width.
+    let ext_len = text
+        .rfind('.')
+        .map(|dot| text[dot..].chars().count())
+        .filter(|len| *len < width / 2)
+        .unwrap_or(0);
+    let tail = ((width - 1) / 3).max(ext_len).min(width - 2);
+    let head = width - 1 - tail;
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
+}
+
+/// Runs the native file picker off the UI thread and reports back on `tx`.
+#[cfg(not(test))]
+fn spawn_file_picker(
+    token: u64,
+    mode: attach::PickerMode,
+    last_dir: Option<PathBuf>,
+    tx: mpsc::UnboundedSender<FilePickerResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = attach::run_file_picker(mode, last_dir).await;
+        let _ = tx.send(FilePickerResult { token, result });
+    })
+}
+
+/// Tests never open real dialogs; they inject results on the channel.
+#[cfg(test)]
+fn spawn_file_picker(
+    _token: u64,
+    _mode: attach::PickerMode,
+    _last_dir: Option<PathBuf>,
+    _tx: mpsc::UnboundedSender<FilePickerResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {})
 }
 
 fn expand_home_path(raw_path: &str) -> String {
@@ -16946,6 +18845,40 @@ fn compose_emoticon_query(text: &str, cursor: usize) -> Option<(String, usize)> 
         return None;
     }
     Some((query.to_owned(), token.chars().count()))
+}
+
+/// Detect an active `@` mention query at the cursor. Returns the query text
+/// (without the leading `@`) and the char length of the whole `@query` token so
+/// the picker can backspace exactly that many characters when inserting.
+///
+/// The `@` must start the current whitespace-delimited token, so `user@host`
+/// and `email@example.com` do not trigger the picker, matching the emoji
+/// detector's boundary behavior.
+fn compose_mention_query(text: &str, cursor: usize) -> Option<(String, usize)> {
+    let before_cursor = text.get(..cursor)?;
+    let token = before_cursor
+        .rsplit(|value: char| value.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    let query = token.strip_prefix('@')?;
+    // A bare `@` opens the full member list; any further `@` (e.g. an email
+    // address like `user@host`) means this is not a mention token.
+    if query.contains('@') {
+        return None;
+    }
+    Some((query.to_owned(), token.chars().count()))
+}
+
+/// Broadcast mention keywords offered for a chat, if the platform supports
+/// them. These resolve server-side from the plain `@keyword` token.
+fn mention_broadcast_keywords(chat: &Chat) -> &'static [&'static str] {
+    match chat.platform {
+        Platform::Slack if !matches!(chat.kind, ChatKind::Direct) => {
+            &["here", "channel", "everyone"]
+        }
+        Platform::ClickUp if !matches!(chat.kind, ChatKind::Direct) => &["all"],
+        _ => &[],
+    }
 }
 
 const EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER: &str = "[empty WhatsApp message]";
@@ -17126,6 +19059,29 @@ fn invalidate_rendered_cells<B: Backend>(terminal: &mut Terminal<B>) {
     terminal.swap_buffers();
 }
 
+/// Centered ` ▶ ` badge drawn over an HD video poster. Terminal images cover
+/// the halfblock rows (and their badge), so the badge is repainted on top.
+fn render_hd_play_badge(frame: &mut Frame<'_>, image_area: Rect) {
+    if image_area.width < 5 || image_area.height == 0 {
+        return;
+    }
+    let badge = Rect::new(
+        image_area.x + image_area.width / 2 - 1,
+        image_area.y + image_area.height / 2,
+        3,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new(" ▶ ").style(
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
+        badge,
+    );
+}
+
 /// A cell that no rendered frame realistically produces, so diffing any real
 /// frame against a sentinel-filled buffer rewrites every cell.
 fn repaint_sentinel_cell() -> Cell {
@@ -17173,6 +19129,7 @@ async fn run_app_loop(
                 CrosstermEvent::Resize(width, height) => {
                     app.handle_event(AppEvent::Resize(width, height)).await?;
                 }
+                CrosstermEvent::Paste(text) => app.handle_event(AppEvent::Paste(text)).await?,
                 _ => {}
             }
             app.log_slow_perf_duration("terminal.input_event", event_started, "immediate=true");
@@ -17194,10 +19151,17 @@ async fn run_app_loop(
         // Wake early when a debounced navigation load is due so a settled
         // selection starts loading promptly instead of waiting a full idle
         // poll interval.
-        let idle_timeout = app
-            .deferred_navigation_wakeup_in()
-            .map(|remaining| remaining.min(IDLE_POLL_TIMEOUT))
-            .unwrap_or(IDLE_POLL_TIMEOUT);
+        // Inline GIF loops also shorten the poll so the next frame is drawn
+        // on time; with no animation visible this stays fully idle.
+        let animation_wakeup = app.animation_wakeup_in();
+        if animation_wakeup == Some(Duration::ZERO) {
+            needs_draw = true;
+            continue;
+        }
+        let idle_timeout = [app.deferred_navigation_wakeup_in(), animation_wakeup]
+            .into_iter()
+            .flatten()
+            .fold(IDLE_POLL_TIMEOUT, Duration::min);
         if event::poll(idle_timeout)? {
             let event_started = Instant::now();
             match event::read()? {
@@ -17206,6 +19170,7 @@ async fn run_app_loop(
                 CrosstermEvent::Resize(width, height) => {
                     app.handle_event(AppEvent::Resize(width, height)).await?;
                 }
+                CrosstermEvent::Paste(text) => app.handle_event(AppEvent::Paste(text)).await?,
                 _ => {}
             }
             app.log_slow_perf_duration("terminal.input_event", event_started, "immediate=false");
@@ -17252,12 +19217,12 @@ fn draw_messages_details(app: &App, area: Rect) -> String {
 
 fn draw_compose_details(app: &App, area: Rect) -> String {
     format!(
-        "area={}x{} chars={} lines={} attachment={} reply={}",
+        "area={}x{} chars={} lines={} attachments={} reply={}",
         area.width,
         area.height,
         app.state.compose_text.chars().count(),
         app.state.compose.lines().len(),
-        app.state.pending_attachment.is_some(),
+        app.state.pending_attachments.len(),
         app.state.reply_to.is_some()
     )
 }
@@ -17367,6 +19332,7 @@ fn app_event_label(event: &AppEvent) -> &'static str {
         AppEvent::Key(_) => "key",
         AppEvent::Mouse(_) => "mouse",
         AppEvent::Resize(_, _) => "resize",
+        AppEvent::Paste(_) => "paste",
         AppEvent::Tick => "tick",
         AppEvent::Provider(_, _) => "provider",
         AppEvent::MediaReady(_, _) => "media_ready",
@@ -17461,6 +19427,9 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste lets dropped files arrive as one event (attached, not
+    // typed) and keeps pasted newlines from sending the draft.
+    let _ = execute!(stdout, EnableBracketedPaste);
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(
@@ -17481,7 +19450,8 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        DisableBracketedPaste
     )?;
     terminal.show_cursor()?;
     Ok(())
@@ -18557,6 +20527,18 @@ fn action_menu_items_for_message(
     if message_has_direct_image_preview(&message.content) {
         items.push(ActionMenuItem::OpenImage);
     }
+    if let Content::Video(media) = &message.content
+        && (message_video_local_path(&message.content).is_some()
+            || message_list::media_awaits_retrieve(media))
+    {
+        items.push(ActionMenuItem::PlayVideo);
+    }
+    if let Content::File(media) | Content::Audio(media) = &message.content
+        && (message_file_local_path(&message.content).is_some()
+            || message_list::media_awaits_retrieve(media))
+    {
+        items.push(ActionMenuItem::OpenFile);
+    }
     items.push(ActionMenuItem::Cancel);
     items
 }
@@ -18640,7 +20622,9 @@ async fn forward_send_content(
     content: Content,
 ) -> Result<(MessageId, Content)> {
     let content = ensure_forward_media_local(content, source).await?;
-    let sent_id = destination.send(chat_id, content.clone(), None).await?;
+    let sent_id = destination
+        .send(chat_id, OutboundContent::new(content.clone()), None)
+        .await?;
     Ok((sent_id, content))
 }
 
@@ -18935,6 +20919,62 @@ fn open_url(url: &str) {
 #[cfg(test)]
 fn open_url(_url: &str) {}
 
+#[cfg_attr(test, allow(dead_code))]
+struct MediaOpenRequest {
+    token: u64,
+    path: PathBuf,
+    name: String,
+    mime_type: String,
+    kind: launch::OpenKind,
+    started: Instant,
+}
+
+struct MediaOpenResult {
+    request: MediaOpenRequest,
+    result: Result<launch::Opened, String>,
+}
+
+#[cfg(not(test))]
+fn spawn_media_open(request: MediaOpenRequest, tx: mpsc::UnboundedSender<MediaOpenResult>) {
+    tokio::task::spawn_blocking(move || {
+        let result = launch::open_verified(&request.path, &request.mime_type, request.kind);
+        let _ = tx.send(MediaOpenResult { request, result });
+    });
+}
+
+/// Tests never launch desktop apps; the launch "succeeds" immediately.
+#[cfg(test)]
+fn spawn_media_open(request: MediaOpenRequest, tx: mpsc::UnboundedSender<MediaOpenResult>) {
+    let _ = tx.send(MediaOpenResult {
+        request,
+        result: Ok("test-player".to_owned()),
+    });
+}
+
+/// Locally cached video file for a message, when the bytes are on disk.
+fn message_video_local_path(content: &Content) -> Option<PathBuf> {
+    match content {
+        Content::Video(media) => media
+            .local_path
+            .as_ref()
+            .filter(|path| path.exists())
+            .cloned(),
+        _ => None,
+    }
+}
+
+/// Locally cached document or voice note for a message.
+fn message_file_local_path(content: &Content) -> Option<PathBuf> {
+    match content {
+        Content::File(media) | Content::Audio(media) => media
+            .local_path
+            .as_ref()
+            .filter(|path| path.exists())
+            .cloned(),
+        _ => None,
+    }
+}
+
 fn content_copy_text(content: &Content) -> String {
     match content {
         Content::Text(text) => text.to_string(),
@@ -19158,8 +21198,17 @@ struct GeneratedAvatarThumbnail {
     png: Vec<u8>,
 }
 
+/// Decodes an image by sniffing its content rather than trusting the file
+/// extension. Provider avatar caches use opaque names (ClickUp stores
+/// `<hash>.blob`), which `image::open` rejects as an unsupported format.
+fn open_image_sniffed(path: &Path) -> image::ImageResult<image::DynamicImage> {
+    image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()
+}
+
 fn generate_avatar_thumbnail_png(path: &Path) -> Result<GeneratedAvatarThumbnail, String> {
-    let image = image::open(path)
+    let image = open_image_sniffed(path)
         .map_err(|error| format!("decoding avatar image {}: {error}", path.display()))?;
     let mut thumbnail = resize_avatar_cover(image, AVATAR_THUMBNAIL_SIZE).to_rgba8();
     message_list::apply_rounded_thumbnail_mask(&mut thumbnail);
@@ -19186,7 +21235,7 @@ fn resize_avatar_cover(image: image::DynamicImage, size: u32) -> image::DynamicI
 
 #[cfg(test)]
 fn account_badge_image_rows(path: &Path) -> Result<chat_list::AvatarRows, String> {
-    let image = image::open(path)
+    let image = open_image_sniffed(path)
         .map_err(|error| format!("decoding account badge image {}: {error}", path.display()))?
         .to_rgba8();
     let (width, height) = image.dimensions();
@@ -19246,7 +21295,7 @@ fn sample_image_region(
 
 fn write_static_account_icon(path: &Path, icon_bytes: &[u8]) -> Result<()> {
     if path.exists() {
-        image::open(path)
+        open_image_sniffed(path)
             .with_context(|| format!("decoding cached account icon {}", path.display()))?;
         return Ok(());
     }
@@ -23223,6 +25272,107 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn compose_mention_query_fires_only_at_token_boundaries() {
+        // A bare `@` at the start of the text opens the full member list.
+        assert_eq!(compose_mention_query("@", 1), Some((String::new(), 1)));
+        // A `@` after whitespace starts a fresh token and carries the query.
+        assert_eq!(
+            compose_mention_query("hi @Bog", 7),
+            Some(("Bog".to_owned(), 4))
+        );
+        // A `@` inside a word (an email address) is not a mention.
+        assert_eq!(compose_mention_query("mail me@host", 12), None);
+        // Text without an `@` token never opens the picker.
+        assert_eq!(compose_mention_query("hello", 5), None);
+        // A trailing space ends the token, so nothing is suggested.
+        assert_eq!(compose_mention_query("hi @Maya ", 9), None);
+    }
+
+    #[tokio::test]
+    async fn app_compose_mention_picker_shows_loading_then_populates() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = app.state().selected_chat().unwrap().clone();
+        // Move focus off the chat list so keystrokes reach the compose box.
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        // Typing `@` before the roster is cached opens the picker in its
+        // loading placeholder state without blocking the event loop.
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('@'), KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state().compose_mention_picker_open());
+        assert!(app.state().compose_mention_picker_loading());
+        assert_eq!(app.state().compose_mention_match_count(), Some(0));
+
+        // Once the background fetch completes, the picker repopulates with the
+        // cached members without another keystroke.
+        app.chat_members_tx.send(ChatMembersFetchResult {
+            account: chat.account.clone(),
+            chat_id: chat.id.clone(),
+            result: Ok(vec![
+                ChatMember::new(Sender {
+                    platform_id: Arc::from("mock:user:maya"),
+                    display_name: Arc::from("Maya"),
+                    avatar: None,
+                }),
+                ChatMember::new(Sender {
+                    platform_id: Arc::from("mock:user:dad"),
+                    display_name: Arc::from("Dad"),
+                    avatar: None,
+                }),
+            ]),
+        })?;
+        assert!(app.drain_chat_member_fetches());
+
+        assert!(app.state().compose_mention_picker_open());
+        assert!(!app.state().compose_mention_picker_loading());
+        assert_eq!(app.state().compose_mention_match_count(), Some(2));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_compose_mention_picker_filters_and_inserts() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = app.state().selected_chat().unwrap().clone();
+        app.chat_members_tx.send(ChatMembersFetchResult {
+            account: chat.account.clone(),
+            chat_id: chat.id.clone(),
+            result: Ok(vec![
+                ChatMember::new(Sender {
+                    platform_id: Arc::from("mock:user:maya"),
+                    display_name: Arc::from("Maya"),
+                    avatar: None,
+                }),
+                ChatMember::new(Sender {
+                    platform_id: Arc::from("mock:user:dad"),
+                    display_name: Arc::from("Dad"),
+                    avatar: None,
+                }),
+            ]),
+        })?;
+        assert!(app.drain_chat_member_fetches());
+        // Move focus off the chat list so keystrokes reach the compose box.
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        for value in "hi @May".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        assert!(app.state().compose_mention_picker_open());
+        assert_eq!(app.state().compose_mention_match_count(), Some(1));
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert!(!app.state().compose_mention_picker_open());
+        assert_eq!(app.state().compose_text(), "hi @Maya ");
+        assert!(app.state().status().contains("mentioned @Maya"));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn app_sends_single_media_attachment_with_caption() -> Result<()> {
         let mut app = test_app().await?;
@@ -23272,8 +25422,7 @@ mod tests {
         }
         app.open_compose_attach_menu();
         assert!(app.state().compose_attach_menu_open());
-        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
-            .await?;
+        // First entry is "Photos & videos", which attaches the typed path.
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
             .await?;
         assert_eq!(app.state().compose_text(), "");
@@ -23321,6 +25470,191 @@ mod tests {
         }));
 
         Ok(())
+    }
+
+    fn write_attachment_fixture(dir: &Path, name: &str) -> Result<PathBuf> {
+        let path = dir.join(name);
+        fs::write(&path, b"GIF89a")?;
+        Ok(path)
+    }
+
+    #[tokio::test]
+    async fn file_picker_selection_fills_tray_and_sends_caption_on_first_item() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        let temp_dir = tempfile::tempdir()?;
+        let first = write_attachment_fixture(temp_dir.path(), "one.gif")?;
+        let second = write_attachment_fixture(temp_dir.path(), "report.pdf")?;
+
+        // Phase 1: Ctrl+U opens the sheet; choosing an item opens the picker
+        // in the background and nothing is attached yet.
+        app.state.focus = FocusPane::Compose;
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert!(app.state().compose_attach_menu_open());
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('p'), KeyModifiers::NONE)))
+            .await?;
+        let token = app.state.file_picker.as_ref().expect("picker active").token;
+        assert!(app.state.pending_attachments.is_empty());
+
+        // Phase 2: the picker reports back; the drain applies it.
+        app.file_picker_tx.send(FilePickerResult {
+            token,
+            result: Ok(vec![first.clone(), second.clone()]),
+        })?;
+        assert!(app.drain_file_picker_results());
+        assert!(app.state.file_picker.is_none());
+        assert_eq!(app.state.pending_attachments.len(), 2);
+        assert_eq!(
+            app.state.pending_attachments[0].kind,
+            PendingAttachmentKind::Image
+        );
+        assert_eq!(
+            app.state.pending_attachments[1].kind,
+            PendingAttachmentKind::File
+        );
+        assert_eq!(app.state.last_attach_dir.as_deref(), Some(temp_dir.path()));
+
+        for value in "two files".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        assert!(app.state.pending_attachments.is_empty());
+        assert_eq!(app.state().compose_text(), "");
+        let sent: Vec<&Message> = app
+            .state()
+            .messages()
+            .iter()
+            .filter(|message| message.is_from_me)
+            .collect();
+        assert!(sent.iter().any(|message| matches!(&message.content,
+            Content::Image(media) if media.file_name.as_ref() == "one.gif"
+                && media.caption.as_deref() == Some("two files"))));
+        assert!(sent.iter().any(|message| matches!(&message.content,
+            Content::File(media) if media.file_name.as_ref() == "report.pdf"
+                && media.caption.is_none())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_picker_result_is_discarded_when_chat_changed_or_stale() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        let temp_dir = tempfile::tempdir()?;
+        let file = write_attachment_fixture(temp_dir.path(), "late.gif")?;
+
+        app.open_file_picker(attach::PickerMode::Media, AttachCommandKind::Media);
+        let token = app.state.file_picker.as_ref().expect("picker").token;
+        // An older request's result is ignored and keeps the picker open.
+        app.file_picker_tx.send(FilePickerResult {
+            token: token.wrapping_sub(1),
+            result: Ok(vec![file.clone()]),
+        })?;
+        app.drain_file_picker_results();
+        assert!(app.state.file_picker.is_some());
+        assert!(app.state.pending_attachments.is_empty());
+
+        // The user navigated to another chat while the dialog was open.
+        if let Some(active) = &mut app.state.file_picker {
+            active.chat_id = ChatId::from("some-other-chat");
+        }
+        app.file_picker_tx.send(FilePickerResult {
+            token,
+            result: Ok(vec![file]),
+        })?;
+        app.drain_file_picker_results();
+        assert!(app.state.file_picker.is_none());
+        assert!(app.state.pending_attachments.is_empty());
+        assert!(app.state().status().contains("chat changed"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paste_attaches_dropped_files_and_never_sends_pasted_text() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        let before = app.state().messages().len();
+        let temp_dir = tempfile::tempdir()?;
+        let spaced = write_attachment_fixture(temp_dir.path(), "my photo.gif")?;
+        let quoted = format!("'{}'", spaced.display());
+
+        app.handle_event(AppEvent::Paste(quoted)).await?;
+        assert_eq!(app.state().focus(), FocusPane::Compose);
+        assert_eq!(app.state.pending_attachments.len(), 1);
+        assert_eq!(
+            app.state.pending_attachments[0].media.file_name.as_ref(),
+            "my photo.gif"
+        );
+        assert_eq!(app.state().compose_text(), "");
+
+        app.handle_event(AppEvent::Paste("line one\nline two".to_owned()))
+            .await?;
+        assert_eq!(app.state().compose_text(), "line one\nline two");
+        assert_eq!(app.state().messages().len(), before);
+        assert_eq!(app.state.pending_attachments.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_shows_attach_button_and_tray_with_clickable_remove() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        let mut terminal = Terminal::new(TestBackend::new(140, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        let button = app
+            .state
+            .compose_attach_button
+            .expect("attach button drawn");
+        assert!(buffer_text(terminal.backend().buffer()).contains("+ Attach"));
+
+        // Clicking the button opens the sheet anchored above it.
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            button.x + 1,
+            button.y,
+        )))
+        .await?;
+        assert!(app.state().compose_attach_menu_open());
+        let sheet = app.compose_attach_menu_rect(app.state.frame_area);
+        assert!(sheet.bottom() <= button.y);
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+
+        let temp_dir = tempfile::tempdir()?;
+        let doc = write_attachment_fixture(temp_dir.path(), "quarterly-report.pdf")?;
+        app.attach_paths(&[doc], AttachCommandKind::Document);
+        terminal.draw(|frame| app.draw(frame))?;
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("PDF"), "type badge in tray");
+        assert!(text.contains("quarterly"), "file name in tray");
+        let hit = *app.state.compose_tray_hits.first().expect("tray tile hit");
+
+        app.handle_event(AppEvent::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.remove.x,
+            hit.remove.y,
+        )))
+        .await?;
+        assert!(app.state.pending_attachments.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn truncate_middle_keeps_extension() {
+        assert_eq!(truncate_middle("short.pdf", 20), "short.pdf");
+        let cut = truncate_middle("a-very-long-document-name.pdf", 12);
+        assert_eq!(cut.chars().count(), 12);
+        assert!(cut.ends_with(".pdf"));
     }
 
     #[tokio::test]
@@ -25874,6 +28208,68 @@ mod tests {
         assert!(poll_items.contains(&ActionMenuItem::Forward));
         assert!(!poll_items.contains(&ActionMenuItem::OpenLink));
         assert!(!poll_items.contains(&ActionMenuItem::OpenImage));
+        assert!(!poll_items.contains(&ActionMenuItem::PlayVideo));
+    }
+
+    #[test]
+    fn action_menu_offers_play_only_for_available_videos() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("clip.mp4");
+        std::fs::write(&local, b"video").expect("write video");
+        let video = |local_path: Option<PathBuf>, size_bytes: Option<u64>| {
+            test_message_with_content(Content::Video(Media {
+                id: Arc::<str>::from("video-1"),
+                file_name: Arc::<str>::from("clip.mp4"),
+                mime_type: Arc::<str>::from("video/mp4"),
+                size_bytes,
+                caption: None,
+                local_path,
+                thumbnail: None,
+            }))
+        };
+
+        let cached = action_menu_items_for_message(&video(Some(local), Some(10)), 0);
+        assert!(cached.contains(&ActionMenuItem::PlayVideo));
+        assert!(!cached.contains(&ActionMenuItem::OpenImage));
+
+        let retrievable = action_menu_items_for_message(
+            &video(
+                Some(dir.path().join("missing.mp4")),
+                Some(chat_core::MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES + 1),
+            ),
+            0,
+        );
+        assert!(retrievable.contains(&ActionMenuItem::PlayVideo));
+
+        let unavailable = action_menu_items_for_message(&video(None, Some(10)), 0);
+        assert!(!unavailable.contains(&ActionMenuItem::PlayVideo));
+    }
+
+    #[test]
+    fn action_menu_offers_open_file_for_cached_documents_and_voice_notes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let local = dir.path().join("report.pdf");
+        std::fs::write(&local, b"%PDF").expect("write pdf");
+        let media = |local_path: Option<PathBuf>| Media {
+            id: Arc::<str>::from("doc-1"),
+            file_name: Arc::<str>::from("report.pdf"),
+            mime_type: Arc::<str>::from("application/pdf"),
+            size_bytes: Some(10),
+            caption: None,
+            local_path,
+            thumbnail: None,
+        };
+
+        let document = test_message_with_content(Content::File(media(Some(local.clone()))));
+        let items = action_menu_items_for_message(&document, 0);
+        assert!(items.contains(&ActionMenuItem::OpenFile));
+        assert!(!items.contains(&ActionMenuItem::PlayVideo));
+
+        let voice = test_message_with_content(Content::Audio(media(Some(local))));
+        assert!(action_menu_items_for_message(&voice, 0).contains(&ActionMenuItem::OpenFile));
+
+        let missing = test_message_with_content(Content::File(media(None)));
+        assert!(!action_menu_items_for_message(&missing, 0).contains(&ActionMenuItem::OpenFile));
     }
 
     #[test]
@@ -26411,6 +28807,67 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn deferred_startup_shows_cached_chats_before_slow_account_connects() -> Result<()> {
+        let store = Arc::new(Store::open_memory().await?);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider = StaticTestProvider::from_mock("slow:1", "Slow", &MockProvider::new(), "s-")?
+            .with_connect_gate(Arc::clone(&gate));
+        let fresh_chat_ids = provider
+            .chats
+            .iter()
+            .map(|chat| chat.id.clone())
+            .collect::<Vec<_>>();
+        let mut cached = provider.chats[0].clone();
+        cached.id = Arc::from("s-cached-only");
+        cached.name = Arc::from("Cached chat");
+        store.upsert_account(&provider.account, "{}").await?;
+        store.upsert_chat(&cached).await?;
+
+        // Phase 1: the app is ready while the account is still connecting.
+        let mut app = tokio::time::timeout(
+            Duration::from_secs(5),
+            App::new_with_factory_deferred(store, vec![Arc::new(provider)], None),
+        )
+        .await
+        .expect("deferred startup must not wait for provider connect")?;
+        assert!(app.pending_bootstrap.is_some());
+        assert!(app.state().status().starts_with("connecting 1 account"));
+        assert!(
+            app.state()
+                .chats
+                .iter()
+                .any(|chat| chat.id.as_ref() == "s-cached-only")
+        );
+        assert!(
+            !app.state()
+                .chats
+                .iter()
+                .any(|chat| fresh_chat_ids.contains(&chat.id))
+        );
+        assert!(!app.drain_bootstrap_connects().await?);
+
+        // Phase 2: once the connect finishes, the loop drain applies it.
+        gate.notify_one();
+        for _ in 0..500 {
+            app.drain_provider_events().await?;
+            if app.pending_bootstrap.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(app.pending_bootstrap.is_none(), "connect should be applied");
+        assert!(
+            fresh_chat_ids
+                .iter()
+                .all(|id| app.state().chats.iter().any(|chat| &chat.id == id))
+        );
+        // Provider events may own the status line by now; the startup
+        // "connecting…" text must be gone either way.
+        assert!(!app.state().status().starts_with("connecting "));
+        Ok(())
+    }
+
     async fn test_app() -> Result<App> {
         test_app_with_providers(vec![Arc::new(MockProvider::new())]).await
     }
@@ -26451,6 +28908,9 @@ mod tests {
         require_auth_until_submit: bool,
         bundled_oauth_app: bool,
         configured_realtime: bool,
+        /// When set, `connect` waits for a notification (simulates a slow
+        /// account at startup).
+        connect_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl StaticTestProvider {
@@ -26502,6 +28962,7 @@ mod tests {
                 require_auth_until_submit: false,
                 bundled_oauth_app: false,
                 configured_realtime: false,
+                connect_gate: None,
             }
         }
 
@@ -26561,7 +29022,13 @@ mod tests {
                 require_auth_until_submit: false,
                 bundled_oauth_app: false,
                 configured_realtime: false,
+                connect_gate: None,
             })
+        }
+
+        fn with_connect_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+            self.connect_gate = Some(gate);
+            self
         }
 
         fn with_submit_error(mut self, error: &str) -> Self {
@@ -26626,6 +29093,9 @@ mod tests {
         }
 
         async fn connect(&self) -> Result<()> {
+            if let Some(gate) = &self.connect_gate {
+                gate.notified().await;
+            }
             if self.require_auth_until_submit && self.auth_submissions.lock().unwrap().is_empty() {
                 self.events
                     .send(ProviderEvent::AuthRequired(AuthChallenge::Waiting));
@@ -26686,7 +29156,7 @@ mod tests {
         async fn send(
             &self,
             _chat_id: &Arc<str>,
-            _content: Content,
+            _outbound: OutboundContent,
             _reply_to: Option<&Message>,
         ) -> Result<Arc<str>> {
             if let Some(error) = &self.send_error {
@@ -27046,6 +29516,31 @@ mod tests {
         assert_eq!(rows[0][0].style.bg, Some(Color::Rgb(0, 0, 255)));
         assert_eq!(rows[0][1].style.fg, Some(Color::Rgb(0, 255, 0)));
         assert_eq!(rows[0][1].style.bg, Some(Color::Rgb(255, 255, 0)));
+        Ok(())
+    }
+
+    #[test]
+    fn avatar_thumbnail_decodes_images_with_opaque_extensions() -> Result<()> {
+        // ClickUp caches avatars as `<hash>.blob`; decoding must sniff the
+        // content instead of trusting the extension.
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("a49d4157405ca8ba.blob");
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            32,
+            32,
+            image::Rgb([10, 200, 30]),
+        ))
+        .write_to(&mut io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)?;
+        fs::write(&path, jpeg)?;
+
+        let thumbnail = generate_avatar_thumbnail_png(&path).map_err(anyhow::Error::msg)?;
+
+        assert_eq!(
+            thumbnail.image.dimensions(),
+            (AVATAR_THUMBNAIL_SIZE, AVATAR_THUMBNAIL_SIZE)
+        );
+        assert!(!thumbnail.png.is_empty());
         Ok(())
     }
 

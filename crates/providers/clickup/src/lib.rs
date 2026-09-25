@@ -38,10 +38,12 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use chat_core::{
     events::{
-        AccountNoticeSeverity, AuthChallenge, EventBus, NetworkActivityDirection,
-        NetworkActivityKind, ProviderEvent,
+        AuthChallenge, EventBus, NetworkActivityDirection, NetworkActivityKind, ProviderEvent,
     },
-    provider::{AuthSubmission, AuthSubmissionMode, OutboundCapabilities, Provider},
+    provider::{
+        AuthSubmission, AuthSubmissionMode, OutboundCapabilities, OutboundContent,
+        OutboundMentions, Provider, resolve_mention_tokens,
+    },
     types::*,
 };
 use chrono::Utc;
@@ -578,18 +580,6 @@ impl ClickUpProvider {
             handle.abort();
         }
     }
-
-    /// Tells the user, once per connection, that ClickUp cannot push messages.
-    fn announce_polling(&self) {
-        self.events.send(ProviderEvent::AccountNotice {
-            title: arc_str("ClickUp has no realtime chat feed"),
-            body: arc_str(
-                "ClickUp does not offer webhooks or a socket for Chat, so new messages are \
-                 collected by periodic checks and can lag by up to a few seconds.",
-            ),
-            severity: AccountNoticeSeverity::Info,
-        });
-    }
 }
 
 impl fmt::Debug for ClickUpProvider {
@@ -627,9 +617,32 @@ impl Provider for ClickUpProvider {
     }
 
     fn outbound_capabilities(&self) -> OutboundCapabilities {
-        OutboundCapabilities::text_only(
-            "ClickUp attachments are not supported yet; send a link instead",
-        )
+        OutboundCapabilities {
+            mentions: true,
+            ..OutboundCapabilities::text_only(
+                "ClickUp attachments are not supported yet; send a link instead",
+            )
+        }
+    }
+
+    /// ClickUp renders mentions as `@Display Name` in Markdown, which is exactly
+    /// the token the composer inserts, so the text is sent unchanged. We still
+    /// resolve the tokens so the resolved identities are reported to callers.
+    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
+        let resolved = resolve_mention_tokens(text, members);
+        let mut mentioned: Vec<Mention> = Vec::new();
+        for item in &resolved {
+            if !mentioned
+                .iter()
+                .any(|existing| existing.platform_id == item.mention.platform_id)
+            {
+                mentioned.push(item.mention.clone());
+            }
+        }
+        OutboundMentions {
+            text: text.to_owned(),
+            mentioned,
+        }
     }
 
     fn discovery_capabilities(&self) -> DiscoveryCapabilities {
@@ -668,7 +681,6 @@ impl Provider for ClickUpProvider {
                     }
                 }
                 self.events.send(ProviderEvent::SyncComplete);
-                self.announce_polling();
                 self.start_polling();
                 Ok(())
             }
@@ -770,9 +782,10 @@ impl Provider for ClickUpProvider {
     async fn send(
         &self,
         chat_id: &ChatId,
-        content: Content,
+        outbound: OutboundContent,
         reply_to: Option<&Message>,
     ) -> Result<MessageId> {
+        let OutboundContent { content, .. } = outbound;
         let text = match content {
             Content::Text(text) => text,
             other => {
@@ -1581,6 +1594,43 @@ mod tests {
     // Unit tests
     // -----------------------------------------------------------------------
 
+    fn mention_member(id: &str, name: &str) -> ChatMember {
+        ChatMember::new(Sender {
+            platform_id: Arc::from(id),
+            display_name: Arc::from(name),
+            avatar: None,
+        })
+    }
+
+    #[test]
+    fn clickup_mentions_pass_through_as_display_names() {
+        let provider = provider_with(FakeClient::new(FakeState::default()));
+        let members = vec![mention_member("12345", "Bogdan")];
+
+        // ClickUp resolves `@Display Name` server-side, so the text is sent
+        // unchanged while the resolved identity is still reported.
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        assert_eq!(encoded.text, "hi @Bogdan");
+        assert_eq!(
+            encoded
+                .mentioned
+                .iter()
+                .map(|mention| mention.platform_id.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["12345"]
+        );
+    }
+
+    #[test]
+    fn clickup_leaves_unresolved_mentions_as_plain_text() {
+        let provider = provider_with(FakeClient::new(FakeState::default()));
+        let members = vec![mention_member("12345", "Bogdan")];
+
+        let encoded = provider.encode_outbound_mentions("hi @Nobody", &members);
+        assert_eq!(encoded.text, "hi @Nobody");
+        assert!(encoded.mentioned.is_empty());
+    }
+
     #[test]
     fn slug_prefers_the_workspace_id_over_the_renameable_label() {
         // The id is the authoritative identity, so the same workspace slugs
@@ -1757,13 +1807,12 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, ProviderEvent::SyncComplete))
         );
-        // The user must be told once that ClickUp cannot push.
-        assert_eq!(
-            drained
+        // Polling is expected behaviour (explained in the setup screen), so a
+        // successful connect must not raise an account notice.
+        assert!(
+            !drained
                 .iter()
-                .filter(|event| matches!(event, ProviderEvent::AccountNotice { .. }))
-                .count(),
-            1
+                .any(|event| matches!(event, ProviderEvent::AccountNotice { .. }))
         );
     }
 
@@ -2116,7 +2165,11 @@ mod tests {
         let mut events = provider.events();
 
         let id = provider
-            .send(&arc_str("c-1"), Content::Text(arc_str("hello")), None)
+            .send(
+                &arc_str("c-1"),
+                OutboundContent::new(Content::Text(arc_str("hello"))),
+                None,
+            )
             .await
             .expect("send succeeds");
 
@@ -2141,7 +2194,11 @@ mod tests {
 
         assert!(
             provider
-                .send(&arc_str("c-1"), Content::Text(arc_str("   ")), None)
+                .send(
+                    &arc_str("c-1"),
+                    OutboundContent::new(Content::Text(arc_str("   "))),
+                    None,
+                )
                 .await
                 .is_err()
         );
@@ -2169,7 +2226,7 @@ mod tests {
         provider
             .send(
                 &arc_str("c-1"),
-                Content::Text(arc_str("me too")),
+                OutboundContent::new(Content::Text(arc_str("me too"))),
                 Some(child),
             )
             .await
@@ -2201,7 +2258,7 @@ mod tests {
         provider
             .send(
                 &arc_str("c-1"),
-                Content::Text(arc_str("reply")),
+                OutboundContent::new(Content::Text(arc_str("reply"))),
                 Some(&history[0]),
             )
             .await

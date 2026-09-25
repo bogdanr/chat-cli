@@ -1,6 +1,9 @@
 pub mod app;
+pub mod attach;
 pub mod event;
+pub mod launch;
 pub mod theme;
+pub mod video;
 pub mod voice_summary;
 pub mod widgets;
 

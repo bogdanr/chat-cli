@@ -33,6 +33,7 @@ unsafe extern "C" {
         reply_id: *const c_char,
         reply_participant: *const c_char,
         reply_text: *const c_char,
+        mentioned_jids: *const c_char,
     ) -> *mut c_char;
     fn C_RequestHistory(
         client_id: u64,
@@ -122,6 +123,7 @@ pub fn send_text(
     chat_jid: &str,
     text: &str,
     reply: Option<&ReplyTarget>,
+    mentioned_jids: &[String],
 ) -> anyhow::Result<String> {
     let chat_jid = CString::new(chat_jid)?;
     let text = CString::new(text)?;
@@ -129,6 +131,9 @@ pub fn send_text(
     let reply_participant =
         CString::new(reply.map(|r| r.participant.as_str()).unwrap_or_default())?;
     let reply_text = CString::new(reply.map(|r| r.quoted_text.as_str()).unwrap_or_default())?;
+    // JIDs never contain commas, so a comma-separated list is unambiguous. An
+    // empty list preserves the previous no-mention behavior.
+    let mentioned_jids = CString::new(mentioned_jids.join(","))?;
     let response = unsafe {
         C_SendText(
             handle,
@@ -137,6 +142,7 @@ pub fn send_text(
             reply_id.as_ptr(),
             reply_participant.as_ptr(),
             reply_text.as_ptr(),
+            mentioned_jids.as_ptr(),
         )
     };
     take_c_string(response)

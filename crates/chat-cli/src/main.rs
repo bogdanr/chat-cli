@@ -13,6 +13,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use storage::Store;
 use tui::{AccountProviderFactory, AccountProviderKind, ProviderBox, run_with_factory};
@@ -148,8 +149,27 @@ enum NotificationCommand {
     Status,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// How long exit waits for in-flight background work before the process ends.
+/// Slack requests run on blocking threads that can be parked for up to a
+/// minute (a `Retry-After` backoff, a 12s HTTP timeout, a 20s ffmpeg probe);
+/// the default `#[tokio::main]` runtime drop waits for all of them, which made
+/// quitting hang. User actions (sends, settings) are awaited by the UI loop;
+/// what may still be in flight is cache/metadata work (avatar thumbnails,
+/// chat metadata upserts) that the next sync restores, and SQLite commits are
+/// atomic, so abandoning it cannot corrupt the store.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
+
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building async runtime")?;
+    let result = runtime.block_on(async_main());
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    result
+}
+
+async fn async_main() -> Result<()> {
     let args = Args::parse();
     configure_diagnostic_log(&args);
     let cleanup_paths = cleanup_paths(&args);
@@ -751,6 +771,27 @@ fn cleanup_database(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_does_not_wait_for_parked_blocking_work() {
+        // Mirrors `main`: a blocking worker parked in a long backoff (like a
+        // Slack `Retry-After` sleep) must not hold up process exit.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(10)));
+            tokio::task::yield_now().await;
+        });
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(SHUTDOWN_GRACE);
+        assert!(
+            started.elapsed() < SHUTDOWN_GRACE + Duration::from_secs(1),
+            "shutdown waited {:?}",
+            started.elapsed()
+        );
+    }
 
     fn base_args() -> Args {
         Args {
