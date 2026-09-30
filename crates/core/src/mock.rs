@@ -27,6 +27,9 @@ pub struct MockProvider {
     messages: Arc<RwLock<Vec<Message>>>,
     sent_mentions: Arc<RwLock<Vec<Vec<Mention>>>>,
     events: EventBus,
+    /// Optional edit window, to exercise providers like WhatsApp that only
+    /// allow editing recent messages.
+    edit_window: Option<chrono::Duration>,
 }
 
 impl MockProvider {
@@ -49,7 +52,14 @@ impl MockProvider {
             messages,
             sent_mentions: Arc::new(RwLock::new(Vec::new())),
             events: EventBus::new(),
+            edit_window: None,
         }
+    }
+
+    /// Limits edits to messages sent within `window`, like WhatsApp.
+    pub fn with_edit_window(mut self, window: chrono::Duration) -> Self {
+        self.edit_window = Some(window);
+        self
     }
 
     pub fn seed_chats(&self) -> Vec<Chat> {
@@ -108,7 +118,10 @@ impl Provider for MockProvider {
     }
 
     fn outbound_capabilities(&self) -> crate::OutboundCapabilities {
-        crate::OutboundCapabilities::all()
+        crate::OutboundCapabilities {
+            edit_window: self.edit_window,
+            ..crate::OutboundCapabilities::all()
+        }
     }
 
     fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {

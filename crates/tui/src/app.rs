@@ -15243,6 +15243,9 @@ impl App {
                 return;
             };
             let can_edit = self.can_edit_message(message);
+            let edit_hint = (!can_edit)
+                .then(|| self.edit_window_expired_hint(message))
+                .flatten();
             let items = action_menu_items_for_message(
                 message,
                 self.thread_reply_count(&message_id),
@@ -15256,10 +15259,31 @@ impl App {
                 selected: 0,
                 items,
             });
-            self.state.status = "message actions opened".to_owned();
+            self.state.status = edit_hint.unwrap_or_else(|| "message actions opened".to_owned());
         } else {
             self.state.status = "select a message first".to_owned();
         }
+    }
+
+    /// Explains why Edit is missing for the user's own text message when the
+    /// only obstacle is the provider's edit window (e.g. WhatsApp's 20
+    /// minutes), so the option doesn't silently disappear. Cheap: capability
+    /// lookup only.
+    fn edit_window_expired_hint(&self, message: &Message) -> Option<String> {
+        let provider = self.provider_for_id(&message.account)?;
+        let capabilities = provider.outbound_capabilities();
+        let window = capabilities.edit_window?;
+        if !capabilities.edit
+            || !message.is_from_me
+            || chat_core::editable_text(&message.content).is_none()
+            || Utc::now().signed_duration_since(message.timestamp) <= window
+        {
+            return None;
+        }
+        Some(format!(
+            "message actions opened · editing is only possible within {} minutes of sending",
+            window.num_minutes()
+        ))
     }
 
     fn start_reply(&mut self, message_id: MessageId) {
@@ -29256,6 +29280,55 @@ mod tests {
         let mut unknown_provider = own.clone();
         unknown_provider.account = ProviderId::from("missing-account");
         assert!(!app.can_edit_message(&unknown_provider));
+        Ok(())
+    }
+
+    // WhatsApp-style edit windows: Edit is offered for recent own messages and
+    // replaced by an explanation (not silently dropped) once the window ends.
+    #[tokio::test]
+    async fn edit_window_hides_edit_with_explanation_for_old_messages() -> Result<()> {
+        let provider = MockProvider::new().with_edit_window(chrono::Duration::minutes(20));
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        drain_async_app_work(&mut app).await?;
+        let mut found = None;
+        for position in 0..app.state.visible_chat_indices.len() {
+            if position > 0 {
+                app.select_visible_position(position);
+                app.reload_selected_messages_after_navigation_with_options(true, false)
+                    .await?;
+                drain_async_app_work(&mut app).await?;
+            }
+            found = app
+                .state
+                .messages
+                .iter()
+                .position(|m| m.is_from_me && chat_core::editable_text(&m.content).is_some());
+            if found.is_some() {
+                break;
+            }
+        }
+        let index = found.expect("mock data has an own text message");
+        let message_id = app.state.messages[index].id.clone();
+        app.state.selected_message_id = Some(message_id.clone());
+
+        app.state.messages[index].timestamp = Utc::now() - chrono::Duration::hours(2);
+        app.open_action_menu();
+        let items = &app.state.action_menu.as_ref().unwrap().items;
+        assert!(!items.contains(&ActionMenuItem::Edit));
+        assert!(
+            app.state.status.contains("within 20 minutes"),
+            "status should explain the missing Edit: {}",
+            app.state.status
+        );
+
+        app.state.action_menu = None;
+        app.state.messages[index].timestamp = Utc::now() - chrono::Duration::minutes(1);
+        app.open_action_menu();
+        let items = &app.state.action_menu.as_ref().unwrap().items;
+        assert!(items.contains(&ActionMenuItem::Edit));
+        assert_eq!(app.state.status, "message actions opened");
         Ok(())
     }
 
