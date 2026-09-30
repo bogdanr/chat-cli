@@ -56,6 +56,13 @@ pub struct OutboundCapabilities {
     /// or bot tokens can; a Slack incoming webhook cannot). The compose UI uses
     /// this to decide whether to offer the mention autocomplete.
     pub mentions: bool,
+    /// Whether this identity can edit the text of messages it previously sent.
+    /// The action menu uses this to decide whether to offer "Edit".
+    pub edit: bool,
+    /// Optional platform-imposed window after sending during which a message
+    /// can still be edited (e.g. WhatsApp allows 20 minutes). `None` means
+    /// there is no time limit.
+    pub edit_window: Option<chrono::Duration>,
     pub max_upload_size: Option<u64>,
     pub media_note: Option<Arc<str>>,
 }
@@ -71,6 +78,8 @@ impl Default for OutboundCapabilities {
             file: false,
             sticker: false,
             mentions: false,
+            edit: false,
+            edit_window: None,
             max_upload_size: None,
             media_note: None,
         }
@@ -88,6 +97,8 @@ impl OutboundCapabilities {
             file: true,
             sticker: true,
             mentions: true,
+            edit: true,
+            edit_window: None,
             max_upload_size: None,
             media_note: None,
         }
@@ -127,6 +138,38 @@ impl OutboundCapabilities {
             .unwrap_or("this provider does not support that outbound content yet");
         Some(format!("{kind} sending is not available: {note}"))
     }
+}
+
+/// The editable text of a message, when its content kind supports text edits.
+/// Only plain text messages are editable; media captions, polls, cards and
+/// deleted/unsupported messages are not.
+pub fn editable_text(content: &Content) -> Option<&str> {
+    match content {
+        Content::Text(text) => Some(text.as_ref()),
+        _ => None,
+    }
+}
+
+/// Shared eligibility rule for editing a message: the provider identity must
+/// support edits, the message must be the user's own editable text message,
+/// and it must still be within the provider's edit window (if any).
+pub fn can_edit_message(
+    capabilities: &OutboundCapabilities,
+    message: &Message,
+    now: Timestamp,
+) -> bool {
+    if !capabilities.edit || !message.is_from_me {
+        return false;
+    }
+    if editable_text(&message.content).is_none() {
+        return false;
+    }
+    if let Some(window) = capabilities.edit_window
+        && now.signed_duration_since(message.timestamp) > window
+    {
+        return false;
+    }
+    true
 }
 
 fn outbound_content_label(content: &Content) -> &'static str {
@@ -393,6 +436,22 @@ pub trait Provider: Send + Sync + 'static {
         bail!("poll voting is not supported by this provider")
     }
 
+    /// Edit the text of a message previously sent by this account.
+    ///
+    /// `message` is the full original message so providers can read the
+    /// platform identifiers they need from `platform_data`. `outbound` carries
+    /// the new (already mention-encoded) content. Returns the edit timestamp as
+    /// confirmed by the provider (or the local time when the platform does not
+    /// report one).
+    async fn edit_message(
+        &self,
+        _chat_id: &ChatId,
+        _message: &Message,
+        _outbound: OutboundContent,
+    ) -> anyhow::Result<Timestamp> {
+        bail!("editing is not supported by this provider")
+    }
+
     /// Submit interactive authentication/setup inputs. Providers that support
     /// runtime setup should validate the submission and emit auth/status events.
     async fn submit_auth(&self, _submission: AuthSubmission) -> anyhow::Result<()> {
@@ -586,6 +645,96 @@ mod tests {
     fn outbound_capabilities_mentions_defaults_false() {
         assert!(!OutboundCapabilities::default().mentions);
         assert!(OutboundCapabilities::all().mentions);
+    }
+
+    fn own_text_message(sent_at: Timestamp) -> Message {
+        Message {
+            id: Arc::from("m1"),
+            chat_id: Arc::from("c1"),
+            account: Arc::from("acct"),
+            sender: Sender {
+                platform_id: Arc::from("me"),
+                display_name: Arc::from("Me"),
+                avatar: None,
+            },
+            timestamp: sent_at,
+            edited_at: None,
+            content: Content::Text(Arc::from("hello")),
+            reply_to: None,
+            thread_id: None,
+            reactions: Vec::new(),
+            receipts: Vec::new(),
+            is_from_me: true,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        }
+    }
+
+    #[test]
+    fn edit_capability_defaults_off() {
+        assert!(!OutboundCapabilities::default().edit);
+        assert!(OutboundCapabilities::all().edit);
+        assert!(OutboundCapabilities::default().edit_window.is_none());
+    }
+
+    #[test]
+    fn can_edit_message_requires_capability_ownership_and_text() {
+        let now = chrono::Utc::now();
+        let caps = OutboundCapabilities::all();
+        let message = own_text_message(now);
+        assert!(can_edit_message(&caps, &message, now));
+
+        assert!(!can_edit_message(
+            &OutboundCapabilities::default(),
+            &message,
+            now
+        ));
+
+        let mut other = message.clone();
+        other.is_from_me = false;
+        assert!(!can_edit_message(&caps, &other, now));
+
+        let mut deleted = message.clone();
+        deleted.content = Content::Deleted;
+        assert!(!can_edit_message(&caps, &deleted, now));
+
+        let mut unsupported = message.clone();
+        unsupported.content = Content::Unsupported(Arc::from("x"));
+        assert!(!can_edit_message(&caps, &unsupported, now));
+    }
+
+    #[test]
+    fn can_edit_message_honours_edit_window() {
+        let now = chrono::Utc::now();
+        let caps = OutboundCapabilities {
+            edit_window: Some(chrono::Duration::minutes(20)),
+            ..OutboundCapabilities::all()
+        };
+        assert!(can_edit_message(
+            &caps,
+            &own_text_message(now - chrono::Duration::minutes(19)),
+            now
+        ));
+        assert!(!can_edit_message(
+            &caps,
+            &own_text_message(now - chrono::Duration::minutes(21)),
+            now
+        ));
+    }
+
+    #[tokio::test]
+    async fn default_edit_message_is_unsupported() {
+        let provider = PassthroughProvider;
+        let message = own_text_message(chrono::Utc::now());
+        let error = provider
+            .edit_message(
+                &message.chat_id,
+                &message,
+                OutboundContent::new(Content::Text(Arc::from("new"))),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not supported"));
     }
 
     #[test]

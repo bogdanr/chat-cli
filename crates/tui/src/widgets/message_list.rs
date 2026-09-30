@@ -43,6 +43,8 @@ const SLACK_AVATAR_GAP: usize = 1;
 const SLACK_BODY_INDENT_WIDTH: usize =
     SLACK_TIMESTAMP_WIDTH + SLACK_GUTTER_GAP + MESSAGE_AVATAR_WIDTH as usize + SLACK_AVATAR_GAP;
 const SLACK_MESSAGE_SPACER_LINES: usize = 1;
+/// Label shown next to messages whose text was edited after sending.
+const EDITED_MARKER: &str = "edited";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConversationPresentation {
@@ -1459,7 +1461,16 @@ fn message_lines(
             ),
             Span::raw(if message.is_from_me { " (me)" } else { "" }),
         ]);
-        let timestamp = format_message_time(message.timestamp);
+        // Own messages carry the marker on their per-bubble status line, so
+        // only incoming headers show it (avoids a duplicate marker).
+        let timestamp = if message.edited_at.is_some() && !message.is_from_me {
+            format!(
+                "{EDITED_MARKER} · {}",
+                format_message_time(message.timestamp)
+            )
+        } else {
+            format_message_time(message.timestamp)
+        };
         push_right_aligned_spans(
             &mut header_spans,
             context.content_width,
@@ -1506,10 +1517,26 @@ fn message_lines(
 
     let receipts = receipt_summary(message);
     if message.is_from_me {
-        let status = if receipts.is_empty() {
-            format_message_time(message.timestamp)
+        let time = if message.edited_at.is_some() {
+            format!(
+                "{} · {EDITED_MARKER}",
+                format_message_time(message.timestamp)
+            )
         } else {
-            format!("{} · {receipts}", format_message_time(message.timestamp))
+            format_message_time(message.timestamp)
+        };
+        let status = if receipts.is_empty() {
+            time
+        } else {
+            format!("{time} · {receipts}")
+        };
+        lines.push(status_line(&status, context.theme.muted()));
+    } else if grouped && message.edited_at.is_some() {
+        // Grouped incoming bubbles have no header, so the marker moves here.
+        let status = if receipts.is_empty() {
+            EDITED_MARKER.to_owned()
+        } else {
+            format!("{EDITED_MARKER} · {receipts}")
         };
         lines.push(status_line(&status, context.theme.muted()));
     } else if !receipts.is_empty() {
@@ -1588,6 +1615,47 @@ fn slack_message_lines(
     }
     let merge_first_body_line =
         !grouped && message.reply_to.is_none() && slack_content_can_merge(&message.content);
+    match slack_edited_marker_placement(
+        message,
+        grouped,
+        context.content_width,
+        context.link_metadata,
+    ) {
+        FlatEditedMarker::None => {}
+        FlatEditedMarker::Inline => {
+            if let Some(last) = body_lines.last_mut() {
+                last.spans.push(Span::styled(
+                    format!(" ({EDITED_MARKER})"),
+                    context.theme.muted(),
+                ));
+            }
+        }
+        FlatEditedMarker::OwnRow => {
+            body_lines.push(Line::from(Span::styled(
+                format!("({EDITED_MARKER})"),
+                context.theme.muted(),
+            )));
+        }
+        FlatEditedMarker::BestEffort => {
+            // Rich content whose last row can't be predicted without drawing:
+            // trail the marker only when it fits, never adding a row.
+            let header_width = if merge_first_body_line && body_lines.len() == 1 {
+                slack_merged_header_width(message)
+            } else {
+                0
+            };
+            let available = slack_body_width(context.content_width).saturating_sub(header_width);
+            if let Some(last) = body_lines.last_mut() {
+                let suffix = format!(" ({EDITED_MARKER})");
+                if UnicodeWidthStr::width(line_text(last).as_str())
+                    + UnicodeWidthStr::width(suffix.as_str())
+                    <= available
+                {
+                    last.spans.push(Span::styled(suffix, context.theme.muted()));
+                }
+            }
+        }
+    }
 
     if !grouped {
         let mut header_spans = slack_header_spans(message, context);
@@ -1639,6 +1707,63 @@ fn slack_message_lines(
     }
 
     lines
+}
+
+/// Where the flat layout shows the "(edited)" marker. Computed from message
+/// data only, so the draw pass and `slack_message_lines_len` always agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlatEditedMarker {
+    None,
+    /// Trailing the last body row.
+    Inline,
+    /// On a row of its own because the last body row is full.
+    OwnRow,
+    /// Rich content: trailed only if it fits once drawn; never adds a row.
+    BestEffort,
+}
+
+/// Width the sender header adds in front of a merged single body row.
+fn slack_merged_header_width(message: &Message) -> usize {
+    UnicodeWidthStr::width(message.sender.display_name.as_ref())
+        + if message.is_from_me { 5 } else { 0 }
+        + 1
+}
+
+fn slack_edited_marker_placement(
+    message: &Message,
+    grouped: bool,
+    content_width: u16,
+    link_metadata: &LinkMetadataCache,
+) -> FlatEditedMarker {
+    if message.edited_at.is_none() || !slack_content_can_merge(&message.content) {
+        return FlatEditedMarker::None;
+    }
+    let Content::Text(text) = &message.content else {
+        return FlatEditedMarker::BestEffort;
+    };
+    let has_preview = first_url_in_text(text)
+        .and_then(|url| link_metadata.get(url.url))
+        .is_some_and(link_metadata_is_useful);
+    if has_preview {
+        return FlatEditedMarker::BestEffort;
+    }
+    let body_width = slack_body_width(content_width);
+    let wrapped = wrap_text(text, flat_text_width(body_width as u16));
+    let last_width = wrapped
+        .last()
+        .map_or(0, |line| UnicodeWidthStr::width(line.as_str()));
+    let merged_single_row = !grouped && message.reply_to.is_none() && wrapped.len() <= 1;
+    let header_width = if merged_single_row {
+        slack_merged_header_width(message)
+    } else {
+        0
+    };
+    let suffix_width = UnicodeWidthStr::width(EDITED_MARKER) + 3;
+    if last_width + suffix_width <= body_width.saturating_sub(header_width) {
+        FlatEditedMarker::Inline
+    } else {
+        FlatEditedMarker::OwnRow
+    }
 }
 
 fn slack_message_spacer_lines(grouped: bool, has_previous_message: bool) -> usize {
@@ -5177,7 +5302,11 @@ fn message_lines_len(
     usize::from(!grouped)
         + reply_quote_overhead_lines(message)
         + content_lines_len(&message.content, content_width, link_metadata, presentation)
-        + usize::from(message.is_from_me || !receipt_summary(message).is_empty())
+        + usize::from(
+            message.is_from_me
+                || (grouped && message.edited_at.is_some())
+                || !receipt_summary(message).is_empty(),
+        )
         + usize::from(!message.reactions.is_empty())
         + usize::from(thread_summary.is_some())
         + 1
@@ -5210,6 +5339,10 @@ fn slack_message_lines_len(
         + usize::from(!grouped)
         + reply_quote_overhead_lines(message)
         + content_count.saturating_sub(merged_content_line)
+        + usize::from(
+            slack_edited_marker_placement(message, grouped, content_width, link_metadata)
+                == FlatEditedMarker::OwnRow,
+        )
         + usize::from(!message.reactions.is_empty())
         + usize::from(thread_summary.is_some())
 }
@@ -7628,6 +7761,100 @@ mod tests {
                 "count pass and draw pass disagree for {presentation:?}:\n{}",
                 rendered.join("\n")
             );
+        }
+    }
+
+    #[test]
+    fn edited_marker_renders_and_keeps_count_and_draw_in_sync() {
+        let account = arc_str("mock:local");
+        let chat_id = arc_str("mock:chat:alice");
+        let long_text =
+            "Fixed the typo in the deployment notes and linked the runbook for the rollback";
+
+        for presentation in [
+            ConversationPresentation::Bubbles,
+            ConversationPresentation::Flat,
+        ] {
+            for width in [24_u16, 40, 60, 100] {
+                let mut edited = text_message(
+                    "edited",
+                    &chat_id,
+                    &account,
+                    sender("me", "Me"),
+                    long_text,
+                    9,
+                    30,
+                    true,
+                );
+                edited.edited_at = Some(edited.timestamp + chrono::Duration::minutes(2));
+                let plain = text_message(
+                    "plain",
+                    &chat_id,
+                    &account,
+                    sender("alice", "Alice"),
+                    "Thanks!",
+                    9,
+                    35,
+                    false,
+                );
+                let mut grouped_incoming = text_message(
+                    "grouped-edited",
+                    &chat_id,
+                    &account,
+                    sender("alice", "Alice"),
+                    "Typo fixed",
+                    9,
+                    36,
+                    false,
+                );
+                grouped_incoming.edited_at =
+                    Some(grouped_incoming.timestamp + chrono::Duration::minutes(1));
+                let messages = vec![edited, plain, grouped_incoming];
+                let mut cache = MediaPreviewCache::default();
+                let render = build_message_lines_with_presentation(
+                    &messages,
+                    width,
+                    0,
+                    400,
+                    None,
+                    &HashSet::new(),
+                    &HashMap::new(),
+                    &mut cache,
+                    &LinkMetadataCache::default(),
+                    Theme::default(),
+                    presentation,
+                );
+                let rendered = rendered_lines(&render.lines);
+                assert_eq!(
+                    message_line_count_with_presentation(
+                        &messages,
+                        width,
+                        &LinkMetadataCache::default(),
+                        presentation,
+                    ),
+                    render.total_lines,
+                    "measured height disagrees for {presentation:?} at width {width}:\n{}",
+                    rendered.join("\n")
+                );
+                assert_eq!(
+                    render.lines.len(),
+                    render.total_lines,
+                    "count pass and draw pass disagree for {presentation:?} at width {width}:\n{}",
+                    rendered.join("\n")
+                );
+                let edited_rows = rendered
+                    .iter()
+                    .filter(|line| line.contains(EDITED_MARKER))
+                    .count();
+                // Plain text always shows the marker exactly once: inline when
+                // it fits, otherwise on its own (measured) row.
+                assert_eq!(
+                    edited_rows,
+                    2,
+                    "one edited marker per edited message for {presentation:?} at width {width}:\n{}",
+                    rendered.join("\n")
+                );
+            }
         }
     }
 

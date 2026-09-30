@@ -55,6 +55,13 @@ unsafe extern "C" {
         reply_participant: *const c_char,
         reply_text: *const c_char,
     ) -> *mut c_char;
+    fn C_EditMessage(
+        client_id: u64,
+        chat_jid: *const c_char,
+        message_id: *const c_char,
+        text: *const c_char,
+        mentioned_jids: *const c_char,
+    ) -> *mut c_char;
     fn C_SendReaction(
         client_id: u64,
         chat_jid: *const c_char,
@@ -142,6 +149,32 @@ pub fn send_text(
             reply_id.as_ptr(),
             reply_participant.as_ptr(),
             reply_text.as_ptr(),
+            mentioned_jids.as_ptr(),
+        )
+    };
+    take_c_string(response)
+}
+
+/// Replaces the text of one of our own messages. `mentioned_jids` is the same
+/// comma-separated list `send_text` takes. Returns the bridge's JSON result:
+/// an `edit` event on success or an `error` event.
+pub fn edit_message(
+    handle: ClientHandle,
+    chat_jid: &str,
+    message_id: &str,
+    text: &str,
+    mentioned_jids: &str,
+) -> anyhow::Result<String> {
+    let chat_jid = CString::new(chat_jid)?;
+    let message_id = CString::new(message_id)?;
+    let text = CString::new(text)?;
+    let mentioned_jids = CString::new(mentioned_jids)?;
+    let response = unsafe {
+        C_EditMessage(
+            handle,
+            chat_jid.as_ptr(),
+            message_id.as_ptr(),
+            text.as_ptr(),
             mentioned_jids.as_ptr(),
         )
     };

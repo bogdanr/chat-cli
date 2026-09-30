@@ -6,8 +6,8 @@ use chat_core::{
     DiscoveryResult, DiscoveryResultKind, EventBus, Media, Mention, Message, MessageId,
     NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, OutboundContent,
     OutboundMentions, Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider,
-    ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData, resolve_mention_tokens,
-    rewrite_mention_tokens,
+    ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData, can_edit_message,
+    resolve_mention_tokens, rewrite_mention_tokens,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,8 @@ const WHATSAPP_ON_DEMAND_HISTORY_WAIT: Duration = Duration::from_millis(12_000);
 const WHATSAPP_ON_DEMAND_HISTORY_POLL: Duration = Duration::from_millis(250);
 /// Upper bound on how many read receipts a single mark-read call sends.
 const WHATSAPP_MARK_READ_MAX_MESSAGES: usize = 100;
+/// Mirrors whatsmeow's `EditWindow` (20 minutes after sending).
+const WHATSAPP_EDIT_WINDOW_MINUTES: i64 = 20;
 
 pub mod bridge;
 
@@ -334,6 +336,9 @@ impl Provider for WhatsAppProvider {
             file: true,
             sticker: true,
             mentions: true,
+            edit: true,
+            // whatsmeow's `EditWindow`: WhatsApp rejects edits older than this.
+            edit_window: Some(chrono::Duration::minutes(WHATSAPP_EDIT_WINDOW_MINUTES)),
             max_upload_size: None,
             media_note: Some(Arc::from(
                 "WhatsApp GIFs may be sent as documents depending on format",
@@ -565,6 +570,71 @@ impl Provider for WhatsAppProvider {
             is_historical: false,
         });
         Ok(message_id)
+    }
+
+    async fn edit_message(
+        &self,
+        chat_id: &ChatId,
+        message: &Message,
+        outbound: OutboundContent,
+    ) -> Result<Timestamp> {
+        let OutboundContent { content, mentions } = outbound;
+        let Content::Text(text) = content else {
+            bail!("WhatsApp can only edit the text of a message")
+        };
+        if text.trim().is_empty() {
+            bail!("cannot save an empty WhatsApp message")
+        }
+        if !message.is_from_me {
+            bail!("WhatsApp only allows editing your own messages")
+        }
+        if !can_edit_message(&self.outbound_capabilities(), message, Utc::now()) {
+            bail!(
+                "WhatsApp messages can only be edited within {WHATSAPP_EDIT_WINDOW_MINUTES} minutes of sending"
+            )
+        }
+        let chat_jid = whatsapp_jid_from_chat_id(chat_id);
+        if chat_jid.is_empty() {
+            bail!("cannot edit messages in the WhatsApp bridge/system chat")
+        }
+        let chat_jid = normalize_whatsapp_jid(&chat_jid);
+        let mentioned_jids = mentions
+            .iter()
+            .map(|mention| normalize_whatsapp_jid(&mention.platform_id))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // The bridge call does network IO; keep it off the async runtime.
+        let handle = self.handle;
+        let message_id = message.id.to_string();
+        let body = text.to_string();
+        self.emit_network_activity(NetworkActivityDirection::Tx, NetworkActivityKind::Send);
+        let raw_response = tokio::task::spawn_blocking(move || {
+            bridge::edit_message(handle, &chat_jid, &message_id, &body, &mentioned_jids)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("WhatsApp edit worker failed: {error}"))??;
+        let event = BridgeEvent::decode(&raw_response)?;
+        if event.kind == "error" {
+            bail!(
+                "{}",
+                event
+                    .message
+                    .unwrap_or_else(|| "WhatsApp edit failed".to_owned())
+            );
+        }
+        self.emit_network_activity(NetworkActivityDirection::Rx, NetworkActivityKind::Send);
+
+        let edited_at = event.edited_at().unwrap_or_else(Utc::now);
+        apply_cached_message_edit(
+            &self.messages,
+            &self.events,
+            chat_id.clone(),
+            message.id.clone(),
+            text,
+            edited_at,
+        );
+        Ok(edited_at)
     }
 
     async fn download_media(&self, _media: &Media) -> Result<PathBuf> {
@@ -1140,6 +1210,7 @@ struct BridgeEvent {
     #[serde(default)]
     group_only_admins_edit: bool,
     group_disappearing_seconds: Option<u32>,
+    edited_at: Option<String>,
 }
 
 impl BridgeEvent {
@@ -1198,6 +1269,7 @@ impl BridgeEvent {
                 group_only_admins_send: false,
                 group_only_admins_edit: false,
                 group_disappearing_seconds: None,
+                edited_at: None,
             })
         }
     }
@@ -1211,6 +1283,13 @@ impl BridgeEvent {
 
     fn last_message_timestamp(&self) -> Option<Timestamp> {
         self.last_message_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+    }
+
+    fn edited_at(&self) -> Option<Timestamp> {
+        self.edited_at
             .as_deref()
             .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc))
@@ -1397,6 +1476,9 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         }
         "reaction" => {
             forward_reaction_event(context, event);
+        }
+        "edit" => {
+            forward_edit_event(context, event);
         }
         "poll_vote" => {
             forward_poll_vote_event(context, event);
@@ -1945,6 +2027,71 @@ fn media_default_mime(kind: &str) -> &str {
         "sticker" => "image/webp",
         _ => "application/octet-stream",
     }
+}
+
+/// Routes an incoming `edit` bridge event (made on another device, or replayed
+/// by history sync) to a narrow content update of the original message. It
+/// never creates a new message, so replayed edits cannot duplicate or reorder
+/// the timeline.
+fn forward_edit_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
+    let Some(message_id) = event.id.clone().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let Some(text) = event.text.clone() else {
+        return;
+    };
+    let chat_jid = event
+        .chat_jid
+        .clone()
+        .unwrap_or_else(|| INBOX_CHAT_ID.to_owned());
+    let edited_at = event
+        .edited_at()
+        .or_else(|| event.timestamp())
+        .unwrap_or_else(Utc::now);
+    apply_cached_message_edit(
+        context.messages,
+        context.events,
+        chat_id_from_jid(&chat_jid),
+        arc_str(message_id),
+        arc_str(text),
+        edited_at,
+    );
+}
+
+/// Applies an edit to the in-memory history cache (monotonically, keeping
+/// media kind and replacing only text/caption) and emits the narrow
+/// `MessageContentEdited` event consumers persist.
+fn apply_cached_message_edit(
+    messages: &Arc<RwLock<Vec<Message>>>,
+    events: &EventBus,
+    chat_id: ChatId,
+    message_id: MessageId,
+    text: Arc<str>,
+    edited_at: Timestamp,
+) {
+    {
+        let mut messages = lock_rw_write(messages);
+        if let Some(cached) = messages.iter_mut().find(|cached| cached.id == message_id)
+            && !matches!(cached.content, Content::Deleted)
+            && cached.edited_at.is_none_or(|previous| previous < edited_at)
+        {
+            match &mut cached.content {
+                Content::Image(media)
+                | Content::Video(media)
+                | Content::Audio(media)
+                | Content::File(media)
+                | Content::Sticker(media) => media.caption = Some(text.clone()),
+                other => *other = Content::Text(text.clone()),
+            }
+            cached.edited_at = Some(edited_at);
+        }
+    }
+    events.send(ProviderEvent::MessageContentEdited {
+        chat_id,
+        message_id,
+        content: Content::Text(text),
+        edited_at,
+    });
 }
 
 fn forward_reaction_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
@@ -3006,6 +3153,121 @@ mod tests {
             edited.reactions[0].senders[0].as_ref(),
             "456@s.whatsapp.net"
         );
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_applies_inbound_edits_without_new_messages() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:inbound-edit")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"message","id":"edit-target","chat_jid":"123@s.whatsapp.net","sender_jid":"123@s.whatsapp.net","sender_name":"Ada","text":"teh typo","timestamp":"2026-06-05T12:00:00Z"}"#
+        )?);
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"edit","id":"edit-target","chat_jid":"123@s.whatsapp.net","sender_jid":"123@s.whatsapp.net","text":"the typo","timestamp":"2026-06-05T12:05:00Z","edited_at":"2026-06-05T12:05:00Z"}"#
+        )?);
+
+        let mut new_messages = 0;
+        let (message_id, content, edited_at) = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::Message { message, .. } if message.id.as_ref() == "edit-target" => {
+                    new_messages += 1;
+                }
+                ProviderEvent::MessageContentEdited {
+                    message_id,
+                    content,
+                    edited_at,
+                    ..
+                } => break (message_id, content, edited_at),
+                _ => continue,
+            }
+        };
+        assert_eq!(new_messages, 1, "an edit must never add a message");
+        assert_eq!(message_id.as_ref(), "edit-target");
+        assert!(matches!(&content, Content::Text(text) if text.as_ref() == "the typo"));
+        assert_eq!(edited_at.to_rfc3339(), "2026-06-05T12:05:00+00:00");
+
+        let history = provider
+            .history(&chat_id_from_jid("123@s.whatsapp.net"), None, 10)
+            .await?;
+        let cached = history
+            .iter()
+            .find(|message| message.id.as_ref() == "edit-target")
+            .expect("original message stays cached");
+        assert!(matches!(&cached.content, Content::Text(text) if text.as_ref() == "the typo"));
+        assert_eq!(cached.edited_at, Some(edited_at));
+        assert_eq!(
+            cached.timestamp.to_rfc3339(),
+            "2026-06-05T12:00:00+00:00",
+            "the edit must not move the message in the timeline"
+        );
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_provider_edits_own_messages_within_window() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:outbound-edit")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+        let capabilities = provider.outbound_capabilities();
+        assert!(capabilities.edit);
+        assert_eq!(
+            capabilities.edit_window,
+            Some(chrono::Duration::minutes(20))
+        );
+
+        let chat_id = chat_id_from_jid("123@s.whatsapp.net");
+        let sent_id = provider
+            .send(
+                &chat_id,
+                OutboundContent::new(Content::Text(arc_str("draft"))),
+                None,
+            )
+            .await?;
+        let sent = provider
+            .history(&chat_id, None, 10)
+            .await?
+            .into_iter()
+            .find(|message| message.id == sent_id)
+            .expect("sent message cached");
+
+        provider
+            .edit_message(
+                &chat_id,
+                &sent,
+                OutboundContent::new(Content::Text(arc_str("final"))),
+            )
+            .await?;
+        let edited_id = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::MessageContentEdited { message_id, .. } => break message_id,
+                _ => continue,
+            }
+        };
+        assert_eq!(edited_id, sent_id);
+
+        // Outside whatsmeow's edit window the bridge is never called.
+        let stale = Message {
+            timestamp: Utc::now() - chrono::Duration::minutes(30),
+            ..sent.clone()
+        };
+        let error = provider
+            .edit_message(
+                &chat_id,
+                &stale,
+                OutboundContent::new(Content::Text(arc_str("late"))),
+            )
+            .await
+            .expect_err("stale edits are rejected");
+        assert!(error.to_string().contains("20 minutes"));
 
         provider.disconnect().await?;
         Ok(())

@@ -536,6 +536,24 @@ struct SlackHistoryMessageResponse {
     files: Option<Vec<SlackFileResponse>>,
     hidden: Option<bool>,
     reactions: Option<Vec<SlackReactionResponse>>,
+    /// Present only when the author edited the message text.
+    #[serde(default)]
+    edited: Option<SlackEditedResponse>,
+}
+
+/// Slack's `edited` marker (`{"user": "U123", "ts": "1700000000.000100"}`).
+/// Other `message_changed` causes (unfurls, thread metadata) omit it, so it
+/// is the reliable signal that the text itself was edited.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct SlackEditedResponse {
+    #[serde(default)]
+    ts: Option<String>,
+}
+
+fn slack_edited_at(edited: Option<&SlackEditedResponse>) -> Option<Timestamp> {
+    edited
+        .and_then(|edited| non_empty_option(&edited.ts))
+        .and_then(|ts| slack_ts_to_timestamp(&ts))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -926,6 +944,16 @@ pub trait SlackApiClient: Send + Sync {
 
     async fn post_webhook(&self, webhook_url: &str, text: &str) -> Result<SlackPostedMessage>;
 
+    /// Replace the text of an existing message via `chat.update`. Slack only
+    /// allows the identity that posted a message to edit it.
+    async fn update_message(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+        ts: &str,
+        text: &str,
+    ) -> Result<SlackPostedMessage>;
+
     async fn upload_file(
         &self,
         credential: SlackCredential,
@@ -1174,6 +1202,8 @@ struct SlackRealtimeInnerMessage {
     blocks: Option<Vec<serde_json::Value>>,
     attachments: Option<Vec<SlackAttachmentResponse>>,
     files: Option<Vec<SlackFileResponse>>,
+    #[serde(default)]
+    edited: Option<SlackEditedResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1293,6 +1323,16 @@ impl SlackApiClient for SlackWebApiClient {
 
     async fn post_webhook(&self, webhook_url: &str, text: &str) -> Result<SlackPostedMessage> {
         post_webhook_message(webhook_url, text).await
+    }
+
+    async fn update_message(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+        ts: &str,
+        text: &str,
+    ) -> Result<SlackPostedMessage> {
+        update_web_api_message(credential, channel, ts, text).await
     }
 
     async fn upload_file(
@@ -1503,6 +1543,74 @@ async fn post_web_api_message(
     })
     .await
     .context("joining Slack message posting task")?
+}
+
+#[derive(Debug, Serialize)]
+struct SlackUpdateMessageRequest<'a> {
+    channel: &'a str,
+    ts: &'a str,
+    text: &'a str,
+}
+
+/// Readable explanation for the `chat.update` errors a user can trigger.
+fn slack_update_error_message(code: &str) -> String {
+    match code {
+        "cant_update_message" => {
+            "Slack only lets the account that posted a message edit it".to_owned()
+        }
+        "edit_window_closed" => "Slack's edit window for this message has closed".to_owned(),
+        "message_not_found" => "the message no longer exists in Slack".to_owned(),
+        other => format!("Slack chat.update failed: {other}"),
+    }
+}
+
+async fn update_web_api_message(
+    credential: SlackCredential,
+    channel: &str,
+    ts: &str,
+    text: &str,
+) -> Result<SlackPostedMessage> {
+    if !matches!(
+        credential.kind,
+        SlackCredentialKind::UserToken
+            | SlackCredentialKind::BotToken
+            | SlackCredentialKind::Unknown
+    ) {
+        bail!("Slack chat.update requires a user or bot Web API token");
+    }
+
+    let token = credential.value;
+    let channel = channel.to_owned();
+    let ts = ts.to_owned();
+    let text = text.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let request = SlackUpdateMessageRequest {
+            channel: &channel,
+            ts: &ts,
+            text: &text,
+        };
+        let mut response = slack_http_agent()
+            .post("https://slack.com/api/chat.update")
+            .header("Authorization", format!("Bearer {token}"))
+            .send_json(&request)
+            .context("calling Slack chat.update")?;
+        // chat.update shares chat.postMessage's `{ok, error, channel, ts}` shape.
+        let updated: SlackPostMessageResponse = response
+            .body_mut()
+            .read_json()
+            .context("decoding Slack chat.update response")?;
+        if !updated.ok {
+            bail!(slack_update_error_message(
+                updated.error.as_deref().unwrap_or("unknown_error")
+            ));
+        }
+        Ok(SlackPostedMessage {
+            channel: updated.channel,
+            ts: updated.ts.unwrap_or(ts),
+        })
+    })
+    .await
+    .context("joining Slack message update task")?
 }
 
 async fn post_webhook_message(webhook_url: &str, text: &str) -> Result<SlackPostedMessage> {
@@ -4139,6 +4247,8 @@ impl Provider for SlackProvider {
                 file: true,
                 sticker: false,
                 mentions: true,
+                edit: true,
+                edit_window: None,
                 max_upload_size: None,
                 media_note: Some(Arc::from(
                     "Slack uploads files for image, GIF, video, audio, and document content",
@@ -4481,6 +4591,52 @@ impl Provider for SlackProvider {
                 .unwrap_or_else(|| arc_str("slack")),
         });
         Ok(())
+    }
+
+    async fn edit_message(
+        &self,
+        chat_id: &ChatId,
+        message: &Message,
+        outbound: OutboundContent,
+    ) -> Result<Timestamp> {
+        let Content::Text(text) = outbound.content else {
+            bail!("only Slack text messages can be edited");
+        };
+        let connection = read_lock(&self.connection).clone();
+        let credential = match self.send_identity() {
+            SlackSendIdentity::User => connection
+                .user_token
+                .map(|token| SlackCredential::new(SlackCredentialKind::UserToken, token)),
+            SlackSendIdentity::Bot => connection
+                .bot_token
+                .map(|token| SlackCredential::new(SlackCredentialKind::BotToken, token)),
+            SlackSendIdentity::Webhook | SlackSendIdentity::None => None,
+        }
+        .ok_or_else(|| self.unsupported("message editing"))?;
+        // Locally sent messages are stored before any realtime echo fills in
+        // `platform_data`; their id is the Slack `ts` and the chat is the
+        // channel, which is exactly what `chat.update` needs.
+        let slack_data = message.platform_data.slack.as_ref();
+        let channel = slack_data
+            .map(|data| data.channel.as_ref())
+            .filter(|channel| !channel.is_empty())
+            .unwrap_or(chat_id.as_ref());
+        let ts = slack_data
+            .map(|data| data.ts.as_ref())
+            .filter(|ts| !ts.is_empty())
+            .unwrap_or(message.id.as_ref());
+        self.call_api(
+            NetworkActivityKind::Send,
+            self.api_client
+                .update_message(credential, channel, ts, text.as_ref()),
+        )
+        .await
+        .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
+        slack_diagnostic_log(
+            "slack.provider.message_edited",
+            format!("account={} chat={channel} ts={ts}", self.id),
+        );
+        Ok(Utc::now())
     }
 
     async fn submit_auth(&self, submission: AuthSubmission) -> Result<()> {
@@ -5768,6 +5924,7 @@ async fn emit_realtime_message(
 
     if matches!(subtype, Some("message_changed")) {
         if let Some(message) = event.message.and_then(|message| {
+            let edited_at = slack_edited_at(message.edited.as_ref());
             slack_message_from_parts(
                 account,
                 current_user_id,
@@ -5786,6 +5943,10 @@ async fn emit_realtime_message(
                 false,
                 web_api_credential.map(SlackCredential::value),
             )
+            .map(|mut built| {
+                built.edited_at = edited_at;
+                built
+            })
         }) {
             let mut message = message;
             resolve_realtime_message_users(&mut message, users, events, web_api_credential).await;
@@ -5935,7 +6096,8 @@ fn slack_history_message(
     }
 
     let is_thread_root = message.reply_count.unwrap_or(0) > 0;
-    slack_message_from_parts(
+    let edited_at = slack_edited_at(message.edited.as_ref());
+    let mut built = slack_message_from_parts(
         &account,
         current_user_id,
         Some(channel),
@@ -5952,7 +6114,9 @@ fn slack_history_message(
         users,
         is_thread_root,
         web_api_token,
-    )
+    )?;
+    built.edited_at = edited_at;
+    Some(built)
 }
 
 fn slack_message_from_parts(
@@ -8017,6 +8181,7 @@ mod tests {
         team_info_calls: Mutex<Vec<(SlackCredentialKind, Option<String>)>>,
         fail_team_info_for: Mutex<Vec<SlackCredentialKind>>,
         posted_messages: Mutex<Vec<PostedCall>>,
+        updated_messages: Mutex<Vec<PostedCall>>,
         posted_webhooks: Mutex<Vec<(String, String)>>,
         listed_conversations: Mutex<Vec<SlackCredentialKind>>,
         conversations: Mutex<Vec<SlackConversation>>,
@@ -8114,6 +8279,30 @@ mod tests {
             Ok(SlackPostedMessage {
                 channel: Some(channel.to_owned()),
                 ts: "1710000000.000100".to_owned(),
+            })
+        }
+
+        async fn update_message(
+            &self,
+            credential: SlackCredential,
+            channel: &str,
+            ts: &str,
+            text: &str,
+        ) -> Result<SlackPostedMessage> {
+            if credential.value().contains("update-fail") {
+                bail!(slack_update_error_message("cant_update_message"));
+            }
+            // `thread_ts` records the edited message's `ts` for assertions.
+            self.updated_messages.lock().unwrap().push(PostedCall {
+                kind: credential.kind,
+                token: credential.value,
+                channel: channel.to_owned(),
+                text: text.to_owned(),
+                thread_ts: Some(ts.to_owned()),
+            });
+            Ok(SlackPostedMessage {
+                channel: Some(channel.to_owned()),
+                ts: ts.to_owned(),
             })
         }
 
@@ -9948,6 +10137,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_mode_edits_message_via_chat_update() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client.clone())?;
+        provider.connect().await?;
+        assert!(provider.outbound_capabilities().edit);
+        assert!(provider.outbound_capabilities().edit_window.is_none());
+
+        let members = vec![mention_member("U123", "Bogdan")];
+        let encoded = provider.encode_outbound_mentions("fixed @Bogdan", &members);
+        // A locally sent message has no Slack platform data yet: the id is the
+        // `ts` and the chat id is the channel.
+        let mut message = poll_history_message("C123", "1710000000.000100", Utc::now());
+        message.is_from_me = true;
+        provider
+            .edit_message(
+                &arc_str("C123"),
+                &message,
+                OutboundContent::with_mentions(
+                    Content::Text(arc_str(encoded.text.clone())),
+                    encoded.mentioned,
+                ),
+            )
+            .await?;
+
+        assert_eq!(
+            *client.updated_messages.lock().unwrap(),
+            vec![PostedCall {
+                kind: SlackCredentialKind::UserToken,
+                token: "xoxp-user".to_owned(),
+                channel: "C123".to_owned(),
+                text: "fixed <@U123>".to_owned(),
+                thread_ts: Some("1710000000.000100".to_owned()),
+            }]
+        );
+        assert!(client.posted_messages.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slack_edit_failures_are_readable() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user-update-fail".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client)?;
+        provider.connect().await?;
+
+        let message = poll_history_message("C123", "1710000000.000100", Utc::now());
+        let error = provider
+            .edit_message(
+                &arc_str("C123"),
+                &message,
+                OutboundContent::new(Content::Text(arc_str("new"))),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only lets the account that posted a message edit it"),
+            "{error:#}"
+        );
+        assert_eq!(
+            slack_update_error_message("edit_window_closed"),
+            "Slack's edit window for this message has closed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn webhook_identity_cannot_edit() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::Webhook);
+        options.webhook_url = Some("https://hooks.slack.com/services/T/B/X".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client.clone())?;
+        provider.connect().await?;
+
+        assert!(!provider.outbound_capabilities().edit);
+        let message = poll_history_message("C123", "1710000000.000100", Utc::now());
+        assert!(
+            provider
+                .edit_message(
+                    &arc_str("C123"),
+                    &message,
+                    OutboundContent::new(Content::Text(arc_str("new"))),
+                )
+                .await
+                .is_err()
+        );
+        assert!(client.updated_messages.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn slack_history_message_parses_edited_marker() {
+        let parse = |json: &str| {
+            let response: SlackHistoryMessageResponse = serde_json::from_str(json).unwrap();
+            slack_history_message(
+                arc_str("slack:test"),
+                Some("U123"),
+                "C123".to_owned(),
+                response,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let edited = parse(
+            r#"{"type":"message","user":"U123","ts":"1710000000.000100","text":"v2",
+                "edited":{"user":"U123","ts":"1710000060.000000"}}"#,
+        );
+        assert_eq!(
+            edited.edited_at.map(|at| at.timestamp()),
+            Some(1_710_000_060)
+        );
+        assert_eq!(edited.timestamp.timestamp(), 1_710_000_000);
+
+        let unedited =
+            parse(r#"{"type":"message","user":"U123","ts":"1710000000.000100","text":"v1"}"#);
+        assert!(unedited.edited_at.is_none());
+    }
+
+    #[test]
+    fn slack_realtime_inner_message_parses_edited_marker() {
+        let inner: SlackRealtimeInnerMessage = serde_json::from_str(
+            r#"{"user":"U1","ts":"1710000000.000100","text":"v2",
+                "edited":{"user":"U1","ts":"1710000060.000000"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            slack_edited_at(inner.edited.as_ref()).map(|at| at.timestamp()),
+            Some(1_710_000_060)
+        );
+        let unfurl: SlackRealtimeInnerMessage =
+            serde_json::from_str(r#"{"user":"U1","ts":"1710000000.000100","text":"v1"}"#).unwrap();
+        assert!(slack_edited_at(unfurl.edited.as_ref()).is_none());
+    }
+
+    #[tokio::test]
     async fn webhook_mode_posts_text_to_webhook_only() -> Result<()> {
         let mut options = SlackProviderOptions::new(SlackAuthMode::Webhook);
         options.webhook_url = Some("https://hooks.slack.com/services/T000/B000/secret".to_owned());
@@ -10331,6 +10660,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: None,
                 user: None,
@@ -10462,6 +10792,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: Some("bot_message".to_owned()),
                 user: None,
@@ -10592,6 +10923,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: Some("bot_message".to_owned()),
                 user: None,
@@ -10694,6 +11026,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: Some("bot_message".to_owned()),
                 user: None,
@@ -10910,6 +11243,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: None,
                 user: Some("U234".to_owned()),
@@ -10973,6 +11307,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: None,
                 user: Some("U234".to_owned()),
@@ -11216,6 +11551,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: None,
                 user: Some("U234".to_owned()),
@@ -11264,6 +11600,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: None,
                 user: Some("U234".to_owned()),
@@ -11305,6 +11642,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: None,
                 user: Some("U234".to_owned()),
@@ -11339,6 +11677,7 @@ mod tests {
             Some("U123"),
             "C123".to_owned(),
             SlackHistoryMessageResponse {
+                edited: None,
                 message_type: Some("message".to_owned()),
                 subtype: None,
                 user: Some("U234".to_owned()),

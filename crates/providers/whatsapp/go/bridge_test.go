@@ -371,3 +371,102 @@ func TestOfflineSyncWindowTogglesBacklogFlag(t *testing.T) {
 		t.Fatal("expected offline sync flag to be cleared after OfflineSyncCompleted")
 	}
 }
+
+// editWireMessage builds the payload whatsmeow's BuildEdit sends for an edit.
+func editWireMessage(targetID, text string, editedAtMS int64) *waProto.Message {
+	return &waProto.Message{EditedMessage: &waProto.FutureProofMessage{Message: &waProto.Message{
+		ProtocolMessage: &waProto.ProtocolMessage{
+			Key:           &waProto.MessageKey{FromMe: proto.Bool(true), ID: proto.String(targetID)},
+			Type:          waProto.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			EditedMessage: &waProto.Message{Conversation: proto.String(text)},
+			TimestampMS:   proto.Int64(editedAtMS),
+		},
+	}}}
+}
+
+func TestDetectMessageEditLivePayload(t *testing.T) {
+	editedAt := time.Date(2026, 9, 29, 12, 0, 5, 0, time.UTC)
+	evt := &events.Message{
+		Info:       types.MessageInfo{ID: "EDIT-STANZA", Timestamp: editedAt.Add(time.Second)},
+		RawMessage: editWireMessage("ORIG-1", "fixed typo", editedAt.UnixMilli()),
+	}
+	evt.UnwrapRaw() // what whatsmeow does for live messages
+
+	edit, ok := detectMessageEdit(evt)
+	if !ok {
+		t.Fatal("live MESSAGE_EDIT must be detected")
+	}
+	if edit.targetID != "ORIG-1" {
+		t.Fatalf("edit must target the original message, got %q", edit.targetID)
+	}
+	if !edit.editedAt.Equal(editedAt) {
+		t.Fatalf("edit time must come from TimestampMS, got %s", edit.editedAt)
+	}
+	event, ok := buildEditEvent(nil, context.Background(), evt, edit, types.NewJID("40700000000", types.DefaultUserServer), "", "", false)
+	if !ok || event.Type != "edit" || event.ID != "ORIG-1" || event.Text != "fixed typo" || event.EditedAt == "" {
+		t.Fatalf("unexpected edit event: %+v", event)
+	}
+}
+
+func TestDetectMessageEditHistoryParsedPayload(t *testing.T) {
+	editedAt := time.Date(2026, 9, 29, 12, 0, 5, 0, time.UTC)
+	evt := &events.Message{
+		Info:       types.MessageInfo{ID: "EDIT-STANZA", Timestamp: editedAt},
+		RawMessage: editWireMessage("ORIG-2", "history edit", editedAt.UnixMilli()),
+	}
+	// Mirror ParseWebMessage: unwrap, then rewrite id and content in place.
+	evt.UnwrapRaw()
+	evt.Info.ID = evt.Message.GetProtocolMessage().GetKey().GetID()
+	evt.Message = evt.Message.GetProtocolMessage().GetEditedMessage()
+
+	edit, ok := detectMessageEdit(evt)
+	if !ok {
+		t.Fatal("history-parsed edit must be detected, not replayed as a new message")
+	}
+	if edit.targetID != "ORIG-2" {
+		t.Fatalf("history edit must keep the original id, got %q", edit.targetID)
+	}
+	if text, ok := editedText(edit.content); !ok || text != "history edit" {
+		t.Fatalf("unexpected edited text %q ok=%v", text, ok)
+	}
+
+	// The edit's timestamp must not count as conversation activity.
+	older := editedAt.Add(-time.Hour)
+	ts, preview := conversationActivity(nil, context.Background(), []*events.Message{
+		historyTestMessage(older, &waProto.Message{Conversation: proto.String("original")}),
+		evt,
+	}, 0)
+	if !ts.Equal(older) || preview != "original" {
+		t.Fatalf("history edit leaked into activity: ts=%s preview=%q", ts, preview)
+	}
+}
+
+func TestDetectMessageEditIgnoresPlainAndRevokeMessages(t *testing.T) {
+	plain := &events.Message{RawMessage: &waProto.Message{Conversation: proto.String("hello")}}
+	plain.UnwrapRaw()
+	if _, ok := detectMessageEdit(plain); ok {
+		t.Fatal("a normal text message is not an edit")
+	}
+
+	revoke := &events.Message{RawMessage: &waProto.Message{EditedMessage: &waProto.FutureProofMessage{Message: &waProto.Message{
+		ProtocolMessage: &waProto.ProtocolMessage{
+			Key:  &waProto.MessageKey{ID: proto.String("X")},
+			Type: waProto.ProtocolMessage_REVOKE.Enum(),
+		},
+	}}}}
+	revoke.UnwrapRaw()
+	if _, ok := detectMessageEdit(revoke); ok {
+		t.Fatal("an admin revoke shares the wrapper but is not an edit")
+	}
+}
+
+func TestEditedTextSupportsCaptionsOnly(t *testing.T) {
+	caption := &waProto.Message{ImageMessage: &waProto.ImageMessage{Caption: proto.String("new caption")}}
+	if text, ok := editedText(caption); !ok || text != "new caption" {
+		t.Fatalf("caption edits must be forwarded, got %q ok=%v", text, ok)
+	}
+	sticker := &waProto.Message{StickerMessage: &waProto.StickerMessage{}}
+	if _, ok := editedText(sticker); ok {
+		t.Fatal("non-text edits must be ignored")
+	}
+}

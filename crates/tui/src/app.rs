@@ -414,6 +414,33 @@ struct ForwardSendResult {
     elapsed: Duration,
 }
 
+/// A message the user is currently editing in the main composer.
+#[derive(Clone, Debug)]
+struct EditTarget {
+    account: ProviderId,
+    chat_id: ChatId,
+    message_id: MessageId,
+    /// Text of the message when editing started; submitting it unchanged is a
+    /// no-op.
+    original_text: String,
+    /// The unsent draft that was in the composer before editing started. It is
+    /// restored when the edit is cancelled so the user never loses typed text.
+    saved_draft: String,
+}
+
+/// Completion of a background `Provider::edit_message` call.
+#[derive(Debug)]
+struct EditSendResult {
+    account: ProviderId,
+    chat_id: ChatId,
+    message_id: MessageId,
+    /// The new content as displayed locally (mention tokens in display form).
+    content: Content,
+    /// On success, the provider-confirmed edit timestamp.
+    result: Result<Timestamp, String>,
+    elapsed: Duration,
+}
+
 struct ImageProtocolFetchResult {
     key: ImageProtocolKey,
     result: Result<Protocol, String>,
@@ -1172,6 +1199,7 @@ struct ImageProtocolKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActionMenuItem {
     Reply,
+    Edit,
     ViewThread,
     React,
     Forward,
@@ -1190,6 +1218,7 @@ impl ActionMenuItem {
     fn label(self) -> &'static str {
         match self {
             Self::Reply => "Reply",
+            Self::Edit => "Edit",
             Self::ViewThread => "View thread",
             Self::React => "React",
             Self::Forward => "Forward",
@@ -2599,6 +2628,12 @@ pub struct AppState {
     network_activity: HashMap<ProviderId, AccountNetworkActivity>,
     typing_indicators: HashMap<(ProviderId, ChatId), Vec<TypingIndicator>>,
     reply_to: Option<MessageId>,
+    /// The message being edited in the main composer, if any. Mutually
+    /// exclusive with `reply_to`.
+    editing: Option<EditTarget>,
+    /// Messages with an edit in flight; Edit is hidden for them until the
+    /// provider confirms or rejects the pending edit.
+    pending_edits: HashSet<MessageId>,
     /// Attachments queued in the compose tray, in send order. The typed
     /// compose text becomes the caption of the first one.
     pending_attachments: Vec<PendingAttachment>,
@@ -2715,6 +2750,8 @@ impl Default for AppState {
             network_activity: HashMap::new(),
             typing_indicators: HashMap::new(),
             reply_to: None,
+            editing: None,
+            pending_edits: HashSet::new(),
             pending_attachments: Vec::new(),
             compose_attach_button: None,
             compose_tray_hits: Vec::new(),
@@ -2945,6 +2982,10 @@ impl AppState {
         account_status_summary(&self.account_statuses)
     }
 
+    pub fn editing_message_id(&self) -> Option<&MessageId> {
+        self.editing.as_ref().map(|target| &target.message_id)
+    }
+
     pub fn reply_to(&self) -> Option<&MessageId> {
         self.reply_to.as_ref()
     }
@@ -3000,6 +3041,8 @@ pub struct App {
     media_download_rx: mpsc::UnboundedReceiver<MediaDownloadResult>,
     forward_send_tx: mpsc::UnboundedSender<ForwardSendResult>,
     forward_send_rx: mpsc::UnboundedReceiver<ForwardSendResult>,
+    edit_send_tx: mpsc::UnboundedSender<EditSendResult>,
+    edit_send_rx: mpsc::UnboundedReceiver<EditSendResult>,
     message_layout_cache: message_list::MessageLayoutCache,
     /// Monotonic counter identifying the current draw frame. Bumped once per
     /// [`Self::draw`] so the message layout cache can memoize its validity
@@ -3130,6 +3173,7 @@ impl App {
         let (video_probe_tx, video_probe_rx) = mpsc::unbounded_channel();
         let (media_download_tx, media_download_rx) = mpsc::unbounded_channel();
         let (forward_send_tx, forward_send_rx) = mpsc::unbounded_channel();
+        let (edit_send_tx, edit_send_rx) = mpsc::unbounded_channel();
         let (avatar_preview_tx, avatar_preview_rx) = mpsc::unbounded_channel();
         let (image_protocol_tx, image_protocol_rx) = mpsc::unbounded_channel();
         let (history_tx, history_rx) = mpsc::unbounded_channel();
@@ -3190,6 +3234,8 @@ impl App {
             media_download_rx,
             forward_send_tx,
             forward_send_rx,
+            edit_send_tx,
+            edit_send_rx,
             message_layout_cache: message_list::MessageLayoutCache::default(),
             draw_frame_counter: 0,
             avatar_preview_cache: HashMap::new(),
@@ -4663,6 +4709,7 @@ impl App {
         let file_picker_changed = self.drain_file_picker_results();
         let media_open_changed = self.drain_media_open_results();
         let forward_send_changed = self.drain_forward_sends().await?;
+        let edit_send_changed = self.drain_edit_sends().await?;
         let image_protocol_changed = self.drain_image_protocol_fetches();
         let avatar_preview_changed = self.drain_avatar_preview_fetches();
         let link_metadata_changed = self.drain_link_metadata_fetches();
@@ -4685,6 +4732,7 @@ impl App {
             || file_picker_changed
             || media_open_changed
             || forward_send_changed
+            || edit_send_changed
             || image_protocol_changed
             || avatar_preview_changed
             || link_metadata_changed
@@ -5531,7 +5579,7 @@ impl App {
             return area.height.min(3);
         }
 
-        let reply_extra = u16::from(self.state.reply_to.is_some());
+        let reply_extra = u16::from(self.state.reply_to.is_some() || self.state.editing.is_some());
         let attachment_extra = if self.state.pending_attachments.is_empty() {
             0
         } else {
@@ -5572,7 +5620,7 @@ impl App {
 
         let editor_area = {
             let mut constraints = Vec::new();
-            if self.state.reply_to.is_some() {
+            if self.state.reply_to.is_some() || self.state.editing.is_some() {
                 constraints.push(Constraint::Length(1));
             }
             let tray_visible =
@@ -5588,7 +5636,18 @@ impl App {
                 .split(inner);
             let mut area_index = 0;
 
-            if let Some(reply_to) = &self.state.reply_to {
+            if self.state.editing.is_some() {
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled("Editing message · ", self.theme.status_key()),
+                        Span::styled("Enter saves", self.theme.muted()),
+                        Span::raw("  "),
+                        Span::styled("Esc cancels", self.theme.status_key()),
+                    ])),
+                    areas[area_index],
+                );
+                area_index += 1;
+            } else if let Some(reply_to) = &self.state.reply_to {
                 let preview = self
                     .message_by_id(reply_to)
                     .map(reply_preview)
@@ -7195,7 +7254,10 @@ impl App {
                     hint("Enter sends text otherwise"),
                     hint("F1 help"),
                 ];
-                if self.state.reply_to.is_some() {
+                if self.state.editing.is_some() {
+                    hints.push(hint("Enter saves edit"));
+                    hints.push(hint("Esc cancels edit"));
+                } else if self.state.reply_to.is_some() {
                     hints.push(hint("Esc cancels reply"));
                 } else {
                     hints.push(hint("Esc returns to messages"));
@@ -9861,6 +9923,26 @@ impl App {
                 }
                 self.state.status = format!("message edited from {provider_id}");
             }
+            ProviderEvent::MessageContentEdited {
+                chat_id,
+                message_id,
+                content,
+                edited_at,
+            } => {
+                let started = Instant::now();
+                let account = provider_id.clone();
+                let applied = self
+                    .apply_content_edit(&account, &chat_id, &message_id, &content, edited_at)
+                    .await?;
+                self.log_slow_perf_duration(
+                    "provider.message_content_edited.apply",
+                    started,
+                    format!("provider={provider_id} chat={chat_id} applied={applied}"),
+                );
+                if applied {
+                    self.state.status = format!("message edited from {provider_id}");
+                }
+            }
             ProviderEvent::ChatUpdated(mut chat) => {
                 let merge_started = Instant::now();
                 let state_chat = self
@@ -10488,6 +10570,7 @@ impl App {
     ) -> Result<()> {
         match item {
             ActionMenuItem::Reply => self.start_reply(message_id),
+            ActionMenuItem::Edit => self.start_edit(message_id),
             ActionMenuItem::ViewThread => self.open_thread(message_id),
             ActionMenuItem::React => {
                 let allow_freeform = self
@@ -12787,6 +12870,8 @@ impl App {
                 } else if !self.state.pending_attachments.is_empty() {
                     let last = self.state.pending_attachments.len() - 1;
                     self.remove_pending_attachment(last);
+                } else if self.cancel_edit() {
+                    self.state.status = "edit cancelled".to_owned();
                 } else if self.state.reply_to.take().is_some() {
                     self.state.status = "reply cancelled".to_owned();
                 } else {
@@ -13342,6 +13427,10 @@ impl App {
     }
 
     async fn send_composed_message(&mut self) -> Result<()> {
+        if self.state.editing.is_some() {
+            self.submit_edit();
+            return Ok(());
+        }
         let text = self.state.compose_text.trim_end().to_owned();
         let auto_attachment = if self.state.pending_attachments.is_empty() {
             self.auto_attachment_from_compose_text(&text)?
@@ -14026,6 +14115,11 @@ impl App {
             return false;
         }
 
+        if self.cancel_edit() {
+            self.state.status = "edit cancelled".to_owned();
+            return false;
+        }
+
         if self.state.reply_to.take().is_some() {
             self.state.status = "reply cancelled".to_owned();
             return false;
@@ -14101,6 +14195,7 @@ impl App {
             self.state.reaction_picker = None;
             self.state.account_switcher = None;
             self.state.reply_to = None;
+            self.cancel_edit();
             self.state.thread_root = None;
             self.reset_history_window_state();
         }
@@ -14271,6 +14366,7 @@ impl App {
             self.state.reaction_picker = None;
             self.state.account_switcher = None;
             self.state.reply_to = None;
+            self.cancel_edit();
             self.state.thread_root = None;
             self.state.image_viewer = None;
             self.reset_history_window_state();
@@ -15146,8 +15242,12 @@ impl App {
                 self.state.status = "selected message was not found".to_owned();
                 return;
             };
-            let items =
-                action_menu_items_for_message(message, self.thread_reply_count(&message_id));
+            let can_edit = self.can_edit_message(message);
+            let items = action_menu_items_for_message(
+                message,
+                self.thread_reply_count(&message_id),
+                can_edit,
+            );
             self.state.reaction_picker = None;
             self.state.poll_vote_picker = None;
             self.state.forward_picker = None;
@@ -15163,6 +15263,9 @@ impl App {
     }
 
     fn start_reply(&mut self, message_id: MessageId) {
+        // Replying and editing share the composer banner; starting a reply
+        // abandons any in-progress edit (restoring the saved draft).
+        self.cancel_edit();
         let preview = self
             .message_by_id(&message_id)
             .map(reply_preview)
@@ -15170,6 +15273,251 @@ impl App {
         self.state.reply_to = Some(message_id);
         self.state.focus = FocusPane::Compose;
         self.state.status = format!("replying to {preview}");
+    }
+
+    /// Whether the "Edit" action should be offered for `message`, using the
+    /// shared core eligibility rule plus the platform identifiers the owning
+    /// provider needs to target the edit. Cheap: capability lookup only.
+    fn can_edit_message(&self, message: &Message) -> bool {
+        let Some(provider) = self.provider_for_id(&message.account) else {
+            return false;
+        };
+        chat_core::can_edit_message(&provider.outbound_capabilities(), message, Utc::now())
+            && !is_placeholder_whatsapp_message(message)
+            && !self.state.pending_edits.contains(&message.id)
+    }
+
+    /// Enters edit mode for one of the user's own text messages: the composer
+    /// is loaded with the original text and the unsent draft is saved so
+    /// cancelling restores it.
+    fn start_edit(&mut self, message_id: MessageId) {
+        let Some(message) = self.message_by_id(&message_id).cloned() else {
+            self.state.status = "selected message was not found".to_owned();
+            return;
+        };
+        if !self.can_edit_message(&message) {
+            self.state.status = "this message can no longer be edited".to_owned();
+            return;
+        }
+        let Some(original_text) = chat_core::editable_text(&message.content).map(str::to_owned)
+        else {
+            self.state.status = "only text messages can be edited".to_owned();
+            return;
+        };
+        // Switching edit targets keeps the draft saved by the first edit.
+        let saved_draft = match self.state.editing.take() {
+            Some(previous) => previous.saved_draft,
+            None => self.state.compose_text.clone(),
+        };
+        self.state.reply_to = None;
+        self.state.action_menu = None;
+        self.state.compose = compose_textarea_with_text(&original_text);
+        self.state.sync_compose_cache();
+        self.state.editing = Some(EditTarget {
+            account: message.account.clone(),
+            chat_id: message.chat_id.clone(),
+            message_id,
+            original_text,
+            saved_draft,
+        });
+        self.state.focus = FocusPane::Compose;
+        self.state.status = "editing message · Enter saves · Esc cancels".to_owned();
+    }
+
+    /// Leaves edit mode, restoring the draft that was in the composer before
+    /// editing started. Returns whether an edit was active.
+    fn cancel_edit(&mut self) -> bool {
+        let Some(target) = self.state.editing.take() else {
+            return false;
+        };
+        self.state.compose = compose_textarea_with_text(&target.saved_draft);
+        self.state.sync_compose_cache();
+        true
+    }
+
+    /// Validates the edited text and dispatches `Provider::edit_message` on a
+    /// background task. The composer is restored immediately; the drain step
+    /// applies the confirmed edit to storage and the visible timeline.
+    fn submit_edit(&mut self) {
+        let Some(target) = self.state.editing.clone() else {
+            return;
+        };
+        let text = self.state.compose_text.trim_end().to_owned();
+        if text.trim().is_empty() {
+            self.state.status = "edited message cannot be empty · Esc cancels the edit".to_owned();
+            return;
+        }
+        if text == target.original_text.trim_end() {
+            self.cancel_edit();
+            self.state.status = "message unchanged".to_owned();
+            return;
+        }
+        let Some(message) = self.message_by_id(&target.message_id).cloned() else {
+            self.cancel_edit();
+            self.state.status = "edited message is no longer loaded".to_owned();
+            return;
+        };
+        let Some(provider) = self
+            .providers
+            .iter()
+            .find(|provider| provider.id().as_ref() == target.account.as_ref())
+            .cloned()
+        else {
+            self.state.status = format!("no provider registered for {}", target.account);
+            return;
+        };
+        if !chat_core::can_edit_message(&provider.outbound_capabilities(), &message, Utc::now()) {
+            self.cancel_edit();
+            self.state.status = "this message can no longer be edited".to_owned();
+            return;
+        }
+        let members = self
+            .state
+            .chats
+            .iter()
+            .find(|chat| chat.account == target.account && chat.id == target.chat_id)
+            .cloned()
+            .map(|chat| self.mention_members_for_chat(&chat))
+            .unwrap_or_default();
+        let encoded = provider.encode_outbound_mentions(&text, &members);
+        let outbound = OutboundContent::with_mentions(
+            Content::Text(Arc::from(encoded.text.as_str())),
+            encoded.mentioned.clone(),
+        );
+        let display_content = Content::Text(Arc::from(text.as_str()));
+
+        self.cancel_edit();
+        self.state.pending_edits.insert(target.message_id.clone());
+        self.state.status = "saving edit…".to_owned();
+        self.log_perf_marker(
+            "edit_send.start",
+            format!(
+                "account={} chat={} message={}",
+                target.account, target.chat_id, target.message_id
+            ),
+        );
+        let tx = self.edit_send_tx.clone();
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = provider
+                .edit_message(&target.chat_id, &message, outbound)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(EditSendResult {
+                account: target.account,
+                chat_id: target.chat_id,
+                message_id: target.message_id,
+                content: display_content,
+                result,
+                elapsed: started.elapsed(),
+            });
+        });
+    }
+
+    /// Applies a confirmed text edit: narrow monotonic storage update, then an
+    /// in-place refresh of the visible message and sidebar preview. Shared by
+    /// local edit completions and `ProviderEvent::MessageContentEdited`.
+    /// Returns whether the edit changed stored state.
+    async fn apply_content_edit(
+        &mut self,
+        account: &ProviderId,
+        chat_id: &ChatId,
+        message_id: &MessageId,
+        content: &Content,
+        edited_at: Timestamp,
+    ) -> Result<bool> {
+        let Some(updated) = self
+            .store
+            .apply_message_edit(account, message_id, content, edited_at)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let mut replaced = false;
+        if let Some(existing) = self
+            .state
+            .messages
+            .iter_mut()
+            .find(|message| message.account == *account && message.id == *message_id)
+        {
+            *existing = updated.clone();
+            replaced = true;
+        }
+        if replaced {
+            self.clear_message_layout_cache();
+        } else if self
+            .state
+            .selected_chat()
+            .is_some_and(|chat| chat.account == *account && chat.id == *chat_id)
+        {
+            // Thread replies or messages outside the loaded window.
+            self.reload_selected_messages().await?;
+        }
+        self.refresh_chat_preview_from_message(&updated).await?;
+        Ok(true)
+    }
+
+    /// Drains completed background edits in bounded batches.
+    async fn drain_edit_sends(&mut self) -> Result<bool> {
+        let drain_started = Instant::now();
+        let mut changed = false;
+        let mut drained = 0;
+        let mut errors = 0;
+        let mut stale = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && (drained == 0 || drain_started.elapsed() < COMPLETION_DRAIN_BUDGET)
+            && let Ok(result) = self.edit_send_rx.try_recv()
+        {
+            drained += 1;
+            self.state.pending_edits.remove(&result.message_id);
+            let failed = result.result.is_err();
+            if failed {
+                errors += 1;
+            }
+            self.log_slow_perf_elapsed(
+                "edit_send.complete",
+                result.elapsed,
+                format!(
+                    "account={} chat={} message={} result={}",
+                    result.account,
+                    result.chat_id,
+                    result.message_id,
+                    if failed { "err" } else { "ok" }
+                ),
+            );
+            match result.result {
+                Ok(edited_at) => {
+                    let applied = self
+                        .apply_content_edit(
+                            &result.account,
+                            &result.chat_id,
+                            &result.message_id,
+                            &result.content,
+                            edited_at,
+                        )
+                        .await?;
+                    if !applied {
+                        stale += 1;
+                    }
+                    self.state.status = "message edited".to_owned();
+                }
+                Err(error) => {
+                    self.state.status = format!("edit failed: {error}");
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.log_slow_perf_duration(
+                "edit_send.drain",
+                drain_started,
+                format!(
+                    "count={drained} errors={errors} stale={stale} budget_exhausted={}",
+                    drain_started.elapsed() >= COMPLETION_DRAIN_BUDGET
+                ),
+            );
+        }
+        Ok(changed)
     }
 
     fn open_thread(&mut self, message_id: MessageId) {
@@ -16892,6 +17240,7 @@ impl App {
         self.state.reaction_picker = None;
         self.state.help_overlay = None;
         self.state.reply_to = None;
+        self.cancel_edit();
         self.state.thread_root = None;
         self.state.image_viewer = None;
         self.state.message_scroll = 0;
@@ -19344,6 +19693,7 @@ fn provider_event_label(event: &ProviderEvent) -> &'static str {
         ProviderEvent::Message { is_historical, .. } if *is_historical => "message.historical",
         ProviderEvent::Message { .. } => "message.live",
         ProviderEvent::MessageEdited { .. } => "message_edited",
+        ProviderEvent::MessageContentEdited { .. } => "message_content_edited",
         ProviderEvent::MessageDeleted { .. } => "message_deleted",
         ProviderEvent::ReactionChanged { .. } => "reaction_changed",
         ProviderEvent::Receipt { .. } => "receipt",
@@ -19461,6 +19811,19 @@ fn new_compose_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_placeholder_text("Type a message...");
     textarea.set_cursor_line_style(Style::default());
+    textarea
+}
+
+/// A main-composer textarea pre-filled with `text`, cursor at the end.
+fn compose_textarea_with_text(text: &str) -> TextArea<'static> {
+    if text.is_empty() {
+        return new_compose_textarea();
+    }
+    let mut textarea = TextArea::new(text.split('\n').map(str::to_owned).collect());
+    textarea.set_placeholder_text("Type a message...");
+    textarea.set_cursor_line_style(Style::default());
+    textarea.move_cursor(ratatui_textarea::CursorMove::Bottom);
+    textarea.move_cursor(ratatui_textarea::CursorMove::End);
     textarea
 }
 
@@ -20513,8 +20876,13 @@ fn thread_message_card_line_count(
 fn action_menu_items_for_message(
     message: &Message,
     thread_reply_count: usize,
+    can_edit: bool,
 ) -> Vec<ActionMenuItem> {
     let mut items = Vec::from(ActionMenuItem::COMMON);
+    if can_edit {
+        // Directly after Reply, matching the native apps' menu order.
+        items.insert(1, ActionMenuItem::Edit);
+    }
     if thread_reply_count > 0 || message.thread_id.as_ref() == Some(&message.id) {
         items.insert(1, ActionMenuItem::ViewThread);
     }
@@ -28195,7 +28563,7 @@ mod tests {
                 description: None,
                 image: None,
             }));
-        let link_items = action_menu_items_for_message(&link_message, 0);
+        let link_items = action_menu_items_for_message(&link_message, 0, false);
         assert!(link_items.contains(&ActionMenuItem::OpenLink));
         assert!(link_items.contains(&ActionMenuItem::Forward));
         assert!(!link_items.contains(&ActionMenuItem::OpenImage));
@@ -28203,7 +28571,7 @@ mod tests {
 
         let poll_content = Content::Poll(test_poll());
         let poll_message = test_message_with_content(poll_content.clone());
-        let poll_items = action_menu_items_for_message(&poll_message, 0);
+        let poll_items = action_menu_items_for_message(&poll_message, 0, false);
         assert!(poll_items.contains(&ActionMenuItem::VotePoll));
         assert!(poll_items.contains(&ActionMenuItem::Forward));
         assert!(!poll_items.contains(&ActionMenuItem::OpenLink));
@@ -28228,7 +28596,7 @@ mod tests {
             }))
         };
 
-        let cached = action_menu_items_for_message(&video(Some(local), Some(10)), 0);
+        let cached = action_menu_items_for_message(&video(Some(local), Some(10)), 0, false);
         assert!(cached.contains(&ActionMenuItem::PlayVideo));
         assert!(!cached.contains(&ActionMenuItem::OpenImage));
 
@@ -28238,10 +28606,11 @@ mod tests {
                 Some(chat_core::MEDIA_AUTO_DOWNLOAD_LIMIT_BYTES + 1),
             ),
             0,
+            false,
         );
         assert!(retrievable.contains(&ActionMenuItem::PlayVideo));
 
-        let unavailable = action_menu_items_for_message(&video(None, Some(10)), 0);
+        let unavailable = action_menu_items_for_message(&video(None, Some(10)), 0, false);
         assert!(!unavailable.contains(&ActionMenuItem::PlayVideo));
     }
 
@@ -28261,15 +28630,19 @@ mod tests {
         };
 
         let document = test_message_with_content(Content::File(media(Some(local.clone()))));
-        let items = action_menu_items_for_message(&document, 0);
+        let items = action_menu_items_for_message(&document, 0, false);
         assert!(items.contains(&ActionMenuItem::OpenFile));
         assert!(!items.contains(&ActionMenuItem::PlayVideo));
 
         let voice = test_message_with_content(Content::Audio(media(Some(local))));
-        assert!(action_menu_items_for_message(&voice, 0).contains(&ActionMenuItem::OpenFile));
+        assert!(
+            action_menu_items_for_message(&voice, 0, false).contains(&ActionMenuItem::OpenFile)
+        );
 
         let missing = test_message_with_content(Content::File(media(None)));
-        assert!(!action_menu_items_for_message(&missing, 0).contains(&ActionMenuItem::OpenFile));
+        assert!(
+            !action_menu_items_for_message(&missing, 0, false).contains(&ActionMenuItem::OpenFile)
+        );
     }
 
     #[test]
@@ -28734,11 +29107,302 @@ mod tests {
                 && app.pending_media_previews.is_empty()
                 && app.pending_avatar_previews.is_empty()
                 && app.chat_persists_in_flight() == 0
+                && app.state.pending_edits.is_empty()
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        Ok(())
+    }
+
+    /// Opens the selected mock chat and returns the newest own text message.
+    async fn open_chat_with_own_text_message(app: &mut App) -> Result<Message> {
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        drain_async_app_work(app).await?;
+        for _ in 0..app.state.visible_chat_indices.len() {
+            if let Some(message) = app
+                .state
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.is_from_me && app.can_edit_message(message))
+                .cloned()
+            {
+                return Ok(message);
+            }
+            let next = app
+                .state
+                .visible_chat_indices
+                .iter()
+                .position(|index| *index == app.state.selected_chat_index())
+                .map_or(0, |position| position + 1);
+            if !app.select_visible_position(next) {
+                break;
+            }
+            app.reload_selected_messages_after_navigation_with_options(true, false)
+                .await?;
+            drain_async_app_work(app).await?;
+        }
+        anyhow::bail!("mock data should contain an editable own text message")
+    }
+
+    // Two-phase contract for editing: submitting marks the edit as saving and
+    // leaves the visible text untouched until the provider confirms; draining
+    // the background completion applies the new text, edited time, and storage.
+    #[tokio::test]
+    async fn edit_message_shows_saving_state_then_applies_after_drain() -> Result<()> {
+        let mut app = test_app().await?;
+        let target = open_chat_with_own_text_message(&mut app).await?;
+        let original = chat_core::editable_text(&target.content)
+            .unwrap()
+            .to_owned();
+
+        app.start_edit(target.id.clone());
+        assert_eq!(app.state.editing_message_id(), Some(&target.id));
+        assert_eq!(app.state.compose_text, original);
+        assert_eq!(app.state.focus, FocusPane::Compose);
+
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('!'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        // Phase 1: saving, composer restored, visible text not yet changed.
+        assert!(app.state.editing_message_id().is_none());
+        assert!(app.state.pending_edits.contains(&target.id));
+        assert!(
+            !app.can_edit_message(&target),
+            "no double edit while saving"
+        );
+        assert!(app.state.compose_text.is_empty());
+        let visible = app
+            .state
+            .messages
+            .iter()
+            .find(|message| message.id == target.id)
+            .unwrap();
+        assert_eq!(
+            chat_core::editable_text(&visible.content),
+            Some(original.as_str())
+        );
+
+        // Phase 2: confirmed edit applied in place and persisted.
+        drain_async_app_work(&mut app).await?;
+        let expected = format!("{original}!");
+        assert!(app.state.pending_edits.is_empty());
+        let visible = app
+            .state
+            .messages
+            .iter()
+            .find(|message| message.id == target.id)
+            .unwrap();
+        assert_eq!(
+            chat_core::editable_text(&visible.content),
+            Some(expected.as_str())
+        );
+        assert!(visible.edited_at.is_some());
+        assert_eq!(
+            visible.timestamp, target.timestamp,
+            "edit keeps timeline position"
+        );
+        let stored = app
+            .store
+            .get_messages_for_chat(&target.account, &target.chat_id, None, 500)
+            .await?;
+        let stored = stored
+            .iter()
+            .find(|message| message.id == target.id)
+            .unwrap();
+        assert_eq!(
+            chat_core::editable_text(&stored.content),
+            Some(expected.as_str())
+        );
+        assert!(stored.edited_at.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_edit_restores_the_unsent_draft() -> Result<()> {
+        let mut app = test_app().await?;
+        let target = open_chat_with_own_text_message(&mut app).await?;
+        app.state.compose = compose_textarea_with_text("half-typed draft");
+        app.state.sync_compose_cache();
+
+        app.start_edit(target.id.clone());
+        assert_ne!(app.state.compose_text, "half-typed draft");
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+
+        assert!(app.state.editing_message_id().is_none());
+        assert_eq!(app.state.compose_text, "half-typed draft");
+        assert!(app.state.pending_edits.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_action_is_hidden_for_other_peoples_messages() -> Result<()> {
+        let mut app = test_app().await?;
+        let own = open_chat_with_own_text_message(&mut app).await?;
+        assert!(app.can_edit_message(&own));
+        assert!(action_menu_items_for_message(&own, 0, true).contains(&ActionMenuItem::Edit));
+        assert!(!action_menu_items_for_message(&own, 0, false).contains(&ActionMenuItem::Edit));
+
+        let mut foreign = own.clone();
+        foreign.is_from_me = false;
+        assert!(!app.can_edit_message(&foreign));
+
+        let mut unknown_provider = own.clone();
+        unknown_provider.account = ProviderId::from("missing-account");
+        assert!(!app.can_edit_message(&unknown_provider));
+        Ok(())
+    }
+
+    // A completion that lands after the user navigated away is still
+    // persisted, but must not reload or rewrite the newly selected chat.
+    #[tokio::test]
+    async fn stale_edit_completion_persists_without_touching_new_chat() -> Result<()> {
+        let mut app = test_app().await?;
+        let target = open_chat_with_own_text_message(&mut app).await?;
+        let original = chat_core::editable_text(&target.content)
+            .unwrap()
+            .to_owned();
+
+        app.start_edit(target.id.clone());
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('?'), KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert!(app.state.pending_edits.contains(&target.id));
+
+        // Navigate to a different chat before the completion is drained.
+        let current = app
+            .state
+            .visible_chat_indices
+            .iter()
+            .position(|index| *index == app.state.selected_chat_index())
+            .unwrap_or(0);
+        let other = if current == 0 { 1 } else { 0 };
+        assert!(app.select_visible_position(other));
+        app.reload_selected_messages_after_navigation_with_options(true, false)
+            .await?;
+        let selected = app.state.selected_chat().cloned().unwrap();
+        assert!(selected.id != target.chat_id || selected.account != target.account);
+
+        drain_async_app_work(&mut app).await?;
+        assert!(app.state.pending_edits.is_empty());
+        assert_eq!(
+            app.state.selected_chat().map(|chat| chat.id.clone()),
+            Some(selected.id.clone())
+        );
+        assert!(
+            app.state
+                .messages
+                .iter()
+                .all(|message| message.chat_id == selected.id),
+            "new chat's timeline must not receive the stale edit target"
+        );
+        let stored = app
+            .store
+            .get_messages_for_chat(&target.account, &target.chat_id, None, 500)
+            .await?;
+        let stored = stored
+            .iter()
+            .find(|message| message.id == target.id)
+            .unwrap();
+        let expected = format!("{original}?");
+        assert_eq!(
+            chat_core::editable_text(&stored.content),
+            Some(expected.as_str())
+        );
+        Ok(())
+    }
+
+    // Inbound edits update the visible message in place; the sidebar preview
+    // only changes when the edited message is the chat's latest one.
+    #[tokio::test]
+    async fn inbound_content_edit_updates_preview_only_for_latest_message() -> Result<()> {
+        let mut app = test_app().await?;
+        let _ = open_chat_with_own_text_message(&mut app).await?;
+        let mut texts: Vec<Message> = app
+            .state
+            .messages
+            .iter()
+            .filter(|message| chat_core::editable_text(&message.content).is_some())
+            .cloned()
+            .collect();
+        texts.sort_by_key(|message| message.timestamp);
+        let older = texts
+            .first()
+            .cloned()
+            .expect("mock chat has a text message");
+        // Deliver a known-newest text message so "latest" is unambiguous even
+        // when the mock chat ends with a card or media message.
+        let newest_at = app
+            .state
+            .messages
+            .iter()
+            .map(|message| message.timestamp)
+            .max()
+            .unwrap_or_else(Utc::now);
+        let mut latest = older.clone();
+        latest.id = MessageId::from("mock:msg:edit-preview:latest");
+        latest.content = Content::Text(Arc::from("latest original"));
+        latest.timestamp = newest_at + chrono::Duration::minutes(1);
+        latest.edited_at = None;
+        latest.thread_id = None;
+        app.handle_provider_event(
+            latest.account.clone(),
+            ProviderEvent::Message {
+                message: latest.clone(),
+                is_historical: false,
+            },
+        )
+        .await?;
+        drain_async_app_work(&mut app).await?;
+        let chat_preview = |app: &App| {
+            app.state
+                .chats
+                .iter()
+                .find(|chat| chat.account == latest.account && chat.id == latest.chat_id)
+                .and_then(|chat| chat.last_message_preview.clone())
+        };
+        let preview_before = chat_preview(&app);
+
+        app.handle_provider_event(
+            older.account.clone(),
+            ProviderEvent::MessageContentEdited {
+                chat_id: older.chat_id.clone(),
+                message_id: older.id.clone(),
+                content: Content::Text(Arc::from("older fixed")),
+                edited_at: Utc::now(),
+            },
+        )
+        .await?;
+        let visible = app.message_by_id(&older.id).unwrap();
+        assert_eq!(
+            chat_core::editable_text(&visible.content),
+            Some("older fixed")
+        );
+        assert!(visible.edited_at.is_some());
+        assert_eq!(chat_preview(&app), preview_before);
+
+        app.handle_provider_event(
+            latest.account.clone(),
+            ProviderEvent::MessageContentEdited {
+                chat_id: latest.chat_id.clone(),
+                message_id: latest.id.clone(),
+                content: Content::Text(Arc::from("latest fixed")),
+                edited_at: Utc::now(),
+            },
+        )
+        .await?;
+        assert!(
+            chat_preview(&app)
+                .as_deref()
+                .is_some_and(|preview| preview.contains("latest fixed"))
+        );
         Ok(())
     }
 

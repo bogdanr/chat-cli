@@ -930,6 +930,75 @@ impl Store {
         upsert_message_on_conn(&conn, msg)
     }
 
+    /// Apply a text edit to a stored message as a narrow, monotonic update.
+    ///
+    /// Only the content columns and `edited_at` change; reactions, receipts,
+    /// timestamps and ordering are left untouched. The update is skipped when
+    /// the message is unknown, has been deleted, or already carries an edit at
+    /// or after `edited_at`, so replaying the same or an older edit is a no-op.
+    /// For media messages a text edit updates the caption.
+    ///
+    /// Returns the updated message when a row changed.
+    pub async fn apply_message_edit(
+        &self,
+        account_id: &ProviderId,
+        message_id: &MessageId,
+        content: &Content,
+        edited_at: Timestamp,
+    ) -> Result<Option<Message>> {
+        let conn = self.conn.lock().await;
+        let edited_millis = edited_at.timestamp_millis();
+        let changed = match content {
+            Content::Text(text) => conn.execute(
+                "UPDATE messages SET
+                    content_type = CASE WHEN content_type IN ('image','video','audio','file','sticker')
+                        THEN content_type ELSE 'text' END,
+                    content_text = CASE WHEN content_type IN ('image','video','audio','file','sticker')
+                        THEN content_text ELSE ?1 END,
+                    content_caption = CASE WHEN content_type IN ('image','video','audio','file','sticker')
+                        THEN ?1 ELSE NULL END,
+                    edited_at = ?2
+                 WHERE id = ?3 AND account_id = ?4 AND content_type != 'deleted'
+                    AND (edited_at IS NULL OR edited_at < ?2)",
+                params![text.as_ref(), edited_millis, message_id.as_ref(), account_id.as_ref()],
+            )?,
+            other => {
+                let stored = StoredContent::from_content(other);
+                conn.execute(
+                    "UPDATE messages SET content_type = ?1, content_text = ?2, content_caption = ?3,
+                        edited_at = ?4
+                     WHERE id = ?5 AND account_id = ?6 AND content_type != 'deleted'
+                        AND (edited_at IS NULL OR edited_at < ?4)",
+                    params![
+                        stored.kind,
+                        stored.text,
+                        stored.caption,
+                        edited_millis,
+                        message_id.as_ref(),
+                        account_id.as_ref()
+                    ],
+                )?
+            }
+        };
+        if changed == 0 {
+            return Ok(None);
+        }
+        let mut message = conn
+            .query_row(
+                "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
+                        content_type, content_text, content_caption, media_id, media_filename, media_mime,
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
+                 FROM messages WHERE id = ?1 AND account_id = ?2",
+                params![message_id.as_ref(), account_id.as_ref()],
+                message_from_row,
+            )
+            .optional()?;
+        if let Some(message) = &mut message {
+            hydrate_reactions_and_receipts(&conn, message)?;
+        }
+        Ok(message)
+    }
+
     pub async fn upsert_messages(&self, messages: &[Message]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -2227,10 +2296,21 @@ fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
                 sender_id = excluded.sender_id,
                 sender_name = excluded.sender_name,
                 sender_avatar = COALESCE(excluded.sender_avatar, messages.sender_avatar),
-                edited_at = excluded.edited_at,
+                -- Never let a stale snapshot (e.g. a history replay of the
+                -- original text) regress a newer text edit already applied.
+                edited_at = CASE WHEN messages.edited_at IS NOT NULL
+                        AND excluded.content_type = messages.content_type
+                        AND (excluded.edited_at IS NULL OR excluded.edited_at < messages.edited_at)
+                    THEN messages.edited_at ELSE excluded.edited_at END,
                 content_type = excluded.content_type,
-                content_text = excluded.content_text,
-                content_caption = excluded.content_caption,
+                content_text = CASE WHEN messages.edited_at IS NOT NULL
+                        AND excluded.content_type = messages.content_type
+                        AND (excluded.edited_at IS NULL OR excluded.edited_at < messages.edited_at)
+                    THEN messages.content_text ELSE excluded.content_text END,
+                content_caption = CASE WHEN messages.edited_at IS NOT NULL
+                        AND excluded.content_type = messages.content_type
+                        AND (excluded.edited_at IS NULL OR excluded.edited_at < messages.edited_at)
+                    THEN messages.content_caption ELSE excluded.content_caption END,
                 media_id = excluded.media_id,
                 media_filename = excluded.media_filename,
                 media_mime = excluded.media_mime,
@@ -3877,6 +3957,183 @@ mod tests {
             0
         );
         assert!(store.unread_thread_summaries(&account).await?.is_empty());
+        Ok(())
+    }
+
+    fn edit_test_message(id: &str, text: &str, timestamp: Timestamp) -> Message {
+        Message {
+            id: arc_str(id.to_owned()),
+            chat_id: arc_str("chat-edit".to_owned()),
+            account: arc_str("slack:T1".to_owned()),
+            sender: Sender {
+                platform_id: arc_str("U1".to_owned()),
+                display_name: arc_str("Me".to_owned()),
+                avatar: None,
+            },
+            timestamp,
+            edited_at: None,
+            content: Content::Text(arc_str(text.to_owned())),
+            reply_to: None,
+            thread_id: None,
+            reactions: vec![Reaction {
+                emoji: arc_str("👍".to_owned()),
+                senders: vec![arc_str("U2".to_owned())],
+            }],
+            receipts: vec![Receipt {
+                platform_id: arc_str("U2".to_owned()),
+                kind: ReceiptKind::Read,
+                at: Some(timestamp),
+            }],
+            is_from_me: true,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_message_edit_updates_text_and_keeps_reactions() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let sent_at = Utc::now() - chrono::Duration::minutes(5);
+        let message = edit_test_message("m1", "helo", sent_at);
+        store.upsert_message(&message).await?;
+
+        let edited_at = Utc::now();
+        let updated = store
+            .apply_message_edit(
+                &message.account,
+                &message.id,
+                &Content::Text(arc_str("hello".to_owned())),
+                edited_at,
+            )
+            .await?
+            .expect("edit applied");
+        assert!(matches!(&updated.content, Content::Text(text) if text.as_ref() == "hello"));
+        assert_eq!(
+            updated.edited_at.map(|t| t.timestamp_millis()),
+            Some(edited_at.timestamp_millis())
+        );
+        assert_eq!(
+            updated.timestamp.timestamp_millis(),
+            sent_at.timestamp_millis()
+        );
+        assert_eq!(updated.reactions.len(), 1);
+        assert_eq!(updated.receipts.len(), 1);
+
+        let latest = store.latest_message_for_each_chat().await?;
+        assert!(matches!(
+            &latest[0].message.content,
+            Content::Text(text) if text.as_ref() == "hello"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn apply_message_edit_is_monotonic_and_ignores_unknown_rows() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let sent_at = Utc::now() - chrono::Duration::minutes(5);
+        let message = edit_test_message("m1", "v1", sent_at);
+        store.upsert_message(&message).await?;
+        let newer = Utc::now();
+        let older = newer - chrono::Duration::minutes(1);
+
+        assert!(
+            store
+                .apply_message_edit(
+                    &message.account,
+                    &arc_str("missing".to_owned()),
+                    &Content::Text(arc_str("x".to_owned())),
+                    newer,
+                )
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .apply_message_edit(
+                    &message.account,
+                    &message.id,
+                    &Content::Text(arc_str("v3".to_owned())),
+                    newer,
+                )
+                .await?
+                .is_some()
+        );
+        // Replaying the same edit and applying an older edit are no-ops.
+        for (text, at) in [("v3", newer), ("v2", older)] {
+            assert!(
+                store
+                    .apply_message_edit(
+                        &message.account,
+                        &message.id,
+                        &Content::Text(arc_str(text.to_owned())),
+                        at,
+                    )
+                    .await?
+                    .is_none()
+            );
+        }
+        let stored = store
+            .get_messages_for_chat(&message.account, &message.chat_id, None, 10)
+            .await?;
+        assert!(matches!(&stored[0].content, Content::Text(text) if text.as_ref() == "v3"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_upsert_does_not_regress_applied_edit() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let sent_at = Utc::now() - chrono::Duration::minutes(5);
+        let original = edit_test_message("m1", "original", sent_at);
+        store.upsert_message(&original).await?;
+        let edited_at = Utc::now();
+        store
+            .apply_message_edit(
+                &original.account,
+                &original.id,
+                &Content::Text(arc_str("edited".to_owned())),
+                edited_at,
+            )
+            .await?;
+
+        // A history replay of the original (no edit marker) must not revert it.
+        store.upsert_message(&original).await?;
+        let stored = store
+            .get_messages_for_chat(&original.account, &original.chat_id, None, 10)
+            .await?;
+        assert!(matches!(&stored[0].content, Content::Text(text) if text.as_ref() == "edited"));
+        assert!(stored[0].edited_at.is_some());
+
+        // A newer snapshot carrying its own later edit still wins.
+        let mut newer = original.clone();
+        newer.content = Content::Text(arc_str("edited again".to_owned()));
+        newer.edited_at = Some(edited_at + chrono::Duration::minutes(1));
+        store.upsert_message(&newer).await?;
+        let stored = store
+            .get_messages_for_chat(&original.account, &original.chat_id, None, 10)
+            .await?;
+        assert!(
+            matches!(&stored[0].content, Content::Text(text) if text.as_ref() == "edited again")
+        );
+
+        // Deleting still overrides an edited message.
+        let mut deleted = original.clone();
+        deleted.content = Content::Deleted;
+        store.upsert_message(&deleted).await?;
+        let stored = store
+            .get_messages_for_chat(&original.account, &original.chat_id, None, 10)
+            .await?;
+        assert!(matches!(stored[0].content, Content::Deleted));
+        assert!(
+            store
+                .apply_message_edit(
+                    &original.account,
+                    &original.id,
+                    &Content::Text(arc_str("zombie".to_owned())),
+                    Utc::now() + chrono::Duration::minutes(5),
+                )
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 }

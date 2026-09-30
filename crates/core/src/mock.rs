@@ -60,9 +60,9 @@ impl MockProvider {
         self.read_messages().clone()
     }
 
-    /// Mentions attached to each message sent through this provider, in send
-    /// order. Used by tests and the `--mock-provider` demo to exercise the
-    /// outbound mention path.
+    /// Mentions attached to each message sent (or edited) through this
+    /// provider, in call order. Used by tests and the `--mock-provider` demo to
+    /// exercise the outbound mention path.
     pub fn sent_mentions(&self) -> Vec<Vec<Mention>> {
         self.sent_mentions
             .read()
@@ -283,6 +283,51 @@ impl Provider for MockProvider {
         } else {
             bail!("mock message not found for poll vote: {message_id}")
         }
+    }
+
+    async fn edit_message(
+        &self,
+        chat_id: &ChatId,
+        message: &Message,
+        outbound: OutboundContent,
+    ) -> Result<Timestamp> {
+        let OutboundContent { content, mentions } = outbound;
+        if !matches!(content, Content::Text(_)) {
+            bail!("mock provider can only edit text messages");
+        }
+        let message_id = message.id.clone();
+        let edited_at = Utc::now();
+        let found = {
+            let mut messages = self.write_messages();
+            match messages
+                .iter_mut()
+                .find(|candidate| candidate.chat_id == *chat_id && candidate.id == message_id)
+            {
+                Some(stored) if !stored.is_from_me => {
+                    bail!("mock provider can only edit your own messages")
+                }
+                Some(stored) => {
+                    stored.content = content.clone();
+                    stored.edited_at = Some(edited_at);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !found {
+            bail!("mock message not found for edit: {message_id}");
+        }
+        self.sent_mentions
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(mentions);
+        self.events.send(ProviderEvent::MessageContentEdited {
+            chat_id: chat_id.clone(),
+            message_id,
+            content,
+            edited_at,
+        });
+        Ok(edited_at)
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<Message>> {

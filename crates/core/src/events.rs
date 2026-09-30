@@ -31,6 +31,19 @@ pub enum ProviderEvent {
     MessageEdited {
         message: Message,
     },
+    /// The text content of an existing message was edited by its author.
+    ///
+    /// Unlike [`ProviderEvent::MessageEdited`] (a generic "message changed"
+    /// snapshot also used for reactions and poll votes), this carries only the
+    /// target identity, the new content and the edit time, so consumers can
+    /// apply it as a narrow, monotonic update without touching reactions or
+    /// receipts.
+    MessageContentEdited {
+        chat_id: ChatId,
+        message_id: MessageId,
+        content: Content,
+        edited_at: Timestamp,
+    },
     MessageDeleted {
         chat_id: ChatId,
         message_id: MessageId,

@@ -10,6 +10,7 @@ pub use events::{
 pub use mock::MockProvider;
 pub use provider::{
     AuthSubmission, AuthSubmissionMode, OutboundCapabilities, OutboundContent, OutboundMentions,
-    Provider, ResolvedMention, resolve_mention_tokens, rewrite_mention_tokens,
+    Provider, ResolvedMention, can_edit_message, editable_text, resolve_mention_tokens,
+    rewrite_mention_tokens,
 };
 pub use types::*;

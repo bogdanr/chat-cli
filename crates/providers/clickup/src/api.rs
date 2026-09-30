@@ -375,6 +375,15 @@ pub trait ClickUpApiClient: Send + Sync {
         content: &str,
     ) -> Result<WireMessage>;
 
+    /// Replaces the text content of an existing message the caller authored.
+    async fn update_message(
+        &self,
+        authorization: &str,
+        workspace_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<()>;
+
     /// Lists reactions on a message.
     async fn message_reactions(
         &self,
@@ -653,6 +662,29 @@ impl ClickUpApiClient for ClickUpHttpClient {
             let url =
                 format!("{API_BASE}/api/v3/workspaces/{workspace}/chat/messages/{message}/replies");
             http::request_json(Method::Post, &url, &authorization, Some(&body))
+        })
+        .await
+    }
+
+    async fn update_message(
+        &self,
+        authorization: &str,
+        workspace_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<()> {
+        let authorization = authorization.to_owned();
+        let workspace = encode_segment(workspace_id);
+        let message = encode_segment(message_id);
+        let body = serde_json::json!({
+            "content": content,
+            "content_format": "text/md",
+        });
+        // The response body shape is not relied upon: the provider applies the
+        // confirmed text locally and polling reconciles any server-side drift.
+        blocking("update_message", move || {
+            let url = format!("{API_BASE}/api/v3/workspaces/{workspace}/chat/messages/{message}");
+            http::request_empty(Method::Patch, &url, &authorization, Some(&body))
         })
         .await
     }

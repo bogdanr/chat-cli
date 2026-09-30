@@ -215,6 +215,10 @@ type bridgeEvent struct {
 	GroupOnlyAdminsSend      bool   `json:"group_only_admins_send,omitempty"`
 	GroupOnlyAdminsEdit      bool   `json:"group_only_admins_edit,omitempty"`
 	GroupDisappearingSeconds uint32 `json:"group_disappearing_seconds,omitempty"`
+
+	// EditedAt is set on `edit` events: the time the edit was made, while ID
+	// names the original (edited) message and Text carries the new content.
+	EditedAt string `json:"edited_at,omitempty"`
 }
 
 var (
@@ -623,6 +627,73 @@ func C_SendMedia(clientID C.uint64_t, chatJID *C.char, path *C.char, mimeType *C
 		MediaSize:      uint64(info.Size()),
 		MediaLocalPath: pathRaw,
 		Caption:        captionRaw,
+	})
+}
+
+// C_EditMessage replaces the text of one of our own messages. The new body is
+// built exactly like a fresh text send (so mentions survive) and wrapped with
+// whatsmeow's BuildEdit. The result is an `edit` event naming the original
+// message id; errors use the same `error` shape as C_SendText.
+//
+//export C_EditMessage
+func C_EditMessage(clientID C.uint64_t, chatJID *C.char, messageID *C.char, text *C.char, mentionedJIDs *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	chatRaw := C.GoString(chatJID)
+	targetID := strings.TrimSpace(C.GoString(messageID))
+	body := C.GoString(text)
+	mentioned := parseMentionedJIDs(C.GoString(mentionedJIDs))
+	if targetID == "" {
+		return cJSON(bridgeEvent{Type: "error", Message: "cannot edit a WhatsApp message without its message ID"})
+	}
+	if strings.TrimSpace(body) == "" {
+		return cJSON(bridgeEvent{Type: "error", Message: "cannot save an empty WhatsApp message"})
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{
+			Type:      "edit",
+			ID:        targetID,
+			ChatJID:   chatRaw,
+			SenderJID: "test-device@s.whatsapp.net",
+			Text:      body,
+			Timestamp: now,
+			EditedAt:  now,
+			FromMe:    true,
+			IsGroup:   strings.Contains(chatRaw, "@g.us"),
+		})
+	}
+	if c.wa == nil {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+
+	jid, err := types.ParseJID(chatRaw)
+	if err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
+	}
+
+	content := buildTextMessage(c, body, "", "", "", mentioned)
+	if _, err := c.wa.SendMessage(context.Background(), jid, c.wa.BuildEdit(jid, targetID, content)); err != nil {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("edit WhatsApp message: %s", describeSendError(err))})
+	}
+	c.log("edited WhatsApp message id=%s chat=%s mentions=%d", targetID, jid.String(), len(mentioned))
+
+	canonicalChat := canonicalJID(c, context.Background(), jid)
+	return cJSON(bridgeEvent{
+		Type:      "edit",
+		ID:        targetID,
+		ChatJID:   canonicalChat.String(),
+		SenderJID: c.ownJID(),
+		Text:      body,
+		Timestamp: now,
+		EditedAt:  now,
+		FromMe:    true,
+		IsGroup:   strings.HasSuffix(jid.Server, "g.us"),
 	})
 }
 
@@ -1591,6 +1662,17 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	}
 	mentionsMe := !message.Info.IsFromMe && messageMentionsUser(messagePayload, ownJID)
 
+	// Edits must be recognised before anything else: live edits arrive as a
+	// MESSAGE_EDIT protocol message (previously dropped as unsupported) and
+	// history-synced edits are pre-rewritten by ParseWebMessage into a normal
+	// looking message stamped with the edit time (previously duplicated).
+	if edit, ok := detectMessageEdit(message); ok {
+		if event, ok := buildEditEvent(c, ctx, message, edit, chatJID, chatName, senderName, isGroup); ok {
+			emit(event)
+		}
+		return
+	}
+
 	if reaction := messagePayload.GetReactionMessage(); reaction != nil {
 		emitReactionMessageEvent(c, message, reaction, chatJID, chatName, senderName, isGroup)
 		return
@@ -1672,6 +1754,98 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 			go c.fetchAndEmitProfile(ctx, message.Info.SenderAlt, senderName, false)
 		}
 	}
+}
+
+// messageEdit describes an edit found in an incoming WhatsApp message.
+type messageEdit struct {
+	targetID string
+	content  *waProto.Message
+	editedAt time.Time
+}
+
+// detectMessageEdit recognises both edit shapes whatsmeow produces:
+//   - live: Message is a MESSAGE_EDIT ProtocolMessage whose Key names the
+//     target and whose EditedMessage carries the new content;
+//   - history: ParseWebMessage has already replaced Info.ID with the target
+//     and Message with the new content, so the raw payload is what still
+//     identifies it as an edit.
+//
+// Admin revokes share the EditedMessage wrapper, so the protocol type is
+// always checked rather than relying on IsEdit alone.
+func detectMessageEdit(message *events.Message) (messageEdit, bool) {
+	if message == nil {
+		return messageEdit{}, false
+	}
+	if protocol := displayableMessage(message.Message).GetProtocolMessage(); protocol.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+		targetID := protocol.GetKey().GetID()
+		if targetID == "" || protocol.GetEditedMessage() == nil {
+			return messageEdit{}, false
+		}
+		return messageEdit{
+			targetID: targetID,
+			content:  protocol.GetEditedMessage(),
+			editedAt: editTimestamp(protocol, message.Info.Timestamp),
+		}, true
+	}
+	if raw := displayableMessage(message.RawMessage).GetProtocolMessage(); raw.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+		if message.Info.ID == "" || message.Message == nil {
+			return messageEdit{}, false
+		}
+		return messageEdit{
+			targetID: message.Info.ID,
+			content:  message.Message,
+			editedAt: editTimestamp(raw, message.Info.Timestamp),
+		}, true
+	}
+	return messageEdit{}, false
+}
+
+func editTimestamp(protocol *waProto.ProtocolMessage, fallback time.Time) time.Time {
+	if ms := protocol.GetTimestampMS(); ms > 0 {
+		return time.UnixMilli(ms)
+	}
+	return fallback
+}
+
+// editedText returns the user-visible text of edited content. Only text and
+// captions can be edited on WhatsApp; anything else is ignored.
+func editedText(content *waProto.Message) (string, bool) {
+	content = displayableMessage(content)
+	switch {
+	case content == nil:
+		return "", false
+	case content.Conversation != nil:
+		return content.GetConversation(), true
+	case content.GetExtendedTextMessage() != nil:
+		return content.GetExtendedTextMessage().GetText(), true
+	case content.GetImageMessage() != nil:
+		return content.GetImageMessage().GetCaption(), true
+	case content.GetVideoMessage() != nil:
+		return content.GetVideoMessage().GetCaption(), true
+	case content.GetDocumentMessage() != nil:
+		return content.GetDocumentMessage().GetCaption(), true
+	}
+	return "", false
+}
+
+func buildEditEvent(c *client, ctx context.Context, message *events.Message, edit messageEdit, chatJID types.JID, chatName, senderName string, isGroup bool) (bridgeEvent, bool) {
+	text, ok := editedText(edit.content)
+	if !ok {
+		return bridgeEvent{}, false
+	}
+	return bridgeEvent{
+		Type:       "edit",
+		ID:         edit.targetID,
+		ChatJID:    canonicalJIDString(c, ctx, chatJID),
+		ChatName:   chatName,
+		SenderJID:  canonicalJIDString(c, ctx, message.Info.Sender),
+		SenderName: senderName,
+		Text:       resolveMentions(c, ctx, text, messageMentionedJID(edit.content)),
+		Timestamp:  message.Info.Timestamp.UTC().Format(time.RFC3339Nano),
+		EditedAt:   edit.editedAt.UTC().Format(time.RFC3339Nano),
+		FromMe:     message.Info.IsFromMe,
+		IsGroup:    isGroup,
+	}, true
 }
 
 func emitReactionMessageEvent(c *client, message *events.Message, reaction *waProto.ReactionMessage, chatJID types.JID, chatName, senderName string, isGroup bool) {
@@ -2692,6 +2866,10 @@ func conversationActivity(c *client, ctx context.Context, messages []*events.Mes
 			payload.GetEncReactionMessage() != nil ||
 			payload.GetPollUpdateMessage() != nil ||
 			payload.GetProtocolMessage() != nil {
+			continue
+		}
+		// A history-synced edit carries the edit time, not message activity.
+		if _, isEdit := detectMessageEdit(message); isEdit {
 			continue
 		}
 		if !message.Info.Timestamp.After(newest) {

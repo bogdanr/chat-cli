@@ -49,7 +49,7 @@ use chat_core::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fmt,
     path::PathBuf,
     sync::{
@@ -619,6 +619,10 @@ impl Provider for ClickUpProvider {
     fn outbound_capabilities(&self) -> OutboundCapabilities {
         OutboundCapabilities {
             mentions: true,
+            // ClickUp lets authors edit their own chat messages with no
+            // documented time limit.
+            edit: true,
+            edit_window: None,
             ..OutboundCapabilities::text_only(
                 "ClickUp attachments are not supported yet; send a link instead",
             )
@@ -842,6 +846,41 @@ impl Provider for ClickUpProvider {
         }
 
         bail!("ClickUp accepted the message but returned no usable id")
+    }
+
+    async fn edit_message(
+        &self,
+        chat_id: &ChatId,
+        message: &Message,
+        outbound: OutboundContent,
+    ) -> Result<Timestamp> {
+        let OutboundContent { content, .. } = outbound;
+        let text = match content {
+            Content::Text(text) => text,
+            _ => bail!("ClickUp can only edit the text of a message"),
+        };
+        if text.trim().is_empty() {
+            bail!("cannot save an empty ClickUp message");
+        }
+        if !message.is_from_me {
+            bail!("ClickUp only allows editing your own messages");
+        }
+
+        let (authorization, workspace_id) = self.scope()?;
+        self.note_tx(NetworkActivityKind::Send);
+        self.api_client
+            .update_message(&authorization, &workspace_id, &message.id, &text)
+            .await?;
+        self.note_rx(NetworkActivityKind::Send);
+
+        let edited_at = Utc::now();
+        self.events.send(ProviderEvent::MessageContentEdited {
+            chat_id: chat_id.clone(),
+            message_id: message.id.clone(),
+            content: Content::Text(text),
+            edited_at,
+        });
+        Ok(edited_at)
     }
 
     async fn download_media(&self, _media: &Media) -> Result<PathBuf> {
@@ -1106,7 +1145,10 @@ struct PollContext {
 /// Mutable state carried between poll passes.
 #[derive(Default)]
 struct PollState {
-    seen_message_ids: HashSet<String>,
+    /// `chat:message` keys seen this session, mapped to the last observed
+    /// `edited_at` so a later `date_updated` bump surfaces as an edit without
+    /// any extra request.
+    seen_message_ids: HashMap<String, Option<Timestamp>>,
     /// End of the window covered by the last successful pass. `None` on the
     /// first pass, which lists every channel to establish a baseline.
     covered_until: Option<Timestamp>,
@@ -1216,7 +1258,20 @@ async fn run_poll_pass(context: &PollContext, state: &mut PollState) -> bool {
                 continue;
             };
             let key = format!("{}:{}", message.chat_id, message.id);
-            let first_seen = state.seen_message_ids.insert(key);
+            let previous = state.seen_message_ids.insert(key, message.edited_at);
+            let first_seen = previous.is_none();
+            if let Some(previous_edit) = previous
+                && poll_edit_is_new(previous_edit, message.edited_at)
+                && let Some(edited_at) = message.edited_at
+            {
+                context.events.send(ProviderEvent::MessageContentEdited {
+                    chat_id: message.chat_id.clone(),
+                    message_id: message.id.clone(),
+                    content: message.content.clone(),
+                    edited_at,
+                });
+                continue;
+            }
             if !poll_message_is_live(context.started_at, message.timestamp, first_seen) {
                 continue;
             }
@@ -1248,11 +1303,22 @@ fn poll_message_is_live(
     first_seen && message_timestamp > started_at
 }
 
+/// Whether a re-polled message carries an edit newer than the one last seen.
+/// Storage applies edits monotonically, so a spurious repeat is harmless, but
+/// suppressing it here keeps the event stream quiet.
+fn poll_edit_is_new(previous: Option<Timestamp>, current: Option<Timestamp>) -> bool {
+    match (previous, current) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(previous), Some(current)) => current > previous,
+    }
+}
+
 /// Keeps the dedup set bounded. Clearing wholesale is safe because the
 /// `started_at` anchor still suppresses backlog, so the worst case after a
 /// prune is that recent messages are re-emitted once and deduped downstream by
 /// message id.
-fn prune_seen_message_ids(seen: &mut HashSet<String>) {
+fn prune_seen_message_ids<V>(seen: &mut HashMap<String, V>) {
     if seen.len() > MAX_SEEN_MESSAGE_IDS {
         seen.clear();
     }
@@ -1481,6 +1547,17 @@ mod tests {
                 parent_message: Some(message_id.to_owned()),
                 ..WireMessage::default()
             })
+        }
+
+        async fn update_message(
+            &self,
+            _authorization: &str,
+            _workspace_id: &str,
+            message_id: &str,
+            content: &str,
+        ) -> Result<()> {
+            self.record(format!("update_message:{message_id}:{content}"));
+            Ok(())
         }
 
         async fn message_reactions(
@@ -2309,6 +2386,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_message_patches_and_emits_content_edit() {
+        let base = Utc::now() - chrono::Duration::minutes(5);
+        let client = FakeClient::new(single_workspace_state(vec![message(
+            "m-1", "c-1", "1001", "orig", base,
+        )]));
+        let provider = provider_with(Arc::clone(&client));
+        provider.connect().await.expect("connect succeeds");
+        provider.stop_polling();
+        assert!(provider.outbound_capabilities().edit);
+
+        let message = provider
+            .history(&arc_str("c-1"), None, 10)
+            .await
+            .expect("history")[0]
+            .clone();
+        assert!(message.is_from_me);
+        let mut events = provider.events();
+
+        provider
+            .edit_message(
+                &arc_str("c-1"),
+                &message,
+                OutboundContent::new(Content::Text(arc_str("fixed"))),
+            )
+            .await
+            .expect("edit succeeds");
+
+        assert!(
+            client
+                .calls()
+                .contains(&"update_message:m-1:fixed".to_owned())
+        );
+        assert!(drain(&mut events).iter().any(|event| matches!(
+            event,
+            ProviderEvent::MessageContentEdited { message_id, content: Content::Text(text), .. }
+                if message_id.as_ref() == "m-1" && text.as_ref() == "fixed"
+        )));
+    }
+
+    #[tokio::test]
+    async fn edit_message_rejects_foreign_messages() {
+        let base = Utc::now() - chrono::Duration::minutes(5);
+        let client = FakeClient::new(single_workspace_state(vec![message(
+            "m-1", "c-1", "1002", "theirs", base,
+        )]));
+        let provider = provider_with(Arc::clone(&client));
+        provider.connect().await.expect("connect succeeds");
+        provider.stop_polling();
+        let message = provider
+            .history(&arc_str("c-1"), None, 10)
+            .await
+            .expect("history")[0]
+            .clone();
+
+        assert!(
+            provider
+                .edit_message(
+                    &arc_str("c-1"),
+                    &message,
+                    OutboundContent::new(Content::Text(arc_str("x")))
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(client.calls_starting_with("update_message:"), 0);
+    }
+
+    #[test]
+    fn poll_edit_is_new_only_for_newer_edits() {
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(5);
+        assert!(poll_edit_is_new(None, Some(t0)));
+        assert!(poll_edit_is_new(Some(t0), Some(t1)));
+        assert!(!poll_edit_is_new(Some(t1), Some(t1)));
+        assert!(!poll_edit_is_new(Some(t1), Some(t0)));
+        assert!(!poll_edit_is_new(None, None));
+    }
+
+    #[tokio::test]
+    async fn poll_detects_edits_of_already_seen_messages() {
+        let started_at = Utc::now() - chrono::Duration::seconds(1);
+        let arrival = Utc::now() + chrono::Duration::seconds(1);
+        let client = FakeClient::new(single_workspace_state(vec![message(
+            "m-new", "c-1", "1002", "hi", arrival,
+        )]));
+        let context = poll_context(Arc::clone(&client), started_at);
+        let mut state = PollState::default();
+        assert!(run_poll_pass(&context, &mut state).await);
+        let mut events = context.events.subscribe();
+
+        // The author edits the message: same id, bumped `date_updated`.
+        {
+            let mut fake = client.lock();
+            let wire = &mut fake.messages.get_mut("c-1").expect("channel")[0];
+            wire.content = Some("hi (edited)".to_owned());
+            wire.date_updated =
+                Some(millis_from_timestamp(arrival + chrono::Duration::seconds(30)) as f64);
+        }
+
+        assert!(
+            !run_poll_pass(&context, &mut state).await,
+            "an edit is not a new live message"
+        );
+        let drained = drain(&mut events);
+        assert!(drained.iter().any(|event| matches!(
+            event,
+            ProviderEvent::MessageContentEdited { message_id, .. } if message_id.as_ref() == "m-new"
+        )));
+        assert!(
+            !drained
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Message { .. }))
+        );
+
+        // The same edit polled again must not re-emit.
+        let mut events = context.events.subscribe();
+        run_poll_pass(&context, &mut state).await;
+        assert!(
+            !drain(&mut events)
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::MessageContentEdited { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn mark_read_clears_the_badge_locally() {
         let provider = provider_with(FakeClient::new(single_workspace_state(Vec::new())));
         let mut events = provider.events();
@@ -2473,13 +2675,14 @@ mod tests {
 
     #[test]
     fn pruning_the_dedup_set_is_bounded() {
-        let mut seen: HashSet<String> = (0..MAX_SEEN_MESSAGE_IDS + 10)
-            .map(|index| index.to_string())
+        let mut seen: HashMap<String, Option<Timestamp>> = (0..MAX_SEEN_MESSAGE_IDS + 10)
+            .map(|index| (index.to_string(), None))
             .collect();
         prune_seen_message_ids(&mut seen);
         assert!(seen.is_empty());
 
-        let mut small: HashSet<String> = ["a".to_owned()].into_iter().collect();
+        let mut small: HashMap<String, Option<Timestamp>> =
+            [("a".to_owned(), None)].into_iter().collect();
         prune_seen_message_ids(&mut small);
         assert_eq!(small.len(), 1);
     }
