@@ -154,6 +154,9 @@ type bridgeMember struct {
 	AvatarPath   string `json:"avatar_path,omitempty"`
 	IsAdmin      bool   `json:"is_admin,omitempty"`
 	IsSuperAdmin bool   `json:"is_super_admin,omitempty"`
+	// IsSelf marks the signed-in account so the UI never suggests or
+	// resolves an ambiguous @mention to the user themself.
+	IsSelf bool `json:"is_self,omitempty"`
 }
 
 type bridgeEvent struct {
@@ -951,6 +954,10 @@ func C_GroupMembers(clientID C.uint64_t, chatJID *C.char) *C.char {
 func (c *client) groupMembers(ctx context.Context, info *types.GroupInfo) []bridgeMember {
 	members := make([]bridgeMember, 0, len(info.Participants))
 	avatarsResolved := 0
+	ownPN, ownLID := types.EmptyJID, types.EmptyJID
+	if c.wa != nil && c.wa.Store != nil {
+		ownPN, ownLID = c.wa.Store.GetJID(), c.wa.Store.GetLID()
+	}
 	for _, participant := range info.Participants {
 		primary := participant.JID
 		if primary.IsEmpty() {
@@ -987,6 +994,8 @@ func (c *client) groupMembers(ctx context.Context, info *types.GroupInfo) []brid
 			AvatarPath:   avatar,
 			IsAdmin:      participant.IsAdmin || participant.IsSuperAdmin,
 			IsSuperAdmin: participant.IsSuperAdmin,
+			IsSelf: isOwnParticipant(ownPN, ownLID,
+				participant.JID, participant.LID, participant.PhoneNumber),
 		})
 	}
 
@@ -1153,6 +1162,29 @@ func C_Disconnect(clientID C.uint64_t) {
 		c.wa.Disconnect()
 	}
 	emit(bridgeEvent{Type: "disconnected"})
+}
+
+// isOwnParticipant reports whether any of a participant's identities (its
+// primary JID, LID, or phone-number JID) is the signed-in account. Device
+// suffixes are ignored, and phone-number and LID identities are compared
+// within their own namespace.
+func isOwnParticipant(ownPN, ownLID types.JID, identities ...types.JID) bool {
+	for _, identity := range identities {
+		if identity.IsEmpty() {
+			continue
+		}
+		identity = identity.ToNonAD()
+		for _, own := range []types.JID{ownPN, ownLID} {
+			if own.IsEmpty() {
+				continue
+			}
+			own = own.ToNonAD()
+			if identity.User == own.User && identity.Server == own.Server {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *client) ownJID() string {

@@ -1,4 +1,5 @@
 pub mod events;
+pub mod markup;
 pub mod mock;
 pub mod provider;
 pub mod types;

@@ -4416,7 +4416,12 @@ impl Provider for SlackProvider {
         }
     }
 
-    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
+    fn encode_outbound_mentions(
+        &self,
+        text: &str,
+        members: &[ChatMember],
+        picks: &[Mention],
+    ) -> OutboundMentions {
         if !self.outbound_capabilities().mentions {
             return OutboundMentions {
                 text: text.to_owned(),
@@ -4426,7 +4431,7 @@ impl Provider for SlackProvider {
         // Broadcast tokens first, so `@here`/`@channel`/`@everyone` become
         // `<!here>` etc. before name resolution runs.
         let text = rewrite_slack_broadcast_mentions(text);
-        let resolved = resolve_mention_tokens(&text, members);
+        let resolved = resolve_mention_tokens(&text, members, picks);
         let mut mentioned: Vec<Mention> = Vec::new();
         for item in &resolved {
             if !mentioned
@@ -4451,7 +4456,10 @@ impl Provider for SlackProvider {
         let OutboundContent { content, .. } = outbound;
         let reply_to = reply_to.map(|message| &message.id);
         match content {
-            Content::Text(text) => self.send_text_message(chat_id, text, reply_to).await,
+            Content::Text(text) => {
+                let text = Arc::from(chat_core::markup::markdown_to_chat_markup(&text));
+                self.send_text_message(chat_id, text, reply_to).await
+            }
             Content::Image(media)
             | Content::Video(media)
             | Content::Audio(media)
@@ -4602,6 +4610,7 @@ impl Provider for SlackProvider {
         let Content::Text(text) = outbound.content else {
             bail!("only Slack text messages can be edited");
         };
+        let text = chat_core::markup::markdown_to_chat_markup(&text);
         let connection = read_lock(&self.connection).clone();
         let credential = match self.send_identity() {
             SlackSendIdentity::User => connection
@@ -4753,7 +4762,16 @@ impl Provider for SlackProvider {
                 }
             }
             members.sort_by_key(|member| member.display_name.to_ascii_lowercase());
-            Ok(members.into_iter().map(ChatMember::new).collect())
+            let own_user_id = connection.user_id.clone();
+            Ok(members
+                .into_iter()
+                .map(|sender| {
+                    let is_self = own_user_id
+                        .as_deref()
+                        .is_some_and(|own| own == sender.platform_id.as_ref());
+                    ChatMember::new(sender).as_self(is_self)
+                })
+                .collect())
         } else {
             Err(self.unsupported("member listing"))
         }
@@ -6820,7 +6838,7 @@ fn slack_severity_accent_color(text: &str) -> Option<CardColor> {
 /// untouched for the later user-substitution pass, and code spans are copied
 /// verbatim.
 fn slack_mrkdwn_to_markdown(text: &str) -> String {
-    map_outside_code_spans(text, |segment| {
+    chat_core::markup::map_outside_code_spans(text, |segment| {
         convert_mrkdwn_delimiters(&convert_slack_angle_tokens(segment))
     })
 }
@@ -6829,32 +6847,7 @@ fn slack_mrkdwn_to_markdown(text: &str) -> String {
 /// text, where angle-bracket link tokens must survive for link-preview and
 /// mention handling.
 fn slack_mrkdwn_styles_to_markdown(text: &str) -> String {
-    map_outside_code_spans(text, |segment| convert_mrkdwn_delimiters(segment))
-}
-
-/// Applies `transform` to the parts of `text` outside backtick code spans
-/// (inline and fenced), copying the code spans verbatim.
-fn map_outside_code_spans(text: &str, transform: impl Fn(&str) -> String) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('`') {
-        output.push_str(&transform(&rest[..start]));
-        let code = &rest[start..];
-        let fence = if code.starts_with("```") { "```" } else { "`" };
-        match code[fence.len()..].find(fence) {
-            Some(end) => {
-                let code_end = fence.len() + end + fence.len();
-                output.push_str(&code[..code_end]);
-                rest = &code[code_end..];
-            }
-            None => {
-                output.push_str(code);
-                return output;
-            }
-        }
-    }
-    output.push_str(&transform(rest));
-    output
+    chat_core::markup::chat_markup_to_markdown(text)
 }
 
 fn convert_mrkdwn_delimiters(text: &str) -> String {
@@ -6864,52 +6857,9 @@ fn convert_mrkdwn_delimiters(text: &str) -> String {
 
 fn convert_mrkdwn_delimiter(text: &str, delimiter: char, replacement: &str) -> String {
     text.split('\n')
-        .map(|line| convert_mrkdwn_delimiter_line(line, delimiter, replacement))
+        .map(|line| chat_core::markup::convert_single_delimiter_line(line, delimiter, replacement))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Rewrites single-character mrkdwn delimiter pairs on one line into the
-/// renderer's doubled markers. A pair only converts when it follows mrkdwn's
-/// own rules (opens before non-space, closes after non-space, word-boundary
-/// adjacent), so literal asterisks/tildes in prose survive.
-fn convert_mrkdwn_delimiter_line(line: &str, delimiter: char, replacement: &str) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    let mut output = String::with_capacity(line.len() + 8);
-    let mut index = 0;
-    while index < chars.len() {
-        if chars[index] == delimiter
-            && mrkdwn_delimiter_opens(&chars, index, delimiter)
-            && let Some(close) = mrkdwn_delimiter_close(&chars, index, delimiter)
-        {
-            output.push_str(replacement);
-            output.extend(&chars[index + 1..close]);
-            output.push_str(replacement);
-            index = close + 1;
-        } else {
-            output.push(chars[index]);
-            index += 1;
-        }
-    }
-    output
-}
-
-fn mrkdwn_delimiter_opens(chars: &[char], index: usize, delimiter: char) -> bool {
-    let preceded_ok =
-        index == 0 || (!chars[index - 1].is_alphanumeric() && chars[index - 1] != delimiter);
-    let next = chars.get(index + 1);
-    preceded_ok && next.is_some_and(|next| !next.is_whitespace() && *next != delimiter)
-}
-
-fn mrkdwn_delimiter_close(chars: &[char], open: usize, delimiter: char) -> Option<usize> {
-    (open + 2..chars.len()).find(|&index| {
-        chars[index] == delimiter
-            && !chars[index - 1].is_whitespace()
-            && chars[index - 1] != delimiter
-            && chars
-                .get(index + 1)
-                .is_none_or(|next| !next.is_alphanumeric() && *next != delimiter)
-    })
 }
 
 /// Rewrites Slack angle-bracket tokens: `<url|label>` → `label`, bare `<url>`
@@ -10050,7 +10000,8 @@ mod tests {
         ];
 
         // Longest name wins, so `@Bogdan Adamut` is not split into `@Bogdan`.
-        let encoded = provider.encode_outbound_mentions("hi @Bogdan Adamut and @Bogdan", &members);
+        let encoded =
+            provider.encode_outbound_mentions("hi @Bogdan Adamut and @Bogdan", &members, &[]);
         assert_eq!(encoded.text, "hi <@U456> and <@U123>");
         assert_eq!(
             encoded
@@ -10071,7 +10022,7 @@ mod tests {
         let provider = provider_with_fake_client(options, client)?;
         provider.connect().await?;
 
-        let encoded = provider.encode_outbound_mentions("ping @here and @channel", &[]);
+        let encoded = provider.encode_outbound_mentions("ping @here and @channel", &[], &[]);
         assert_eq!(encoded.text, "ping <!here> and <!channel>");
         assert!(encoded.mentioned.is_empty());
         Ok(())
@@ -10086,7 +10037,8 @@ mod tests {
         provider.connect().await?;
 
         let members = vec![mention_member("U123", "Bogdan")];
-        let encoded = provider.encode_outbound_mentions("hi @Nobody and mail me@host", &members);
+        let encoded =
+            provider.encode_outbound_mentions("hi @Nobody and mail me@host", &members, &[]);
         assert_eq!(encoded.text, "hi @Nobody and mail me@host");
         assert!(encoded.mentioned.is_empty());
         Ok(())
@@ -10102,7 +10054,7 @@ mod tests {
 
         assert!(!provider.outbound_capabilities().mentions);
         let members = vec![mention_member("U123", "Bogdan")];
-        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members, &[]);
         assert_eq!(encoded.text, "hi @Bogdan");
         assert!(encoded.mentioned.is_empty());
         Ok(())
@@ -10147,7 +10099,7 @@ mod tests {
         assert!(provider.outbound_capabilities().edit_window.is_none());
 
         let members = vec![mention_member("U123", "Bogdan")];
-        let encoded = provider.encode_outbound_mentions("fixed @Bogdan", &members);
+        let encoded = provider.encode_outbound_mentions("fixed @Bogdan", &members, &[]);
         // A locally sent message has no Slack platform data yet: the id is the
         // `ts` and the chat id is the channel.
         let mut message = poll_history_message("C123", "1710000000.000100", Utc::now());
@@ -10174,6 +10126,49 @@ mod tests {
             }]
         );
         assert!(client.posted_messages.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn composer_formatting_is_sent_and_edited_as_slack_mrkdwn() -> Result<()> {
+        let mut options = SlackProviderOptions::new(SlackAuthMode::UserOAuth);
+        options.user_token = Some("xoxp-user".to_owned());
+        let client = Arc::new(FakeSlackApiClient::default());
+        let provider = provider_with_fake_client(options, client.clone())?;
+        provider.connect().await?;
+
+        let members = vec![mention_member("U123", "Bogdan")];
+        let encoded = provider.encode_outbound_mentions(
+            "**hi** @Bogdan ~~old~~ _it_ `**raw**`",
+            &members,
+            &[],
+        );
+        provider
+            .send(
+                &arc_str("C123"),
+                OutboundContent::with_mentions(
+                    Content::Text(arc_str(encoded.text.clone())),
+                    encoded.mentioned.clone(),
+                ),
+                None,
+            )
+            .await?;
+        let posted = client.posted_messages.lock().unwrap().clone();
+        assert_eq!(posted[0].text, "*hi* <@U123> ~old~ _it_ `**raw**`");
+
+        let mut message = poll_history_message("C123", "1710000000.000100", Utc::now());
+        message.is_from_me = true;
+        provider
+            .edit_message(
+                &arc_str("C123"),
+                &message,
+                OutboundContent::new(Content::Text(arc_str("now **bold**"))),
+            )
+            .await?;
+        assert_eq!(
+            client.updated_messages.lock().unwrap()[0].text,
+            "now *bold*"
+        );
         Ok(())
     }
 

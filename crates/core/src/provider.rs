@@ -243,7 +243,17 @@ pub struct ResolvedMention {
 /// match. A token matches only when the `@` starts a word and the name ends on a
 /// word boundary, so `user@host` and `@Bogdanr` do not match. Unresolved tokens
 /// are simply not returned and are left untouched by callers.
-pub fn resolve_mention_tokens(text: &str, members: &[ChatMember]) -> Vec<ResolvedMention> {
+///
+/// When several members share the matched name, the target is chosen in this
+/// order: the next unused entry of `picks` (members explicitly chosen in the
+/// mention picker, in insertion order) that belongs to the group, then the
+/// first member that is not the signed-in user, and only then the user
+/// themself.
+pub fn resolve_mention_tokens(
+    text: &str,
+    members: &[ChatMember],
+    picks: &[Mention],
+) -> Vec<ResolvedMention> {
     if members.is_empty() || !text.contains('@') {
         return Vec::new();
     }
@@ -263,6 +273,7 @@ pub fn resolve_mention_tokens(text: &str, members: &[ChatMember]) -> Vec<Resolve
 
     let chars = text.char_indices().collect::<Vec<_>>();
     let mut resolved = Vec::new();
+    let mut used_picks = vec![false; picks.len()];
     let mut index = 0;
     while index < chars.len() {
         if chars[index].1 != '@' {
@@ -275,8 +286,13 @@ pub fn resolve_mention_tokens(text: &str, members: &[ChatMember]) -> Vec<Resolve
             continue;
         }
         let name_start = index + 1;
-        let mut matched: Option<(usize, &ChatMember)> = None;
+        // Every member whose name matches at the longest matching length.
+        let mut group: Vec<&ChatMember> = Vec::new();
+        let mut name_len = 0;
         for (name, member) in &candidates {
+            if !group.is_empty() && name.len() < name_len {
+                break;
+            }
             if name.is_empty() || name_start + name.len() > chars.len() {
                 continue;
             }
@@ -289,13 +305,33 @@ pub fn resolve_mention_tokens(text: &str, members: &[ChatMember]) -> Vec<Resolve
             }
             let after = name_start + name.len();
             if after >= chars.len() || !chars[after].1.is_alphanumeric() {
-                matched = Some((name.len(), member));
-                break;
+                name_len = name.len();
+                group.push(member);
             }
         }
-        let Some((name_len, member)) = matched else {
+        if group.is_empty() {
             index += 1;
             continue;
+        }
+        let picked = picks.iter().enumerate().find_map(|(pick_index, pick)| {
+            if used_picks[pick_index] {
+                return None;
+            }
+            group
+                .iter()
+                .find(|member| member.sender.platform_id == pick.platform_id)
+                .map(|member| (pick_index, *member))
+        });
+        let member = match picked {
+            Some((pick_index, member)) => {
+                used_picks[pick_index] = true;
+                member
+            }
+            None => group
+                .iter()
+                .find(|member| !member.is_self)
+                .copied()
+                .unwrap_or(group[0]),
         };
         let end_char = name_start + name_len;
         let start_byte = chars[index].0;
@@ -396,7 +432,15 @@ pub trait Provider: Send + Sync + 'static {
     /// provider-native form, resolving names against the chat's `members`
     /// roster. The default leaves the text unchanged and reports no mentions,
     /// which is correct for providers without outbound mention support.
-    fn encode_outbound_mentions(&self, text: &str, _members: &[ChatMember]) -> OutboundMentions {
+    ///
+    /// `picks` are the members explicitly chosen in the mention picker for
+    /// this text; they disambiguate members that share a display name.
+    fn encode_outbound_mentions(
+        &self,
+        text: &str,
+        _members: &[ChatMember],
+        _picks: &[Mention],
+    ) -> OutboundMentions {
         OutboundMentions {
             text: text.to_owned(),
             mentioned: Vec::new(),
@@ -620,7 +664,7 @@ mod tests {
     fn default_encode_outbound_mentions_is_passthrough() {
         let provider = PassthroughProvider;
         let members = vec![member("U1", "Bogdan")];
-        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members, &[]);
         assert_eq!(encoded.text, "hi @Bogdan");
         assert!(encoded.mentioned.is_empty());
     }
@@ -740,7 +784,7 @@ mod tests {
     #[test]
     fn resolve_mention_tokens_matches_longest_name_first() {
         let members = vec![member("U1", "Ada"), member("U2", "Ada Lovelace")];
-        let resolved = resolve_mention_tokens("hi @Ada Lovelace and @Ada", &members);
+        let resolved = resolve_mention_tokens("hi @Ada Lovelace and @Ada", &members, &[]);
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].mention.platform_id.as_ref(), "U2");
         assert_eq!(resolved[1].mention.platform_id.as_ref(), "U1");
@@ -749,18 +793,66 @@ mod tests {
     #[test]
     fn resolve_mention_tokens_ignores_emails_and_partial_words() {
         let members = vec![member("U1", "Bogdan")];
-        assert!(resolve_mention_tokens("mail user@host", &members).is_empty());
-        assert!(resolve_mention_tokens("@Bogdanr", &members).is_empty());
-        assert_eq!(resolve_mention_tokens("@bogdan", &members).len(), 1);
+        assert!(resolve_mention_tokens("mail user@host", &members, &[]).is_empty());
+        assert!(resolve_mention_tokens("@Bogdanr", &members, &[]).is_empty());
+        assert_eq!(resolve_mention_tokens("@bogdan", &members, &[]).len(), 1);
     }
 
     #[test]
     fn rewrite_mention_tokens_replaces_only_matched_ranges() {
         let members = vec![member("U1", "Bogdan")];
-        let resolved = resolve_mention_tokens("hey @Bogdan, ping", &members);
+        let resolved = resolve_mention_tokens("hey @Bogdan, ping", &members, &[]);
         let text = rewrite_mention_tokens("hey @Bogdan, ping", &resolved, |mention| {
             format!("<@{}>", mention.platform_id)
         });
         assert_eq!(text, "hey <@U1>, ping");
+    }
+
+    fn pick(id: &str, name: &str) -> Mention {
+        Mention {
+            platform_id: Arc::from(id),
+            display_name: Arc::from(name),
+        }
+    }
+
+    #[test]
+    fn same_name_mention_prefers_someone_other_than_you() {
+        // "You" listed first, as WhatsApp rosters often do.
+        let members = vec![
+            member("me@s.whatsapp.net", "Bogdan").as_self(true),
+            member("other@s.whatsapp.net", "Bogdan"),
+        ];
+        let resolved = resolve_mention_tokens("hi @Bogdan", &members, &[]);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].mention.platform_id.as_ref(),
+            "other@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn same_name_mention_uses_explicit_picks_in_order() {
+        let members = vec![
+            member("a", "Bogdan"),
+            member("b", "Bogdan"),
+            member("me", "Bogdan").as_self(true),
+        ];
+        let picks = [pick("b", "Bogdan"), pick("a", "Bogdan")];
+        let resolved = resolve_mention_tokens("@Bogdan and @Bogdan", &members, &picks);
+        let ids: Vec<&str> = resolved
+            .iter()
+            .map(|r| r.mention.platform_id.as_ref())
+            .collect();
+        assert_eq!(ids, ["b", "a"]);
+
+        // A pick for someone not in the roster is ignored safely.
+        let stale = [pick("gone", "Bogdan")];
+        let resolved = resolve_mention_tokens("@Bogdan", &members, &stale);
+        assert_eq!(resolved[0].mention.platform_id.as_ref(), "a");
+
+        // Only "you" has the name: you are still mentioned.
+        let only_me = vec![member("me", "Bogdan").as_self(true)];
+        let resolved = resolve_mention_tokens("@Bogdan", &only_me, &[]);
+        assert_eq!(resolved[0].mention.platform_id.as_ref(), "me");
     }
 }

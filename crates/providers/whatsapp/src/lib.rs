@@ -348,8 +348,13 @@ impl Provider for WhatsAppProvider {
 
     /// Rewrite `@DisplayName` tokens into WhatsApp's `@<jid-user>` form and
     /// report the mentioned JIDs so `send` can attach them as `MentionedJID`.
-    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
-        let resolved = resolve_mention_tokens(text, members);
+    fn encode_outbound_mentions(
+        &self,
+        text: &str,
+        members: &[ChatMember],
+        picks: &[Mention],
+    ) -> OutboundMentions {
+        let resolved = resolve_mention_tokens(text, members, picks);
         let mut mentioned: Vec<Mention> = Vec::new();
         for item in &resolved {
             if !mentioned
@@ -482,9 +487,12 @@ impl Provider for WhatsAppProvider {
             .collect::<Vec<_>>();
 
         let raw_response = match &content {
-            Content::Text(text) => self.bridge_call(NetworkActivityKind::Send, || {
-                bridge::send_text(self.handle, &chat_jid, text, reply, &mentioned_jids)
-            })?,
+            Content::Text(text) => {
+                let text = chat_core::markup::markdown_to_chat_markup(text);
+                self.bridge_call(NetworkActivityKind::Send, || {
+                    bridge::send_text(self.handle, &chat_jid, &text, reply, &mentioned_jids)
+                })?
+            }
             Content::Image(media) if media.mime_type.as_ref() == "image/gif" => {
                 self.send_media_to_bridge(&chat_jid, media, "gif", reply)?
             }
@@ -607,7 +615,7 @@ impl Provider for WhatsAppProvider {
         // The bridge call does network IO; keep it off the async runtime.
         let handle = self.handle;
         let message_id = message.id.to_string();
-        let body = text.to_string();
+        let body = chat_core::markup::markdown_to_chat_markup(&text);
         self.emit_network_activity(NetworkActivityDirection::Tx, NetworkActivityKind::Send);
         let raw_response = tokio::task::spawn_blocking(move || {
             bridge::edit_message(handle, &chat_jid, &message_id, &body, &mentioned_jids)
@@ -1014,7 +1022,7 @@ impl Provider for WhatsAppProvider {
             } else {
                 ChatMemberRole::Member
             };
-            members.push(ChatMember::with_role(sender, role));
+            members.push(ChatMember::with_role(sender, role).as_self(member.is_self));
         }
         Ok(members)
     }
@@ -1143,6 +1151,8 @@ struct BridgeMember {
     is_admin: bool,
     #[serde(default)]
     is_super_admin: bool,
+    #[serde(default)]
+    is_self: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1602,6 +1612,8 @@ fn forward_message_event(
         event.avatar_path.clone(),
     );
     let preview = content_preview_for_event(&event, &text);
+    // WhatsApp's `*bold*`/`~strike~` → the renderer's markdown dialect.
+    let text = chat_core::markup::chat_markup_to_markdown(&text);
     let content = content_from_event(&event, text);
     let is_placeholder_message = is_empty_message_placeholder(&content);
     if !is_placeholder_message {
@@ -1993,7 +2005,10 @@ fn content_from_event(event: &BridgeEvent, text: String) -> Content {
             .caption
             .as_deref()
             .filter(|caption| !caption.is_empty())
-            .or((!text.is_empty() && text != EMPTY_MESSAGE_PLACEHOLDER).then_some(text.as_str()))
+            .map(chat_core::markup::chat_markup_to_markdown)
+            .or_else(|| {
+                (!text.is_empty() && text != EMPTY_MESSAGE_PLACEHOLDER).then(|| text.clone())
+            })
             .map(arc_str),
         local_path: event.media_local_path.clone(),
         thumbnail: event.media_thumbnail_path.clone(),
@@ -2040,6 +2055,7 @@ fn forward_edit_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
     let Some(text) = event.text.clone() else {
         return;
     };
+    let text = chat_core::markup::chat_markup_to_markdown(&text);
     let chat_jid = event
         .chat_jid
         .clone()
@@ -3159,6 +3175,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whatsapp_inbound_formatting_is_converted_for_the_renderer() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:inbound-format")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"message","id":"fmt-1","chat_jid":"123@s.whatsapp.net","sender_jid":"123@s.whatsapp.net","sender_name":"Ada","text":"*bold* _it_ ~gone~ `*code*` 2*3*4","timestamp":"2026-06-05T12:00:00Z"}"#
+        )?);
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"edit","id":"fmt-1","chat_jid":"123@s.whatsapp.net","sender_jid":"123@s.whatsapp.net","text":"now *bolder*","timestamp":"2026-06-05T12:05:00Z","edited_at":"2026-06-05T12:05:00Z"}"#
+        )?);
+
+        let mut inbound = None;
+        let edited = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::Message { message, .. } if message.id.as_ref() == "fmt-1" => {
+                    inbound = Some(message.content);
+                }
+                ProviderEvent::MessageContentEdited { content, .. } => break content,
+                _ => continue,
+            }
+        };
+        assert!(matches!(
+            inbound,
+            Some(Content::Text(text))
+                if text.as_ref() == "**bold** _it_ ~~gone~~ `*code*` 2*3*4"
+        ));
+        assert!(matches!(&edited, Content::Text(text) if text.as_ref() == "now **bolder**"));
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn whatsapp_provider_applies_inbound_edits_without_new_messages() -> Result<()> {
         let _guard = ffi_test_guard().await;
         let provider = WhatsAppProvider::new("test:inbound-edit")?;
@@ -3837,7 +3888,7 @@ mod tests {
 
         // The body carries the bare phone number, and the resolved identity is
         // reported so the send path can populate `MentionedJID`.
-        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members, &[]);
         assert_eq!(encoded.text, "hi @40721274801");
         assert_eq!(
             encoded

@@ -17,9 +17,10 @@ use arboard::SetExtLinux;
 use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
     CardKind, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMembership, ContactProfile,
-    Content, DiscoveryAction, DiscoveryResult, Media, Message, MessageId, NetworkActivityDirection,
-    OutboundCapabilities, OutboundContent, Platform, PlatformData, PlatformId, Poll, Provider,
-    ProviderEvent, ProviderId, Reaction, Sender, ThreadId, ThreadParticipation, Timestamp,
+    Content, DiscoveryAction, DiscoveryResult, Media, Mention, Message, MessageId,
+    NetworkActivityDirection, OutboundCapabilities, OutboundContent, Platform, PlatformData,
+    PlatformId, Poll, Provider, ProviderEvent, ProviderId, Reaction, Sender, ThreadId,
+    ThreadParticipation, Timestamp,
 };
 use chat_notify::{DesktopNotifier, MessageNotification};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -1371,7 +1372,18 @@ struct ComposeMentionCandidates {
     account: ProviderId,
     chat_id: ChatId,
     roster_len: usize,
-    names: Vec<Arc<str>>,
+    entries: Vec<ComposeMentionCandidate>,
+}
+
+/// One mention suggestion. Members that share a display name stay separate
+/// entries (told apart by `hint`), so picking one mentions that exact person.
+#[derive(Clone, Debug)]
+struct ComposeMentionCandidate {
+    name: Arc<str>,
+    /// Short identity hint shown only when several members share `name`.
+    hint: Option<Arc<str>>,
+    /// The member identity; `None` for broadcast keywords such as `here`.
+    mention: Option<Mention>,
 }
 
 #[derive(Clone, Debug)]
@@ -2599,6 +2611,9 @@ pub struct AppState {
     /// Cached mention candidates for the currently selected chat (bounded to one
     /// chat so memory does not grow with the number of visited chats).
     compose_mention_candidates: Option<ComposeMentionCandidates>,
+    /// Members explicitly chosen in the mention picker for the current draft,
+    /// in insertion order. Cleared whenever the draft becomes empty.
+    compose_mention_picks: Vec<Mention>,
     compose_attach_menu: Option<ComposeAttachMenu>,
     poll_vote_picker: Option<PollVotePicker>,
     help_overlay: Option<HelpOverlay>,
@@ -2639,6 +2654,9 @@ pub struct AppState {
     pending_attachments: Vec<PendingAttachment>,
     /// Clickable "+ Attach" button on the compose border (last draw).
     compose_attach_button: Option<Rect>,
+    /// Clickable formatting buttons shown on the compose border while text is
+    /// selected (last draw).
+    compose_format_buttons: Vec<(ComposeFormat, Rect)>,
     /// Clickable tray tiles (last draw).
     compose_tray_hits: Vec<ComposeTrayHit>,
     /// Native file picker currently open, if any.
@@ -2729,6 +2747,7 @@ impl Default for AppState {
             compose_emoticon_picker: None,
             compose_mention_picker: None,
             compose_mention_candidates: None,
+            compose_mention_picks: Vec::new(),
             compose_attach_menu: None,
             poll_vote_picker: None,
             help_overlay: None,
@@ -2754,6 +2773,7 @@ impl Default for AppState {
             pending_edits: HashSet::new(),
             pending_attachments: Vec::new(),
             compose_attach_button: None,
+            compose_format_buttons: Vec::new(),
             compose_tray_hits: Vec::new(),
             file_picker: None,
             last_attach_dir: None,
@@ -2800,6 +2820,9 @@ impl AppState {
     fn sync_compose_cache(&mut self) {
         self.compose_text = self.compose.lines().join("\n");
         self.compose_cursor = textarea_byte_cursor(&self.compose);
+        if self.compose_text.is_empty() {
+            self.compose_mention_picks.clear();
+        }
     }
 
     fn sync_thread_compose_cache(&mut self) {
@@ -4327,6 +4350,17 @@ impl App {
                         &result.chat_id,
                         &members,
                     );
+                    // A refreshed roster (for example one that now flags the
+                    // signed-in user) must rebuild the mention suggestions even
+                    // when the member count is unchanged.
+                    if self
+                        .state
+                        .compose_mention_candidates
+                        .as_ref()
+                        .is_some_and(|cached| cached.account == key.0 && cached.chat_id == key.1)
+                    {
+                        self.state.compose_mention_candidates = None;
+                    }
                     self.state.chat_members.insert(key, members);
                 }
                 Err(error) => {
@@ -5617,6 +5651,7 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.draw_compose_attach_button(frame, area);
+        self.draw_compose_format_toolbar(frame, area);
 
         let editor_area = {
             let mut constraints = Vec::new();
@@ -5709,6 +5744,60 @@ impl App {
         };
         frame.render_widget(Paragraph::new(Span::styled(label, style)), rect);
         self.state.compose_attach_button = Some(rect);
+    }
+
+    /// Draws the B / I / S / code buttons on the compose border while the
+    /// composer has a non-empty selection, left of the attach button, and
+    /// records their rects for clicks. Draw-only: reads cached editor state.
+    fn draw_compose_format_toolbar(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        self.state.compose_format_buttons.clear();
+        if !self.compose_has_selection() || area.height < 3 {
+            return;
+        }
+        let total: u16 = ComposeFormat::ALL
+            .iter()
+            .map(|format| format.button_label().chars().count() as u16 + 1)
+            .sum();
+        let right = self
+            .state
+            .compose_attach_button
+            .map_or(area.right().saturating_sub(2), |rect| {
+                rect.x.saturating_sub(1)
+            });
+        // Keep the corner and a short title visible on the left.
+        if right < area.x + total + 12 {
+            return;
+        }
+        let mut x = right - total;
+        let style = self.theme.status_key();
+        for format in ComposeFormat::ALL {
+            let label = format.button_label();
+            let width = label.chars().count() as u16;
+            let rect = Rect::new(x, area.y, width, 1);
+            frame.render_widget(
+                Paragraph::new(Span::styled(label, format.button_style(style))),
+                rect,
+            );
+            self.state.compose_format_buttons.push((format, rect));
+            x += width + 1;
+        }
+    }
+
+    /// Handles a click on a compose formatting button. Returns true when the
+    /// click was consumed.
+    fn handle_compose_format_click(&mut self, column: u16, row: u16) -> bool {
+        let Some(format) = self
+            .state
+            .compose_format_buttons
+            .iter()
+            .find(|(_, rect)| rect_contains(*rect, column, row))
+            .map(|(format, _)| *format)
+        else {
+            return false;
+        };
+        self.state.focus = FocusPane::Compose;
+        self.apply_compose_format_to_editor(format);
+        true
     }
 
     /// Draws queued attachments as tiles: a thumbnail (decoded off-thread,
@@ -5932,6 +6021,11 @@ impl App {
         let width = area.width.max(1) as usize;
         let (rows, (cursor_row, cursor_col)) =
             compose_wrapped_layout(lines, source.cursor(), width);
+        let selection = source.selection_range().filter(|(start, end)| start != end);
+        let origins = selection.map(|_| compose_row_origins(lines, width));
+        let select_style = Style::default()
+            .fg(self.theme.foreground)
+            .bg(self.theme.selection_bg);
 
         let visible_rows = area.height.max(1) as usize;
         let first_visible = if cursor_row >= visible_rows {
@@ -5952,11 +6046,18 @@ impl App {
             } else {
                 None
             };
-            text_lines.push(compose_display_line(
+            let selected = selection
+                .zip(origins.as_ref())
+                .and_then(|(range, origins)| {
+                    origins.get(display_row).and_then(|origin| {
+                        compose_row_selection(*origin, row_text.chars().count(), range)
+                    })
+                });
+            text_lines.push(compose_display_line_with_selection(
                 row_text,
                 cursor_here,
-                base_style,
-                cursor_style,
+                selected,
+                (base_style, cursor_style, select_style),
             ));
         }
 
@@ -7662,11 +7763,11 @@ impl App {
                 self.theme.muted(),
             )));
         } else {
-            let names = self
+            let entries = self
                 .state
                 .compose_mention_candidates
                 .as_ref()
-                .map(|cached| cached.names.as_slice())
+                .map(|cached| cached.entries.as_slice())
                 .unwrap_or_default();
             let total = picker.matches.len();
             let scroll_offset = picker
@@ -7687,7 +7788,7 @@ impl App {
                 .enumerate()
             {
                 let row = scroll_offset + window_row;
-                let Some(name) = names.get(candidate_index) else {
+                let Some(entry) = entries.get(candidate_index) else {
                     continue;
                 };
                 let selected = row == picker.selected;
@@ -7697,7 +7798,11 @@ impl App {
                 } else {
                     self.theme.status_bar()
                 };
-                lines.push(Line::from(Span::styled(format!("{prefix}@{name}"), style)));
+                let mut spans = vec![Span::styled(format!("{prefix}@{}", entry.name), style)];
+                if let Some(hint) = &entry.hint {
+                    spans.push(Span::styled(format!("  {hint}"), self.theme.muted()));
+                }
+                lines.push(Line::from(spans));
             }
 
             if window_end < total {
@@ -8427,8 +8532,11 @@ impl App {
             Line::from("  Up to 10 files per message; the caption goes with the first"),
             Line::from("  Tray: click a file to preview it, click ✕ to remove it"),
             Line::from("  Paste a local file path and press Enter to send it as media/file"),
-            Line::from("  Backspace/Delete: edit text"),
-            Line::from("  Esc: remove the last attachment, then return to messages"),
+            Line::from("  Backspace/Delete: edit text, or delete the selected text"),
+            Line::from("  Ctrl+A: select all text; Shift+Arrows/Home/End: select text"),
+            Line::from("  Ctrl+B: bold the selection (or insert ** ** at the cursor)"),
+            Line::from("  With text selected, click B I S </> on the border to format it"),
+            Line::from("  Esc: clear the selection, remove the last attachment, then return"),
             Line::from(""),
             Line::from(Span::styled("Popups", self.theme.status_key())),
             Line::from("  Arrow keys: move inside action, reaction, and account popups"),
@@ -11800,6 +11908,13 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.handle_compose_format_click(mouse.column, mouse.row)
+        {
+            self.attend_selected_chat("compose_format_click");
+            return Ok(false);
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && self.handle_compose_attachment_click(mouse.column, mouse.row)
         {
             self.attend_selected_chat("compose_attach_click");
@@ -11813,7 +11928,7 @@ impl App {
         if self.state.focus != pane {
             self.state.focus = pane;
         }
-        let scope_selection_changed = self.sync_filter_scope_to_focus();
+        let scope_selection_changed = self.sync_filter_scope_to_focus().await?;
 
         if matches!(
             (pane, mouse.kind),
@@ -12448,20 +12563,26 @@ impl App {
             return Ok(false);
         }
 
-        for character in text.chars() {
-            let key = match character {
-                '\r' => continue,
-                '\n' => TextAreaKey::Enter,
-                '\t' => TextAreaKey::Tab,
-                other => TextAreaKey::Char(other),
-            };
-            self.apply_compose_edit_input_without_completion(textarea_input(
-                key,
-                KeyModifiers::NONE,
-            ));
-        }
+        // One insertion (replacing any selection) instead of a keystroke per
+        // character: large pastes stay fast and form a single edit.
+        let paste_started = Instant::now();
+        let normalized = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        let replaced_selection = self.compose_has_selection();
+        self.state.compose.insert_str(&normalized);
+        self.state.sync_compose_cache();
         self.update_compose_emoticon_completion();
         self.update_compose_mention_completion();
+        self.log_slow_perf_duration(
+            "compose_paste",
+            paste_started,
+            format!(
+                "chars={} replaced_selection={replaced_selection}",
+                normalized.chars().count()
+            ),
+        );
         self.state.status = "pasted text".to_owned();
         Ok(false)
     }
@@ -12586,13 +12707,19 @@ impl App {
         }
     }
 
-    fn sync_filter_scope_to_focus(&mut self) -> bool {
+    async fn sync_filter_scope_to_focus(&mut self) -> Result<bool> {
         if !self.state.filter_mode {
-            return false;
+            return Ok(false);
         }
         let scope = self.active_filter_scope();
         if scope == self.state.filter_scope {
-            return false;
+            return Ok(false);
+        }
+        // Leaving the chat list ends a chat search: the highlighted chat is
+        // opened instead of the search silently following focus into the
+        // message pane (where typed letters should start a message).
+        if self.state.filter_scope == FilterScope::Chats {
+            return self.leave_chat_search().await;
         }
         // Switching the edited scope only changes which pane's independent
         // buffer receives keystrokes; it never copies the query across scopes.
@@ -12600,7 +12727,67 @@ impl App {
         self.note_filter_interaction();
         let selection_changed = self.apply_active_filter();
         self.state.status = self.filter_status();
-        selection_changed
+        Ok(selection_changed)
+    }
+
+    /// End an active chat search because focus left the chat list: clear the
+    /// chat query, exit filter mode, and open the highlighted chat (or the
+    /// first discovery result when no existing chat matched). The focus the
+    /// user moved to is preserved. Message loading stays asynchronous: the
+    /// returned flag asks the caller to load the selected chat as usual.
+    async fn leave_chat_search(&mut self) -> Result<bool> {
+        let focus = self.state.focus;
+        let discovery = if self.state.visible_chat_indices.is_empty() {
+            self.state.discovery_results.first().cloned()
+        } else {
+            None
+        };
+        let selected_key = self.selected_chat_key();
+
+        self.state.filter_mode = false;
+        self.state.filters.chats.clear();
+        self.state.discovery_results.clear();
+        self.pending_discovery_query = None;
+        if !self.state.filters.any_active() {
+            self.state.filter_last_interaction = None;
+        }
+
+        if let Some(result) = discovery {
+            let changed = self.open_discovery_result(result).await?;
+            let opened_key = self.selected_chat_key();
+            self.apply_filter();
+            self.restore_chat_selection(opened_key.as_ref());
+            self.state.focus = focus;
+            return Ok(changed);
+        }
+
+        self.apply_filter();
+        self.restore_chat_selection(selected_key.as_ref());
+        let changed = if self.state.selected_chat().is_some() {
+            self.activate_selected_chat()
+        } else {
+            self.state.status = "chat search closed".to_owned();
+            false
+        };
+        self.state.focus = focus;
+        Ok(changed)
+    }
+
+    /// Re-select a chat by its stable key after the visible list changed.
+    fn restore_chat_selection(&mut self, key: Option<&(ProviderId, ChatId)>) {
+        let Some((account, chat_id)) = key else {
+            return;
+        };
+        if let Some(index) = self
+            .state
+            .chats
+            .iter()
+            .position(|chat| chat.account == *account && chat.id == *chat_id)
+            && self.state.visible_chat_indices.contains(&index)
+        {
+            self.state.selected_chat = index;
+            self.state.older_chats_selected = false;
+        }
     }
 
     /// Record that the user just interacted with the filter, resetting the
@@ -12825,13 +13012,11 @@ impl App {
             KeyCode::PageUp => self.filter_page_up().await,
             KeyCode::Left => {
                 self.focus_previous_pane();
-                let selection_changed = self.sync_filter_scope_to_focus();
-                Ok(selection_changed)
+                self.sync_filter_scope_to_focus().await
             }
             KeyCode::Right => {
                 self.focus_next_pane();
-                let selection_changed = self.sync_filter_scope_to_focus();
-                Ok(selection_changed)
+                self.sync_filter_scope_to_focus().await
             }
             KeyCode::Char(value)
                 if !key
@@ -12861,8 +13046,22 @@ impl App {
             self.open_compose_attach_menu();
             return Ok(false);
         }
+        if is_ctrl_char(key, 'a') {
+            self.select_all_compose_text();
+            return Ok(false);
+        }
+        if is_ctrl_char(key, 'b') {
+            self.apply_compose_format_to_editor(ComposeFormat::Bold);
+            return Ok(false);
+        }
+        // Shift+arrows extend the selection and must never move focus.
+        let extending = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
+            KeyCode::Esc if self.compose_has_selection() => {
+                self.state.compose.cancel_selection();
+                self.state.status = "selection cleared".to_owned();
+            }
             KeyCode::Esc => {
                 if self.state.file_picker.is_some() {
                     self.cancel_file_picker();
@@ -12904,7 +13103,8 @@ impl App {
                 self.apply_compose_edit_input(textarea_input(TextAreaKey::Delete, key.modifiers));
             }
             KeyCode::Left => {
-                if self.compose_cursor_at_start() {
+                if !extending && self.compose_cursor_at_start() {
+                    self.state.compose.cancel_selection();
                     self.state.focus = FocusPane::Messages;
                     self.state.status = "focused Messages".to_owned();
                 } else {
@@ -12915,7 +13115,8 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                if self.compose_cursor_at_end() {
+                if !extending && self.compose_cursor_at_end() {
+                    self.state.compose.cancel_selection();
                     self.state.focus = FocusPane::Details;
                     self.state.status = "focused Details".to_owned();
                 } else {
@@ -12926,7 +13127,8 @@ impl App {
                 }
             }
             KeyCode::Up => {
-                if self.compose_cursor_on_first_line() {
+                if !extending && self.compose_cursor_on_first_line() {
+                    self.state.compose.cancel_selection();
                     self.state.focus = FocusPane::Messages;
                     self.state.status = "focused Messages".to_owned();
                 } else {
@@ -12937,7 +13139,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                if self.compose_cursor_on_last_line() {
+                if !extending && self.compose_cursor_on_last_line() {
                     self.state.status = "compose focused".to_owned();
                 } else {
                     self.apply_compose_navigation_input(textarea_input(
@@ -13124,7 +13326,11 @@ impl App {
         if let Some(members) = self.state.chat_members.get(&key)
             && !members.is_empty()
         {
-            return members.len();
+            // Include whether the signed-in member is known, so a refreshed
+            // roster that newly marks "you" rebuilds the picker even when the
+            // member count is unchanged.
+            let has_self = members.iter().any(|member| member.is_self);
+            return members.len() * 2 + usize::from(has_self);
         }
         usize::from(self.dm_peer_platform_id(chat).is_some())
     }
@@ -13171,29 +13377,12 @@ impl App {
         }
 
         let members = self.mention_members_for_chat(chat);
-        let mut names: Vec<Arc<str>> = Vec::with_capacity(members.len() + 4);
-        let mut seen: HashSet<String> = HashSet::new();
-        for member in &members {
-            let name = &member.sender.display_name;
-            if name.is_empty() {
-                continue;
-            }
-            if seen.insert(name.to_lowercase()) {
-                names.push(name.clone());
-            }
-        }
-        for keyword in mention_broadcast_keywords(chat) {
-            if seen.insert(keyword.to_lowercase()) {
-                names.push(Arc::from(*keyword));
-            }
-        }
-        names.sort_by_key(|name| name.to_lowercase());
-
+        let entries = mention_candidate_entries(&members, mention_broadcast_keywords(chat));
         self.state.compose_mention_candidates = Some(ComposeMentionCandidates {
             account: chat.account.clone(),
             chat_id: chat.id.clone(),
             roster_len: signature,
-            names,
+            entries,
         });
     }
 
@@ -13245,11 +13434,11 @@ impl App {
             Some(cached) if cached.account == chat.account && cached.chat_id == chat.id => {
                 let query_lower = query.to_lowercase();
                 cached
-                    .names
+                    .entries
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, name)| {
-                        let name_lower = name.to_lowercase();
+                    .filter_map(|(index, entry)| {
+                        let name_lower = entry.name.to_lowercase();
                         (name_lower.starts_with(&query_lower)
                             || name_lower
                                 .split_whitespace()
@@ -13293,7 +13482,7 @@ impl App {
         let Some(chat) = self.state.selected_chat().cloned() else {
             return;
         };
-        let name = self
+        let entry = self
             .state
             .compose_mention_candidates
             .as_ref()
@@ -13302,12 +13491,18 @@ impl App {
                 picker
                     .matches
                     .get(picker.selected)
-                    .and_then(|index| cached.names.get(*index))
+                    .and_then(|index| cached.entries.get(*index))
             })
             .cloned();
-        let Some(name) = name else {
+        let Some(entry) = entry else {
             return;
         };
+        let name = entry.name.clone();
+        // Remember exactly who was picked so a name shared by several members
+        // resolves to this person when the message is sent.
+        if let Some(mention) = entry.mention {
+            self.state.compose_mention_picks.push(mention);
+        }
         for _ in 0..picker.token_char_len {
             self.apply_compose_edit_input_without_completion(textarea_input(
                 TextAreaKey::Backspace,
@@ -13331,6 +13526,75 @@ impl App {
         let modified = self.state.compose.input(input);
         self.state.sync_compose_cache();
         modified
+    }
+
+    fn compose_has_selection(&self) -> bool {
+        self.state
+            .compose
+            .selection_range()
+            .is_some_and(|(start, end)| start != end)
+    }
+
+    fn select_all_compose_text(&mut self) {
+        if self.state.compose_text.is_empty() {
+            self.state.status = "nothing to select".to_owned();
+            return;
+        }
+        self.state.compose.select_all();
+        self.state.compose_mention_picker = None;
+        self.state.compose_emoticon_picker = None;
+        self.state.status =
+            "all text selected · Backspace deletes · click B I S </> to format".to_owned();
+    }
+
+    /// Applies (or removes) `format` on the composer selection, or inserts a
+    /// marker pair at the cursor when nothing is selected. The formatted text
+    /// stays selected so further formats can be stacked.
+    fn apply_compose_format_to_editor(&mut self, format: ComposeFormat) {
+        let lines = self.state.compose.lines().to_vec();
+        let text = lines.join("\n");
+        let selection = self
+            .state
+            .compose
+            .selection_range()
+            .filter(|(start, end)| start != end)
+            .map(|(start, end)| {
+                (
+                    compose_position_to_byte(&lines, start),
+                    compose_position_to_byte(&lines, end),
+                )
+            });
+        let cursor = compose_position_to_byte(&lines, self.state.compose.cursor());
+        let edit = apply_compose_format(&text, selection, cursor, format);
+        let removed = edit.text.len() < text.len();
+
+        let mut textarea = compose_textarea_with_text(&edit.text);
+        let jump = |textarea: &mut TextArea<'static>, (row, col): (usize, usize)| {
+            textarea.move_cursor(ratatui_textarea::CursorMove::Jump(
+                u16::try_from(row).unwrap_or(u16::MAX),
+                u16::try_from(col).unwrap_or(u16::MAX),
+            ));
+        };
+        match edit.selection {
+            Some((start, end)) if start < end => {
+                jump(&mut textarea, compose_byte_to_position(&edit.text, start));
+                textarea.start_selection();
+                jump(&mut textarea, compose_byte_to_position(&edit.text, end));
+            }
+            _ => jump(
+                &mut textarea,
+                compose_byte_to_position(&edit.text, edit.cursor),
+            ),
+        }
+        self.state.compose = textarea;
+        self.state.sync_compose_cache();
+        self.state.compose_mention_picker = None;
+        self.state.compose_emoticon_picker = None;
+        self.state.status = if removed {
+            format!("removed {}", format.name())
+        } else {
+            format!("{} applied", format.name())
+        };
     }
 
     fn compose_cursor_at_start(&self) -> bool {
@@ -13379,7 +13643,7 @@ impl App {
             .ok_or_else(|| anyhow!("no provider registered for {}", chat.account))?;
         let account = provider.account_info();
         let members = self.mention_members_for_chat(&chat);
-        let encoded = provider.encode_outbound_mentions(&text, &members);
+        let encoded = provider.encode_outbound_mentions(&text, &members, &[]);
         let content = Content::Text(Arc::from(text.as_str()));
         let preview = content_send_preview(&content);
         let reply_message = self.message_by_id(&thread_root).cloned();
@@ -13457,7 +13721,8 @@ impl App {
             .ok_or_else(|| anyhow!("no provider registered for {}", chat.account))?;
         let account = provider.account_info();
         let members = self.mention_members_for_chat(&chat);
-        let encoded = provider.encode_outbound_mentions(&text, &members);
+        let encoded =
+            provider.encode_outbound_mentions(&text, &members, &self.state.compose_mention_picks);
         let capabilities = provider.outbound_capabilities();
 
         // A typed path that is the whole draft is sent as the file itself,
@@ -15336,6 +15601,7 @@ impl App {
         self.state.reply_to = None;
         self.state.action_menu = None;
         self.state.compose = compose_textarea_with_text(&original_text);
+        self.state.compose_mention_picks.clear();
         self.state.sync_compose_cache();
         self.state.editing = Some(EditTarget {
             account: message.account.clone(),
@@ -15355,6 +15621,7 @@ impl App {
             return false;
         };
         self.state.compose = compose_textarea_with_text(&target.saved_draft);
+        self.state.compose_mention_picks.clear();
         self.state.sync_compose_cache();
         true
     }
@@ -15403,7 +15670,8 @@ impl App {
             .cloned()
             .map(|chat| self.mention_members_for_chat(&chat))
             .unwrap_or_default();
-        let encoded = provider.encode_outbound_mentions(&text, &members);
+        let encoded =
+            provider.encode_outbound_mentions(&text, &members, &self.state.compose_mention_picks);
         let outbound = OutboundContent::with_mentions(
             Content::Text(Arc::from(encoded.text.as_str())),
             encoded.mentioned.clone(),
@@ -19254,6 +19522,72 @@ fn mention_broadcast_keywords(chat: &Chat) -> &'static [&'static str] {
     }
 }
 
+/// Build the mention suggestions for a roster: one entry per distinct member
+/// identity (never the signed-in user), plus broadcast keywords. Members that
+/// share a display name get a short identity hint so they can be told apart.
+fn mention_candidate_entries(
+    members: &[ChatMember],
+    broadcast_keywords: &[&str],
+) -> Vec<ComposeMentionCandidate> {
+    let mut entries: Vec<ComposeMentionCandidate> = Vec::with_capacity(members.len() + 4);
+    let mut seen_ids: HashSet<&str> = HashSet::new();
+    for member in members {
+        let name = &member.sender.display_name;
+        if name.is_empty() || member.is_self {
+            continue;
+        }
+        if !seen_ids.insert(member.sender.platform_id.as_ref()) {
+            continue;
+        }
+        entries.push(ComposeMentionCandidate {
+            name: name.clone(),
+            hint: None,
+            mention: Some(Mention {
+                platform_id: member.sender.platform_id.clone(),
+                display_name: name.clone(),
+            }),
+        });
+    }
+    let mut name_counts: HashMap<String, usize> = HashMap::new();
+    for entry in &entries {
+        *name_counts.entry(entry.name.to_lowercase()).or_default() += 1;
+    }
+    for entry in &mut entries {
+        if name_counts.get(&entry.name.to_lowercase()).copied() > Some(1)
+            && let Some(mention) = &entry.mention
+        {
+            entry.hint = Some(Arc::from(mention_identity_hint(&mention.platform_id)));
+        }
+    }
+    for keyword in broadcast_keywords {
+        if !name_counts.contains_key(&keyword.to_lowercase()) {
+            entries.push(ComposeMentionCandidate {
+                name: Arc::from(*keyword),
+                hint: None,
+                mention: None,
+            });
+        }
+    }
+    entries.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.hint.cmp(&b.hint))
+    });
+    entries
+}
+
+/// A short, non-sensitive hint that tells same-name members apart: the last
+/// four characters of the identity's user part (for WhatsApp, the phone
+/// number or LID digits before `@`).
+fn mention_identity_hint(platform_id: &str) -> String {
+    let user = platform_id.split('@').next().unwrap_or(platform_id);
+    let user = user.split(':').next().unwrap_or(user);
+    let chars: Vec<char> = user.chars().collect();
+    let tail: String = chars[chars.len().saturating_sub(4)..].iter().collect();
+    format!("…{tail}")
+}
+
 const EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER: &str = "[empty WhatsApp message]";
 
 fn message_sidebar_preview(message: &Message) -> Arc<str> {
@@ -20392,6 +20726,333 @@ fn compose_display_line(
         spans.push(Span::styled(" ".to_owned(), cursor_style));
     }
     Line::from(spans)
+}
+
+/// For each wrapped display row: the logical line index and the char column
+/// where the row starts. Mirrors `compose_wrapped_layout`'s wrapping.
+fn compose_row_origins(lines: &[String], width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut origins = Vec::new();
+    for (logical_index, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        for start in compose_wrap_line_starts(&chars, width) {
+            origins.push((logical_index, start));
+        }
+    }
+    if origins.is_empty() {
+        origins.push((0, 0));
+    }
+    origins
+}
+
+/// The char range of display row `row_text` (starting at logical `origin`)
+/// covered by `selection` (ordered, char-based `(row, col)` pairs).
+fn compose_row_selection(
+    origin: (usize, usize),
+    row_len: usize,
+    selection: ((usize, usize), (usize, usize)),
+) -> Option<(usize, usize)> {
+    let ((start_row, start_col), (end_row, end_col)) = selection;
+    let (line, row_start) = origin;
+    if line < start_row || line > end_row {
+        return None;
+    }
+    let lo = if line == start_row { start_col } else { 0 };
+    let hi = if line == end_row { end_col } else { usize::MAX };
+    let row_end = row_start + row_len;
+    let from = lo.max(row_start);
+    let to = hi.min(row_end);
+    (from < to).then(|| (from - row_start, to - row_start))
+}
+
+/// Like `compose_display_line`, additionally painting `selected` (a local
+/// char range) with `select_style`. The cursor style wins over selection.
+fn compose_display_line_with_selection(
+    row: &str,
+    cursor_col: Option<usize>,
+    selected: Option<(usize, usize)>,
+    styles: (Style, Style, Style),
+) -> Line<'static> {
+    let (base, cursor_style, select_style) = styles;
+    let Some((sel_from, sel_to)) = selected else {
+        return compose_display_line(row, cursor_col, base, cursor_style);
+    };
+    let chars: Vec<char> = row.chars().collect();
+    let style_at = |index: usize| {
+        if cursor_col == Some(index) {
+            cursor_style
+        } else if (sel_from..sel_to).contains(&index) {
+            select_style
+        } else {
+            base
+        }
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style = base;
+    for (index, ch) in chars.iter().enumerate() {
+        let style = style_at(index);
+        if style != run_style && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run_style = style;
+        run.push(*ch);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
+    }
+    if cursor_col.is_some_and(|col| col >= chars.len()) {
+        spans.push(Span::styled(" ".to_owned(), cursor_style));
+    }
+    Line::from(spans)
+}
+
+/// Inline formats offered by Ctrl+B and the selection toolbar, written in the
+/// composer's markdown dialect (converted per provider on send).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComposeFormat {
+    Bold,
+    Italic,
+    Strike,
+    Code,
+}
+
+impl ComposeFormat {
+    const ALL: [Self; 4] = [Self::Bold, Self::Italic, Self::Strike, Self::Code];
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Bold => "**",
+            Self::Italic => "_",
+            Self::Strike => "~~",
+            Self::Code => "`",
+        }
+    }
+
+    fn button_label(self) -> &'static str {
+        match self {
+            Self::Bold => " B ",
+            Self::Italic => " I ",
+            Self::Strike => " S ",
+            Self::Code => " </> ",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bold => "bold",
+            Self::Italic => "italic",
+            Self::Strike => "strikethrough",
+            Self::Code => "code",
+        }
+    }
+
+    fn button_style(self, base: Style) -> Style {
+        match self {
+            Self::Bold => base.add_modifier(Modifier::BOLD),
+            Self::Italic => base.add_modifier(Modifier::ITALIC),
+            Self::Strike => base.add_modifier(Modifier::CROSSED_OUT),
+            Self::Code => base,
+        }
+    }
+}
+
+/// Result of applying a format: the new text and either a selection to keep
+/// (byte range, covering the formatted text without its markers) or a cursor.
+#[derive(Debug, PartialEq, Eq)]
+struct ComposeFormatEdit {
+    text: String,
+    selection: Option<(usize, usize)>,
+    cursor: usize,
+}
+
+/// Finds `marker` around `[start, end)` in `text`, looking past other format
+/// markers in between (so `**_x_**` with `x` selected still finds `**`).
+/// Returns the byte offsets of the left and right marker.
+fn find_surrounding_marker(
+    text: &str,
+    start: usize,
+    end: usize,
+    marker: &str,
+) -> Option<(usize, usize)> {
+    let others: Vec<&str> = ComposeFormat::ALL
+        .iter()
+        .map(|format| format.marker())
+        .filter(|other| *other != marker)
+        .collect();
+    let mut left = start;
+    let left_marker = loop {
+        if text[..left].ends_with(marker) {
+            break left - marker.len();
+        }
+        let other = others
+            .iter()
+            .find(|other| text[..left].ends_with(**other))?;
+        left -= other.len();
+    };
+    let mut right = end;
+    let right_marker = loop {
+        if text[right..].starts_with(marker) {
+            break right;
+        }
+        let other = others
+            .iter()
+            .find(|other| text[right..].starts_with(**other))?;
+        right += other.len();
+    };
+    Some((left_marker, right_marker))
+}
+
+/// Pure formatting step for the composer. With a selection, each selected
+/// line is wrapped (ignoring surrounding whitespace); if every selected line
+/// already has the format, it is removed instead. Without a selection a
+/// marker pair is inserted around the cursor, or an empty pair removed.
+fn apply_compose_format(
+    text: &str,
+    selection: Option<(usize, usize)>,
+    cursor: usize,
+    format: ComposeFormat,
+) -> ComposeFormatEdit {
+    let marker = format.marker();
+    let width = marker.len();
+
+    // Trimmed, non-empty per-line segments of the selection.
+    let segments: Vec<(usize, usize)> = selection
+        .map(|(start, end)| {
+            let mut segments = Vec::new();
+            let mut line_start = start;
+            for piece in text[start..end].split('\n') {
+                let piece_start = line_start;
+                line_start += piece.len() + 1;
+                let lead = piece.len() - piece.trim_start().len();
+                let trimmed = piece.trim();
+                if !trimmed.is_empty() {
+                    let a = piece_start + lead;
+                    segments.push((a, a + trimmed.len()));
+                }
+            }
+            segments
+        })
+        .unwrap_or_default();
+
+    if segments.is_empty() {
+        let cursor = selection.map_or(cursor, |(_, end)| end);
+        if text[..cursor].ends_with(marker) && text[cursor..].starts_with(marker) {
+            let mut out = String::with_capacity(text.len());
+            out.push_str(&text[..cursor - width]);
+            out.push_str(&text[cursor + width..]);
+            return ComposeFormatEdit {
+                text: out,
+                selection: None,
+                cursor: cursor - width,
+            };
+        }
+        let mut out = String::with_capacity(text.len() + 2 * width);
+        out.push_str(&text[..cursor]);
+        out.push_str(marker);
+        out.push_str(marker);
+        out.push_str(&text[cursor..]);
+        return ComposeFormatEdit {
+            text: out,
+            selection: None,
+            cursor: cursor + width,
+        };
+    }
+
+    enum Action {
+        Wrap,
+        Keep,
+        Surround(usize, usize),
+        Inside,
+    }
+    let detect = |(a, b): (usize, usize)| -> Option<Action> {
+        if let Some((left, right)) = find_surrounding_marker(text, a, b, marker) {
+            return Some(Action::Surround(left, right));
+        }
+        let inner = &text[a..b];
+        (inner.len() > 2 * width && inner.starts_with(marker) && inner.ends_with(marker))
+            .then_some(Action::Inside)
+    };
+    let detected: Vec<Option<Action>> = segments.iter().map(|segment| detect(*segment)).collect();
+    let remove = detected.iter().all(Option::is_some);
+
+    let mut out = String::with_capacity(text.len() + segments.len() * 2 * width);
+    let mut last = 0;
+    let mut new_start = None;
+    let mut new_end = 0;
+    for (&(a, b), found) in segments.iter().zip(detected) {
+        let action = if remove {
+            found.expect("all segments are formatted")
+        } else if found.is_some() {
+            Action::Keep
+        } else {
+            Action::Wrap
+        };
+        let (inner_start, inner_end);
+        match action {
+            Action::Wrap => {
+                out.push_str(&text[last..a]);
+                out.push_str(marker);
+                inner_start = out.len();
+                out.push_str(&text[a..b]);
+                inner_end = out.len();
+                out.push_str(marker);
+                last = b;
+            }
+            Action::Keep => {
+                out.push_str(&text[last..a]);
+                inner_start = out.len();
+                out.push_str(&text[a..b]);
+                inner_end = out.len();
+                last = b;
+            }
+            Action::Surround(left, right) => {
+                out.push_str(&text[last..left]);
+                out.push_str(&text[left + width..a]);
+                inner_start = out.len();
+                out.push_str(&text[a..b]);
+                inner_end = out.len();
+                out.push_str(&text[b..right]);
+                last = right + width;
+            }
+            Action::Inside => {
+                out.push_str(&text[last..a]);
+                inner_start = out.len();
+                out.push_str(&text[a + width..b - width]);
+                inner_end = out.len();
+                last = b;
+            }
+        }
+        new_start.get_or_insert(inner_start);
+        new_end = inner_end;
+    }
+    out.push_str(&text[last..]);
+    let start = new_start.unwrap_or(0);
+    ComposeFormatEdit {
+        text: out,
+        selection: Some((start, new_end)),
+        cursor: new_end,
+    }
+}
+
+/// Char-based `(row, col)` → byte offset in the joined `lines` text.
+fn compose_position_to_byte(lines: &[String], (row, col): (usize, usize)) -> usize {
+    let mut offset: usize = lines.iter().take(row).map(|line| line.len() + 1).sum();
+    if let Some(line) = lines.get(row) {
+        offset += line
+            .char_indices()
+            .nth(col)
+            .map_or(line.len(), |(index, _)| index);
+    }
+    offset
+}
+
+/// Byte offset in `text` → char-based `(row, col)`.
+fn compose_byte_to_position(text: &str, byte: usize) -> (usize, usize) {
+    let before = &text[..byte.min(text.len())];
+    let row = before.matches('\n').count();
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    (row, before[line_start..].chars().count())
 }
 
 fn textarea_input(key: TextAreaKey, modifiers: KeyModifiers) -> TextAreaInput {
@@ -25287,7 +25948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_f_filter_scope_follows_focused_pane() -> Result<()> {
+    async fn moving_right_ends_chat_search_and_opens_highlighted_chat() -> Result<()> {
         let mut app = test_app().await?;
 
         // Filtering from the chat list searches chats/contacts.
@@ -25312,25 +25973,84 @@ mod tests {
             .expect("media chat should exist");
         assert_eq!(app.state().visible_chat_indices(), &[media_index]);
 
-        // Moving focus into the Messages pane switches the *edited* scope to
-        // messages, but the chat-list filter stays applied: the query never
-        // leaks across panes, so the sidebar remains narrowed and the now-active
-        // message scope starts from its own empty buffer.
+        // Moving focus into the Messages pane ends the chat search: the query
+        // is cleared, filter mode is off, and the highlighted chat stays
+        // selected (by key, in the now unfiltered list) and opens.
         app.handle_event(AppEvent::Key(key(KeyCode::Right, KeyModifiers::NONE)))
             .await?;
         assert_eq!(app.state().focus(), FocusPane::Messages);
-        assert!(app.state().filter_mode());
-        assert_eq!(app.state().visible_chat_indices(), &[media_index]);
+        assert!(!app.state().filter_mode());
         assert_eq!(app.state().filter(), "");
+        assert!(app.state().visible_chat_indices().len() > 1);
+        assert_eq!(
+            app.state().selected_chat().map(|chat| chat.name.as_ref()),
+            Some("Media Samples")
+        );
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(app.state().messages().len(), 3);
+        assert_eq!(
+            app.state().selected_chat().map(|chat| chat.name.as_ref()),
+            Some("Media Samples")
+        );
 
-        // Moving focus back to the chat list resumes editing the chat filter,
-        // whose buffer was preserved untouched.
-        app.handle_event(AppEvent::Key(key(KeyCode::Left, KeyModifiers::NONE)))
+        // Typing in the message pane now starts a message instead of
+        // filtering messages.
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('h'), KeyModifiers::NONE)))
             .await?;
-        assert_eq!(app.state().focus(), FocusPane::ChatList);
+        assert!(!app.state().filter_mode());
+        assert_eq!(app.state().focus(), FocusPane::Compose);
+        assert_eq!(app.state.compose_text, "h");
+
+        // Ctrl+F from the message pane still searches messages.
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
         assert!(app.state().filter_mode());
-        assert_eq!(app.state().filter(), "media");
-        assert_eq!(app.state().visible_chat_indices(), &[media_index]);
+        assert_eq!(app.state.filter_scope, FilterScope::Messages);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clicking_messages_pane_ends_chat_search_and_opens_chat() -> Result<()> {
+        let mut app = test_app().await?;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+        terminal.draw(|frame| app.draw(frame))?;
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        for value in "media".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        drain_async_app_work(&mut app).await?;
+        terminal.draw(|frame| app.draw(frame))?;
+
+        let area = app.state.frame_area;
+        let (column, row) = (area.width / 2, area.height / 3);
+        assert_eq!(app.pane_at(column, row), Some(FocusPane::Messages));
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .await?;
+        assert!(!app.state().filter_mode());
+        assert_eq!(app.state().filter(), "");
+        assert_eq!(
+            app.state().selected_chat().map(|chat| chat.name.as_ref()),
+            Some("Media Samples")
+        );
+        drain_async_app_work(&mut app).await?;
+        assert_eq!(app.state().messages().len(), 3);
 
         Ok(())
     }
@@ -25766,6 +26486,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_name_mention_pick_skips_you_and_sends_the_picked_person() -> Result<()> {
+        let mock = MockProvider::new();
+        let mut app = test_app_with_providers(vec![Arc::new(mock.clone())]).await?;
+        let chat = app.state().selected_chat().unwrap().clone();
+        let bogdan = |id: &str| {
+            ChatMember::new(Sender {
+                platform_id: Arc::from(id),
+                display_name: Arc::from("Bogdan"),
+                avatar: None,
+            })
+        };
+        app.chat_members_tx.send(ChatMembersFetchResult {
+            account: chat.account.clone(),
+            chat_id: chat.id.clone(),
+            // "You" first, as in the WhatsApp group that triggered the bug.
+            result: Ok(vec![
+                bogdan("40711110001@s.whatsapp.net").as_self(true),
+                bogdan("40722220002@s.whatsapp.net"),
+                bogdan("40733330003@s.whatsapp.net"),
+            ]),
+        })?;
+        assert!(app.drain_chat_member_fetches());
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        for value in "hi @Bog".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        // You are never suggested; the two other Bogdans carry phone hints.
+        assert_eq!(app.state().compose_mention_match_count(), Some(2));
+        let entries = &app
+            .state
+            .compose_mention_candidates
+            .as_ref()
+            .unwrap()
+            .entries;
+        let hints: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry.hint.as_deref())
+            .collect();
+        assert_eq!(hints, ["…0002", "…0003"]);
+
+        // Pick the second suggestion (the …0003 Bogdan) and send.
+        app.handle_event(AppEvent::Key(key(KeyCode::Down, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().compose_text(), "hi @Bogdan ");
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+
+        let sent = mock.sent_mentions();
+        let last = sent.last().expect("a message was sent");
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0].platform_id.as_ref(), "40733330003@s.whatsapp.net");
+        assert!(app.state.compose_mention_picks.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn app_sends_single_media_attachment_with_caption() -> Result<()> {
         let mut app = test_app().await?;
         app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
@@ -26039,6 +26821,259 @@ mod tests {
         .await?;
         assert!(app.state.pending_attachments.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_ctrl_a_selects_all_and_backspace_or_paste_replaces_it() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Paste("a very long\npasted text".to_owned()))
+            .await?;
+        assert_eq!(app.state().compose_text(), "a very long\npasted text");
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert_eq!(
+            app.state().focus(),
+            FocusPane::Compose,
+            "Ctrl+A stays in compose"
+        );
+        assert!(app.state.account_switcher.is_none());
+        assert!(app.compose_has_selection());
+        app.handle_event(AppEvent::Key(key(KeyCode::Backspace, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().compose_text(), "");
+
+        app.handle_event(AppEvent::Paste("old".to_owned())).await?;
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        app.handle_event(AppEvent::Paste("new".to_owned())).await?;
+        assert_eq!(
+            app.state().compose_text(),
+            "new",
+            "paste replaces the selection"
+        );
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Char('x'), KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(
+            app.state().compose_text(),
+            "x",
+            "typing replaces the selection"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_large_paste_is_a_single_insert() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        let big = "lorem ipsum dolor\r\n".repeat(2_000);
+        app.handle_event(AppEvent::Paste(big.clone())).await?;
+        let expected = big.replace("\r\n", "\n");
+        assert_eq!(app.state().compose_text(), expected);
+        // One history entry: a single undo removes the whole paste.
+        app.state.compose.undo();
+        app.state.sync_compose_cache();
+        assert_eq!(app.state().compose_text(), "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_selection_shows_format_toolbar_and_buttons_toggle_markers() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Paste("hello world".to_owned()))
+            .await?;
+        let mut terminal = Terminal::new(TestBackend::new(140, 36))?;
+        terminal.draw(|frame| app.draw(frame))?;
+        assert!(
+            app.state.compose_format_buttons.is_empty(),
+            "no toolbar without a selection"
+        );
+
+        for _ in 0.."world".len() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Left, KeyModifiers::SHIFT)))
+                .await?;
+        }
+        assert_eq!(app.state().focus(), FocusPane::Compose);
+        terminal.draw(|frame| app.draw(frame))?;
+        let buttons = app.state.compose_format_buttons.clone();
+        assert_eq!(buttons.len(), 4, "toolbar drawn while text is selected");
+        assert!(buffer_text(terminal.backend().buffer()).contains("</>"));
+        let attach = app.state.compose_attach_button.expect("attach button");
+        assert!(buttons.iter().all(|(_, rect)| rect.right() <= attach.x));
+
+        let click = |format: ComposeFormat| {
+            let rect = buttons
+                .iter()
+                .find(|(candidate, _)| *candidate == format)
+                .map(|(_, rect)| *rect)
+                .expect("button drawn");
+            mouse(MouseEventKind::Down(MouseButton::Left), rect.x + 1, rect.y)
+        };
+        let cases = [
+            (ComposeFormat::Bold, "hello **world**"),
+            (ComposeFormat::Italic, "hello _world_"),
+            (ComposeFormat::Strike, "hello ~~world~~"),
+            (ComposeFormat::Code, "hello `world`"),
+        ];
+        for (format, formatted) in cases {
+            app.handle_event(AppEvent::Mouse(click(format))).await?;
+            assert_eq!(app.state().compose_text(), formatted, "{format:?} applied");
+            assert!(app.compose_has_selection(), "result stays selected");
+            app.handle_event(AppEvent::Mouse(click(format))).await?;
+            assert_eq!(
+                app.state().compose_text(),
+                "hello world",
+                "{format:?} removed"
+            );
+        }
+
+        // Buttons can be stacked on the kept selection.
+        app.handle_event(AppEvent::Mouse(click(ComposeFormat::Bold)))
+            .await?;
+        app.handle_event(AppEvent::Mouse(click(ComposeFormat::Italic)))
+            .await?;
+        assert_eq!(app.state().compose_text(), "hello **_world_**");
+
+        // Esc clears the selection (without leaving compose) and hides the toolbar.
+        app.handle_event(AppEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE)))
+            .await?;
+        assert_eq!(app.state().focus(), FocusPane::Compose);
+        terminal.draw(|frame| app.draw(frame))?;
+        assert!(app.state.compose_format_buttons.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_ctrl_b_wraps_selection_or_inserts_marker_pair() -> Result<()> {
+        let mut app = test_app().await?;
+        app.handle_event(AppEvent::Key(key(KeyCode::Enter, KeyModifiers::NONE)))
+            .await?;
+        app.handle_event(AppEvent::Paste("make ".to_owned()))
+            .await?;
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert_eq!(app.state().compose_text(), "make ****");
+        for value in "it".chars() {
+            app.handle_event(AppEvent::Key(key(KeyCode::Char(value), KeyModifiers::NONE)))
+                .await?;
+        }
+        assert_eq!(
+            app.state().compose_text(),
+            "make **it**",
+            "cursor sat inside the pair"
+        );
+
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert_eq!(
+            app.state().compose_text(),
+            "**make **it****",
+            "partially bold selection gets wrapped as a whole"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ctrl_a_outside_compose_still_opens_account_switcher() -> Result<()> {
+        let mut app = test_app().await?;
+        assert_eq!(app.state().focus(), FocusPane::ChatList);
+        app.handle_event(AppEvent::Key(key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        )))
+        .await?;
+        assert!(app.state.account_switcher.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_compose_format_wraps_toggles_and_inserts_pairs() {
+        let bold = ComposeFormat::Bold;
+        // Wrap a selection; the result selects the inner text.
+        let edit = apply_compose_format("say hi", Some((4, 6)), 6, bold);
+        assert_eq!(edit.text, "say **hi**");
+        assert_eq!(edit.selection, Some((6, 8)));
+        // Toggle off when the selection sits inside markers.
+        let edit = apply_compose_format("say **hi**", Some((6, 8)), 8, bold);
+        assert_eq!(edit.text, "say hi");
+        assert_eq!(edit.selection, Some((4, 6)));
+        // Toggle off when the selection includes the markers.
+        let edit = apply_compose_format("**hi**", Some((0, 6)), 6, bold);
+        assert_eq!(edit.text, "hi");
+        // Multi-line: each non-empty line is wrapped, surrounding spaces kept out.
+        let edit = apply_compose_format(" one \n\ntwo", Some((0, 10)), 10, ComposeFormat::Strike);
+        assert_eq!(edit.text, " ~~one~~ \n\n~~two~~");
+        // No selection: insert a pair, then an empty pair is removed again.
+        let edit = apply_compose_format("ab", None, 1, ComposeFormat::Code);
+        assert_eq!(edit.text, "a``b");
+        assert_eq!(edit.cursor, 2);
+        let edit = apply_compose_format(&edit.text, None, edit.cursor, ComposeFormat::Code);
+        assert_eq!(edit.text, "ab");
+        assert_eq!(edit.cursor, 1);
+        // Nested markers are looked through when removing.
+        let edit = apply_compose_format("**_x_**", Some((3, 4)), 4, bold);
+        assert_eq!(edit.text, "_x_");
+        // Multi-byte text keeps valid boundaries.
+        let text = "héllo wörld";
+        let start = text.find('w').unwrap();
+        let edit = apply_compose_format(text, Some((start, text.len())), text.len(), bold);
+        assert_eq!(edit.text, "héllo **wörld**");
+        assert_eq!(
+            compose_byte_to_position(&edit.text, edit.text.len()),
+            (0, 15)
+        );
+        assert_eq!(
+            compose_position_to_byte(&["héllo".to_owned(), "x".to_owned()], (1, 1)),
+            "héllo\nx".len()
+        );
+    }
+
+    #[test]
+    fn compose_row_selection_maps_wrapped_rows() {
+        let lines = vec!["abcdefgh".to_owned(), "xy".to_owned()];
+        let origins = compose_row_origins(&lines, 4);
+        assert_eq!(origins, vec![(0, 0), (0, 4), (1, 0)]);
+        let selection = ((0, 2), (1, 1));
+        assert_eq!(
+            compose_row_selection(origins[0], 4, selection),
+            Some((2, 4))
+        );
+        assert_eq!(
+            compose_row_selection(origins[1], 4, selection),
+            Some((0, 4))
+        );
+        assert_eq!(
+            compose_row_selection(origins[2], 2, selection),
+            Some((0, 1))
+        );
+        assert_eq!(compose_row_selection(origins[2], 2, ((0, 0), (0, 3))), None);
     }
 
     #[test]

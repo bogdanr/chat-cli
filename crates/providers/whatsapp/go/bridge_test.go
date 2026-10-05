@@ -470,3 +470,26 @@ func TestEditedTextSupportsCaptionsOnly(t *testing.T) {
 		t.Fatal("non-text edits must be ignored")
 	}
 }
+
+func TestIsOwnParticipantMatchesPhoneNumberAndLIDIgnoringDevice(t *testing.T) {
+	ownPN := types.NewADJID("40711111111", 0, 12)
+	ownLID := types.NewJID("123456789", types.HiddenUserServer)
+
+	if !isOwnParticipant(ownPN, ownLID, types.NewJID("40711111111", types.DefaultUserServer)) {
+		t.Fatal("phone-number participant should match own JID without the device suffix")
+	}
+	if !isOwnParticipant(ownPN, ownLID, types.EmptyJID, types.NewJID("123456789", types.HiddenUserServer)) {
+		t.Fatal("LID participant should match own LID")
+	}
+	other := types.NewJID("40722222222", types.DefaultUserServer)
+	if isOwnParticipant(ownPN, ownLID, other, types.NewJID("987654321", types.HiddenUserServer)) {
+		t.Fatal("another participant must not be marked as self")
+	}
+	// Same user digits in the other namespace must not match.
+	if isOwnParticipant(ownPN, ownLID, types.NewJID("40711111111", types.HiddenUserServer)) {
+		t.Fatal("identities are compared within their own namespace")
+	}
+	if isOwnParticipant(types.EmptyJID, types.EmptyJID, other) {
+		t.Fatal("without a signed-in identity nobody is self")
+	}
+}

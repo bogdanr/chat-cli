@@ -292,20 +292,31 @@ impl ChatMemberRole {
 pub struct ChatMember {
     pub sender: Sender,
     pub role: ChatMemberRole,
+    /// Whether this member is the signed-in user of the account. Used to keep
+    /// the user out of mention suggestions and to never resolve an ambiguous
+    /// `@Name` to the user when another member shares the name.
+    pub is_self: bool,
 }
 
 impl ChatMember {
     /// A plain member with no elevated role.
     pub fn new(sender: Sender) -> Self {
-        Self {
-            sender,
-            role: ChatMemberRole::Member,
-        }
+        Self::with_role(sender, ChatMemberRole::Member)
     }
 
     /// A member with an explicit role.
     pub fn with_role(sender: Sender, role: ChatMemberRole) -> Self {
-        Self { sender, role }
+        Self {
+            sender,
+            role,
+            is_self: false,
+        }
+    }
+
+    /// Mark this member as the signed-in user.
+    pub fn as_self(mut self, is_self: bool) -> Self {
+        self.is_self = is_self;
+        self
     }
 }
 

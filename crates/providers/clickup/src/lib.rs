@@ -632,8 +632,13 @@ impl Provider for ClickUpProvider {
     /// ClickUp renders mentions as `@Display Name` in Markdown, which is exactly
     /// the token the composer inserts, so the text is sent unchanged. We still
     /// resolve the tokens so the resolved identities are reported to callers.
-    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
-        let resolved = resolve_mention_tokens(text, members);
+    fn encode_outbound_mentions(
+        &self,
+        text: &str,
+        members: &[ChatMember],
+        picks: &[Mention],
+    ) -> OutboundMentions {
+        let resolved = resolve_mention_tokens(text, members, picks);
         let mut mentioned: Vec<Mention> = Vec::new();
         for item in &resolved {
             if !mentioned
@@ -996,7 +1001,14 @@ impl Provider for ClickUpProvider {
 
         cache_channel_members(&self.users, &self.members, chat_id, &members);
 
-        Ok(members.iter().map(chat_member_from_user).collect())
+        let self_user_id = read_lock(&self.connection).self_user_id.clone();
+        Ok(members
+            .iter()
+            .map(|user| {
+                let is_self = self_user_id.as_deref() == Some(user.id.as_str());
+                chat_member_from_user(user).as_self(is_self)
+            })
+            .collect())
     }
 
     async fn chat_details(&self, chat_id: &ChatId) -> Result<ChatDetails> {
@@ -1686,7 +1698,7 @@ mod tests {
 
         // ClickUp resolves `@Display Name` server-side, so the text is sent
         // unchanged while the resolved identity is still reported.
-        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members, &[]);
         assert_eq!(encoded.text, "hi @Bogdan");
         assert_eq!(
             encoded
@@ -1703,7 +1715,7 @@ mod tests {
         let provider = provider_with(FakeClient::new(FakeState::default()));
         let members = vec![mention_member("12345", "Bogdan")];
 
-        let encoded = provider.encode_outbound_mentions("hi @Nobody", &members);
+        let encoded = provider.encode_outbound_mentions("hi @Nobody", &members, &[]);
         assert_eq!(encoded.text, "hi @Nobody");
         assert!(encoded.mentioned.is_empty());
     }
@@ -2261,6 +2273,31 @@ mod tests {
             ProviderEvent::Message { message, is_historical: false }
                 if message.id.as_ref() == "m-sent" && message.is_from_me
         )));
+    }
+
+    #[tokio::test]
+    async fn send_keeps_composer_markdown_unchanged() {
+        // ClickUp chat renders markdown natively, so the composer's
+        // `**bold**`/`~~strike~~` go out as typed.
+        let client = FakeClient::new(single_workspace_state(Vec::new()));
+        let provider = provider_with(Arc::clone(&client));
+        provider.connect().await.expect("connect succeeds");
+        provider.stop_polling();
+
+        provider
+            .send(
+                &arc_str("c-1"),
+                OutboundContent::new(Content::Text(arc_str("**b** _i_ ~~s~~ `c`"))),
+                None,
+            )
+            .await
+            .expect("send succeeds");
+
+        assert!(
+            client
+                .calls()
+                .contains(&"send_message:c-1:**b** _i_ ~~s~~ `c`".to_owned())
+        );
     }
 
     #[tokio::test]

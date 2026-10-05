@@ -124,8 +124,13 @@ impl Provider for MockProvider {
         }
     }
 
-    fn encode_outbound_mentions(&self, text: &str, members: &[ChatMember]) -> OutboundMentions {
-        let resolved = resolve_mention_tokens(text, members);
+    fn encode_outbound_mentions(
+        &self,
+        text: &str,
+        members: &[ChatMember],
+        picks: &[Mention],
+    ) -> OutboundMentions {
+        let resolved = resolve_mention_tokens(text, members, picks);
         OutboundMentions {
             text: text.to_owned(),
             mentioned: resolved.into_iter().map(|item| item.mention).collect(),
@@ -2703,7 +2708,7 @@ mod tests {
             avatar: None,
         })];
 
-        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members);
+        let encoded = provider.encode_outbound_mentions("hi @Bogdan", &members, &[]);
         assert_eq!(encoded.text, "hi @Bogdan");
         assert_eq!(encoded.mentioned.len(), 1);
         assert_eq!(
