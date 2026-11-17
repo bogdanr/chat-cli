@@ -17,7 +17,7 @@ exclude = ["packaging/crates-io"]
 
 [workspace.package]
 edition = "2024"
-version = "0.6.0"
+version = "0.6.1"
 license = "GPL-3.0-only"
 repository = "https://github.com/bogdanr/chat-cli"
 
