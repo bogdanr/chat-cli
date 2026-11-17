@@ -79,6 +79,10 @@ type client struct {
 	closed atomic.Bool
 	// outdatedRecovering keeps ClientOutdated recovery single-flight.
 	outdatedRecovering atomic.Bool
+
+	// groupNames caches group subjects so messages never trigger a
+	// per-message group-info query (see group_names.go).
+	groupNames groupNameCache
 }
 
 // maxPresenceSubscriptions bounds how many users the bridge subscribes to
@@ -1185,6 +1189,7 @@ func C_GroupMembers(clientID C.uint64_t, chatJID *C.char) *C.char {
 		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("fetch WhatsApp group info: %v", err)})
 	}
 
+	c.rememberGroupName(jid, info.Name)
 	members := c.groupMembers(ctx, info)
 	c.log("listed WhatsApp group members chat=%s members=%d elapsed_ms=%d", jid.String(), len(members), time.Since(started).Milliseconds())
 	event := bridgeEvent{Type: "group_members", ChatJID: jid.String(), Members: members}
@@ -1847,6 +1852,7 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 		}
 	case *events.GroupInfo:
 		if v.Name != nil && v.Name.Name != "" {
+			c.rememberGroupName(v.JID, v.Name.Name)
 			muted := chatMuted(c, context.Background(), v.JID)
 			emitProfileEvent(c, context.Background(), v.JID, v.Name.Name, "", true, &muted)
 		}
@@ -2040,7 +2046,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	if c != nil {
 		chatName = conversationName(c, ctx, chatJID, "")
 	}
-	if chatName == "" {
+	if chatName == "" && !isGroup {
 		chatName = message.Info.PushName
 	}
 
@@ -2366,11 +2372,20 @@ func reactionSenderID(key *waProto.MessageKey) string {
 	return key.GetRemoteJID()
 }
 
+// conversationName resolves a chat's display name. For groups it returns
+// the cached subject, then the caller's fallback (for example the history
+// sync display name), then a deduplicated lookup, and "" when the name is
+// unknown: never the raw group ID, which would overwrite the real name
+// downstream.
 func conversationName(c *client, ctx context.Context, jid types.JID, fallback string) string {
-	if jid.Server == types.GroupServer && c != nil && c.wa != nil {
-		if info, err := c.wa.GetGroupInfo(ctx, jid); err == nil && info != nil && info.Name != "" {
-			return info.Name
+	if jid.Server == types.GroupServer {
+		if name := c.cachedGroupName(jid); name != "" {
+			return name
 		}
+		if fallback != "" {
+			return fallback
+		}
+		return c.groupName(ctx, jid)
 	}
 	if name, ok := contactDisplayName(c, ctx, jid); ok {
 		return name
@@ -2624,10 +2639,9 @@ func (c *client) fetchAndEmitGroupInfo(ctx context.Context, jid types.JID) {
 	if c == nil || c.wa == nil || jid.IsEmpty() || jid.Server != types.GroupServer || strings.HasPrefix(c.dbPath, "test:") {
 		return
 	}
-	info, err := c.wa.GetGroupInfo(ctx, jid)
-	if err == nil && info != nil && info.Name != "" {
+	if name := c.groupName(ctx, jid); name != "" {
 		muted := chatMuted(c, ctx, jid)
-		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: info.Name, IsGroup: true, Muted: &muted})
+		emit(bridgeEvent{Type: "profile", JID: jid.String(), SenderName: name, IsGroup: true, Muted: &muted})
 	}
 }
 
@@ -2644,6 +2658,7 @@ func (c *client) emitJoinedGroups(ctx context.Context) {
 		if group == nil || group.JID.IsEmpty() {
 			continue
 		}
+		c.rememberGroupName(group.JID, group.Name)
 		name := group.Name
 		if name == "" {
 			name = group.JID.User

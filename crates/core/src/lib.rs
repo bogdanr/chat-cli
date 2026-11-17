@@ -2,6 +2,7 @@ pub mod events;
 pub mod markup;
 pub mod mock;
 pub mod provider;
+pub mod search;
 pub mod types;
 
 pub use events::{
@@ -14,4 +15,5 @@ pub use provider::{
     Provider, ResolvedMention, can_edit_message, editable_text, resolve_mention_tokens,
     rewrite_mention_tokens,
 };
+pub use search::fold_for_search;
 pub use types::*;

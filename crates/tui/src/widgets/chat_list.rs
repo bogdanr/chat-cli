@@ -1,7 +1,7 @@
 use crate::{theme::Theme, widgets::message_list};
 use chat_core::{
     Account, Chat, ChatId, ChatKind, ChatMembership, DiscoveryAction, DiscoveryResult,
-    DiscoveryResultKind, Platform, ProviderId,
+    DiscoveryResultKind, Platform, ProviderId, fold_for_search,
 };
 use chrono::{Local, NaiveDateTime, Utc};
 use ratatui::{
@@ -174,7 +174,7 @@ pub fn render_chat_list(frame: &mut Frame<'_>, area: Rect, props: ChatListProps<
 pub fn filter_chat_indices(chats: &[Chat], filter: &str) -> Vec<usize> {
     let terms = filter
         .split_whitespace()
-        .map(str::to_lowercase)
+        .map(fold_for_search)
         .collect::<Vec<_>>();
     if terms.is_empty() {
         return (0..chats.len()).collect();
@@ -784,14 +784,13 @@ pub fn selected_row_position_with_older_chats(
 }
 
 fn chat_matches_terms(chat: &Chat, terms: &[String]) -> bool {
-    let haystack = format!(
+    let haystack = fold_for_search(&format!(
         "{} {} {} {}",
         chat.name,
         chat.last_message_preview.as_deref().unwrap_or_default(),
         platform_badge(&chat.platform),
         platform_name(&chat.platform),
-    )
-    .to_lowercase();
+    ));
     terms.iter().all(|term| haystack.contains(term))
 }
 
@@ -1820,6 +1819,23 @@ mod tests {
         assert_eq!(filter_chat_indices(&chats, "screenshot"), vec![2]);
         assert_eq!(filter_chat_indices(&chats, "slack build"), vec![1]);
         assert_eq!(filter_chat_indices(&chats, "wa alice"), vec![0]);
+    }
+
+    #[test]
+    fn filter_ignores_diacritics_in_both_directions() {
+        let mut chats = sample_chats();
+        chats[0].name = Arc::from("Învățat");
+        chats[1].name = Arc::from("Ştiinţă și Țară");
+
+        assert_eq!(filter_chat_indices(&chats, "invatat"), vec![0]);
+        assert_eq!(filter_chat_indices(&chats, "ÎNVĂȚAT"), vec![0]);
+        assert_eq!(filter_chat_indices(&chats, "învățat"), vec![0]);
+        assert_eq!(filter_chat_indices(&chats, "stiinta tara"), vec![1]);
+        // Combining marks (decomposed input) fold the same way.
+        assert_eq!(
+            filter_chat_indices(&chats, "i\u{0302}nva\u{0306}t\u{0326}at"),
+            vec![0]
+        );
     }
 
     #[test]

@@ -20708,6 +20708,17 @@ struct MessageScrollAnchor {
     offset: usize,
 }
 
+/// A WhatsApp chat that is unnamed, or named after its own raw ID, carries a
+/// placeholder rather than a real name.
+fn is_whatsapp_placeholder_name(chat: &Chat) -> bool {
+    let name = chat.name.trim();
+    name.is_empty()
+        || (name
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ch == '-' || ch == '_')
+            && chat.id.contains(name))
+}
+
 fn preserve_sidebar_activity_metadata(chat: &mut Chat, existing: Option<&Chat>) {
     let Some(existing) = existing else {
         return;
@@ -20730,6 +20741,13 @@ fn preserve_sidebar_activity_metadata(chat: &mut Chat, existing: Option<&Chat>) 
     if chat.platform == Platform::WhatsApp {
         if chat.avatar.is_none() {
             chat.avatar = existing.avatar.clone();
+        }
+        // The bridge falls back to the raw group ID when it cannot resolve a
+        // name (for example when WhatsApp rate-limits the lookup). Such a
+        // snapshot must not erase the real name, or the chat can no longer
+        // be found by name.
+        if is_whatsapp_placeholder_name(chat) && !is_whatsapp_placeholder_name(existing) {
+            chat.name = existing.name.clone();
         }
         chat.unread_count = chat.unread_count.max(existing.unread_count);
         if existing.last_message_preview.as_deref() == Some(EMPTY_WHATSAPP_MESSAGE_PLACEHOLDER) {
@@ -31913,6 +31931,34 @@ mod tests {
             unread_snapshot_decision(2, None, 2, None, false),
             UnreadSnapshotDecision::Unchanged
         );
+    }
+
+    #[test]
+    fn whatsapp_snapshot_with_raw_id_name_keeps_real_name() {
+        let account: ProviderId = Arc::from("whatsapp:names");
+        let existing = test_chat(
+            &account,
+            Platform::WhatsApp,
+            "whatsapp:120363028315852690@g.us",
+            "Învățat",
+            ChatKind::Group,
+        );
+
+        let mut placeholder = existing.clone();
+        placeholder.name = Arc::from("120363028315852690");
+        preserve_sidebar_activity_metadata(&mut placeholder, Some(&existing));
+        assert_eq!(placeholder.name.as_ref(), "Învățat");
+
+        let mut renamed = existing.clone();
+        renamed.name = Arc::from("Învățat 2026");
+        preserve_sidebar_activity_metadata(&mut renamed, Some(&existing));
+        assert_eq!(renamed.name.as_ref(), "Învățat 2026");
+
+        let mut stored_placeholder = existing.clone();
+        stored_placeholder.name = Arc::from("120363028315852690");
+        let mut repaired = existing.clone();
+        preserve_sidebar_activity_metadata(&mut repaired, Some(&stored_placeholder));
+        assert_eq!(repaired.name.as_ref(), "Învățat");
     }
 
     #[test]
