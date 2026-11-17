@@ -8,7 +8,7 @@ use chat_core::{
     OutboundCapabilities, OutboundContent, OutboundMentions, Platform, PlatformData, PlatformId,
     Poll, PollOption, PollVote, Presence, PresenceState, PresenceSupport, Provider, ProviderEvent,
     ProviderId, QuotedPreview, Reaction, Sender, Timestamp, WhatsAppData, can_edit_message,
-    resolve_mention_tokens, rewrite_mention_tokens,
+    fold_for_search, resolve_mention_tokens, rewrite_mention_tokens,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -907,11 +907,14 @@ impl Provider for WhatsAppProvider {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        // Local matching ignores diacritics; the bridge contact search below
+        // still gets the query as typed.
+        let folded_query = fold_for_search(&query);
 
         let mut results = Vec::new();
         let mut seen = std::collections::HashSet::<String>::new();
         for chat in lock_rw_read(&self.chats).values().cloned() {
-            if !whatsapp_chat_matches_query(&chat, &query) {
+            if !whatsapp_chat_matches_query(&chat, &folded_query) {
                 continue;
             }
             seen.insert(chat.id.to_string());
@@ -925,7 +928,7 @@ impl Provider for WhatsAppProvider {
             if results.len() >= limit {
                 break;
             }
-            if !whatsapp_sender_matches_query(&profile, &query) {
+            if !whatsapp_sender_matches_query(&profile, &folded_query) {
                 continue;
             }
             append_whatsapp_contact_result(&mut results, &mut seen, &self.id, profile);
@@ -2365,6 +2368,19 @@ fn should_replace_chat_name(current: &str, candidate: &str, is_group: bool) -> b
     looks_like_jid_fallback(current) && !looks_like_jid_fallback(candidate)
 }
 
+/// Profile events normally carry the authoritative chat name (contact or
+/// group subject) and replace the current one. The exception is a raw-ID
+/// fallback (the bridge could not resolve the name, for example because
+/// WhatsApp rate-limited the lookup): that must never replace a real name.
+fn should_apply_profile_chat_name(current: &str, candidate: &str) -> bool {
+    if candidate.is_empty() || current == candidate {
+        return false;
+    }
+    !(looks_like_jid_fallback(candidate)
+        && !current.is_empty()
+        && !looks_like_jid_fallback(current))
+}
+
 fn looks_like_jid_fallback(value: &str) -> bool {
     value
         .chars()
@@ -2944,17 +2960,19 @@ fn quoted_media_preview(media: &Media, label: &str) -> String {
         .unwrap_or_else(|| label.to_owned())
 }
 
+/// `query` must already be folded with [`fold_for_search`].
 fn whatsapp_chat_matches_query(chat: &Chat, query: &str) -> bool {
-    chat.name.to_lowercase().contains(query)
+    fold_for_search(&chat.name).contains(query)
         || chat
             .last_message_preview
             .as_deref()
-            .is_some_and(|preview| preview.to_lowercase().contains(query))
+            .is_some_and(|preview| fold_for_search(preview).contains(query))
         || chat.id.to_lowercase().contains(query)
 }
 
+/// `query` must already be folded with [`fold_for_search`].
 fn whatsapp_sender_matches_query(sender: &Sender, query: &str) -> bool {
-    sender.display_name.to_lowercase().contains(query)
+    fold_for_search(&sender.display_name).contains(query)
         || sender.platform_id.to_lowercase().contains(query)
 }
 
@@ -3211,7 +3229,9 @@ fn forward_profile_event(
     let updated_chat = {
         let mut chats = lock_rw_write(chats);
         if let Some(chat) = chats.get_mut(&chat_id) {
-            chat.name = arc_str(&name);
+            if should_apply_profile_chat_name(chat.name.as_ref(), &name) {
+                chat.name = arc_str(&name);
+            }
             if avatar.is_some() {
                 chat.avatar = avatar.clone();
             }
@@ -3574,6 +3594,107 @@ mod tests {
             r#"{"type":"message","id":"p","chat_jid":"1@s.whatsapp.net","text":"hi","reply_to_id":"  "}"#,
         )?;
         assert!(plain.quoted_reply().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn discovery_matches_ignore_diacritics() {
+        let mut chat = whatsapp_test_group_chat("Învățat");
+        assert!(whatsapp_chat_matches_query(
+            &chat,
+            &fold_for_search("invatat")
+        ));
+        assert!(whatsapp_chat_matches_query(
+            &chat,
+            &fold_for_search("ÎNVĂȚAT")
+        ));
+        chat.name = arc_str("Prietenii");
+        assert!(!whatsapp_chat_matches_query(
+            &chat,
+            &fold_for_search("invatat")
+        ));
+
+        let sender = Sender {
+            platform_id: arc_str("40700000000@s.whatsapp.net"),
+            display_name: arc_str("Ștefan Țăranu"),
+            avatar: None,
+        };
+        assert!(whatsapp_sender_matches_query(
+            &sender,
+            &fold_for_search("stefan taranu")
+        ));
+    }
+
+    fn whatsapp_test_group_chat(name: &str) -> Chat {
+        Chat {
+            id: chat_id_from_jid("120363028315852690@g.us"),
+            account: arc_str("whatsapp"),
+            platform: Platform::WhatsApp,
+            name: arc_str(name),
+            avatar: None,
+            is_group: true,
+            kind: ChatKind::Group,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            last_message_at: None,
+            last_read_at: None,
+            last_message_preview: None,
+            thread_id: None,
+        }
+    }
+
+    #[test]
+    fn profile_chat_name_never_downgrades_to_raw_group_id() {
+        assert!(!should_apply_profile_chat_name(
+            "Învățat",
+            "120363028315852690"
+        ));
+        assert!(!should_apply_profile_chat_name("Învățat", ""));
+        assert!(should_apply_profile_chat_name(
+            "120363028315852690",
+            "Învățat"
+        ));
+        assert!(should_apply_profile_chat_name("", "120363028315852690"));
+        assert!(should_apply_profile_chat_name("Învățat", "Învățat 2026"));
+        assert!(should_apply_profile_chat_name("Ada", "Ada Lovelace"));
+    }
+
+    #[test]
+    fn profile_event_with_raw_id_keeps_real_group_name() -> Result<()> {
+        let account_id: ProviderId = arc_str("whatsapp");
+        let chats = Arc::new(RwLock::new(HashMap::new()));
+        let messages = Arc::new(RwLock::new(Vec::new()));
+        let profiles = Arc::new(RwLock::new(HashMap::new()));
+        let events = EventBus::new();
+        let mut rx = events.subscribe();
+        let named = BridgeEvent::decode(
+            r#"{"type":"profile","jid":"120363028315852690@g.us","sender_name":"Învățat","is_group":true}"#,
+        )?;
+        forward_profile_event(&account_id, &chats, &messages, &profiles, &events, named);
+        let raw = BridgeEvent::decode(
+            r#"{"type":"profile","jid":"120363028315852690@g.us","sender_name":"120363028315852690","avatar_path":"/tmp/g.jpg","is_group":true}"#,
+        )?;
+        forward_profile_event(&account_id, &chats, &messages, &profiles, &events, raw);
+        let unnamed = BridgeEvent::decode(
+            r#"{"type":"profile","jid":"120363028315852690@g.us","is_group":true}"#,
+        )?;
+        forward_profile_event(&account_id, &chats, &messages, &profiles, &events, unnamed);
+
+        let chat_id = chat_id_from_jid("120363028315852690@g.us");
+        let chat = lock_rw_read(&chats).get(&chat_id).cloned().expect("chat");
+        assert_eq!(chat.name.as_ref(), "Învățat");
+        assert_eq!(chat.avatar, Some(PathBuf::from("/tmp/g.jpg")));
+
+        let mut last_name = None;
+        while let Ok(event) = rx.try_recv() {
+            if let ProviderEvent::ChatUpdated(chat) = event {
+                last_name = Some(chat.name);
+            }
+        }
+        assert_eq!(last_name.as_deref(), Some("Învățat"));
         Ok(())
     }
 
