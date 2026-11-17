@@ -2,6 +2,7 @@ pub mod app;
 pub mod attach;
 pub mod event;
 pub mod launch;
+pub(crate) mod member_profile;
 pub mod theme;
 pub mod video;
 pub mod voice_summary;

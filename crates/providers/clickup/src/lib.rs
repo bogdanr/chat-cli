@@ -892,13 +892,17 @@ impl Provider for ClickUpProvider {
         bail!("ClickUp attachment download is not supported yet")
     }
 
-    async fn mark_read(&self, chat_id: &ChatId, _up_to: &MessageId) -> Result<()> {
-        // ClickUp's public v3 Chat surface exposes no documented "mark channel
-        // read" operation. Acknowledge locally so the unread badge clears in
-        // this client; the next channel listing will report ClickUp's own
-        // read state and correct it if the user reads elsewhere.
+    async fn mark_read(&self, chat_id: &ChatId, request: &MarkReadRequest) -> Result<()> {
+        // Known platform limitation: ClickUp's public v3 Chat API exposes no
+        // "mark channel read" operation, so reads done in chat-cli cannot
+        // clear the badge in ClickUp's own apps. Acknowledge locally so the
+        // badge clears here. Channel re-listing reports ClickUp's own unread
+        // count; the TUI keeps a locally-read chat at 0 unless that listing
+        // shows activity newer than the read watermark sent here, and reads
+        // done in ClickUp still lower the badge in chat-cli.
         self.events.send(ProviderEvent::ChatMarkedRead {
             chat_id: chat_id.clone(),
+            read_up_to: request.up_to_at,
         });
         Ok(())
     }
@@ -990,6 +994,15 @@ impl Provider for ClickUpProvider {
         Ok(self.cached_user(platform_id).as_ref().map(sender_from_user))
     }
 
+    async fn contact_profile(&self, platform_id: &PlatformId) -> Result<Option<ContactProfile>> {
+        // Served from the member/user cache only: ClickUp has no per-user
+        // profile endpoint that adds anything beyond name, handle and email.
+        Ok(self
+            .cached_user(platform_id)
+            .as_ref()
+            .map(contact_profile_from_user))
+    }
+
     async fn chat_members(&self, chat_id: &ChatId) -> Result<Vec<ChatMember>> {
         let (authorization, workspace_id) = self.scope()?;
         self.note_tx(NetworkActivityKind::Sync);
@@ -1049,6 +1062,25 @@ impl Provider for ClickUpProvider {
 // ---------------------------------------------------------------------------
 // Direct-chat identity
 // ---------------------------------------------------------------------------
+
+/// Builds the profile shown when a ClickUp member is opened: display name,
+/// `@username` handle (when it differs from the name) and email.
+fn contact_profile_from_user(user: &WireUser) -> ContactProfile {
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(arc_str)
+    };
+    let display_name = user.best_name();
+    let handle = clean(user.username.as_deref()).filter(|handle| handle.as_ref() != display_name);
+    ContactProfile {
+        display_name: Some(arc_str(&display_name)),
+        handle,
+        email: clean(user.email.as_deref()),
+        ..ContactProfile::default()
+    }
+}
 
 /// Records a channel's member list in both shared caches.
 ///
@@ -2553,13 +2585,13 @@ mod tests {
         let mut events = provider.events();
 
         provider
-            .mark_read(&arc_str("c-1"), &arc_str("m-1"))
+            .mark_read(&arc_str("c-1"), &MarkReadRequest::default())
             .await
             .expect("mark read");
 
         assert!(drain(&mut events).iter().any(|event| matches!(
             event,
-            ProviderEvent::ChatMarkedRead { chat_id } if chat_id.as_ref() == "c-1"
+            ProviderEvent::ChatMarkedRead { chat_id, .. } if chat_id.as_ref() == "c-1"
         )));
     }
 
@@ -2722,5 +2754,27 @@ mod tests {
             [("a".to_owned(), None)].into_iter().collect();
         prune_seen_message_ids(&mut small);
         assert_eq!(small.len(), 1);
+    }
+
+    #[test]
+    fn clickup_contact_profile_exposes_handle_and_email() {
+        let user = WireUser {
+            id: "7".to_owned(),
+            name: Some("Ada Lovelace".to_owned()),
+            username: Some("ada".to_owned()),
+            email: Some(" ada@example.com ".to_owned()),
+            ..WireUser::default()
+        };
+        let profile = contact_profile_from_user(&user);
+        assert_eq!(profile.display_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(profile.handle.as_deref(), Some("ada"));
+        assert_eq!(profile.email.as_deref(), Some("ada@example.com"));
+
+        let same = WireUser {
+            id: "8".to_owned(),
+            username: Some("bob".to_owned()),
+            ..WireUser::default()
+        };
+        assert!(contact_profile_from_user(&same).handle.is_none());
     }
 }

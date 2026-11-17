@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
@@ -491,5 +492,200 @@ func TestIsOwnParticipantMatchesPhoneNumberAndLIDIgnoringDevice(t *testing.T) {
 	}
 	if isOwnParticipant(types.EmptyJID, types.EmptyJID, other) {
 		t.Fatal("without a signed-in identity nobody is self")
+	}
+}
+
+func TestMessageQuotedReplyDMTextDefaultsSenderToChat(t *testing.T) {
+	chat := types.NewJID("40747086008", types.DefaultUserServer)
+	message := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+		Text: proto.String("Voiam să-ți amintesc de asta"),
+		ContextInfo: &waProto.ContextInfo{
+			StanzaID:      proto.String("ORIGINAL1"),
+			QuotedMessage: &waProto.Message{Conversation: proto.String("  original\n text ")},
+		},
+	}}
+	reply, ok := messageQuotedReply(message, chat)
+	if !ok {
+		t.Fatal("expected a quoted reply")
+	}
+	if reply.ID != "ORIGINAL1" || reply.SenderJID != chat || reply.Text != "original text" {
+		t.Fatalf("unexpected reply %+v", reply)
+	}
+}
+
+func TestMessageQuotedReplyGroupUsesParticipant(t *testing.T) {
+	chat := types.NewJID("120363157988526102", types.GroupServer)
+	message := &waProto.Message{ImageMessage: &waProto.ImageMessage{
+		Caption: proto.String("look"),
+		ContextInfo: &waProto.ContextInfo{
+			StanzaID:      proto.String("Q2"),
+			Participant:   proto.String("36786512371803@lid"),
+			QuotedMessage: &waProto.Message{AudioMessage: &waProto.AudioMessage{PTT: proto.Bool(true)}},
+		},
+	}}
+	reply, ok := messageQuotedReply(message, chat)
+	if !ok {
+		t.Fatal("expected a quoted reply in an image caption")
+	}
+	if reply.SenderJID.String() != "36786512371803@lid" || reply.Text != "Voice message" {
+		t.Fatalf("unexpected reply %+v", reply)
+	}
+}
+
+func TestMessageQuotedReplyUnwrapsEphemeral(t *testing.T) {
+	chat := types.NewJID("1", types.DefaultUserServer)
+	message := &waProto.Message{EphemeralMessage: &waProto.FutureProofMessage{Message: &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text:        proto.String("hi"),
+			ContextInfo: &waProto.ContextInfo{StanzaID: proto.String("Q3"), QuotedMessage: &waProto.Message{ImageMessage: &waProto.ImageMessage{}}},
+		},
+	}}}
+	reply, ok := messageQuotedReply(message, chat)
+	if !ok || reply.ID != "Q3" || reply.Text != "Photo" {
+		t.Fatalf("unexpected reply %+v ok=%v", reply, ok)
+	}
+}
+
+func TestMessageQuotedReplyIgnoresPlainStatusAndEmpty(t *testing.T) {
+	chat := types.NewJID("1", types.DefaultUserServer)
+	if _, ok := messageQuotedReply(&waProto.Message{Conversation: proto.String("plain")}, chat); ok {
+		t.Fatal("plain message must not be a reply")
+	}
+	mentionOnly := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+		Text: proto.String("@1"), ContextInfo: &waProto.ContextInfo{MentionedJID: []string{"1@s.whatsapp.net"}},
+	}}
+	if _, ok := messageQuotedReply(mentionOnly, chat); ok {
+		t.Fatal("mention-only context must not be a reply")
+	}
+	status := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+		Text: proto.String("nice"), ContextInfo: &waProto.ContextInfo{StanzaID: proto.String("S"), RemoteJID: proto.String("status@broadcast")},
+	}}
+	if _, ok := messageQuotedReply(status, chat); ok {
+		t.Fatal("status replies must be ignored")
+	}
+}
+
+func TestApplyQuotedReplyMarksOwnQuoteAndForwarded(t *testing.T) {
+	chat := types.NewJID("1", types.DefaultUserServer)
+	payload := &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+		Text: proto.String("reply"),
+		ContextInfo: &waProto.ContextInfo{
+			StanzaID:      proto.String("Q4"),
+			QuotedMessage: &waProto.Message{DocumentMessage: &waProto.DocumentMessage{FileName: proto.String("cv.pdf")}},
+			IsForwarded:   proto.Bool(true),
+		},
+	}}
+	var event bridgeEvent
+	applyQuotedReply(nil, context.Background(), nil, payload, chat, &event)
+	if event.ReplyToID != "Q4" || event.ReplyToText != "cv.pdf" || !event.IsForwarded {
+		t.Fatalf("unexpected event %+v", event)
+	}
+	if event.ReplyToSenderJID != chat.String() {
+		t.Fatalf("expected DM quote sender to be the chat peer, got %q", event.ReplyToSenderJID)
+	}
+}
+
+func TestMessageMentionedJIDCoversPollAndLocation(t *testing.T) {
+	poll := &waProto.Message{PollCreationMessageV3: &waProto.PollCreationMessage{
+		Name: proto.String("q"), ContextInfo: &waProto.ContextInfo{MentionedJID: []string{"2@s.whatsapp.net"}},
+	}}
+	if got := messageMentionedJID(poll); len(got) != 1 {
+		t.Fatalf("expected poll mention, got %v", got)
+	}
+	loc := &waProto.Message{LocationMessage: &waProto.LocationMessage{ContextInfo: &waProto.ContextInfo{StanzaID: proto.String("L")}}}
+	if _, ok := messageQuotedReply(loc, types.NewJID("1", types.DefaultUserServer)); !ok {
+		t.Fatal("expected location reply to be detected")
+	}
+}
+
+func TestChatUnreadEventMarkedUnreadForcesBadgeAndCarriesAsOf(t *testing.T) {
+	chat := types.NewJID("40700000000", types.DefaultUserServer)
+	at := time.Date(2026, 10, 8, 9, 30, 0, 0, time.UTC)
+	event := chatUnreadEvent(chat, 0, at, true)
+	if event.Type != "chat_unread" || event.UnreadCount == nil || *event.UnreadCount != 1 || !event.MarkedUnread {
+		t.Fatalf("unexpected marked-unread event %+v", event)
+	}
+	if event.AsOf != "2026-10-08T09:30:00Z" {
+		t.Fatalf("unexpected as_of %q", event.AsOf)
+	}
+	plain := chatUnreadEvent(chat, 3, time.Time{}, false)
+	if *plain.UnreadCount != 3 || plain.MarkedUnread || plain.AsOf != "" {
+		t.Fatalf("unexpected plain event %+v", plain)
+	}
+}
+
+func TestChatReadEventCarriesReadUpTo(t *testing.T) {
+	chat := types.NewJID("1", types.DefaultUserServer)
+	event := chatReadEvent(chat, time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC))
+	if event.Type != "read" || event.ReadUpTo != "2026-10-08T09:00:00Z" {
+		t.Fatalf("unexpected read event %+v", event)
+	}
+	if chatReadEvent(chat, time.Time{}).ReadUpTo != "" {
+		t.Fatal("zero time must not be serialized")
+	}
+}
+
+func TestParseMarkReadRequestAcceptsLegacyArrayAndObject(t *testing.T) {
+	legacy, err := parseMarkReadRequest(`[{"id":"A","sender_jid":"1@s.whatsapp.net"}]`)
+	if err != nil || len(legacy.Entries) != 1 || legacy.ClearMarkedUnread {
+		t.Fatalf("unexpected legacy parse %+v err=%v", legacy, err)
+	}
+	object, err := parseMarkReadRequest(`{"entries":[{"id":"B","sender_jid":""}],"clear_marked_unread":true,"last_id":"B","last_timestamp_ms":1700000000000}`)
+	if err != nil || len(object.Entries) != 1 || !object.ClearMarkedUnread || object.LastID != "B" {
+		t.Fatalf("unexpected object parse %+v err=%v", object, err)
+	}
+}
+
+func TestBuildClearMarkedUnreadPatchTargetsRegularLow(t *testing.T) {
+	chat := types.NewJID("120363157988526102", types.GroupServer)
+	patch := buildClearMarkedUnreadPatch(chat, markReadRequest{
+		ClearMarkedUnread: true,
+		LastID:            "LAST",
+		LastSenderJID:     "36786512371803@lid",
+		LastTimestampMS:   1_700_000_000_000,
+	})
+	if patch.Type != appstate.WAPatchRegularLow || len(patch.Mutations) != 1 {
+		t.Fatalf("unexpected patch %+v", patch)
+	}
+	action := patch.Mutations[0].Value.GetMarkChatAsReadAction()
+	if !action.GetRead() {
+		t.Fatal("patch must mark the chat read")
+	}
+	messages := action.GetMessageRange().GetMessages()
+	if len(messages) != 1 || messages[0].GetKey().GetID() != "LAST" || messages[0].GetKey().GetParticipant() != "36786512371803@lid" {
+		t.Fatalf("unexpected message range %+v", action.GetMessageRange())
+	}
+}
+
+func TestProfilePictureCacheKeySeparatesPreviewAndFull(t *testing.T) {
+	jid := "447700900123@s.whatsapp.net"
+	preview := profilePictureCacheKey("preview", jid, "pic-1", "https://example/p")
+	full := profilePictureCacheKey("full", jid, "pic-1", "https://example/f")
+	if preview == full {
+		t.Fatalf("preview and full avatars share cache key %q", preview)
+	}
+	if got := profilePictureCacheKey("", jid, "pic-1", ""); got != full {
+		t.Fatalf("empty variant should default to full: got %q want %q", got, full)
+	}
+	if got := profilePictureCacheKey("full", jid, "", "https://example/f"); !strings.Contains(got, "https://example/f") {
+		t.Fatalf("missing picture id should key on url: %q", got)
+	}
+}
+
+func TestPresenceEventRecordsLatestSnapshot(t *testing.T) {
+	c := &client{dbPath: "test:presence"}
+	jid := types.NewJID("447700900123", types.DefaultUserServer)
+	seen := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	emitPresenceEvent(c, &events.Presence{From: jid, Unavailable: true, LastSeen: seen})
+	got, ok := c.presenceLatest[jid.String()]
+	if !ok {
+		t.Fatalf("presence snapshot not recorded: %#v", c.presenceLatest)
+	}
+	if got.PresenceState != "offline" || got.LastSeen != "2026-01-02T03:04:05Z" {
+		t.Fatalf("unexpected presence snapshot: %#v", got)
+	}
+	emitPresenceEvent(c, &events.Presence{From: jid})
+	if got := c.presenceLatest[jid.String()]; got.PresenceState != "online" || got.LastSeen != "" {
+		t.Fatalf("online update should replace snapshot: %#v", got)
 	}
 }

@@ -1,4 +1,11 @@
 mod schema;
+mod stats;
+
+pub use stats::{
+    ACTIVITY_MERGE_SECONDS, ChatStats, ChatStatsOptions, ContactNote, LastMessageQuery,
+    LastMessageSeen, LinkReason, LinkedIdentity, ME_SENDER_KEY, MediaBreakdown, SenderChatActivity,
+    SenderStats, SharedItem, SharedItemKind,
+};
 
 use anyhow::{Context, Result, anyhow};
 use chat_core::*;
@@ -142,6 +149,16 @@ pub struct AppSettings {
     /// cleared after a period of inactivity so a forgotten filter does not
     /// silently keep hiding content.
     pub auto_reset_filter: bool,
+    /// When enabled, reading a chat in chat-cli is reported back to the
+    /// platform (WhatsApp read receipts / app state, Slack
+    /// `conversations.mark`) so the native apps clear their unread badges
+    /// too. When disabled, reads only clear badges locally. Reads done in the
+    /// native apps are always applied here regardless of this toggle.
+    pub send_read_status: bool,
+    /// When enabled, the details pane shows member presence (online / last
+    /// seen) and activity statistics computed from local history. Turn off
+    /// for privacy, for example while screen-sharing.
+    pub show_member_activity: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,6 +253,8 @@ impl Default for AppSettings {
             show_empty_chats: true,
             thread_marker_scope: ThreadMarkerScope::Participating,
             auto_reset_filter: true,
+            send_read_status: true,
+            show_member_activity: true,
         }
     }
 }
@@ -265,6 +284,8 @@ impl<'de> Deserialize<'de> for AppSettings {
             show_empty_chats: bool,
             thread_marker_scope: ThreadMarkerScope,
             auto_reset_filter: bool,
+            send_read_status: bool,
+            show_member_activity: bool,
         }
 
         impl Default for AppSettingsCompat {
@@ -288,6 +309,8 @@ impl<'de> Deserialize<'de> for AppSettings {
                     show_empty_chats: defaults.show_empty_chats,
                     thread_marker_scope: defaults.thread_marker_scope,
                     auto_reset_filter: defaults.auto_reset_filter,
+                    send_read_status: defaults.send_read_status,
+                    show_member_activity: defaults.show_member_activity,
                 }
             }
         }
@@ -319,6 +342,8 @@ impl<'de> Deserialize<'de> for AppSettings {
             show_empty_chats: compat.show_empty_chats,
             thread_marker_scope: compat.thread_marker_scope,
             auto_reset_filter: compat.auto_reset_filter,
+            send_read_status: compat.send_read_status,
+            show_member_activity: compat.show_member_activity,
         })
     }
 }
@@ -351,6 +376,7 @@ impl Store {
         ensure_chat_metadata_columns(&conn).context("adding chat metadata columns")?;
         ensure_message_metadata_columns(&conn).context("adding message metadata columns")?;
         normalize_message_sender_ids(&conn).context("normalizing message sender ids")?;
+        clear_whatsapp_quote_thread_ids(&conn).context("clearing WhatsApp quote thread ids")?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -518,9 +544,7 @@ impl Store {
             ("handles", "platform_id"),
         ] {
             transaction.execute(
-                &format!(
-                    "UPDATE OR IGNORE {table} SET account_id = ?2 WHERE account_id = ?1"
-                ),
+                &format!("UPDATE OR IGNORE {table} SET account_id = ?2 WHERE account_id = ?1"),
                 params![from, to],
             )?;
             // Anything still on the old id collided with an existing target
@@ -745,7 +769,7 @@ impl Store {
                     m.timestamp, m.edited_at, m.content_type, m.content_text, m.content_caption,
                     m.media_id, m.media_filename, m.media_mime, m.media_size, m.media_local,
                     m.media_thumbnail, m.reply_to_id, m.thread_id, m.is_from_me, m.platform_json,
-                    m.mentions_me
+                    m.mentions_me, m.reply_preview_json
              FROM messages m
              JOIN (
                  SELECT account_id, chat_id, MAX(timestamp) AS timestamp
@@ -987,7 +1011,7 @@ impl Store {
             .query_row(
                 "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                         content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me, reply_preview_json
                  FROM messages WHERE id = ?1 AND account_id = ?2",
                 params![message_id.as_ref(), account_id.as_ref()],
                 message_from_row,
@@ -1048,7 +1072,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                         content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me, reply_preview_json
                  FROM messages WHERE account_id = ?1 AND chat_id = ?2 AND timestamp < ?3 ORDER BY timestamp DESC LIMIT ?4",
             )?;
             stmt.query_map(
@@ -1060,7 +1084,7 @@ impl Store {
             let mut stmt = conn.prepare(
                 "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                         content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
+                        media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me, reply_preview_json
                  FROM messages WHERE chat_id = ?1 AND timestamp < ?2 ORDER BY timestamp DESC LIMIT ?3",
             )?;
             stmt.query_map(params![chat_id.as_ref(), before, limit], message_from_row)?
@@ -1082,7 +1106,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                     content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me, reply_preview_json
              FROM messages WHERE account_id = ?1 AND chat_id = ?2 ORDER BY timestamp ASC LIMIT 1",
         )?;
         let mut message = stmt
@@ -1104,7 +1128,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                     content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me, reply_preview_json
              FROM messages WHERE content_text LIKE ?1 ORDER BY timestamp DESC LIMIT ?2",
         )?;
         let mut messages = stmt
@@ -1129,7 +1153,7 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                     content_type, content_text, content_caption, media_id, media_filename, media_mime,
-                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me
+                    media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json, mentions_me, reply_preview_json
              FROM messages WHERE account_id = ?1 AND thread_id = ?2 ORDER BY timestamp ASC LIMIT ?3",
         )?;
         let mut messages = stmt
@@ -1309,8 +1333,8 @@ fn upsert_chat_on_conn(conn: &Connection, chat: &Chat) -> Result<()> {
     conn.execute(
         "INSERT INTO chats (
             id, account_id, platform, name, avatar_path, is_group, kind, membership, is_shared,
-            unread_count, muted, pinned, last_msg_at, last_preview, thread_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            unread_count, muted, pinned, last_msg_at, last_preview, thread_id, last_read_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id, account_id) DO UPDATE SET
            platform = excluded.platform,
            name = excluded.name,
@@ -1332,7 +1356,12 @@ fn upsert_chat_on_conn(conn: &Connection, chat: &Chat) -> Result<()> {
                WHEN chats.last_msg_at IS NULL OR excluded.last_msg_at >= chats.last_msg_at THEN COALESCE(excluded.last_preview, chats.last_preview)
                ELSE chats.last_preview
            END,
-           thread_id = excluded.thread_id",
+           thread_id = excluded.thread_id,
+           last_read_at = CASE
+               WHEN excluded.last_read_at IS NULL THEN chats.last_read_at
+               WHEN chats.last_read_at IS NULL OR excluded.last_read_at > chats.last_read_at THEN excluded.last_read_at
+               ELSE chats.last_read_at
+           END",
         params![
             chat.id.as_ref(),
             chat.account.as_ref(),
@@ -1349,6 +1378,7 @@ fn upsert_chat_on_conn(conn: &Connection, chat: &Chat) -> Result<()> {
             chat.last_message_at.map(|t| t.timestamp_millis()),
             chat.last_message_preview.as_deref(),
             chat.thread_id.as_deref(),
+            chat.last_read_at.map(|t| t.timestamp_millis()),
         ],
     )?;
     Ok(())
@@ -1752,7 +1782,7 @@ impl StoredContent {
 fn load_chats(conn: &Connection, where_clause: &str, params: &[&dyn ToSql]) -> Result<Vec<Chat>> {
     let query = format!(
         "SELECT id, account_id, platform, name, avatar_path, is_group, kind, membership, is_shared,
-                unread_count, muted, pinned, last_msg_at, last_preview, thread_id
+                unread_count, muted, pinned, last_msg_at, last_preview, thread_id, last_read_at
          FROM chats {where_clause}"
     );
     let mut chats = conn
@@ -1817,6 +1847,11 @@ fn ensure_chat_metadata_columns(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    // Read watermark (epoch millis). NULL = unknown, which keeps the legacy
+    // "accept every unread snapshot" behaviour for pre-migration rows.
+    if !columns.contains("last_read_at") {
+        conn.execute("ALTER TABLE chats ADD COLUMN last_read_at INTEGER", [])?;
+    }
 
     Ok(())
 }
@@ -1835,6 +1870,15 @@ fn ensure_message_metadata_columns(conn: &Connection) -> Result<()> {
     if !columns.contains("mentions_me") {
         conn.execute(
             "ALTER TABLE messages ADD COLUMN mentions_me INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    // Snapshot of the quoted message for WhatsApp-style replies, so the quote
+    // box renders even when the original is not loaded. Pre-migration rows
+    // stay NULL until a history replay supplies the quote again.
+    if !columns.contains("reply_preview_json") {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN reply_preview_json TEXT",
             [],
         )?;
     }
@@ -1872,6 +1916,28 @@ fn normalize_message_sender_ids(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// One-time data repair: replies sent from chat-cli to WhatsApp used to be
+/// stored with a Slack-style `thread_id`, which made WhatsApp quotes show
+/// "N replies" thread summaries and count toward thread unread totals.
+/// WhatsApp has no threads, so clear those ids. Gated by `PRAGMA user_version`.
+fn clear_whatsapp_quote_thread_ids(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= 2 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE messages SET thread_id = NULL \
+         WHERE thread_id IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM chats c \
+                       WHERE c.id = messages.chat_id \
+                         AND c.account_id = messages.account_id \
+                         AND c.platform = 'WhatsApp')",
+        [],
+    )?;
+    conn.pragma_update(None, "user_version", 2)?;
+    Ok(())
+}
+
 fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
     Ok(Chat {
         id: arc_str(row.get::<_, String>(0)?),
@@ -1887,6 +1953,7 @@ fn chat_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Chat> {
         muted: row.get(10)?,
         pinned: row.get(11)?,
         last_message_at: millis_to_timestamp(row.get(12)?),
+        last_read_at: millis_to_timestamp(row.get(15)?),
         last_message_preview: row.get::<_, Option<String>>(13)?.map(arc_str),
         thread_id: row.get::<_, Option<String>>(14)?.map(arc_str),
     })
@@ -1906,6 +1973,7 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         media_thumbnail: row.get(16)?,
     });
     let platform_json: Option<String> = row.get(20)?;
+    let reply_preview_json: Option<String> = row.get(22)?;
 
     Ok(Message {
         id: arc_str(row.get::<_, String>(0)?),
@@ -1922,10 +1990,43 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         reply_to: row.get::<_, Option<String>>(17)?.map(arc_str),
         thread_id: row.get::<_, Option<String>>(18)?.map(arc_str),
         reactions: Vec::new(),
+        reply_preview: None,
         receipts: Vec::new(),
         is_from_me: row.get(19)?,
         mentions_me: row.get::<_, Option<bool>>(21)?.unwrap_or(false),
         platform_data: platform_data_from_json(platform_json.as_deref()),
+    })
+    .map(|mut message| {
+        message.reply_preview = quoted_preview_from_json(reply_preview_json.as_deref());
+        message
+    })
+}
+
+fn quoted_preview_to_json(preview: Option<&QuotedPreview>) -> Option<String> {
+    let preview = preview?;
+    serde_json::to_string(&serde_json::json!({
+        "sender_id": preview.sender_id.as_deref(),
+        "sender_name": preview.sender_name.as_ref(),
+        "snippet": preview.snippet.as_ref(),
+    }))
+    .ok()
+}
+
+fn quoted_preview_from_json(json: Option<&str>) -> Option<QuotedPreview> {
+    let value = serde_json::from_str::<serde_json::Value>(json?).ok()?;
+    Some(QuotedPreview {
+        sender_id: value
+            .get("sender_id")
+            .and_then(|v| v.as_str())
+            .map(|s| arc_str(s.to_owned())),
+        sender_name: arc_str(value.get("sender_name")?.as_str()?.to_owned()),
+        snippet: arc_str(
+            value
+                .get("snippet")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        ),
     })
 }
 
@@ -2289,8 +2390,8 @@ fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
                 id, chat_id, account_id, sender_id, sender_name, sender_avatar, timestamp, edited_at,
                 content_type, content_text, content_caption, media_id, media_filename, media_mime,
                 media_size, media_local, media_thumbnail, reply_to_id, thread_id, is_from_me, platform_json,
-                mentions_me
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+                mentions_me, reply_preview_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(id, account_id) DO UPDATE SET
                 chat_id = excluded.chat_id,
                 sender_id = excluded.sender_id,
@@ -2317,7 +2418,10 @@ fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
                 media_size = excluded.media_size,
                 media_local = excluded.media_local,
                 media_thumbnail = excluded.media_thumbnail,
-                reply_to_id = excluded.reply_to_id,
+                -- A later copy without reply info (e.g. an edit or a
+                -- partial replay) must not erase a known quote link.
+                reply_to_id = COALESCE(excluded.reply_to_id, messages.reply_to_id),
+                reply_preview_json = COALESCE(excluded.reply_preview_json, messages.reply_preview_json),
                 thread_id = excluded.thread_id,
                 is_from_me = excluded.is_from_me,
                 platform_json = excluded.platform_json,
@@ -2345,6 +2449,7 @@ fn upsert_message_on_conn(conn: &Connection, msg: &Message) -> Result<()> {
             msg.is_from_me,
             platform_json,
             msg.mentions_me,
+            quoted_preview_to_json(msg.reply_preview.as_ref()),
         ],
     )?;
 
@@ -2710,6 +2815,40 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn clear_whatsapp_quote_thread_ids_only_touches_whatsapp_chats() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(schema::V1)?;
+        conn.pragma_update(None, "user_version", 1)?;
+        conn.pragma_update(None, "foreign_keys", false)?;
+        conn.execute_batch(
+            "INSERT INTO chats (id, account_id, platform, name) VALUES ('wa', 'a1', 'WhatsApp', 'Cristina');
+             INSERT INTO chats (id, account_id, platform, name) VALUES ('sl', 'a2', 'Slack', 'general');
+             INSERT INTO messages (id, chat_id, account_id, sender_id, sender_name, timestamp, content_type, reply_to_id, thread_id)
+               VALUES ('w1', 'wa', 'a1', 'me', 'Me', 0, 'text', 'orig', 'orig');
+             INSERT INTO messages (id, chat_id, account_id, sender_id, sender_name, timestamp, content_type, reply_to_id, thread_id)
+               VALUES ('s1', 'sl', 'a2', 'me', 'Me', 0, 'text', 'root', 'root');",
+        )?;
+
+        clear_whatsapp_quote_thread_ids(&conn)?;
+
+        let wa: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT reply_to_id, thread_id FROM messages WHERE id = 'w1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(wa, (Some("orig".to_owned()), None));
+        let slack: Option<String> = conn.query_row(
+            "SELECT thread_id FROM messages WHERE id = 's1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(slack.as_deref(), Some("root"));
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        assert_eq!(version, 2);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn avatar_thumbnail_cache_roundtrips_blob_metadata() -> Result<()> {
         let store = Store::open_memory().await?;
@@ -2965,6 +3104,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: Some(activity),
+            last_read_at: None,
             last_message_preview: Some(arc_str("La prima vedere".to_owned())),
             thread_id: None,
         };
@@ -2978,6 +3118,7 @@ mod tests {
                 avatar: Some(std::path::PathBuf::from("/tmp/vlad.jpg")),
                 unread_count: 0,
                 last_message_at: None,
+                last_read_at: None,
                 last_message_preview: None,
                 ..base_chat.clone()
             })
@@ -2999,6 +3140,7 @@ mod tests {
                 reply_to: None,
                 thread_id: None,
                 reactions: Vec::new(),
+                reply_preview: None,
                 receipts: Vec::new(),
                 is_from_me: false,
                 mentions_me: false,
@@ -3018,7 +3160,10 @@ mod tests {
         let chats = store.get_chats(&canonical).await?;
         assert_eq!(chats.len(), 1, "the chat must not be duplicated");
         assert_eq!(chats[0].name.as_ref(), "Vlad Bolota");
-        assert!(chats[0].avatar.is_some(), "the resolved avatar must survive");
+        assert!(
+            chats[0].avatar.is_some(),
+            "the resolved avatar must survive"
+        );
         assert_eq!(
             chats[0].last_message_at.map(|at| at.timestamp_millis()),
             Some(activity.timestamp_millis()),
@@ -3098,6 +3243,7 @@ mod tests {
             muted: false,
             pinned: true,
             last_message_at: Some(Utc::now()),
+            last_read_at: None,
             last_message_preview: Some(arc_str("hello".to_owned())),
             thread_id: None,
         };
@@ -3126,6 +3272,7 @@ mod tests {
                 emoji: arc_str("👍".to_owned()),
                 senders: vec![arc_str("me".to_owned())],
             }],
+            reply_preview: None,
             receipts: vec![Receipt {
                 platform_id: arc_str("me".to_owned()),
                 kind: ReceiptKind::Read,
@@ -3223,6 +3370,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: Some(newer),
+                last_read_at: None,
                 last_message_preview: Some(arc_str("yesterday's message".to_owned())),
                 thread_id: None,
             })
@@ -3242,6 +3390,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: None,
+                last_read_at: None,
                 last_message_preview: None,
                 thread_id: None,
             })
@@ -3261,6 +3410,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: Some(older),
+                last_read_at: None,
                 last_message_preview: Some(arc_str("older provider preview".to_owned())),
                 thread_id: None,
             })
@@ -3306,6 +3456,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -3378,6 +3529,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: None,
+                last_read_at: None,
                 last_message_preview: None,
                 thread_id: None,
             },
@@ -3395,6 +3547,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: None,
+                last_read_at: None,
                 last_message_preview: None,
                 thread_id: None,
             },
@@ -3412,6 +3565,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: None,
+                last_read_at: None,
                 last_message_preview: None,
                 thread_id: None,
             },
@@ -3429,6 +3583,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: None,
+                last_read_at: None,
                 last_message_preview: None,
                 thread_id: None,
             },
@@ -3483,6 +3638,7 @@ mod tests {
                     reply_to: None,
                     thread_id: None,
                     reactions: Vec::new(),
+                    reply_preview: None,
                     receipts: Vec::new(),
                     is_from_me: false,
                     mentions_me: false,
@@ -3530,6 +3686,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: Some(base + chrono::Duration::minutes(3)),
+                last_read_at: None,
                 last_message_preview: Some(arc_str("third".to_owned())),
                 thread_id: None,
             })
@@ -3556,6 +3713,7 @@ mod tests {
                     reply_to: None,
                     thread_id: None,
                     reactions: Vec::new(),
+                    reply_preview: None,
                     receipts: Vec::new(),
                     is_from_me: false,
                     mentions_me: false,
@@ -3612,6 +3770,7 @@ mod tests {
                 muted: false,
                 pinned: false,
                 last_message_at: Some(base + chrono::Duration::minutes(2)),
+                last_read_at: None,
                 last_message_preview: Some(arc_str("second".to_owned())),
                 thread_id: None,
             })
@@ -3634,6 +3793,7 @@ mod tests {
                 reply_to: None,
                 thread_id: None,
                 reactions: Vec::new(),
+                reply_preview: None,
                 receipts: Vec::new(),
                 is_from_me: false,
                 mentions_me: false,
@@ -3650,6 +3810,7 @@ mod tests {
                 reply_to: None,
                 thread_id: None,
                 reactions: Vec::new(),
+                reply_preview: None,
                 receipts: Vec::new(),
                 is_from_me: false,
                 mentions_me: false,
@@ -3701,6 +3862,7 @@ mod tests {
                     muted: false,
                     pinned: false,
                     last_message_at: None,
+                    last_read_at: None,
                     last_message_preview: None,
                     thread_id: None,
                 })
@@ -3746,6 +3908,7 @@ mod tests {
             reply_to: reply_to.map(|r| arc_str(r.to_owned())),
             thread_id: Some(arc_str(thread_id.to_owned())),
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me,
             mentions_me,
@@ -3767,6 +3930,37 @@ mod tests {
         thread_message_with_flags(
             id, chat_id, account, sender, text, thread_id, reply_to, ts, false, false,
         )
+    }
+
+    #[tokio::test]
+    async fn quoted_reply_preview_round_trips_and_survives_replyless_copy() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account = arc_str("acct-quote".to_owned());
+        let chat_id = arc_str("40747086008@s.whatsapp.net".to_owned());
+        let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let mut reply = thread_message("r1", &chat_id, &account, "me", "reply", "x", None, ts);
+        reply.thread_id = None;
+        reply.reply_to = Some(arc_str("ORIG1".to_owned()));
+        reply.reply_preview = Some(QuotedPreview {
+            sender_id: Some(arc_str("40747086008@s.whatsapp.net".to_owned())),
+            sender_name: arc_str("Cristina".to_owned()),
+            snippet: arc_str("Bună Cristina".to_owned()),
+        });
+        store.upsert_messages(std::slice::from_ref(&reply)).await?;
+
+        // A later copy without quote info (e.g. an edit echo) keeps the link.
+        let mut replyless = reply.clone();
+        replyless.reply_to = None;
+        replyless.reply_preview = None;
+        store.upsert_messages(&[replyless]).await?;
+
+        let loaded = store
+            .get_messages_for_chat(&account, &chat_id, None, 10)
+            .await?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].reply_to.as_deref(), Some("ORIG1"));
+        assert_eq!(loaded[0].reply_preview, reply.reply_preview);
+        Ok(())
     }
 
     #[tokio::test]
@@ -3979,6 +4173,7 @@ mod tests {
                 emoji: arc_str("👍".to_owned()),
                 senders: vec![arc_str("U2".to_owned())],
             }],
+            reply_preview: None,
             receipts: vec![Receipt {
                 platform_id: arc_str("U2".to_owned()),
                 kind: ReceiptKind::Read,
@@ -4134,6 +4329,74 @@ mod tests {
                 .await?
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_read_watermark_round_trips_and_never_moves_backwards() -> Result<()> {
+        let store = Store::open_memory().await?;
+        let account = arc_str("whatsapp:me".to_owned());
+        store
+            .upsert_account(
+                &Account {
+                    id: account.clone(),
+                    platform: Platform::WhatsApp,
+                    display_name: arc_str("Me".to_owned()),
+                    avatar: None,
+                },
+                "{}",
+            )
+            .await?;
+        let read_at = Utc
+            .timestamp_millis_opt(1_700_000_000_000)
+            .single()
+            .unwrap();
+        let chat = Chat {
+            id: arc_str("40700000000@s.whatsapp.net".to_owned()),
+            account: account.clone(),
+            platform: Platform::WhatsApp,
+            name: arc_str("Peer".to_owned()),
+            avatar: None,
+            is_group: false,
+            kind: ChatKind::Direct,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: 0,
+            muted: false,
+            pinned: false,
+            last_message_at: Some(read_at),
+            last_read_at: Some(read_at),
+            last_message_preview: None,
+            thread_id: None,
+        };
+        store.upsert_chat(&chat).await?;
+
+        // An older watermark and an unknown watermark both keep the stored one.
+        let older = read_at - chrono::Duration::minutes(5);
+        store
+            .upsert_chat(&Chat {
+                last_read_at: Some(older),
+                ..chat.clone()
+            })
+            .await?;
+        store
+            .upsert_chat(&Chat {
+                last_read_at: None,
+                ..chat.clone()
+            })
+            .await?;
+        let stored = store.get_chats(&account).await?;
+        assert_eq!(stored[0].last_read_at, Some(read_at));
+
+        let newer = read_at + chrono::Duration::minutes(5);
+        store
+            .upsert_chat(&Chat {
+                last_read_at: Some(newer),
+                ..chat.clone()
+            })
+            .await?;
+        let stored = store.get_chats(&account).await?;
+        assert_eq!(stored[0].last_read_at, Some(newer));
         Ok(())
     }
 }

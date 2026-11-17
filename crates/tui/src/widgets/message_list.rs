@@ -1,5 +1,5 @@
 use crate::theme::Theme;
-use chat_core::{Content, Message, MessageId, ReceiptKind, Sender, Timestamp};
+use chat_core::{Content, Message, MessageId, QuotedPreview, ReceiptKind, Sender, Timestamp};
 use chrono::{DateTime, Datelike, Local};
 use image::imageops::FilterType;
 use ratatui::{
@@ -829,6 +829,11 @@ fn messages_layout_hash(messages: &[Message]) -> u64 {
             .map(|timestamp| timestamp.timestamp_millis())
             .hash(&mut hasher);
         message.reply_to.hash(&mut hasher);
+        message
+            .reply_preview
+            .as_ref()
+            .map(|preview| (&preview.sender_name, &preview.snippet))
+            .hash(&mut hasher);
         message.thread_id.hash(&mut hasher);
         message.is_from_me.hash(&mut hasher);
         message_content_layout_hash(&message.content, &mut hasher);
@@ -1480,7 +1485,8 @@ fn message_lines(
     }
 
     if let Some(reply_to) = &message.reply_to {
-        let (preview, color) = resolve_reply_preview(context, reply_to);
+        let (preview, color) =
+            resolve_reply_preview(context, reply_to, message.reply_preview.as_ref());
         if let Some(text) = reply_inline_text(&message.content) {
             lines.extend(reply_text_bubble_lines(
                 &preview,
@@ -1670,7 +1676,8 @@ fn slack_message_lines(
     }
 
     if let Some(reply_to) = &message.reply_to {
-        let (preview, color) = resolve_reply_preview(context, reply_to);
+        let (preview, color) =
+            resolve_reply_preview(context, reply_to, message.reply_preview.as_ref());
         let box_width = slack_body_width(context.content_width);
         for row in reply_quote_box_rows(&preview, box_width, context.theme, color) {
             lines.push(slack_indented_line(row));
@@ -4960,6 +4967,10 @@ fn thread_summaries(messages: &[Message]) -> HashMap<MessageId, ThreadSummary> {
     let mut summaries: HashMap<MessageId, ThreadSummary> = HashMap::new();
 
     for reply in messages {
+        // WhatsApp quotes reference a message inline; they never form threads.
+        if reply.platform_data.whatsapp.is_some() {
+            continue;
+        }
         let Some(root_id) = reply.reply_to.as_ref().or(reply.thread_id.as_ref()) else {
             continue;
         };
@@ -5220,14 +5231,24 @@ fn reply_text_bubble_lines(
 /// Resolves the quote preview and per-sender color for a reply target, falling
 /// back to a muted "not loaded" box when the quoted message is outside the
 /// loaded window.
+/// Prefers the loaded original, then the provider-captured snapshot stored with
+/// the reply (WhatsApp quotes), and only then the "not loaded" placeholder.
 fn resolve_reply_preview(
     context: &MessageRenderContext<'_>,
     reply_to: &Arc<str>,
+    snapshot: Option<&QuotedPreview>,
 ) -> (ReplyPreview, Color) {
-    match context.reply_previews.get(reply_to) {
+    let loaded = context.reply_previews.get(reply_to).cloned();
+    let captured = || {
+        snapshot.map(|snapshot| ReplyPreview {
+            sender: snapshot.sender_name.clone(),
+            snippet: snapshot.snippet.clone(),
+        })
+    };
+    match loaded.or_else(captured) {
         Some(preview) => {
             let color = quote_color(context.theme, &preview.sender);
-            (preview.clone(), color)
+            (preview, color)
         }
         None => (
             ReplyPreview {
@@ -7859,6 +7880,78 @@ mod tests {
     }
 
     #[test]
+    fn reply_to_unloaded_message_uses_captured_quote_snapshot() {
+        let account = arc_str("whatsapp:main");
+        let chat_id = arc_str("40747086008@s.whatsapp.net");
+        let mut reply = text_message(
+            "reply",
+            &chat_id,
+            &account,
+            sender("me", "Me"),
+            "Voiam să-ți amintesc de asta",
+            7,
+            43,
+            true,
+        );
+        reply.reply_to = Some(arc_str("ORIG1"));
+        reply.reply_preview = Some(QuotedPreview {
+            sender_id: Some(arc_str("40747086008@s.whatsapp.net")),
+            sender_name: arc_str("Cristina"),
+            snippet: arc_str("Bună Cristina"),
+        });
+
+        let (rendered, _) = render_reply_fixture(None, reply, ConversationPresentation::Bubbles);
+        let joined = rendered.join("\n");
+
+        assert!(
+            rendered.iter().any(|line| line.contains("Cristina"))
+                && rendered.iter().any(|line| line.contains("Bună Cristina")),
+            "captured snapshot should render as the quote box:\n{joined}"
+        );
+        assert!(
+            !joined.contains("[message not loaded]"),
+            "snapshot must replace the placeholder:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn whatsapp_quotes_never_form_thread_summaries() {
+        let account = arc_str("whatsapp:main");
+        let chat_id = arc_str("40747086008@s.whatsapp.net");
+        let original = text_message(
+            "orig",
+            &chat_id,
+            &account,
+            sender("cristina", "Cristina"),
+            "Bună",
+            7,
+            40,
+            false,
+        );
+        let mut reply = text_message(
+            "reply",
+            &chat_id,
+            &account,
+            sender("me", "Me"),
+            "ok",
+            7,
+            43,
+            true,
+        );
+        reply.reply_to = Some(original.id.clone());
+        reply.thread_id = Some(original.id.clone());
+        reply.platform_data.whatsapp = Some(chat_core::WhatsAppData {
+            jid: chat_id.clone(),
+        });
+
+        assert!(thread_summaries(&[original.clone(), reply.clone()]).is_empty());
+
+        // The same shape on a non-WhatsApp message still counts as a thread.
+        reply.platform_data.whatsapp = None;
+        assert_eq!(thread_summaries(&[original, reply]).len(), 1);
+    }
+
+    #[test]
     fn reply_to_unloaded_message_renders_muted_placeholder_box() {
         let account = arc_str("mock:local");
         let chat_id = arc_str("mock:chat:alice");
@@ -8020,6 +8113,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me,
             mentions_me: false,

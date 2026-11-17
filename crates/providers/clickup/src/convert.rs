@@ -256,6 +256,7 @@ pub fn chat_from_channel(account: &ProviderId, channel: &WireChannel) -> Chat {
         // provider channel metadata. `latest_comment_at` is deliberately used
         // only to narrow polling, never to order the sidebar.
         last_message_at: None,
+        last_read_at: None,
         last_message_preview: None,
         thread_id: None,
     }
@@ -475,6 +476,7 @@ pub fn message_from_wire(wire: &WireMessage, context: &MessageContext<'_>) -> Op
         reply_to: parent.map(arc_str),
         thread_id,
         reactions: reactions_from_wire(&wire.reactions),
+        reply_preview: None,
         receipts: Vec::new(),
         is_from_me,
         mentions_me,

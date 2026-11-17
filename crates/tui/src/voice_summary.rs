@@ -313,6 +313,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         }
@@ -334,6 +335,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,

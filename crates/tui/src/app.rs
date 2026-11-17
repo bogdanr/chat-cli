@@ -1,5 +1,13 @@
+#[path = "app_member_ui.rs"]
+mod member_ui;
+
 use crate::attach::{self, format_byte_size};
 use crate::launch;
+use crate::member_profile::{
+    self, ChatStatsFetchResult, DetailsMemberHit, LastMessageFetchResult, MemberExtras,
+    MemberExtrasFetchResult, MemberProfilePopup, MemberUiState, NoteEdit, NoteField, PopupTarget,
+    PresenceFetchResult,
+};
 use crate::{
     event::AppEvent,
     theme::Theme,
@@ -17,10 +25,11 @@ use arboard::SetExtLinux;
 use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
     CardKind, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMembership, ContactProfile,
-    Content, DiscoveryAction, DiscoveryResult, Media, Mention, Message, MessageId,
+    Content, DiscoveryAction, DiscoveryResult, MarkReadRequest, Media, Mention, Message, MessageId,
     NetworkActivityDirection, OutboundCapabilities, OutboundContent, Platform, PlatformData,
-    PlatformId, Poll, Provider, ProviderEvent, ProviderId, Reaction, Sender, ThreadId,
-    ThreadParticipation, Timestamp,
+    PlatformId, Poll, Presence, PresenceSupport, Provider, ProviderEvent, ProviderId,
+    QuotedPreview, Reaction, ReadTarget, Sender, ThreadId, ThreadParticipation, Timestamp,
+    WhatsAppData,
 };
 use chat_notify::{DesktopNotifier, MessageNotification};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -67,9 +76,9 @@ use std::{
 };
 use storage::{
     AppSettings, AvatarThumbnailCacheRecord, AvatarThumbnailCacheUpsert, ChatActivityUpdate,
-    ChatInboxStyle, ConversationPresentationSetting, ImagePreviewMode, NetworkActivityDisplay,
-    NotificationMode, NotificationPauseState, NotificationScope, Store, ThreadMarkerScope,
-    UiThemePreset,
+    ChatInboxStyle, ChatStatsOptions, ConversationPresentationSetting, ImagePreviewMode,
+    NetworkActivityDisplay, NotificationMode, NotificationPauseState, NotificationScope, Store,
+    ThreadMarkerScope, UiThemePreset,
 };
 use tokio::sync::{broadcast, mpsc};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -105,6 +114,11 @@ const SELECTED_CHAT_MESSAGE_LIMIT: usize = 5000;
 const MAX_PROVIDER_EVENTS_PER_DRAIN: usize = 16;
 const MAX_COMPLETION_EVENTS_PER_DRAIN: usize = 4;
 const COMPLETION_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+/// Delay before a message that arrives in the chat the user is looking at is
+/// reported read, so a burst is acknowledged once and a glance away cancels it.
+const LIVE_READ_DEBOUNCE: Duration = Duration::from_millis(1_500);
+/// Upper bound on inbound messages acknowledged by one mark-read request.
+const MARK_READ_MAX_TARGETS: usize = 100;
 const DISCOVERY_RESULT_LIMIT: usize = 16;
 const DISCOVERY_PROVIDER_RESULT_LIMIT: usize = 8;
 const SENDER_INFO_REQUEST_LIMIT: usize = 32;
@@ -604,6 +618,24 @@ struct ChatDetailsFetchResult {
     account: ProviderId,
     chat_id: ChatId,
     result: Result<ChatDetails, String>,
+}
+
+/// A live message landed in the attended chat; it is marked read once the
+/// deadline passes if the user is still looking at that chat.
+#[derive(Clone, Debug)]
+struct PendingLiveRead {
+    account: ProviderId,
+    chat_id: ChatId,
+    deadline: Instant,
+}
+
+/// Completion of a background provider `mark_read` call (instrumentation only).
+struct MarkReadOutcome {
+    account: ProviderId,
+    chat_id: ChatId,
+    targets: usize,
+    elapsed: Duration,
+    result: Result<(), String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2097,10 +2129,12 @@ enum SettingsItem {
     NotificationScope,
     VoiceSummaries,
     SuppressLowIntent,
+    SendReadStatus,
+    MemberActivity,
 }
 
 impl SettingsItem {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 17] = [
         Self::InboxStyle,
         Self::Theme,
         Self::ConversationStyle,
@@ -2116,6 +2150,8 @@ impl SettingsItem {
         Self::NotificationScope,
         Self::VoiceSummaries,
         Self::SuppressLowIntent,
+        Self::SendReadStatus,
+        Self::MemberActivity,
     ];
 
     fn label(self) -> &'static str {
@@ -2135,6 +2171,8 @@ impl SettingsItem {
             Self::NotificationScope => "Notify for",
             Self::VoiceSummaries => "Voice summaries",
             Self::SuppressLowIntent => "Quiet low-intent",
+            Self::SendReadStatus => "Sync read status",
+            Self::MemberActivity => "Presence & activity",
         }
     }
 
@@ -2181,6 +2219,12 @@ impl SettingsItem {
             Self::SuppressLowIntent => {
                 "Keep low-intent interactions quiet: a bare shared link with no message body, or a pure link preview. These raise no notification while on, and are never voice-summarized regardless. Reactions are always quiet."
             }
+            Self::SendReadStatus => {
+                "Report chats you read here back to WhatsApp and Slack so the phone and native apps clear their unread badges too. Reads done in the native apps always sync here. ClickUp has no API for this."
+            }
+            Self::MemberActivity => {
+                "Show online / last-seen presence and activity statistics (message shares, busiest hours) in the details pane and member profiles. Turn off for privacy, for example while screen-sharing."
+            }
         }
     }
 
@@ -2209,6 +2253,8 @@ impl SettingsItem {
             Self::NotificationScope => notification_scope_label(settings.notification_scope),
             Self::VoiceSummaries => on_off(settings.voice_summaries),
             Self::SuppressLowIntent => on_off(settings.suppress_low_intent_notifications),
+            Self::SendReadStatus => on_off(settings.send_read_status),
+            Self::MemberActivity => on_off(settings.show_member_activity),
         }
     }
 
@@ -2220,6 +2266,8 @@ impl SettingsItem {
             Self::AutoResetFilter => Some(settings.auto_reset_filter),
             Self::VoiceSummaries => Some(settings.voice_summaries),
             Self::SuppressLowIntent => Some(settings.suppress_low_intent_notifications),
+            Self::SendReadStatus => Some(settings.send_read_status),
+            Self::MemberActivity => Some(settings.show_member_activity),
             Self::InboxStyle
             | Self::Theme
             | Self::ConversationStyle
@@ -2293,6 +2341,14 @@ impl SettingsItem {
             Self::SuppressLowIntent => {
                 settings.suppress_low_intent_notifications =
                     !settings.suppress_low_intent_notifications;
+                false
+            }
+            Self::SendReadStatus => {
+                settings.send_read_status = !settings.send_read_status;
+                false
+            }
+            Self::MemberActivity => {
+                settings.show_member_activity = !settings.show_member_activity;
                 false
             }
         }
@@ -2710,6 +2766,8 @@ pub struct AppState {
     /// Aggregated unread thread-reply counts for non-participating threads per
     /// chat. Used to render a dim ambient glyph without implying action is owed.
     thread_unread_other_by_chat: HashMap<ChatId, u32>,
+    /// Details member list, profile popup, presence and activity stats.
+    members_ui: MemberUiState,
 }
 
 impl Default for AppState {
@@ -2809,6 +2867,7 @@ impl Default for AppState {
             thread_unread: HashMap::new(),
             thread_unread_by_chat: HashMap::new(),
             thread_unread_other_by_chat: HashMap::new(),
+            members_ui: MemberUiState::default(),
         };
         state.sync_compose_cache();
         state.sync_thread_compose_cache();
@@ -3091,6 +3150,17 @@ pub struct App {
     chat_details_rx: mpsc::UnboundedReceiver<ChatDetailsFetchResult>,
     contact_profile_tx: mpsc::UnboundedSender<ContactProfileFetchResult>,
     contact_profile_rx: mpsc::UnboundedReceiver<ContactProfileFetchResult>,
+    chat_stats_tx: mpsc::UnboundedSender<ChatStatsFetchResult>,
+    chat_stats_rx: mpsc::UnboundedReceiver<ChatStatsFetchResult>,
+    presence_tx: mpsc::UnboundedSender<PresenceFetchResult>,
+    presence_rx: mpsc::UnboundedReceiver<PresenceFetchResult>,
+    member_extras_tx: mpsc::UnboundedSender<MemberExtrasFetchResult>,
+    member_extras_rx: mpsc::UnboundedReceiver<MemberExtrasFetchResult>,
+    last_message_tx: mpsc::UnboundedSender<LastMessageFetchResult>,
+    last_message_rx: mpsc::UnboundedReceiver<LastMessageFetchResult>,
+    mark_read_tx: mpsc::UnboundedSender<MarkReadOutcome>,
+    mark_read_rx: mpsc::UnboundedReceiver<MarkReadOutcome>,
+    pending_live_read: Option<PendingLiveRead>,
     sender_info_tx: mpsc::UnboundedSender<SenderInfoFetchResult>,
     sender_info_rx: mpsc::UnboundedReceiver<SenderInfoFetchResult>,
     selected_messages_tx: mpsc::UnboundedSender<SelectedMessagesFetchResult>,
@@ -3203,6 +3273,11 @@ impl App {
         let (chat_members_tx, chat_members_rx) = mpsc::unbounded_channel();
         let (chat_details_tx, chat_details_rx) = mpsc::unbounded_channel();
         let (contact_profile_tx, contact_profile_rx) = mpsc::unbounded_channel();
+        let (chat_stats_tx, chat_stats_rx) = mpsc::unbounded_channel();
+        let (presence_tx, presence_rx) = mpsc::unbounded_channel();
+        let (member_extras_tx, member_extras_rx) = mpsc::unbounded_channel();
+        let (last_message_tx, last_message_rx) = mpsc::unbounded_channel();
+        let (mark_read_tx, mark_read_rx) = mpsc::unbounded_channel();
         let (sender_info_tx, sender_info_rx) = mpsc::unbounded_channel();
         let (selected_messages_tx, selected_messages_rx) = mpsc::unbounded_channel();
         let (discovery_tx, discovery_rx) = mpsc::unbounded_channel();
@@ -3279,6 +3354,17 @@ impl App {
             chat_details_rx,
             contact_profile_tx,
             contact_profile_rx,
+            chat_stats_tx,
+            chat_stats_rx,
+            presence_tx,
+            presence_rx,
+            member_extras_tx,
+            member_extras_rx,
+            last_message_tx,
+            last_message_rx,
+            mark_read_tx,
+            mark_read_rx,
+            pending_live_read: None,
             sender_info_tx,
             sender_info_rx,
             selected_messages_tx,
@@ -4062,12 +4148,82 @@ impl App {
         Ok(true)
     }
 
-    /// Time until the deferred navigation load becomes due, used to shorten
-    /// the idle poll so a settled selection loads promptly.
+    /// Time until the deferred navigation load (or a pending live-arrival
+    /// read) becomes due, used to shorten the idle poll so either runs
+    /// promptly.
     fn deferred_navigation_wakeup_in(&self) -> Option<Duration> {
-        self.deferred_navigation_load
+        let now = Instant::now();
+        [
+            self.deferred_navigation_load
+                .as_ref()
+                .map(|load| load.deadline),
+            self.pending_live_read.as_ref().map(|read| read.deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .min()
+    }
+
+    /// Arms (or extends) the live-arrival read debounce for an attended chat.
+    fn schedule_live_read(&mut self, account: &ProviderId, chat_id: &ChatId) {
+        self.pending_live_read = Some(PendingLiveRead {
+            account: account.clone(),
+            chat_id: chat_id.clone(),
+            deadline: Instant::now() + LIVE_READ_DEBOUNCE,
+        });
+    }
+
+    /// Marks the attended chat read once the live-arrival debounce expires.
+    /// Dropped without effect when the user navigated elsewhere meanwhile.
+    async fn flush_pending_live_read(&mut self) -> Result<bool> {
+        let due = self
+            .pending_live_read
             .as_ref()
-            .map(|load| load.deadline.saturating_duration_since(Instant::now()))
+            .is_some_and(|read| Instant::now() >= read.deadline);
+        if !due {
+            return Ok(false);
+        }
+        let Some(read) = self.pending_live_read.take() else {
+            return Ok(false);
+        };
+        if !self.is_chat_currently_attended(&read.account, &read.chat_id) {
+            self.log_perf_marker(
+                "read_sync.live_read",
+                format!(
+                    "account={} chat={} outcome=stale_navigation",
+                    read.account, read.chat_id
+                ),
+            );
+            return Ok(false);
+        }
+        self.mark_selected_chat_read_with(true).await?;
+        Ok(true)
+    }
+
+    /// Bounded drain of background mark-read completions; logs outcomes so
+    /// receipt failures are visible in the perf log.
+    fn drain_mark_read_outcomes(&mut self) {
+        let mut drained = 0;
+        while drained < MAX_COMPLETION_EVENTS_PER_DRAIN
+            && let Ok(outcome) = self.mark_read_rx.try_recv()
+        {
+            drained += 1;
+            let result = match &outcome.result {
+                Ok(()) => "ok".to_owned(),
+                Err(error) => format!("error={error}"),
+            };
+            if let Some(perf_log) = &mut self.perf_log {
+                perf_log.log(
+                    "read_sync.provider_send",
+                    Some(outcome.elapsed),
+                    format!(
+                        "account={} chat={} targets={} {result}",
+                        outcome.account, outcome.chat_id, outcome.targets
+                    ),
+                );
+            }
+        }
     }
 
     /// Time until the next inline animation frame is due, when the last draw
@@ -4430,10 +4586,24 @@ impl App {
             drained += 1;
             let key = (result.account.clone(), result.platform_id.clone());
             self.state.loading_contact_profiles.remove(&key);
-            if let Ok(Some(profile)) = result.result {
-                self.state.contact_profiles.insert(key, profile);
-                changed = true;
+            match result.result {
+                Ok(Some(profile)) => {
+                    self.state.members_ui.profile_errors.remove(&key);
+                    self.state.contact_profiles.insert(key, profile);
+                }
+                // An empty profile is remembered as an empty error string so
+                // the popup can say "no details" instead of loading forever.
+                Ok(None) => {
+                    self.state
+                        .members_ui
+                        .profile_errors
+                        .insert(key, String::new());
+                }
+                Err(error) => {
+                    self.state.members_ui.profile_errors.insert(key, error);
+                }
             }
+            changed = true;
         }
         if changed {
             self.log_slow_perf_duration(
@@ -4702,6 +4872,7 @@ impl App {
         // A navigation load deferred by the settle debounce is scheduled here
         // once its deadline passes; this drain runs on every loop iteration.
         let navigation_load_flushed = self.flush_deferred_navigation_load().await?;
+        let live_read_flushed = self.flush_pending_live_read().await?;
         let bootstrap_changed = self.drain_bootstrap_connects().await?;
         let mut events = Vec::new();
         'receivers: for (provider_id, receiver) in &mut self.provider_receivers {
@@ -4750,12 +4921,18 @@ impl App {
         let chat_members_changed = self.drain_chat_member_fetches();
         let chat_details_changed = self.drain_chat_detail_fetches();
         let contact_profile_changed = self.drain_contact_profile_fetches();
+        let member_activity_changed = self.drain_chat_stats()
+            | self.drain_presence_fetches()
+            | self.drain_member_extras()
+            | self.drain_member_last_messages();
         let sender_info_changed = self.drain_sender_info_fetches();
+        self.drain_mark_read_outcomes();
         // Safety net: any deferred resort not flushed by the per-event or
         // history paths above is applied once per batch here.
         let sidebar_resort_flushed = self.flush_pending_sidebar_resort();
         let changed = provider_draw_event_count > 0
             || navigation_load_flushed
+            || live_read_flushed
             || bootstrap_changed
             || sidebar_resort_flushed
             || selected_messages_changed
@@ -4773,6 +4950,7 @@ impl App {
             || chat_members_changed
             || chat_details_changed
             || contact_profile_changed
+            || member_activity_changed
             || sender_info_changed
             || history_changed;
         if changed {
@@ -4891,6 +5069,7 @@ impl App {
             app.draw_account_switcher(frame, area);
             app.draw_threads_inbox(frame, area);
             app.draw_settings_overlay(frame, area);
+            app.draw_member_profile_popup(frame, area);
             app.draw_image_viewer(frame, area);
             app.draw_auth_overlay(frame, area);
             app.draw_account_setup_overlay(frame, area);
@@ -6118,6 +6297,8 @@ impl App {
     }
 
     fn draw_details(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        // Member hit regions only exist while the chat overview is drawn.
+        self.state.members_ui.hits.clear();
         if area.is_empty() {
             return;
         }
@@ -6144,8 +6325,12 @@ impl App {
         self.queue_selected_chat_member_avatars();
         self.request_selected_chat_details();
         self.request_selected_contact_profile();
+        self.request_selected_chat_stats();
         let inner_width = area.width.saturating_sub(2);
-        let (details, member_overlays) = self.overview_detail_lines(inner_width);
+        let (details, member_overlays, member_hits) = self.overview_detail_lines(inner_width);
+        self.state.members_ui.hits = member_hits;
+        // Needs this frame's hit regions to know which members are visible.
+        self.request_visible_member_presence();
         let details_len = details.len();
         let paragraph = Paragraph::new(details)
             .block(
@@ -6222,10 +6407,15 @@ impl App {
     fn overview_detail_lines(
         &self,
         inner_width: u16,
-    ) -> (Vec<Line<'static>>, Vec<MemberAvatarOverlay>) {
+    ) -> (
+        Vec<Line<'static>>,
+        Vec<MemberAvatarOverlay>,
+        Vec<DetailsMemberHit>,
+    ) {
         let hd_avatars = self.settings.image_preview_mode == ImagePreviewMode::Hd
             && self.terminal_hd_images_supported();
         let mut member_overlays = Vec::new();
+        let mut member_hits = Vec::new();
         let selected_chat = self.state.selected_chat().cloned();
         let selected_chat_name = selected_chat
             .as_ref()
@@ -6308,9 +6498,11 @@ impl App {
                     inner_width,
                     hd_avatars,
                     &mut member_overlays,
+                    &mut member_hits,
                 );
             }
             self.append_contact_profile_lines(&mut details, &chat, inner_width);
+            self.append_activity_lines(&mut details, &chat, inner_width, &mut member_hits);
         }
 
         details.extend([
@@ -6332,14 +6524,20 @@ impl App {
             Line::from("  PageUp/PageDown: faster"),
             Line::from("  Home/End: edges"),
             Line::from("  Ctrl+Q or Ctrl+C: quit"),
+            Line::from("  Click member/avatar: profile/enlarge"),
+            Line::from("  Tab: member cursor · Enter/v: profile/avatar"),
+            Line::from("  o: sort members · /: find member"),
         ]);
-        (details, member_overlays)
+        (details, member_overlays, member_hits)
     }
 
     /// Appends the "Members" section to the chat-overview details: a count line
     /// followed by one entry per member rendered as a small avatar thumbnail
     /// (or initials placeholder) beside the display name, with any admin/owner
-    /// role badge right-aligned to the panel margin.
+    /// role badge right-aligned to the panel margin. The second row shows a
+    /// presence / recency subtitle. Every rendered member records a
+    /// [`DetailsMemberHit`] so clicks and the keyboard cursor can resolve it.
+    #[allow(clippy::too_many_arguments)]
     fn append_member_detail_lines(
         &self,
         details: &mut Vec<Line<'static>>,
@@ -6347,6 +6545,7 @@ impl App {
         inner_width: u16,
         hd_avatars: bool,
         overlays: &mut Vec<MemberAvatarOverlay>,
+        hits: &mut Vec<DetailsMemberHit>,
     ) {
         const MAX_RENDERED_MEMBERS: usize = 40;
 
@@ -6367,16 +6566,58 @@ impl App {
             details.push(Line::from("  No members"));
             return;
         }
-        details.push(Line::from(format!("  {} members", members.len())));
+        let ui = &self.state.members_ui;
+        let show_activity = self.settings.show_member_activity;
+        let stats = show_activity.then(|| ui.stats.get(&key)).flatten();
+        let presence_support = self.presence_support_for(&chat.account);
+        let now = Utc::now();
+        let query = ui.search.as_deref().unwrap_or("");
+        let presence_of = |id: &PlatformId| {
+            ui.presence
+                .get(&(chat.account.clone(), id.clone()))
+                .cloned()
+        };
+        let order =
+            member_profile::ordered_member_indices(members, query, ui.sort, stats, &presence_of);
+        details.push(Line::from(vec![
+            Span::raw(format!("  {} members", members.len())),
+            Span::styled(
+                format!(" · sort: {} (o)", ui.sort.label()),
+                self.theme.muted(),
+            ),
+        ]));
+        if let Some(search) = ui.search.as_ref() {
+            let cursor = if ui.search_editing { "▏" } else { "" };
+            details.push(Line::from(vec![
+                Span::styled("  Find: ", self.theme.status_key()),
+                Span::raw(format!("{search}{cursor}")),
+                Span::styled(format!("  {} match", order.len()), self.theme.muted()),
+            ]));
+            if order.is_empty() {
+                details.push(Line::from(Span::styled(
+                    "  No matching members",
+                    self.theme.muted(),
+                )));
+                return;
+            }
+        }
+        let cursor_id = ui.cursor.clone();
 
-        for member in members.iter().take(MAX_RENDERED_MEMBERS) {
+        for &index in order.iter().take(MAX_RENDERED_MEMBERS) {
+            let member = &members[index];
             let name = member.sender.display_name.to_string();
             let role_label = member.role.label();
+            let presence = ui
+                .presence
+                .get(&(chat.account.clone(), member.sender.platform_id.clone()))
+                .filter(|_| show_activity);
+            let dot = member_profile::presence_dot(presence);
 
             let indent_width = 2usize;
             let avatar_width = chat_list::CHAT_AVATAR_WIDTH as usize;
             let gap_width = 1usize;
-            let prefix_width = indent_width + avatar_width + gap_width;
+            let dot_width = if dot.is_some() { 2 } else { 0 };
+            let prefix_width = indent_width + avatar_width + gap_width + dot_width;
             let total_width = inner_width as usize;
             let role_reserved = if role_label.is_empty() {
                 0
@@ -6398,6 +6639,18 @@ impl App {
             } else {
                 None
             };
+            let has_avatar = member
+                .sender
+                .avatar
+                .as_deref()
+                .is_some_and(|path| path.exists());
+            hits.push(DetailsMemberHit {
+                line_index: details.len(),
+                rows: 2,
+                platform_id: member.sender.platform_id.clone(),
+                has_avatar,
+                is_member_row: true,
+            });
             let (top_row, bottom_row) = if let Some(key) = hd_key {
                 let blank = vec![Span::raw(" ".repeat(avatar_width))];
                 overlays.push(MemberAvatarOverlay {
@@ -6412,13 +6665,22 @@ impl App {
                 (top_row, bottom_row)
             };
 
+            let is_cursor = cursor_id.as_ref() == Some(&member.sender.platform_id);
+            let name_style = if is_cursor {
+                self.theme.selection()
+            } else {
+                Style::default().fg(self.theme.foreground)
+            };
             let mut first_line = vec![Span::raw("  ")];
             first_line.extend(top_row);
             first_line.push(Span::raw(" "));
-            first_line.push(Span::styled(
-                name,
-                Style::default().fg(self.theme.foreground),
-            ));
+            if let Some((glyph, color)) = dot {
+                first_line.push(Span::styled(
+                    format!("{glyph} "),
+                    Style::default().fg(color),
+                ));
+            }
+            first_line.push(Span::styled(name, name_style));
             if !role_label.is_empty() {
                 let used = prefix_width + name_width;
                 let pad = total_width
@@ -6432,15 +6694,80 @@ impl App {
 
             let mut second_line = vec![Span::raw("  ")];
             second_line.extend(bottom_row);
+            if show_activity {
+                let here = stats
+                    .and_then(|stats| stats.member(&member.sender.platform_id, member.is_self))
+                    .and_then(|(_, sender)| sender.last_at);
+                let anywhere = ui
+                    .last_message
+                    .get(&(chat.account.clone(), member.sender.platform_id.clone()));
+                let last_msg =
+                    member_profile::newest_last_message(anywhere, here).map(|(last, _)| {
+                        format!("last msg {}", member_profile::format_relative(last, now))
+                    });
+                let subtitle = member_profile::presence_label(
+                    presence,
+                    presence_support,
+                    now,
+                    last_msg.clone(),
+                )
+                .or(last_msg);
+                if let Some(subtitle) = subtitle {
+                    let max = total_width.saturating_sub(indent_width + avatar_width + gap_width);
+                    second_line.push(Span::raw(" "));
+                    second_line.push(Span::styled(
+                        truncate_to_width(&subtitle, max.max(1)),
+                        self.theme.muted(),
+                    ));
+                }
+            }
             details.push(Line::from(second_line));
         }
 
-        if members.len() > MAX_RENDERED_MEMBERS {
+        if order.len() > MAX_RENDERED_MEMBERS {
             details.push(Line::from(format!(
-                "  … {} more",
-                members.len() - MAX_RENDERED_MEMBERS
+                "  … {} more (/ to find)",
+                order.len() - MAX_RENDERED_MEMBERS
             )));
         }
+    }
+
+    /// Appends the "Activity" section (local-history stats) for the chat.
+    /// Cache-only: stats are computed in the background by
+    /// [`Self::request_selected_chat_stats`].
+    fn append_activity_lines(
+        &self,
+        details: &mut Vec<Line<'static>>,
+        chat: &Chat,
+        inner_width: u16,
+        hits: &mut Vec<DetailsMemberHit>,
+    ) {
+        if !self.settings.show_member_activity {
+            return;
+        }
+        let key = (chat.account.clone(), chat.id.clone());
+        let ui = &self.state.members_ui;
+        let view = member_profile::ActivityView {
+            stats: ui.stats.get(&key),
+            loading: ui.loading_stats.contains(&key),
+            error: ui.stats_errors.get(&key).map(String::as_str),
+            members: self.state.chat_members.get(&key).map(Vec::as_slice),
+            is_direct: chat.kind == ChatKind::Direct && !chat.is_group,
+            width: inner_width,
+            now: Utc::now(),
+        };
+        let (lines, poster_hits) = member_profile::activity_lines(&view, self.theme);
+        let base = details.len();
+        for (offset, platform_id) in poster_hits {
+            hits.push(DetailsMemberHit {
+                line_index: base + offset,
+                rows: 1,
+                platform_id,
+                has_avatar: false,
+                is_member_row: false,
+            });
+        }
+        details.extend(lines);
     }
 
     /// Appends provider-sourced [`ChatDetails`] (description, creation, counts,
@@ -6660,11 +6987,7 @@ impl App {
         let Some(members) = self.state.chat_members.get(&key) else {
             return;
         };
-        let avatar_keys = members
-            .iter()
-            .take(40)
-            .filter_map(|member| self.member_avatar_preview_key(member))
-            .collect::<Vec<_>>();
+        let avatar_keys = self.rendered_member_avatar_keys(members);
         self.queue_avatar_preview_loads(avatar_keys);
     }
 
@@ -9931,11 +10254,24 @@ impl App {
                 }
                 let preview_started = Instant::now();
                 let chat_known = self.refresh_chat_preview_from_message(&message).await?;
+                if !is_placeholder_whatsapp {
+                    self.mark_chat_stats_dirty(&message.account, &message.chat_id);
+                    self.bump_member_last_message(&message);
+                }
                 if !is_historical {
                     self.mark_slack_live_message_unread_if_needed(&message)
                         .await?;
                     self.mark_live_thread_reply_unread_if_needed(&message)
                         .await?;
+                    // A message arriving in the chat the user is looking at
+                    // is read: acknowledge it after a short debounce so the
+                    // phone/native app clears it too.
+                    if !message.is_from_me
+                        && !is_placeholder_whatsapp
+                        && self.is_chat_currently_attended(&message.account, &message.chat_id)
+                    {
+                        self.schedule_live_read(&message.account, &message.chat_id);
+                    }
                 }
                 self.log_slow_perf_duration(
                     "provider.message.preview",
@@ -10264,7 +10600,10 @@ impl App {
                 }
                 self.state.status = format!("reaction updated from {provider_id}");
             }
-            ProviderEvent::ChatMarkedRead { chat_id } => {
+            ProviderEvent::ChatMarkedRead {
+                chat_id,
+                read_up_to,
+            } => {
                 // The chat was read on another device. Any not-yet-delivered
                 // notification or voice summary for it is now stale: drop it so
                 // catch-up/offline-sync read receipts silence alerts for
@@ -10279,11 +10618,23 @@ impl App {
                     .chats
                     .iter_mut()
                     .find(|chat| chat.account == provider_id && chat.id == chat_id)
-                    .filter(|chat| chat.unread_count > 0)
+                    .filter(|chat| {
+                        chat.unread_count > 0
+                            || read_up_to.is_some_and(|at| Some(at) > chat.last_read_at)
+                    })
                     .map(|chat| {
                         chat.unread_count = 0;
+                        chat.last_read_at = chat.last_read_at.max(read_up_to);
                         chat.clone()
                     });
+                self.log_perf_marker(
+                    "read_sync.remote_read",
+                    format!(
+                        "account={provider_id} chat={chat_id} applied={} read_up_to={}",
+                        updated.is_some(),
+                        read_up_to.map(|at| at.to_rfc3339()).unwrap_or_default()
+                    ),
+                );
                 if let Some(updated) = updated {
                     self.store.upsert_chat(&updated).await?;
                     self.sort_chats_preserving_selection();
@@ -10294,6 +10645,8 @@ impl App {
             ProviderEvent::ChatUnreadSynced {
                 chat_id,
                 unread_count,
+                as_of,
+                marked_unread,
             } => {
                 // The provider reported the phone's authoritative unread count
                 // for this chat (WhatsApp history-sync `Conversation.UnreadCount`).
@@ -10308,16 +10661,44 @@ impl App {
                         "read_elsewhere",
                     );
                 }
-                let updated = self
+                let current = self
                     .state
                     .chats
-                    .iter_mut()
+                    .iter()
                     .find(|chat| chat.account == provider_id && chat.id == chat_id)
-                    .filter(|chat| chat.unread_count != unread_count)
-                    .map(|chat| {
-                        chat.unread_count = unread_count;
-                        chat.clone()
-                    });
+                    .map(|chat| (chat.unread_count, chat.last_read_at));
+                let decision = current.map(|(local, watermark)| {
+                    unread_snapshot_decision(local, watermark, unread_count, as_of, marked_unread)
+                });
+                let attended = self.is_chat_currently_attended(&provider_id, &chat_id);
+                self.log_perf_marker(
+                    "read_sync.snapshot",
+                    format!(
+                        "account={provider_id} chat={chat_id} unread={unread_count} marked_unread={marked_unread} decision={decision:?} attended={attended}"
+                    ),
+                );
+                // A raising snapshot for the chat the user is reading means
+                // the phone still counts messages the user has seen here:
+                // report them read instead of showing a badge in the open chat.
+                if attended
+                    && !marked_unread
+                    && decision == Some(UnreadSnapshotDecision::Apply)
+                    && current.is_some_and(|(local, _)| unread_count > local)
+                {
+                    self.schedule_live_read(&provider_id, &chat_id);
+                }
+                let updated = (decision == Some(UnreadSnapshotDecision::Apply))
+                    .then(|| {
+                        self.state
+                            .chats
+                            .iter_mut()
+                            .find(|chat| chat.account == provider_id && chat.id == chat_id)
+                            .map(|chat| {
+                                chat.unread_count = unread_count;
+                                chat.clone()
+                            })
+                    })
+                    .flatten();
                 if let Some(updated) = updated {
                     self.store.upsert_chat(&updated).await?;
                     self.sort_chats_preserving_selection();
@@ -10338,6 +10719,12 @@ impl App {
             }
             ProviderEvent::NetworkActivity { direction, .. } => {
                 self.record_network_activity(&provider_id, direction);
+            }
+            ProviderEvent::Presence {
+                platform_id,
+                presence,
+            } => {
+                self.apply_presence(provider_id, platform_id, presence);
             }
         }
         Ok(())
@@ -10741,6 +11128,7 @@ impl App {
     fn is_typing_in_text_input(&self) -> bool {
         self.state.focus == FocusPane::Compose
             || (self.state.focus == FocusPane::Details && self.state.thread_root.is_some())
+            || self.member_ui_text_input_active()
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
@@ -10780,6 +11168,10 @@ impl App {
 
         if self.state.help_overlay.is_some() {
             return Ok(self.handle_help_overlay_key(key));
+        }
+
+        if self.state.members_ui.popup.is_some() {
+            return self.handle_member_profile_key(key).await;
         }
 
         if self.state.auth_overlay.is_some()
@@ -10922,6 +11314,9 @@ impl App {
     }
 
     async fn handle_details_key(&mut self, key: KeyEvent) -> bool {
+        if let Some(changed) = self.handle_details_member_key(key) {
+            return changed;
+        }
         match key.code {
             KeyCode::Enter
                 if self.state.thread_root.is_some()
@@ -11714,6 +12109,12 @@ impl App {
     }
 
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        // The member profile popup owns the mouse (including scrollbar tracks
+        // of panes beneath it) unless the image viewer is open on top of it.
+        if self.state.members_ui.popup.is_some() && self.state.image_viewer.is_none() {
+            return Ok(self.handle_member_profile_mouse(mouse));
+        }
+
         // Scrollbar click/drag handling first: an active drag captures all
         // drag/up events, and a left click on a recorded scrollbar track jumps
         // the thumb and starts a drag.
@@ -12527,6 +12928,7 @@ impl App {
             || self.state.slack_setup.is_some()
             || self.state.clickup_setup.is_some()
             || self.state.help_overlay.is_some()
+            || self.state.members_ui.popup.is_some()
             || self.state.action_menu.is_some()
             || self.state.forward_picker.is_some()
             || self.state.reaction_picker.is_some()
@@ -12642,6 +13044,9 @@ impl App {
                 false
             }
             FocusPane::Details => {
+                if self.handle_details_click(mouse.column, mouse.row) {
+                    return false;
+                }
                 self.state.status = "details focused".to_owned();
                 false
             }
@@ -13673,6 +14078,7 @@ impl App {
             reply_to: Some(thread_root.clone()),
             thread_id: Some(thread_root),
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: true,
             mentions_me: false,
@@ -13827,7 +14233,29 @@ impl App {
             } else {
                 None
             };
-            let thread_id = effective_reply_to.clone();
+            // WhatsApp replies are inline quotes, not threads: they keep the
+            // quote link plus a snapshot of the original, but no thread id.
+            let is_quote_platform = chat.platform == Platform::WhatsApp;
+            let thread_id = if is_quote_platform {
+                None
+            } else {
+                effective_reply_to.clone()
+            };
+            let reply_preview = if is_quote_platform && reply_to.is_some() {
+                reply_message.as_ref().map(quoted_preview_from_message)
+            } else {
+                None
+            };
+            let platform_data = if is_quote_platform {
+                PlatformData {
+                    whatsapp: Some(WhatsAppData {
+                        jid: chat.id.clone(),
+                    }),
+                    ..PlatformData::default()
+                }
+            } else {
+                PlatformData::default()
+            };
             let message = Message {
                 id: message_id,
                 chat_id: chat.id.clone(),
@@ -13843,10 +14271,11 @@ impl App {
                 reply_to,
                 thread_id,
                 reactions: Vec::new(),
+                reply_preview,
                 receipts: Vec::new(),
                 is_from_me: true,
                 mentions_me: false,
-                platform_data: PlatformData::default(),
+                platform_data,
             };
             self.store.upsert_message(&message).await?;
             last_timestamp = Some(timestamp);
@@ -14462,6 +14891,9 @@ impl App {
             self.state.reply_to = None;
             self.cancel_edit();
             self.state.thread_root = None;
+            self.state.members_ui.search = None;
+            self.state.members_ui.search_editing = false;
+            self.state.members_ui.cursor = None;
             self.reset_history_window_state();
         }
         self.state.image_viewer = None;
@@ -14736,6 +15168,7 @@ impl App {
     fn request_contact_profile(&mut self, account: &ProviderId, platform_id: &PlatformId) {
         let key = (account.clone(), platform_id.clone());
         if self.state.contact_profiles.contains_key(&key)
+            || self.state.members_ui.profile_errors.contains_key(&key)
             || !self.state.loading_contact_profiles.insert(key.clone())
         {
             return;
@@ -14796,21 +15229,72 @@ impl App {
     }
 
     async fn mark_selected_chat_read(&mut self) -> Result<()> {
+        self.mark_selected_chat_read_with(false).await
+    }
+
+    /// Clears the selected chat's badge, advances its read watermark, and
+    /// reports exactly the inbound messages read to the provider in the
+    /// background (never awaited on the event loop).
+    ///
+    /// Besides a non-zero local badge, a read is also sent when loaded
+    /// inbound messages are newer than the stored watermark (the phone may
+    /// still count them unread even though the local badge is 0), or when
+    /// `live_arrival` reports a message that just arrived in the open chat.
+    async fn mark_selected_chat_read_with(&mut self, live_arrival: bool) -> Result<()> {
         let Some(chat) = self.state.selected_chat().cloned() else {
             return Ok(());
         };
-        if chat.unread_count == 0 {
+        if self
+            .pending_live_read
+            .as_ref()
+            .is_some_and(|read| read.account == chat.account && read.chat_id == chat.id)
+        {
+            self.pending_live_read = None;
+        }
+        let request = build_mark_read_request(&chat, &self.state.messages);
+        let has_new_inbound = request
+            .as_ref()
+            .is_some_and(|request| !request.messages.is_empty());
+        let unread_past_watermark =
+            has_new_inbound && (chat.last_read_at.is_some() || live_arrival);
+        if chat.unread_count == 0 && !unread_past_watermark {
             return Ok(());
         }
+        let request = request.unwrap_or_default();
+        let targets = request.messages.len();
+        let watermark = request.up_to_at;
 
-        if let Some(provider) = self
+        let provider = self
             .providers
             .iter()
             .find(|provider| provider.id().as_ref() == chat.account.as_ref())
-            .cloned()
-            && let Some(message) = self.state.messages.last().cloned()
-        {
-            provider.mark_read(&chat.id, &message.id).await?;
+            .cloned();
+        let send = self.settings.send_read_status && provider.is_some();
+        self.log_perf_marker(
+            "read_sync.request",
+            format!(
+                "account={} chat={} unread={} targets={targets} live={live_arrival} send={send}",
+                chat.account, chat.id, chat.unread_count
+            ),
+        );
+        if send && let Some(provider) = provider {
+            let tx = self.mark_read_tx.clone();
+            let account = chat.account.clone();
+            let chat_id = chat.id.clone();
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let result = provider
+                    .mark_read(&chat_id, &request)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(MarkReadOutcome {
+                    account,
+                    chat_id,
+                    targets,
+                    elapsed: started.elapsed(),
+                    result,
+                });
+            });
         }
 
         if let Some(current) = self
@@ -14820,6 +15304,7 @@ impl App {
             .find(|candidate| candidate.id == chat.id && candidate.account == chat.account)
         {
             current.unread_count = 0;
+            current.last_read_at = current.last_read_at.max(watermark);
             let updated = current.clone();
             self.queue_chat_persist(updated);
         }
@@ -14844,6 +15329,14 @@ impl App {
         else {
             return Ok(());
         };
+        // Already covered by a read done here or in Slack (poll/redelivery):
+        // counting it again would resurrect a cleared badge.
+        if chat
+            .last_read_at
+            .is_some_and(|watermark| message.timestamp <= watermark)
+        {
+            return Ok(());
+        }
 
         chat.unread_count = chat.unread_count.saturating_add(1);
         let updated = chat.clone();
@@ -15985,6 +16478,7 @@ impl App {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: true,
             mentions_me: false,
@@ -17370,6 +17864,11 @@ impl App {
         let members_changed = self.drain_chat_member_fetches();
         let details_changed = self.drain_chat_detail_fetches();
         let profile_changed = self.drain_contact_profile_fetches();
+        let activity_changed = self.drain_chat_stats()
+            | self.drain_presence_fetches()
+            | self.drain_member_extras()
+            | self.drain_member_last_messages();
+        self.refresh_due_chat_stats();
         let expired = if let Some(notification) = &mut self.state.notification {
             notification.ticks_remaining = notification.ticks_remaining.saturating_sub(1);
             notification.ticks_remaining == 0
@@ -17379,7 +17878,12 @@ impl App {
         if expired {
             self.state.notification = None;
         }
-        if metadata_changed || members_changed || details_changed || profile_changed {
+        if metadata_changed
+            || members_changed
+            || details_changed
+            || profile_changed
+            || activity_changed
+        {
             self.state.status = "background details updated".to_owned();
         }
         Ok(())
@@ -18160,10 +18664,11 @@ impl App {
     }
 
     fn overview_details_line_count(&self) -> usize {
-        // Line count is independent of width here (the details paragraph does
-        // not wrap, and each member always renders a fixed two rows), so any
-        // representative width yields the correct count for scroll bounding.
-        self.overview_detail_lines(80).0.len()
+        // The paragraph does not wrap, but some sections pre-wrap free text
+        // to the pane width, so measure with the width last drawn.
+        let width = self.state.pane_areas.details.width.saturating_sub(2);
+        let width = if width == 0 { 80 } else { width };
+        self.overview_detail_lines(width).0.len()
     }
 
     fn message_details_line_count(&self, message: &Message) -> usize {
@@ -18563,6 +19068,7 @@ impl App {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: Some(Arc::from("No messages yet")),
             thread_id: None,
         };
@@ -20068,6 +20574,7 @@ fn provider_event_label(event: &ProviderEvent) -> &'static str {
         ProviderEvent::Reconnecting => "reconnecting",
         ProviderEvent::Typing { .. } => "typing",
         ProviderEvent::NetworkActivity { .. } => "network_activity",
+        ProviderEvent::Presence { .. } => "presence",
     }
 }
 
@@ -20205,6 +20712,20 @@ fn preserve_sidebar_activity_metadata(chat: &mut Chat, existing: Option<&Chat>) 
     let Some(existing) = existing else {
         return;
     };
+    chat.last_read_at = chat.last_read_at.max(existing.last_read_at);
+    // A snapshot that raises the badge without any activity newer than the
+    // read watermark predates a read already performed here (ClickUp cannot
+    // be told about local reads; WhatsApp/Slack metadata can lag). Keep the
+    // local count instead of resurrecting the badge.
+    if chat.unread_count > existing.unread_count
+        && let Some(watermark) = chat.last_read_at
+        && chat
+            .last_message_at
+            .max(existing.last_message_at)
+            .is_none_or(|activity| activity <= watermark)
+    {
+        chat.unread_count = existing.unread_count;
+    }
 
     if chat.platform == Platform::WhatsApp {
         if chat.avatar.is_none() {
@@ -20228,6 +20749,84 @@ fn preserve_sidebar_activity_metadata(chat: &mut Chat, existing: Option<&Chat>) 
     } else if chat.last_message_preview.is_none() {
         chat.last_message_preview = existing.last_message_preview.clone();
     }
+}
+
+/// How a provider unread snapshot is applied to a chat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnreadSnapshotDecision {
+    Apply,
+    /// Count already matches.
+    Unchanged,
+    /// Raising snapshot that predates the chat's read watermark: the phone's
+    /// metadata is older than a read chat-cli already performed.
+    Stale,
+}
+
+fn unread_snapshot_decision(
+    local: u32,
+    watermark: Option<Timestamp>,
+    incoming: u32,
+    as_of: Option<Timestamp>,
+    marked_unread: bool,
+) -> UnreadSnapshotDecision {
+    if incoming == local {
+        return UnreadSnapshotDecision::Unchanged;
+    }
+    if incoming > local
+        && !marked_unread
+        && let (Some(as_of), Some(watermark)) = (as_of, watermark)
+        && as_of <= watermark
+    {
+        return UnreadSnapshotDecision::Stale;
+    }
+    UnreadSnapshotDecision::Apply
+}
+
+/// Builds the explicit mark-read request for a chat from its loaded messages:
+/// the newest message becomes the watermark and the inbound messages newer
+/// than the stored watermark become receipt targets. Without a watermark the
+/// trailing `unread_count` inbound messages after the user's last outbound
+/// message are used (at least one). Returns `None` when nothing is loaded.
+fn build_mark_read_request(chat: &Chat, messages: &[Message]) -> Option<MarkReadRequest> {
+    let mut in_chat = messages
+        .iter()
+        .filter(|message| message.chat_id == chat.id && !is_placeholder_whatsapp_message(message))
+        .collect::<Vec<_>>();
+    in_chat.sort_by_key(|message| message.timestamp);
+    let newest = *in_chat.last()?;
+    let pending = match chat.last_read_at {
+        Some(watermark) => in_chat
+            .iter()
+            .filter(|message| !message.is_from_me && message.timestamp > watermark)
+            .copied()
+            .collect::<Vec<_>>(),
+        None => {
+            let after_outbound = in_chat
+                .iter()
+                .rposition(|message| message.is_from_me)
+                .map_or(0, |index| index + 1);
+            let inbound = in_chat[after_outbound..]
+                .iter()
+                .filter(|message| !message.is_from_me)
+                .copied()
+                .collect::<Vec<_>>();
+            let take = (chat.unread_count as usize).max(1);
+            inbound[inbound.len().saturating_sub(take)..].to_vec()
+        }
+    };
+    let skip = pending.len().saturating_sub(MARK_READ_MAX_TARGETS);
+    Some(MarkReadRequest {
+        up_to: Some(newest.id.clone()),
+        up_to_at: Some(newest.timestamp),
+        messages: pending[skip..]
+            .iter()
+            .map(|message| ReadTarget {
+                id: message.id.clone(),
+                sender: message.sender.platform_id.clone(),
+                timestamp: message.timestamp,
+            })
+            .collect(),
+    })
 }
 
 fn chat_kind_label(kind: ChatKind) -> &'static str {
@@ -21402,11 +22001,23 @@ fn notification_preview(message: &Message) -> String {
     truncate_chars(&preview, 80)
 }
 
+/// Message-filter term restricting results to one sender's platform id
+/// (used by the member profile "search their messages" action).
+const MESSAGE_FILTER_FROM_PREFIX: &str = "from:";
+
 fn message_matches_filter(message: &Message, filter: &str) -> bool {
-    let terms = filter
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .collect::<Vec<_>>();
+    let mut terms = Vec::new();
+    for term in filter.split_whitespace() {
+        if let Some(sender) = term.strip_prefix(MESSAGE_FILTER_FROM_PREFIX)
+            && !sender.is_empty()
+        {
+            if message.sender.platform_id.as_ref() != sender {
+                return false;
+            }
+            continue;
+        }
+        terms.push(term.to_lowercase());
+    }
     if terms.is_empty() {
         return true;
     }
@@ -21428,6 +22039,30 @@ fn is_slack_thread_reply(message: &Message) -> bool {
     }) || message.reply_to.as_ref().is_some_and(|reply_to| {
         message.platform_data.slack.is_some() && reply_to.as_ref() != message.id.as_ref()
     })
+}
+
+/// Snapshot of a quoted message, stored with an outgoing WhatsApp reply so its
+/// quote box still renders once the original scrolls out of the loaded window.
+fn quoted_preview_from_message(message: &Message) -> QuotedPreview {
+    let snippet = content_send_preview(&message.content);
+    let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    QuotedPreview {
+        sender_id: Some(if message.is_from_me {
+            Arc::from("me")
+        } else {
+            message.sender.platform_id.clone()
+        }),
+        sender_name: if message.is_from_me {
+            Arc::from("You")
+        } else {
+            message.sender.display_name.clone()
+        },
+        snippet: Arc::from(if snippet.is_empty() {
+            "Message"
+        } else {
+            snippet.as_str()
+        }),
+    }
 }
 
 /// The thread root id a reply belongs to, or `None` when the message is not a
@@ -23180,6 +23815,7 @@ mod tests {
             is_group: true,
             kind: ChatKind::Group,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             unread_count: 0,
             muted: false,
@@ -23213,6 +23849,7 @@ mod tests {
                 emoji: Arc::from("😂"),
                 senders: vec![reactor.clone()],
             }],
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,
@@ -23302,6 +23939,7 @@ mod tests {
             is_group: true,
             kind: ChatKind::PublicChannel,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             unread_count: 0,
             muted: false,
@@ -23331,6 +23969,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,
@@ -23391,6 +24030,7 @@ mod tests {
             is_group: true,
             kind: ChatKind::PublicChannel,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             unread_count: 0,
             muted: false,
@@ -23420,6 +24060,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,
@@ -23475,6 +24116,7 @@ mod tests {
             is_group: true,
             kind: ChatKind::PublicChannel,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             unread_count: 0,
             muted: false,
@@ -23504,6 +24146,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,
@@ -23641,6 +24284,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -23658,6 +24302,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -23774,6 +24419,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -25111,6 +25757,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -25417,6 +26064,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -25434,6 +26082,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -25491,6 +26140,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -25508,6 +26158,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -25770,7 +26421,10 @@ mod tests {
         // End scrolls the last item into view; Home returns to the top.
         app.handle_event(AppEvent::Key(key(KeyCode::End, KeyModifiers::NONE)))
             .await?;
-        assert_eq!(app.state().settings_overlay_selected(), Some(14));
+        assert_eq!(
+            app.state().settings_overlay_selected(),
+            Some(SettingsItem::ALL.len() - 1)
+        );
         assert_eq!(app.state().settings_overlay_scroll(), Some(max_scroll));
         terminal.draw(|frame| app.draw(frame))?;
         let scrolled = buffer_text(terminal.backend().buffer());
@@ -26482,6 +27136,99 @@ mod tests {
         assert_eq!(app.state().compose_text(), "hi @Maya ");
         assert!(app.state().status().contains("mentioned @Maya"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_message_in_attended_chat_is_marked_read_after_debounce() -> Result<()> {
+        let mock = MockProvider::new();
+        let mut app = test_app_with_providers(vec![Arc::new(mock.clone())]).await?;
+        drain_async_app_work(&mut app).await?;
+        let chat = app.state().selected_chat().unwrap().clone();
+        app.state.focus = FocusPane::Messages;
+        let mut message = test_incoming_message(&chat, "live-read-1", "Ada", "hello");
+        let newest = app
+            .state
+            .messages
+            .iter()
+            .map(|m| m.timestamp)
+            .max()
+            .unwrap_or_else(Utc::now);
+        message.timestamp = newest + chrono::Duration::seconds(5);
+
+        app.handle_event(AppEvent::Provider(
+            chat.account.clone(),
+            Box::new(ProviderEvent::Message {
+                message,
+                is_historical: false,
+            }),
+        ))
+        .await?;
+
+        // Phase 1: the read is only scheduled, nothing is sent yet.
+        let pending = app.pending_live_read.clone().expect("live read scheduled");
+        assert_eq!(pending.chat_id, chat.id);
+        assert!(!mock.mark_read_requests().iter().any(|(_, request)| {
+            request
+                .messages
+                .iter()
+                .any(|t| t.id.as_ref() == "live-read-1")
+        }));
+
+        // Phase 2: once the debounce elapses the exact message is acknowledged
+        // in the background and the watermark advances.
+        app.pending_live_read.as_mut().unwrap().deadline = Instant::now();
+        assert!(app.flush_pending_live_read().await?);
+        assert!(app.pending_live_read.is_none());
+        for _ in 0..50 {
+            if mock.mark_read_requests().iter().any(|(_, request)| {
+                request
+                    .messages
+                    .iter()
+                    .any(|t| t.id.as_ref() == "live-read-1")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let requests = mock.mark_read_requests();
+        let (chat_id, request) = requests
+            .iter()
+            .rev()
+            .find(|(_, request)| {
+                request
+                    .messages
+                    .iter()
+                    .any(|t| t.id.as_ref() == "live-read-1")
+            })
+            .expect("live message acknowledged");
+        assert_eq!(*chat_id, chat.id);
+        assert_eq!(request.up_to.as_deref(), Some("live-read-1"));
+        let current = app
+            .state()
+            .chats()
+            .iter()
+            .find(|candidate| candidate.id == chat.id)
+            .unwrap();
+        assert_eq!(current.unread_count, 0);
+        assert!(current.last_read_at.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn live_read_is_dropped_when_user_navigates_away() -> Result<()> {
+        let mock = MockProvider::new();
+        let mut app = test_app_with_providers(vec![Arc::new(mock.clone())]).await?;
+        drain_async_app_work(&mut app).await?;
+        let chat = app.state().selected_chat().unwrap().clone();
+        app.schedule_live_read(&chat.account, &chat.id);
+        app.state.focus = FocusPane::ChatList;
+        let before = mock.mark_read_requests().len();
+        app.pending_live_read.as_mut().unwrap().deadline = Instant::now();
+        assert!(!app.flush_pending_live_read().await?);
+        assert!(app.pending_live_read.is_none());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(mock.mark_read_requests().len(), before);
         Ok(())
     }
 
@@ -28005,6 +28752,7 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: Some(Utc::now()),
+            last_read_at: None,
             last_message_preview: Some(Arc::from("two unread messages")),
             thread_id: None,
         };
@@ -28472,6 +29220,7 @@ mod tests {
             background_chat.account.clone(),
             Box::new(ProviderEvent::ChatMarkedRead {
                 chat_id: background_chat.id.clone(),
+                read_up_to: None,
             }),
         ))
         .await?;
@@ -30683,6 +31432,7 @@ mod tests {
         /// When set, `connect` waits for a notification (simulates a slow
         /// account at startup).
         connect_gate: Option<Arc<tokio::sync::Notify>>,
+        presence_support: PresenceSupport,
     }
 
     impl StaticTestProvider {
@@ -30735,6 +31485,7 @@ mod tests {
                 bundled_oauth_app: false,
                 configured_realtime: false,
                 connect_gate: None,
+                presence_support: PresenceSupport::Unsupported,
             }
         }
 
@@ -30795,6 +31546,7 @@ mod tests {
                 bundled_oauth_app: false,
                 configured_realtime: false,
                 connect_gate: None,
+                presence_support: PresenceSupport::Unsupported,
             })
         }
 
@@ -30850,6 +31602,10 @@ mod tests {
     impl Provider for StaticTestProvider {
         fn id(&self) -> &ProviderId {
             &self.id
+        }
+
+        fn presence_support(&self) -> PresenceSupport {
+            self.presence_support
         }
 
         fn platform(&self) -> Platform {
@@ -30944,7 +31700,7 @@ mod tests {
                 .unwrap_or_else(|| PathBuf::from(&*media.file_name)))
         }
 
-        async fn mark_read(&self, _chat_id: &Arc<str>, _up_to: &Arc<str>) -> Result<()> {
+        async fn mark_read(&self, _chat_id: &Arc<str>, _request: &MarkReadRequest) -> Result<()> {
             Ok(())
         }
 
@@ -31073,9 +31829,118 @@ mod tests {
             muted: false,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         }
+    }
+
+    fn read_sync_message(chat: &Chat, id: &str, minute: i64, from_me: bool) -> Message {
+        let mut message = test_incoming_message(chat, id, "Ada", "hi");
+        message.timestamp = Utc.timestamp_opt(1_700_000_000 + minute * 60, 0).unwrap();
+        message.is_from_me = from_me;
+        message
+    }
+
+    #[test]
+    fn mark_read_request_without_watermark_targets_unread_tail_after_outbound() {
+        let account: ProviderId = Arc::from("whatsapp:read");
+        let mut chat = test_chat(&account, Platform::WhatsApp, "c", "c", ChatKind::Direct);
+        chat.unread_count = 2;
+        let messages = vec![
+            read_sync_message(&chat, "a", 0, false),
+            read_sync_message(&chat, "me", 1, true),
+            read_sync_message(&chat, "b", 2, false),
+            read_sync_message(&chat, "c", 3, false),
+            read_sync_message(&chat, "d", 4, false),
+        ];
+        let request = build_mark_read_request(&chat, &messages).unwrap();
+        let ids = request
+            .messages
+            .iter()
+            .map(|t| t.id.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["c", "d"]);
+        assert_eq!(request.up_to.as_deref(), Some("d"));
+        assert_eq!(request.up_to_at, Some(messages[4].timestamp));
+        assert!(build_mark_read_request(&chat, &[]).is_none());
+    }
+
+    #[test]
+    fn mark_read_request_with_watermark_targets_every_newer_inbound() {
+        let account: ProviderId = Arc::from("whatsapp:read");
+        let mut chat = test_chat(&account, Platform::WhatsApp, "c", "c", ChatKind::Direct);
+        let messages = vec![
+            read_sync_message(&chat, "old", 0, false),
+            read_sync_message(&chat, "new1", 2, false),
+            read_sync_message(&chat, "mine", 3, true),
+            read_sync_message(&chat, "new2", 4, false),
+        ];
+        chat.last_read_at = Some(messages[0].timestamp);
+        let request = build_mark_read_request(&chat, &messages).unwrap();
+        let ids = request
+            .messages
+            .iter()
+            .map(|t| t.id.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["new1", "new2"]);
+    }
+
+    #[test]
+    fn unread_snapshot_older_than_watermark_is_stale() {
+        let watermark = Utc.timestamp_opt(1_700_000_600, 0).unwrap();
+        let older = Some(watermark - chrono::Duration::seconds(1));
+        let newer = Some(watermark + chrono::Duration::seconds(1));
+        assert_eq!(
+            unread_snapshot_decision(0, Some(watermark), 1, older, false),
+            UnreadSnapshotDecision::Stale
+        );
+        assert_eq!(
+            unread_snapshot_decision(0, Some(watermark), 1, newer, false),
+            UnreadSnapshotDecision::Apply
+        );
+        // Manual "mark as unread" on the phone always applies.
+        assert_eq!(
+            unread_snapshot_decision(0, Some(watermark), 1, older, true),
+            UnreadSnapshotDecision::Apply
+        );
+        // Lowering snapshots always apply; equal counts are no-ops.
+        assert_eq!(
+            unread_snapshot_decision(3, Some(watermark), 0, older, false),
+            UnreadSnapshotDecision::Apply
+        );
+        assert_eq!(
+            unread_snapshot_decision(2, None, 2, None, false),
+            UnreadSnapshotDecision::Unchanged
+        );
+    }
+
+    #[test]
+    fn chat_snapshot_does_not_resurrect_badge_read_locally() {
+        let account: ProviderId = Arc::from("clickup:read");
+        let read_at = Utc.timestamp_opt(1_700_000_600, 0).unwrap();
+        let mut existing = test_chat(
+            &account,
+            Platform::ClickUp,
+            "c",
+            "c",
+            ChatKind::PublicChannel,
+        );
+        existing.last_read_at = Some(read_at);
+        existing.last_message_at = Some(read_at);
+
+        let mut stale = existing.clone();
+        stale.last_read_at = None;
+        stale.unread_count = 2;
+        preserve_sidebar_activity_metadata(&mut stale, Some(&existing));
+        assert_eq!(stale.unread_count, 0);
+        assert_eq!(stale.last_read_at, Some(read_at));
+
+        let mut fresh = stale.clone();
+        fresh.unread_count = 1;
+        fresh.last_message_at = Some(read_at + chrono::Duration::seconds(30));
+        preserve_sidebar_activity_metadata(&mut fresh, Some(&existing));
+        assert_eq!(fresh.unread_count, 1);
     }
 
     #[tokio::test]
@@ -31332,6 +32197,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,
@@ -31355,6 +32221,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,
@@ -31398,6 +32265,321 @@ mod tests {
             .collect::<String>()
     }
 
+    // ----- Details member list / profile popup -------------------------
+
+    /// Selects `chat_id`, seeds its member list, lays out a Details pane at
+    /// a fixed rect, and records member hit regions like `draw_details`.
+    fn select_chat_with_members(app: &mut App, chat_id: &str, members: Vec<ChatMember>) -> Chat {
+        let index = app
+            .state
+            .chats
+            .iter()
+            .position(|chat| chat.id.as_ref() == chat_id)
+            .expect("mock chat exists");
+        app.state.selected_chat = index;
+        app.state.selected_message_id = None;
+        app.state.thread_root = None;
+        let chat = app.state.chats[index].clone();
+        app.state
+            .chat_members
+            .insert((chat.account.clone(), chat.id.clone()), members);
+        app.state.pane_areas.details = Rect::new(80, 0, 42, 60);
+        app.state.focus = FocusPane::Details;
+        rebuild_details_hits(app);
+        chat
+    }
+
+    fn rebuild_details_hits(app: &mut App) {
+        let width = app.state.pane_areas.details.width.saturating_sub(2);
+        let (_, _, hits) = app.overview_detail_lines(width);
+        app.state.members_ui.hits = hits;
+    }
+
+    fn test_member(id: &str, name: &str, avatar: Option<PathBuf>) -> ChatMember {
+        ChatMember {
+            sender: Sender {
+                platform_id: Arc::from(id),
+                display_name: Arc::from(name),
+                avatar,
+            },
+            role: chat_core::ChatMemberRole::Member,
+            is_self: id == "me",
+        }
+    }
+
+    /// Screen position of a member row (`avatar` picks the avatar column).
+    fn member_click_point(app: &App, platform_id: &str, avatar: bool) -> (u16, u16) {
+        let hit = app
+            .state
+            .members_ui
+            .member_rows()
+            .find(|hit| hit.platform_id.as_ref() == platform_id)
+            .expect("member row recorded")
+            .clone();
+        let inner = inner_area(app.state.pane_areas.details);
+        let row = inner.y + (hit.line_index - app.state.details_scroll) as u16;
+        let column = if avatar { inner.x + 3 } else { inner.x + 12 };
+        (column, row)
+    }
+
+    async fn drain_member_pipelines(app: &mut App, mut done: impl FnMut(&App) -> bool) {
+        for _ in 0..200 {
+            app.drain_contact_profile_fetches();
+            app.drain_chat_stats();
+            app.drain_presence_fetches();
+            app.drain_member_extras();
+            app.drain_member_last_messages();
+            if done(app) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("background member pipelines did not settle");
+    }
+
+    fn popup_text(app: &App) -> Vec<String> {
+        let (lines, _) = app.member_profile_lines(60, false);
+        lines.iter().map(line_text).collect()
+    }
+
+    #[tokio::test]
+    async fn clicking_member_opens_profile_with_loading_then_details() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = select_chat_with_members(
+            &mut app,
+            "mock:chat:design",
+            vec![
+                test_member("priya", "Priya Shah", None),
+                test_member("alice", "Alice Chen", None),
+                test_member("me", "Me", None),
+            ],
+        );
+        let (column, row) = member_click_point(&app, "priya", false);
+        app.handle_left_click(FocusPane::Details, left_click(column, row));
+
+        // Phase 1: popup is open immediately from cached identity.
+        let popup = app.state.members_ui.popup.as_ref().expect("popup opened");
+        assert_eq!(popup.platform_id.as_ref(), "priya");
+        assert_eq!(popup.chat_id.as_ref(), Some(&chat.id));
+        let text = popup_text(&app);
+        assert!(text.iter().any(|line| line.contains("Priya Shah")));
+        assert!(text.iter().any(|line| line.contains("Loading profile")));
+
+        // Phase 2: provider profile arrives in the background.
+        drain_member_pipelines(&mut app, |app| {
+            app.state
+                .contact_profiles
+                .contains_key(&(chat.account.clone(), Arc::from("priya")))
+        })
+        .await;
+        let text = popup_text(&app);
+        assert!(text.iter().any(|line| line.contains("+1 555-0147")));
+        assert!(text.iter().any(|line| line.contains("priya@example.com")));
+        assert!(!text.iter().any(|line| line.contains("Loading profile")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn details_member_clicks_follow_scroll_offset() -> Result<()> {
+        let mut app = test_app().await?;
+        let members = (0..12)
+            .map(|index| test_member(&format!("user{index}"), &format!("User {index}"), None))
+            .collect();
+        select_chat_with_members(&mut app, "mock:chat:design", members);
+        let (column, row) = member_click_point(&app, "user5", false);
+        // Scroll the pane by one member (two rows): the same screen row now
+        // shows the next member.
+        app.state.details_scroll += 2;
+        let (hit, on_avatar) = app
+            .details_member_at(column, row)
+            .expect("member under cursor");
+        assert_eq!(hit.platform_id.as_ref(), "user6");
+        assert!(!on_avatar);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clicking_member_avatar_opens_image_viewer_and_esc_closes_in_order() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let avatar = dir.path().join("alice.png");
+        std::fs::write(&avatar, b"not really a png")?;
+        let mut app = test_app().await?;
+        select_chat_with_members(
+            &mut app,
+            "mock:chat:design",
+            vec![test_member("alice", "Alice Chen", Some(avatar.clone()))],
+        );
+        let (column, row) = member_click_point(&app, "alice", true);
+        app.handle_left_click(FocusPane::Details, left_click(column, row));
+        assert_eq!(
+            app.state
+                .image_viewer
+                .as_ref()
+                .map(|viewer| viewer.path.clone()),
+            Some(avatar.clone())
+        );
+        assert!(app.state.members_ui.popup.is_none());
+
+        // Popup + viewer: Esc closes the viewer first, then the popup.
+        app.state.image_viewer = None;
+        app.open_member_profile(&Arc::from("alice"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE))
+            .await?;
+        assert!(app.state.image_viewer.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await?;
+        assert!(app.state.image_viewer.is_none());
+        assert!(app.state.members_ui.popup.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await?;
+        assert!(app.state.members_ui.popup.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyboard_cursor_selects_member_and_enter_opens_profile() -> Result<()> {
+        let mut app = test_app().await?;
+        select_chat_with_members(
+            &mut app,
+            "mock:chat:design",
+            vec![
+                test_member("priya", "Priya Shah", None),
+                test_member("alice", "Alice Chen", None),
+            ],
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await?;
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await?;
+        assert_eq!(app.state.members_ui.cursor.as_deref(), Some("alice"));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await?;
+        assert_eq!(
+            app.state
+                .members_ui
+                .popup
+                .as_ref()
+                .map(|popup| popup.platform_id.as_ref()),
+            Some("alice")
+        );
+        // Clicking outside the popup closes it.
+        app.handle_mouse(left_click(0, 0)).await?;
+        assert!(app.state.members_ui.popup.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn member_search_and_sort_change_rendered_order() -> Result<()> {
+        let mut app = test_app().await?;
+        select_chat_with_members(
+            &mut app,
+            "mock:chat:design",
+            vec![
+                test_member("c", "Carol", None),
+                test_member("a", "Alice", None),
+                test_member("b", "Bob", None),
+            ],
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+            .await?;
+        assert_eq!(app.state.members_ui.sort, member_profile::MemberSort::Name);
+        rebuild_details_hits(&mut app);
+        let order: Vec<String> = app
+            .state
+            .members_ui
+            .member_rows()
+            .map(|hit| hit.platform_id.to_string())
+            .collect();
+        assert_eq!(order, vec!["a", "b", "c"]);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .await?;
+        for ch in "car".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .await?;
+        }
+        rebuild_details_hits(&mut app);
+        let order: Vec<String> = app
+            .state
+            .members_ui
+            .member_rows()
+            .map(|hit| hit.platform_id.to_string())
+            .collect();
+        assert_eq!(order, vec!["c"]);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await?;
+        assert!(app.state.members_ui.search.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_section_shows_loading_then_stats() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = select_chat_with_members(&mut app, "mock:chat:design", Vec::new());
+        let key = (chat.account.clone(), chat.id.clone());
+        app.request_selected_chat_stats();
+        let (lines, _, _) = app.overview_detail_lines(60);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|line| line.contains("Computing activity")));
+
+        drain_member_pipelines(&mut app, |app| {
+            app.state.members_ui.stats.contains_key(&key)
+                || app.state.members_ui.stats_errors.contains_key(&key)
+        })
+        .await;
+        assert!(app.state.members_ui.stats_errors.get(&key).is_none());
+        let (lines, _, _) = app.overview_detail_lines(60);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(!text.iter().any(|line| line.contains("Computing activity")));
+        assert!(text.iter().any(|line| line.trim() == "Activity"));
+
+        // New messages mark stats stale but keep showing the cached numbers.
+        app.mark_chat_stats_dirty(&chat.account, &chat.id);
+        assert!(app.state.members_ui.stats_dirty_at.contains_key(&key));
+        app.request_selected_chat_stats();
+        assert!(!app.state.members_ui.loading_stats.contains(&key));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pushed_presence_shows_in_member_list_and_is_not_downgraded() -> Result<()> {
+        let mut app = test_app().await?;
+        let chat = select_chat_with_members(
+            &mut app,
+            "mock:chat:design",
+            vec![test_member("alice", "Alice Chen", None)],
+        );
+        let now = Utc::now();
+        app.apply_presence(
+            chat.account.clone(),
+            Arc::from("alice"),
+            Presence::new(chat_core::PresenceState::Online, now),
+        );
+        // An older snapshot (e.g. a slow poll) must not replace it.
+        app.apply_presence(
+            chat.account.clone(),
+            Arc::from("alice"),
+            Presence::new(
+                chat_core::PresenceState::Offline,
+                now - chrono::Duration::minutes(1),
+            ),
+        );
+        let (lines, _, _) = app.overview_detail_lines(40);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(text.iter().any(|line| line.contains("Online")), "{text:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn message_filter_from_prefix_matches_sender_id() {
+        let mut message = test_message_with_content(Content::Text(Arc::from("hello world")));
+        message.sender.platform_id = Arc::from("alice");
+        assert!(message_matches_filter(&message, "from:alice"));
+        assert!(message_matches_filter(&message, "from:alice hello"));
+        assert!(!message_matches_filter(&message, "from:bob"));
+        assert!(!message_matches_filter(&message, "from:alice goodbye"));
+    }
+
     #[test]
     fn format_duration_label_uses_largest_whole_unit() {
         assert_eq!(format_duration_label(7 * 24 * 3600), "7 days");
@@ -31429,7 +32611,7 @@ mod tests {
             },
         );
 
-        let (lines, _) = app.overview_detail_lines(80);
+        let (lines, _, _) = app.overview_detail_lines(80);
         let text: Vec<String> = lines.iter().map(line_text).collect();
 
         assert!(text.iter().any(|line| line.contains("Description")));
@@ -31477,5 +32659,374 @@ mod tests {
                 && (matches!(cell.fg, Color::Rgb(_, _, _))
                     || matches!(cell.bg, Color::Rgb(_, _, _)))
         })
+    }
+
+    async fn member_test_app() -> Result<(App, Chat)> {
+        let account_id: ProviderId = Arc::from("whatsapp:members");
+        let chat = test_chat(
+            &account_id,
+            Platform::WhatsApp,
+            "group@g.us",
+            "Trip",
+            ChatKind::Group,
+        );
+        let account = Account {
+            id: account_id.clone(),
+            platform: Platform::WhatsApp,
+            display_name: Arc::from("Test WhatsApp"),
+            avatar: None,
+        };
+        let mut provider = StaticTestProvider::with_account(
+            account,
+            vec![chat.clone()],
+            Vec::new(),
+            OutboundCapabilities::all(),
+        );
+        // Behave like WhatsApp: presence arrives as pushed events.
+        provider.presence_support = PresenceSupport::Pushed;
+        let mut app = test_app_with_providers(vec![Arc::new(provider)]).await?;
+        let avatar = std::env::temp_dir().join("chat-cli-member-avatar-test.png");
+        std::fs::write(&avatar, b"not really a png")?;
+        app.chat_members_tx.send(ChatMembersFetchResult {
+            account: chat.account.clone(),
+            chat_id: chat.id.clone(),
+            result: Ok(vec![
+                ChatMember::new(Sender {
+                    platform_id: Arc::from("mock:user:Maya"),
+                    display_name: Arc::from("Maya"),
+                    avatar: Some(avatar),
+                }),
+                ChatMember::new(Sender {
+                    platform_id: Arc::from("mock:user:Dad"),
+                    display_name: Arc::from("Dad"),
+                    avatar: None,
+                }),
+            ]),
+        })?;
+        assert!(app.drain_chat_member_fetches());
+        app.state.pane_areas.details = Rect::new(80, 0, 42, 60);
+        app.rebuild_member_hits();
+        Ok((app, chat))
+    }
+
+    impl App {
+        /// Mirrors what `draw_details` records, without a terminal.
+        fn rebuild_member_hits(&mut self) {
+            let width = inner_area(self.state.pane_areas.details).width;
+            let (_, _, hits) = self.overview_detail_lines(width);
+            self.state.members_ui.hits = hits;
+        }
+
+        fn member_hit_row(&self, platform_id: &str) -> u16 {
+            let hit = self
+                .state
+                .members_ui
+                .hits
+                .iter()
+                .find(|hit| hit.is_member_row && hit.platform_id.as_ref() == platform_id)
+                .expect("member row recorded");
+            let inner = inner_area(self.state.pane_areas.details);
+            inner.y + (hit.line_index - self.state.details_scroll) as u16
+        }
+
+        fn popup_text(&self) -> String {
+            let (lines, _) = self.member_profile_lines(60, false);
+            lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+        }
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Lets spawned background tasks run, draining completions until `done`.
+    async fn drain_member_ui_until(app: &mut App, done: impl Fn(&App) -> bool) {
+        for _ in 0..200 {
+            app.drain_contact_profile_fetches();
+            app.drain_chat_stats();
+            app.drain_presence_fetches();
+            app.drain_member_extras();
+            app.drain_member_last_messages();
+            if done(app) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("background member work did not finish");
+    }
+
+    #[tokio::test]
+    async fn details_member_click_opens_profile_with_loading_then_final_state() -> Result<()> {
+        let (mut app, chat) = member_test_app().await?;
+        let row = app.member_hit_row("mock:user:Dad");
+        let name_column = inner_area(app.state.pane_areas.details).x + 10;
+
+        app.handle_left_click(FocusPane::Details, left_click(name_column, row));
+
+        // Phase 1: popup is open immediately with identity and a loading line.
+        let popup = app.state.members_ui.popup.as_ref().expect("popup open");
+        assert_eq!(popup.platform_id.as_ref(), "mock:user:Dad");
+        assert!(app.popup_text().contains("Dad"));
+        assert!(app.popup_text().contains("Loading profile"));
+
+        // Phase 2: the background profile load completes.
+        let key = (chat.account.clone(), Arc::<str>::from("mock:user:Dad"));
+        drain_member_ui_until(&mut app, |app| {
+            !app.state.loading_contact_profiles.contains(&key)
+                && app.state.members_ui.loading_extras.is_empty()
+        })
+        .await;
+        let text = app.popup_text();
+        assert!(!text.contains("Loading profile"), "{text}");
+        assert!(text.contains("No additional details available"), "{text}");
+
+        app.handle_event(AppEvent::Key(key_event(KeyCode::Esc)))
+            .await?;
+        assert!(app.state.members_ui.popup.is_none());
+        Ok(())
+    }
+
+    fn key_event(code: KeyCode) -> KeyEvent {
+        key(code, KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn details_member_click_respects_scroll_and_avatar_column() -> Result<()> {
+        let (mut app, _chat) = member_test_app().await?;
+        app.state.details_scroll = 3;
+        let inner = inner_area(app.state.pane_areas.details);
+        let row = app.member_hit_row("mock:user:Maya");
+
+        // The avatar column enlarges the avatar instead of opening the profile.
+        app.handle_left_click(FocusPane::Details, left_click(inner.x + 3, row));
+        assert!(app.state.members_ui.popup.is_none());
+        let viewer = app.state.image_viewer.as_ref().expect("avatar viewer open");
+        assert!(viewer.path.ends_with("chat-cli-member-avatar-test.png"));
+        app.close_image_viewer();
+
+        // The same row's name opens Maya's profile, despite the scroll.
+        app.handle_left_click(FocusPane::Details, left_click(inner.x + 12, row));
+        assert_eq!(
+            app.state
+                .members_ui
+                .popup
+                .as_ref()
+                .map(|popup| popup.platform_id.to_string()),
+            Some("mock:user:Maya".to_owned())
+        );
+
+        // Clicking outside the popup closes it before anything underneath.
+        app.state.members_ui.popup_area = Rect::new(10, 5, 40, 20);
+        app.handle_mouse(left_click(0, 0)).await?;
+        assert!(app.state.members_ui.popup.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn details_member_keyboard_cursor_sort_and_search() -> Result<()> {
+        let (mut app, _chat) = member_test_app().await?;
+        app.state.focus = FocusPane::Details;
+
+        app.handle_event(AppEvent::Key(key_event(KeyCode::Tab)))
+            .await?;
+        let first = app.state.members_ui.cursor.clone().expect("cursor set");
+        app.handle_event(AppEvent::Key(key_event(KeyCode::Char('o'))))
+            .await?;
+        assert_eq!(app.state.members_ui.sort, member_profile::MemberSort::Name);
+        app.rebuild_member_hits();
+        // The cursor follows the person, not the row index, across re-sorts.
+        assert_eq!(app.state.members_ui.cursor.as_ref(), Some(&first));
+
+        app.handle_event(AppEvent::Key(key_event(KeyCode::Char('/'))))
+            .await?;
+        for value in "may".chars() {
+            app.handle_event(AppEvent::Key(key_event(KeyCode::Char(value))))
+                .await?;
+        }
+        assert_eq!(app.state.members_ui.search.as_deref(), Some("may"));
+        app.rebuild_member_hits();
+        let rows: Vec<String> = app
+            .state
+            .members_ui
+            .member_rows()
+            .map(|hit| hit.platform_id.to_string())
+            .collect();
+        assert_eq!(rows, vec!["mock:user:Maya".to_owned()]);
+
+        app.handle_event(AppEvent::Key(key_event(KeyCode::Enter)))
+            .await?;
+        assert!(!app.state.members_ui.search_editing);
+        app.handle_event(AppEvent::Key(key_event(KeyCode::Tab)))
+            .await?;
+        app.handle_event(AppEvent::Key(key_event(KeyCode::Enter)))
+            .await?;
+        assert_eq!(
+            app.state
+                .members_ui
+                .popup
+                .as_ref()
+                .map(|popup| popup.platform_id.to_string()),
+            Some("mock:user:Maya".to_owned())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn details_activity_shows_computing_then_top_posters() -> Result<()> {
+        let (mut app, chat) = member_test_app().await?;
+        // Maya posts three times 5 minutes apart (3 activities) plus a burst
+        // 10s after her last message, which must not count again; Dad once.
+        let base = Utc::now() - chrono::Duration::hours(1);
+        for (index, (sender, offset)) in [
+            ("Maya", 0),
+            ("Maya", 300),
+            ("Maya", 600),
+            ("Maya", 610),
+            ("Dad", 900),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut message = test_incoming_message(&chat, &format!("m{index}"), sender, "hello");
+            message.timestamp = base + chrono::Duration::seconds(*offset);
+            app.store.upsert_message(&message).await?;
+        }
+
+        app.request_selected_chat_stats();
+        let width = inner_area(app.state.pane_areas.details).width;
+        let text = |app: &App| {
+            app.overview_detail_lines(width)
+                .0
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(text(&app).contains("Computing activity"));
+
+        let key = (chat.account.clone(), chat.id.clone());
+        drain_member_ui_until(&mut app, |app| {
+            app.state.members_ui.stats.contains_key(&key)
+        })
+        .await;
+        let rendered = text(&app);
+        assert!(
+            rendered.contains("Based on 5 synced messages"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Top posters"), "{rendered}");
+        assert!(rendered.contains("75%"), "{rendered}");
+
+        // New messages mark stats stale; a refresh waits for the debounce.
+        app.mark_chat_stats_dirty(&chat.account, &chat.id);
+        app.request_selected_chat_stats();
+        assert!(app.state.members_ui.loading_stats.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn presence_events_never_replace_newer_snapshots() -> Result<()> {
+        let (mut app, chat) = member_test_app().await?;
+        let id: PlatformId = Arc::from("mock:user:Maya");
+        let now = Utc::now();
+        app.apply_presence(
+            chat.account.clone(),
+            id.clone(),
+            Presence::new(chat_core::PresenceState::Online, now),
+        );
+        app.apply_presence(
+            chat.account.clone(),
+            id.clone(),
+            Presence::new(
+                chat_core::PresenceState::Offline,
+                now - chrono::Duration::seconds(30),
+            ),
+        );
+        assert_eq!(
+            app.state.members_ui.presence[&(chat.account.clone(), id)].state,
+            chat_core::PresenceState::Online
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hidden_last_seen_falls_back_to_last_message_in_any_chat() -> Result<()> {
+        let (mut app, chat) = member_test_app().await?;
+        let id: PlatformId = Arc::from("mock:user:Maya");
+        let key = (chat.account.clone(), id.clone());
+        let mut presence = Presence::new(chat_core::PresenceState::Offline, Utc::now());
+        presence.last_seen_hidden = true;
+        app.apply_presence(chat.account.clone(), id.clone(), presence);
+        // Settle lookups started by the initial draw (before any messages
+        // existed) so the request below is a fresh one.
+        drain_member_ui_until(&mut app, |app| {
+            app.state.members_ui.loading_last_message.is_empty()
+        })
+        .await;
+        app.state.members_ui.last_message_checked_at.clear();
+
+        // Maya's latest message lives in a different chat of the account.
+        let mut other = chat.clone();
+        other.id = Arc::from("mock:chat:elsewhere");
+        let mut message = test_incoming_message(&other, "x1", "Maya", "elsewhere");
+        message.timestamp = Utc::now() - chrono::Duration::hours(3);
+        app.store.upsert_message(&message).await?;
+
+        let width = inner_area(app.state.pane_areas.details).width;
+        let text = |app: &App| {
+            app.overview_detail_lines(width)
+                .0
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        app.request_member_last_messages(std::slice::from_ref(&key));
+        // Phase 1: nothing cached yet, so the honest presence label shows.
+        assert!(text(&app).contains("Last seen hidden"), "{}", text(&app));
+        assert!(app.state.members_ui.loading_last_message.contains(&key));
+
+        // Phase 2: the cross-chat lookup lands and replaces it.
+        drain_member_ui_until(&mut app, |app| {
+            app.state.members_ui.last_message.contains_key(&key)
+        })
+        .await;
+        let rendered = text(&app);
+        assert!(rendered.contains("last msg 3h ago"), "{rendered}");
+        assert!(!rendered.contains("Last seen hidden"), "{rendered}");
+        assert_eq!(
+            app.state.members_ui.last_message[&key].chat_id.as_ref(),
+            "mock:chat:elsewhere"
+        );
+        // A repeat request within the TTL does not query again.
+        app.request_member_last_messages(std::slice::from_ref(&key));
+        assert!(app.state.members_ui.loading_last_message.is_empty());
+
+        // Live messages raise the cached value without a query; older ones
+        // never lower it.
+        let mut live = test_incoming_message(&chat, "x2", "Maya", "now");
+        live.timestamp = Utc::now() - chrono::Duration::minutes(2);
+        app.bump_member_last_message(&live);
+        let mut stale = test_incoming_message(&other, "x3", "Maya", "old");
+        stale.timestamp = Utc::now() - chrono::Duration::days(2);
+        app.bump_member_last_message(&stale);
+        assert_eq!(app.state.members_ui.last_message[&key].at, live.timestamp);
+        assert!(text(&app).contains("last msg 2m ago"), "{}", text(&app));
+        Ok(())
+    }
+
+    #[test]
+    fn message_filter_from_term_matches_sender_id() {
+        let mut message = test_message_with_content(Content::Text(Arc::from("lunch at noon")));
+        message.sender.platform_id = Arc::from("u-1");
+        assert!(message_matches_filter(&message, "from:u-1"));
+        assert!(message_matches_filter(&message, "from:u-1 lunch"));
+        assert!(!message_matches_filter(&message, "from:u-2"));
+        assert!(!message_matches_filter(&message, "from:u-1 dinner"));
     }
 }
