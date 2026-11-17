@@ -13,10 +13,11 @@ use chat_core::{
     Account, AccountNoticeSeverity, AuthChallenge, AuthSubmission, AuthSubmissionMode, Card,
     CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatDetails, ChatId, ChatKind,
     ChatMember, ChatMembership, ContactProfile, Content, DiscoveryAction, DiscoveryCapabilities,
-    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Mention, Message, MessageId,
-    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, OutboundContent,
-    OutboundMentions, Platform, PlatformData, PlatformId, Provider, ProviderEvent, ProviderId,
-    Reaction, Sender, SlackData, Timestamp, resolve_mention_tokens, rewrite_mention_tokens,
+    DiscoveryResult, DiscoveryResultKind, EventBus, MarkReadRequest, Media, Mention, Message,
+    MessageId, NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities,
+    OutboundContent, OutboundMentions, Platform, PlatformData, PlatformId, Presence, PresenceState,
+    PresenceSupport, Provider, ProviderEvent, ProviderId, Reaction, Sender, SlackData, Timestamp,
+    resolve_mention_tokens, rewrite_mention_tokens,
 };
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -89,6 +90,14 @@ const SLACK_DM_POLL_INTERVAL: Duration = Duration::from_secs(8);
 // `run_history_poll_loop` keep this safe: already-seen or pre-startup messages
 // are never re-surfaced as live, so a larger window only improves catch-up.
 const SLACK_HISTORY_POLL_LIMIT: usize = 15;
+// Slack asks clients to coalesce `conversations.mark` calls behind a timer so
+// following a busy channel costs one call per channel, not one per message.
+const SLACK_MARK_READ_DEBOUNCE: Duration = Duration::from_secs(3);
+// Read state done in Slack's own apps is not delivered over Socket Mode, so
+// channels with unread live messages are re-checked via `conversations.info`
+// (`last_read`) on this cadence, a few channels per pass.
+const SLACK_READ_STATE_POLL_INTERVAL: Duration = Duration::from_secs(45);
+const SLACK_READ_STATE_POLL_MAX_CHANNELS: usize = 6;
 const PERF_LOG_FILE_ENV: &str = "CHAT_CLI_PERF_LOG_FILE";
 
 // Official distributed chat-cli Slack app credentials. Distributors bake these
@@ -184,6 +193,9 @@ pub struct SlackProvider {
     realtime_task: RwLock<Option<JoinHandle<()>>>,
     history_poll_task: RwLock<Option<JoinHandle<()>>>,
     dm_poll_task: RwLock<Option<JoinHandle<()>>>,
+    read_state_task: RwLock<Option<JoinHandle<()>>>,
+    /// Channel -> newest ts waiting for a debounced `conversations.mark`.
+    pending_marks: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -331,6 +343,9 @@ pub struct SlackUser {
     pub tz: Option<String>,
     pub tz_label: Option<String>,
     pub tz_offset: Option<i64>,
+    /// Largest avatar URL Slack offers (original / 1024 / 512), used when the
+    /// user enlarges an avatar. `avatar` stays the 72px list thumbnail.
+    pub avatar_full: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -372,6 +387,8 @@ pub struct SlackConversation {
     pub is_muted: bool,
     pub is_pinned: bool,
     pub unread_count: u32,
+    /// The user's read cursor (`last_read` ts); only returned for user tokens.
+    pub last_read: Option<String>,
     pub updated: Option<i64>,
     pub created: Option<i64>,
     pub creator: Option<String>,
@@ -488,6 +505,7 @@ struct SlackConversationResponse {
     is_pinned: Option<bool>,
     unread_count: Option<u32>,
     unread_count_display: Option<u32>,
+    last_read: Option<String>,
     updated: Option<i64>,
     created: Option<i64>,
     creator: Option<String>,
@@ -713,6 +731,59 @@ struct SlackUsersInfoResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct SlackUserPresenceResponse {
+    ok: bool,
+    error: Option<String>,
+    presence: Option<String>,
+}
+
+/// Maps Slack's `users.getPresence` value to the domain presence state.
+fn slack_presence_state(raw: &str) -> PresenceState {
+    match raw.trim() {
+        "active" => PresenceState::Online,
+        "away" => PresenceState::Away,
+        _ => PresenceState::Unknown,
+    }
+}
+
+async fn get_web_api_user_presence(
+    credential: SlackCredential,
+    user_id: &str,
+) -> Result<Option<String>> {
+    if !matches!(
+        credential.kind,
+        SlackCredentialKind::UserToken
+            | SlackCredentialKind::BotToken
+            | SlackCredentialKind::Unknown
+    ) {
+        return Ok(None);
+    }
+    let token = credential.value;
+    let user_id = user_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut response = slack_http_agent()
+            .get("https://slack.com/api/users.getPresence")
+            .header("Authorization", format!("Bearer {token}"))
+            .query("user", &user_id)
+            .call()
+            .context("calling Slack users.getPresence")?;
+        let info: SlackUserPresenceResponse = response
+            .body_mut()
+            .read_json()
+            .context("decoding Slack users.getPresence response")?;
+        if !info.ok {
+            bail!(
+                "Slack users.getPresence failed: {}",
+                info.error.unwrap_or_else(|| "unknown_error".to_owned())
+            );
+        }
+        Ok(info.presence.and_then(non_empty_string))
+    })
+    .await
+    .context("joining Slack presence task")?
+}
+
+#[derive(Debug, Deserialize)]
 struct SlackConversationsMembersResponse {
     ok: bool,
     error: Option<String>,
@@ -739,6 +810,9 @@ struct SlackUserProfileResponse {
     real_name: Option<String>,
     display_name: Option<String>,
     image_72: Option<String>,
+    image_512: Option<String>,
+    image_1024: Option<String>,
+    image_original: Option<String>,
     title: Option<String>,
     status_text: Option<String>,
     status_emoji: Option<String>,
@@ -851,6 +925,14 @@ impl SlackUser {
             .as_ref()
             .and_then(|profile| profile.email.clone())
             .and_then(non_empty_string);
+        let avatar_full = profile.as_ref().and_then(|profile| {
+            profile
+                .image_original
+                .clone()
+                .and_then(non_empty_string)
+                .or_else(|| profile.image_1024.clone().and_then(non_empty_string))
+                .or_else(|| profile.image_512.clone().and_then(non_empty_string))
+        });
         let avatar = profile
             .and_then(|profile| profile.image_72)
             .and_then(non_empty_string);
@@ -874,6 +956,7 @@ impl SlackUser {
             tz: response.tz.and_then(non_empty_string),
             tz_label: response.tz_label.and_then(non_empty_string),
             tz_offset: response.tz_offset,
+            avatar_full,
         })
     }
 
@@ -922,6 +1005,8 @@ impl SlackUser {
             is_bot: self.is_bot,
             is_business: false,
             is_deactivated: self.deleted,
+            avatar_full: self.avatar_full.as_deref().and_then(slack_avatar_path),
+            phone_hidden: false,
             facts: Vec::new(),
         }
     }
@@ -990,6 +1075,17 @@ pub trait SlackApiClient: Send + Sync {
         user_id: &str,
     ) -> Result<Option<SlackUser>>;
 
+    /// `users.getPresence`: returns Slack's raw presence (`active`/`away`).
+    /// Slack never shares a last-seen time. Defaults to unsupported so test
+    /// clients need not implement it.
+    async fn user_presence(
+        &self,
+        _credential: SlackCredential,
+        _user_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     async fn team_info(
         &self,
         credential: SlackCredential,
@@ -1026,6 +1122,17 @@ pub trait SlackApiClient: Send + Sync {
         timestamp: &str,
         emoji: &str,
     ) -> Result<()>;
+
+    /// Move the token owner's read cursor (`conversations.mark`). Fakes
+    /// default to a no-op.
+    async fn mark_conversation(
+        &self,
+        _credential: SlackCredential,
+        _channel: &str,
+        _ts: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     async fn remove_reaction(
         &self,
@@ -1264,6 +1371,7 @@ impl SlackConversation {
                 .unread_count_display
                 .or(response.unread_count)
                 .unwrap_or(0),
+            last_read: response.last_read.and_then(non_empty_string),
             updated: response.updated,
             created: response.created,
             creator: response.creator.and_then(non_empty_string),
@@ -1371,6 +1479,14 @@ impl SlackApiClient for SlackWebApiClient {
         get_web_api_user_info(credential, user_id).await
     }
 
+    async fn user_presence(
+        &self,
+        credential: SlackCredential,
+        user_id: &str,
+    ) -> Result<Option<String>> {
+        get_web_api_user_presence(credential, user_id).await
+    }
+
     async fn team_info(
         &self,
         credential: SlackCredential,
@@ -1403,6 +1519,15 @@ impl SlackApiClient for SlackWebApiClient {
         emoji: &str,
     ) -> Result<()> {
         post_web_api_reaction("reactions.add", credential, channel, timestamp, emoji).await
+    }
+
+    async fn mark_conversation(
+        &self,
+        credential: SlackCredential,
+        channel: &str,
+        ts: &str,
+    ) -> Result<()> {
+        post_web_api_conversation_mark(credential, channel, ts).await
     }
 
     async fn remove_reaction(
@@ -2117,6 +2242,39 @@ async fn list_web_api_conversation_members(
     })
     .await
     .context("joining Slack conversation members task")?
+}
+
+async fn post_web_api_conversation_mark(
+    credential: SlackCredential,
+    channel: &str,
+    ts: &str,
+) -> Result<()> {
+    if credential.kind != SlackCredentialKind::UserToken {
+        bail!("Slack conversations.mark requires a user token");
+    }
+    let token = credential.value;
+    let channel = channel.to_owned();
+    let ts = ts.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut response = slack_http_agent()
+            .post("https://slack.com/api/conversations.mark")
+            .header("Authorization", format!("Bearer {token}"))
+            .send_form([("channel", channel.as_str()), ("ts", ts.as_str())])
+            .context("calling Slack conversations.mark")?;
+        let result: SlackReactionsApiResponse = response
+            .body_mut()
+            .read_json()
+            .context("decoding Slack conversations.mark response")?;
+        if !result.ok {
+            bail!(
+                "Slack conversations.mark failed: {}",
+                result.error.unwrap_or_else(|| "unknown_error".to_owned())
+            );
+        }
+        Ok(())
+    })
+    .await
+    .context("joining Slack conversations.mark task")?
 }
 
 async fn post_web_api_reaction(
@@ -2920,6 +3078,8 @@ impl SlackProvider {
             realtime_task: RwLock::new(None),
             history_poll_task: RwLock::new(None),
             dm_poll_task: RwLock::new(None),
+            read_state_task: RwLock::new(None),
+            pending_marks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -3823,6 +3983,7 @@ impl SlackProvider {
             .await;
         });
         *write_lock(&self.history_poll_task) = Some(handle);
+        self.start_read_state_polling();
     }
 
     fn start_history_polling_with_realtime_notice(&self) {
@@ -3876,6 +4037,35 @@ impl SlackProvider {
             .await;
         });
         *write_lock(&self.dm_poll_task) = Some(handle);
+        self.start_read_state_polling();
+    }
+
+    /// Watches live inbound messages and periodically checks the user's
+    /// Slack read cursor for those channels, emitting `ChatMarkedRead` when
+    /// they were read in Slack's own apps. Requires a user token.
+    fn start_read_state_polling(&self) {
+        let connection = read_lock(&self.connection).clone();
+        let Some(credential) = connection.user_credential() else {
+            return;
+        };
+        self.stop_read_state_polling();
+        let api_client = Arc::clone(&self.api_client);
+        let events = self.events.clone();
+        let account = self.id.clone();
+        let handle = tokio::spawn(run_read_state_poll_loop(
+            api_client,
+            events,
+            account,
+            credential,
+            SLACK_READ_STATE_POLL_INTERVAL,
+        ));
+        *write_lock(&self.read_state_task) = Some(handle);
+    }
+
+    fn stop_read_state_polling(&self) {
+        if let Some(handle) = write_lock(&self.read_state_task).take() {
+            handle.abort();
+        }
     }
 
     fn stop_dm_polling(&self) {
@@ -4126,7 +4316,7 @@ impl SlackAuthMode {
                 "team:read,users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,files:read,search:read"
             }
             Self::UserOAuth | Self::ManualApp | Self::ImportedToken => {
-                "team:read,users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,chat:write,reactions:read,reactions:write,files:read,files:write,search:read"
+                "team:read,users:read,users.profile:read,channels:read,groups:read,im:read,mpim:read,channels:history,groups:history,im:history,mpim:history,channels:write,groups:write,im:write,mpim:write,chat:write,reactions:read,reactions:write,files:read,files:write,search:read"
             }
             Self::BotToken | Self::Webhook => "",
         }
@@ -4348,6 +4538,7 @@ impl Provider for SlackProvider {
         self.stop_realtime();
         self.stop_history_polling();
         self.stop_dm_polling();
+        self.stop_read_state_polling();
         self.connected.store(false, Ordering::Release);
         *write_lock(&self.connection) = SlackConnectionState::default();
         *write_lock(&self.chats) = Vec::new();
@@ -4532,12 +4723,68 @@ impl Provider for SlackProvider {
         Ok(path)
     }
 
-    async fn mark_read(&self, _chat_id: &ChatId, _up_to: &MessageId) -> Result<()> {
-        if self.capabilities().can_read_history {
-            Ok(())
-        } else {
-            Err(self.unsupported("read receipts"))
+    async fn mark_read(&self, chat_id: &ChatId, request: &MarkReadRequest) -> Result<()> {
+        if !self.capabilities().can_read_history {
+            return Err(self.unsupported("read receipts"));
         }
+        // `conversations.mark` moves the cursor of the token owner, so only a
+        // user token makes the user's own Slack apps clear the badge.
+        let Some(credential) = read_lock(&self.connection).user_credential() else {
+            return Ok(());
+        };
+        let Some(ts) = slack_mark_read_ts(request) else {
+            return Ok(());
+        };
+        let channel = chat_id.to_string();
+        // Coalesce: a pending timer for this channel just picks up the newer ts.
+        {
+            let mut pending = self
+                .pending_marks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let newer = pending
+                .get(&channel)
+                .is_none_or(|existing| slack_ts_key(&ts) > slack_ts_key(existing));
+            let already_scheduled = pending.contains_key(&channel);
+            if newer {
+                pending.insert(channel.clone(), ts);
+            }
+            if already_scheduled {
+                return Ok(());
+            }
+        }
+        let pending_marks = Arc::clone(&self.pending_marks);
+        let api_client = Arc::clone(&self.api_client);
+        let events = self.events.clone();
+        let account = self.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SLACK_MARK_READ_DEBOUNCE).await;
+            let Some(ts) = pending_marks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&channel)
+            else {
+                return;
+            };
+            events.send(ProviderEvent::NetworkActivity {
+                direction: NetworkActivityDirection::Tx,
+                kind: NetworkActivityKind::Receipt,
+            });
+            let result = api_client
+                .mark_conversation(credential, &channel, &ts)
+                .await;
+            slack_diagnostic_log(
+                "read_sync.slack_mark",
+                format!(
+                    "account={account} channel={channel} ts={ts} result={}",
+                    match &result {
+                        Ok(()) => "ok".to_owned(),
+                        Err(error) => sanitize_slack_error(error),
+                    }
+                ),
+            );
+        });
+        Ok(())
     }
 
     async fn react(&self, chat_id: &ChatId, message: &Message, emoji: &str) -> Result<()> {
@@ -4846,6 +5093,29 @@ impl Provider for SlackProvider {
             .await?
             .map(|user| user.profile()))
     }
+
+    fn presence_support(&self) -> PresenceSupport {
+        PresenceSupport::Polled
+    }
+
+    async fn presence(&self, platform_id: &PlatformId) -> Result<Option<Presence>> {
+        let user_id = platform_id.trim();
+        if user_id.is_empty() || is_slack_bot_id(user_id) || !self.capabilities().can_read_history {
+            return Ok(None);
+        }
+        let connection = read_lock(&self.connection).clone();
+        let Some(credential) = connection.read_credential() else {
+            return Ok(None);
+        };
+        let raw = self
+            .call_api(
+                NetworkActivityKind::Other,
+                self.api_client.user_presence(credential, user_id),
+            )
+            .await
+            .map_err(|error| anyhow!(sanitize_slack_error(&error)))?;
+        Ok(raw.map(|raw| Presence::new(slack_presence_state(&raw), Utc::now())))
+    }
 }
 
 fn redacted_option(value: &Option<String>) -> Option<&'static str> {
@@ -5102,6 +5372,10 @@ fn chat_from_slack_conversation(
         muted: conversation.is_muted,
         pinned: conversation.is_pinned,
         last_message_at: None,
+        last_read_at: conversation
+            .last_read
+            .as_deref()
+            .and_then(slack_ts_to_precise_timestamp),
         last_message_preview: None,
         thread_id: None,
     })
@@ -6236,6 +6510,7 @@ fn slack_message_from_parts(
         reply_to,
         thread_id: thread_id.map(arc_str),
         reactions,
+        reply_preview: None,
         receipts: Vec::new(),
         is_from_me: current_user_id.is_some_and(|current_user_id| current_user_id == sender_id),
         mentions_me,
@@ -7766,6 +8041,128 @@ fn slack_timestamp_from_datetime(timestamp: Timestamp) -> String {
     )
 }
 
+/// Orderable `(seconds, micros)` key for a Slack ts such as `1700000000.000200`.
+fn slack_ts_key(ts: &str) -> Option<(i64, u32)> {
+    let (seconds, micros) = ts.split_once('.').unwrap_or((ts, "0"));
+    if micros.is_empty() || !micros.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = seconds.parse::<i64>().ok()?;
+    let micros = format!("{micros:0<6}").get(..6)?.parse::<u32>().ok()?;
+    Some((seconds, micros))
+}
+
+fn slack_ts_to_precise_timestamp(ts: &str) -> Option<Timestamp> {
+    let (seconds, micros) = slack_ts_key(ts)?;
+    if seconds <= 0 {
+        return None;
+    }
+    DateTime::<Utc>::from_timestamp(seconds, micros * 1_000)
+}
+
+/// Picks the ts to mark as read: the newest message, falling back to the
+/// newest acknowledged inbound message. Ids that are not Slack ts are ignored.
+fn slack_mark_read_ts(request: &MarkReadRequest) -> Option<String> {
+    request
+        .up_to
+        .iter()
+        .chain(request.messages.iter().rev().map(|target| &target.id))
+        .find(|id| slack_ts_key(id).is_some())
+        .map(|id| id.to_string())
+}
+
+/// Tracks channels with unread live inbound messages and asks Slack for the
+/// user's read cursor on a slow cadence. A cursor at or past the newest
+/// tracked message means the channel was read in another Slack client.
+async fn run_read_state_poll_loop(
+    api_client: Arc<dyn SlackApiClient>,
+    events: EventBus,
+    account: ProviderId,
+    credential: SlackCredential,
+    interval: Duration,
+) {
+    let mut receiver = events.subscribe();
+    let mut candidates: HashMap<String, String> = HashMap::new();
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            event = receiver.recv() => match event {
+                Ok(event) => track_read_state_candidate(&mut candidates, &event),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = ticker.tick() => {
+                if candidates.is_empty() {
+                    continue;
+                }
+                let mut batch = candidates
+                    .iter()
+                    .map(|(channel, ts)| (channel.clone(), ts.clone()))
+                    .collect::<Vec<_>>();
+                batch.sort_by_key(|entry| std::cmp::Reverse(slack_ts_key(&entry.1)));
+                batch.truncate(SLACK_READ_STATE_POLL_MAX_CHANNELS);
+                let (mut read, mut errors) = (0usize, 0usize);
+                for (channel, newest) in batch {
+                    match api_client.conversation_info(credential.clone(), &channel).await {
+                        Ok(Some(conversation)) => {
+                            let Some(last_read) = conversation.last_read else {
+                                continue;
+                            };
+                            if slack_ts_key(&last_read) >= slack_ts_key(&newest) {
+                                read += 1;
+                                candidates.remove(&channel);
+                                events.send(ProviderEvent::ChatMarkedRead {
+                                    chat_id: arc_str(&channel),
+                                    read_up_to: slack_ts_to_precise_timestamp(&last_read),
+                                });
+                            }
+                        }
+                        Ok(None) => {
+                            candidates.remove(&channel);
+                        }
+                        Err(_) => errors += 1,
+                    }
+                }
+                slack_diagnostic_log(
+                    "read_sync.slack_poll",
+                    format!(
+                        "account={account} tracked={} read={read} errors={errors}",
+                        candidates.len()
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn track_read_state_candidate(candidates: &mut HashMap<String, String>, event: &ProviderEvent) {
+    match event {
+        ProviderEvent::Message {
+            message,
+            is_historical: false,
+        } if !message.is_from_me
+            && message.platform_data.slack.is_some()
+            && message
+                .thread_id
+                .as_ref()
+                .is_none_or(|thread| *thread == message.id) =>
+        {
+            let newer = candidates
+                .get(message.chat_id.as_ref())
+                .is_none_or(|existing| slack_ts_key(&message.id) > slack_ts_key(existing));
+            if newer && slack_ts_key(&message.id).is_some() {
+                candidates.insert(message.chat_id.to_string(), message.id.to_string());
+            }
+        }
+        ProviderEvent::ChatMarkedRead { chat_id, .. } => {
+            candidates.remove(chat_id.as_ref());
+        }
+        _ => {}
+    }
+}
+
 fn slack_ts_to_timestamp(ts: &str) -> Option<Timestamp> {
     let seconds = ts.split('.').next()?.parse::<i64>().ok()?;
     DateTime::<Utc>::from_timestamp(seconds, 0)
@@ -8114,6 +8511,72 @@ mod tests {
     use super::*;
     use chat_core::Provider;
     use std::sync::Mutex;
+
+    #[test]
+    fn slack_ts_key_orders_and_rejects_non_ts_ids() {
+        assert!(slack_ts_key("1700000000.000200") > slack_ts_key("1700000000.000100"));
+        assert!(slack_ts_key("1700000001.000000") > slack_ts_key("1700000000.999999"));
+        assert_eq!(slack_ts_key("1700000000.5"), Some((1_700_000_000, 500_000)));
+        assert_eq!(slack_ts_key("pending-abc"), None);
+        assert_eq!(slack_ts_key("1700000000."), None);
+    }
+
+    #[test]
+    fn slack_mark_read_ts_prefers_newest_message_then_targets() {
+        let target = |id: &str| chat_core::ReadTarget {
+            id: arc_str(id),
+            sender: arc_str("U1"),
+            timestamp: Utc::now(),
+        };
+        let request = MarkReadRequest {
+            up_to: Some(arc_str("1700000000.000300")),
+            up_to_at: None,
+            messages: vec![target("1700000000.000100")],
+        };
+        assert_eq!(
+            slack_mark_read_ts(&request).as_deref(),
+            Some("1700000000.000300")
+        );
+        let fallback = MarkReadRequest {
+            up_to: Some(arc_str("local-pending")),
+            up_to_at: None,
+            messages: vec![target("1700000000.000100"), target("1700000000.000200")],
+        };
+        assert_eq!(
+            slack_mark_read_ts(&fallback).as_deref(),
+            Some("1700000000.000200")
+        );
+        assert_eq!(slack_mark_read_ts(&MarkReadRequest::default()), None);
+    }
+
+    #[test]
+    fn slack_precise_timestamp_keeps_micros() {
+        let at = slack_ts_to_precise_timestamp("1700000000.000250").unwrap();
+        assert_eq!(at.timestamp(), 1_700_000_000);
+        assert_eq!(at.timestamp_subsec_micros(), 250);
+    }
+
+    #[test]
+    fn read_state_candidates_track_live_inbound_and_clear_on_read() {
+        let mut candidates = HashMap::new();
+        track_read_state_candidate(
+            &mut candidates,
+            &ProviderEvent::ChatMarkedRead {
+                chat_id: arc_str("C1"),
+                read_up_to: None,
+            },
+        );
+        assert!(candidates.is_empty());
+        candidates.insert("C1".to_owned(), "1700000000.000100".to_owned());
+        track_read_state_candidate(
+            &mut candidates,
+            &ProviderEvent::ChatMarkedRead {
+                chat_id: arc_str("C1"),
+                read_up_to: None,
+            },
+        );
+        assert!(candidates.is_empty());
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct PostedCall {
@@ -8530,6 +8993,7 @@ mod tests {
             topic: None,
             purpose: None,
             num_members: None,
+            last_read: None,
             created: None,
             creator: None,
         }
@@ -8555,6 +9019,7 @@ mod tests {
             topic: None,
             purpose: None,
             num_members: None,
+            last_read: None,
             created: None,
             creator: None,
         }
@@ -8580,6 +9045,7 @@ mod tests {
             topic: None,
             purpose: None,
             num_members: None,
+            last_read: None,
             created: None,
             creator: None,
         }
@@ -8832,6 +9298,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: false,
             mentions_me: false,
@@ -11723,5 +12190,30 @@ mod tests {
         assert_eq!(provider.id().as_ref(), PROVIDER_ID);
         assert_eq!(provider.platform(), Platform::Slack);
         Ok(())
+    }
+
+    #[test]
+    fn slack_user_prefers_largest_avatar_for_full_size_profile() {
+        let response: SlackUserResponse = serde_json::from_str(
+            r#"{"id":"U1","name":"ada","profile":{"image_72":"https://a/72.png","image_512":"https://a/512.png","image_original":" "}}"#,
+        )
+        .expect("decode user");
+        let user = SlackUser::from_response(response).expect("user");
+        assert_eq!(user.avatar.as_deref(), Some("https://a/72.png"));
+        assert_eq!(user.avatar_full.as_deref(), Some("https://a/512.png"));
+
+        let response: SlackUserResponse = serde_json::from_str(
+            r#"{"id":"U2","profile":{"image_72":"https://a/72.png","image_1024":"https://a/1024.png","image_original":"https://a/orig.png"}}"#,
+        )
+        .expect("decode user");
+        let user = SlackUser::from_response(response).expect("user");
+        assert_eq!(user.avatar_full.as_deref(), Some("https://a/orig.png"));
+    }
+
+    #[test]
+    fn slack_presence_maps_active_and_away() {
+        assert_eq!(slack_presence_state("active"), PresenceState::Online);
+        assert_eq!(slack_presence_state("away"), PresenceState::Away);
+        assert_eq!(slack_presence_state("other"), PresenceState::Unknown);
     }
 }

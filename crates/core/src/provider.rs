@@ -464,8 +464,10 @@ pub trait Provider: Send + Sync + 'static {
     /// Download media to a local cache path. Returns path to the file.
     async fn download_media(&self, media: &Media) -> anyhow::Result<PathBuf>;
 
-    /// Mark messages as read.
-    async fn mark_read(&self, chat_id: &ChatId, up_to: &MessageId) -> anyhow::Result<()>;
+    /// Mark messages as read on the platform. `request` lists exactly which
+    /// inbound messages the user has seen; implementations must not block the
+    /// caller on network IO.
+    async fn mark_read(&self, chat_id: &ChatId, request: &MarkReadRequest) -> anyhow::Result<()>;
 
     /// Add a reaction emoji.
     async fn react(&self, chat_id: &ChatId, message: &Message, emoji: &str) -> anyhow::Result<()>;
@@ -581,6 +583,20 @@ pub trait Provider: Send + Sync + 'static {
                 ..ContactProfile::default()
             }))
     }
+
+    /// How this provider delivers presence ("last seen"). The default is
+    /// [`PresenceSupport::Unsupported`].
+    fn presence_support(&self) -> PresenceSupport {
+        PresenceSupport::Unsupported
+    }
+
+    /// Current presence for a user. Push-based providers also subscribe to
+    /// future updates here (delivered as [`crate::ProviderEvent::Presence`])
+    /// and return the latest known snapshot, if any. Callers must invoke this
+    /// lazily and for a bounded set of users only.
+    async fn presence(&self, _platform_id: &PlatformId) -> anyhow::Result<Option<Presence>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -646,7 +662,7 @@ mod tests {
         async fn download_media(&self, _media: &Media) -> Result<PathBuf> {
             unimplemented!()
         }
-        async fn mark_read(&self, _chat_id: &ChatId, _up_to: &MessageId) -> Result<()> {
+        async fn mark_read(&self, _chat_id: &ChatId, _request: &MarkReadRequest) -> Result<()> {
             unimplemented!()
         }
         async fn react(&self, _chat_id: &ChatId, _message: &Message, _emoji: &str) -> Result<()> {
@@ -707,6 +723,7 @@ mod tests {
             reply_to: None,
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: true,
             mentions_me: false,

@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages (chat_id, account_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages (thread_id, account_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_text ON messages (content_text);
+-- Per-person recency across chats ("last message X ago" when presence is hidden).
+CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages (account_id, sender_id, timestamp DESC);
 
 CREATE TABLE IF NOT EXISTS reactions (
     message_id  TEXT NOT NULL,
@@ -123,5 +125,15 @@ CREATE TABLE IF NOT EXISTS thread_reads (
     last_read_at         INTEGER,
     last_read_message_id TEXT,
     PRIMARY KEY (account_id, thread_id)
+);
+
+-- Private, local-only nickname and note per contact (never sent anywhere).
+CREATE TABLE IF NOT EXISTS contact_notes (
+    account_id  TEXT NOT NULL,
+    platform_id TEXT NOT NULL,
+    nickname    TEXT,
+    note        TEXT,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (account_id, platform_id)
 );
 "#;

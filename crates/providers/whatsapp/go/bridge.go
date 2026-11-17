@@ -35,6 +35,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
@@ -65,7 +66,29 @@ type client struct {
 	// deterministically instead of relying on ctx propagation alone.
 	cableMu     sync.Mutex
 	cableCancel func()
+
+	// presenceMu guards the presence subscription set and the latest pushed
+	// presence per user. Subscriptions are bounded (maxPresenceSubscriptions)
+	// so the bridge never looks like it is scraping presence.
+	presenceMu         sync.Mutex
+	presenceSubscribed map[string]time.Time
+	presenceLatest     map[string]bridgeEvent
+
+	// closed is set by C_Disconnect so background recovery never reconnects
+	// a client the app already tore down.
+	closed atomic.Bool
+	// outdatedRecovering keeps ClientOutdated recovery single-flight.
+	outdatedRecovering atomic.Bool
 }
+
+// maxPresenceSubscriptions bounds how many users the bridge subscribes to
+// for presence per session. The UI only asks for the open profile, the DM
+// peer and visible members, so this is a safety net, not a working limit.
+const maxPresenceSubscriptions = 64
+
+// presenceResubscribeAfter re-sends a subscription for a user the UI keeps
+// looking at; WhatsApp drops subscriptions across reconnects.
+const presenceResubscribeAfter = 10 * time.Minute
 
 // setCableCancel stores (or clears, with nil) the teardown hook for the active
 // caBLE linger session, cancelling any previous one first.
@@ -163,6 +186,8 @@ type bridgeEvent struct {
 	Type         string `json:"type"`
 	Event        string `json:"event,omitempty"`
 	Reason       string `json:"reason,omitempty"`
+	Title        string `json:"title,omitempty"`    // "notice" events; body in Message
+	Severity     string `json:"severity,omitempty"` // "notice" events: "info" or "system_alert"
 	Message      string `json:"message,omitempty"`
 	Code         string `json:"code,omitempty"`
 	JID          string `json:"jid,omitempty"`
@@ -190,6 +215,15 @@ type bridgeEvent struct {
 
 	LastMessageAt      string `json:"last_message_at,omitempty"`
 	LastMessagePreview string `json:"last_message_preview,omitempty"`
+
+	// ReadUpTo is the time a "read" event refers to (receipt or app-state
+	// action timestamp), so the consumer can advance its read watermark.
+	ReadUpTo string `json:"read_up_to,omitempty"`
+	// AsOf is the newest message/action time a "chat_unread" snapshot
+	// reflects; the consumer ignores raising snapshots older than its watermark.
+	AsOf string `json:"as_of,omitempty"`
+	// MarkedUnread reports a manual "mark as unread" on another client.
+	MarkedUnread bool `json:"marked_unread,omitempty"`
 
 	ContentType           string           `json:"content_type,omitempty"`
 	MediaID               string           `json:"media_id,omitempty"`
@@ -222,6 +256,227 @@ type bridgeEvent struct {
 	// EditedAt is set on `edit` events: the time the edit was made, while ID
 	// names the original (edited) message and Text carries the new content.
 	EditedAt string `json:"edited_at,omitempty"`
+
+	// Quoted-reply metadata read from the inbound message's ContextInfo.
+	// ReplyToID is the quoted message's stanza ID; the sender/text fields are
+	// a snapshot so the consumer can render the quote even when the original
+	// message was never synced.
+	ReplyToID         string `json:"reply_to_id,omitempty"`
+	ReplyToSenderJID  string `json:"reply_to_sender_jid,omitempty"`
+	ReplyToSenderName string `json:"reply_to_sender_name,omitempty"`
+	ReplyToText       string `json:"reply_to_text,omitempty"`
+	IsForwarded       bool   `json:"is_forwarded,omitempty"`
+
+	// Contact profile fields carried by `user_info` responses.
+	DisplayName        string   `json:"display_name,omitempty"`
+	About              string   `json:"about,omitempty"`
+	VerifiedName       string   `json:"verified_name,omitempty"`
+	Phone              string   `json:"phone,omitempty"`
+	PhoneHidden        bool     `json:"phone_hidden,omitempty"`
+	AvatarFullPath     string   `json:"avatar_full_path,omitempty"`
+	IsBusiness         bool     `json:"is_business,omitempty"`
+	BusinessEmail      string   `json:"business_email,omitempty"`
+	BusinessAddress    string   `json:"business_address,omitempty"`
+	BusinessCategories []string `json:"business_categories,omitempty"`
+
+	// Presence fields carried by `presence` events. PresenceState is
+	// "online" or "offline"; LastSeen is RFC3339 when shared.
+	PresenceState string `json:"presence_state,omitempty"`
+	LastSeen      string `json:"last_seen,omitempty"`
+}
+
+// presenceDisabled reports whether the user opted out of presence (our own
+// availability announcement and therefore other users' presence, which
+// WhatsApp only delivers to clients that are themselves online).
+func presenceDisabled() bool {
+	return os.Getenv("CHATCLI_WHATSAPP_NO_PRESENCE") != ""
+}
+
+// emitPresenceEvent forwards a pushed presence update and remembers it so a
+// later C_SubscribePresence call can answer immediately.
+func emitPresenceEvent(c *client, evt *events.Presence) {
+	if c == nil || evt == nil || evt.From.IsEmpty() {
+		return
+	}
+	ctx := context.Background()
+	event := bridgeEvent{
+		Type:          "presence",
+		JID:           canonicalJIDString(c, ctx, evt.From.ToNonAD()),
+		PresenceState: "online",
+	}
+	if evt.Unavailable {
+		event.PresenceState = "offline"
+	}
+	if !evt.LastSeen.IsZero() {
+		event.LastSeen = evt.LastSeen.UTC().Format(time.RFC3339)
+	}
+	c.presenceMu.Lock()
+	if c.presenceLatest == nil {
+		c.presenceLatest = map[string]bridgeEvent{}
+	}
+	c.presenceLatest[event.JID] = event
+	c.presenceMu.Unlock()
+	emit(event)
+}
+
+//export C_SubscribePresence
+func C_SubscribePresence(clientID C.uint64_t, userJID *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "unknown WhatsApp bridge client"})
+	}
+	raw := strings.TrimSpace(C.GoString(userJID))
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{Type: "presence", JID: raw, PresenceState: "offline",
+			LastSeen: "2026-01-02T03:04:05Z"})
+	}
+	if presenceDisabled() {
+		return cJSON(bridgeEvent{Type: "presence_disabled", JID: raw})
+	}
+	if c.wa == nil || !c.wa.IsConnected() {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+	jid, err := types.ParseJID(raw)
+	if err != nil || jid.IsEmpty() || jid.Server == types.GroupServer {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp user JID: %v", err)})
+	}
+	key := canonicalJIDString(c, context.Background(), jid)
+
+	c.presenceMu.Lock()
+	if c.presenceSubscribed == nil {
+		c.presenceSubscribed = map[string]time.Time{}
+	}
+	last, already := c.presenceSubscribed[key]
+	fresh := already && time.Since(last) < presenceResubscribeAfter
+	full := !already && len(c.presenceSubscribed) >= maxPresenceSubscriptions
+	latest, hasLatest := c.presenceLatest[key]
+	if !fresh && !full {
+		c.presenceSubscribed[key] = time.Now()
+	}
+	c.presenceMu.Unlock()
+
+	if full {
+		c.log("presence subscription limit reached jid=%s limit=%d", key, maxPresenceSubscriptions)
+	} else if !fresh {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		started := time.Now()
+		if err := c.wa.SubscribePresence(ctx, jid); err != nil {
+			c.presenceMu.Lock()
+			delete(c.presenceSubscribed, key)
+			c.presenceMu.Unlock()
+			c.log("subscribe WhatsApp presence failed jid=%s: %v", key, err)
+			return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("subscribe presence: %v", err)})
+		}
+		c.log("subscribed WhatsApp presence jid=%s elapsed_ms=%d", key, time.Since(started).Milliseconds())
+	}
+	if hasLatest {
+		return cJSON(latest)
+	}
+	// No snapshot yet: the server pushes one shortly after subscribing.
+	return cJSON(bridgeEvent{Type: "presence_pending", JID: key})
+}
+
+//export C_UserInfo
+func C_UserInfo(clientID C.uint64_t, userJID *C.char) *C.char {
+	mu.Lock()
+	c, ok := clients[uint64(clientID)]
+	mu.Unlock()
+	if !ok {
+		return cJSON(bridgeEvent{Type: "error", Message: "unknown WhatsApp bridge client"})
+	}
+	raw := strings.TrimSpace(C.GoString(userJID))
+	if strings.HasPrefix(c.dbPath, "test:") {
+		return cJSON(bridgeEvent{Type: "user_info", JID: raw, DisplayName: "Alan Turing",
+			About: "Hey there! I am using WhatsApp.", Phone: "+447700900123"})
+	}
+	if c.wa == nil || !c.wa.IsConnected() {
+		return cJSON(bridgeEvent{Type: "error", Message: "WhatsApp bridge client is not connected"})
+	}
+	jid, err := types.ParseJID(raw)
+	if err != nil || jid.IsEmpty() || jid.Server == types.GroupServer {
+		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp user JID: %v", err)})
+	}
+	jid = jid.ToNonAD()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	started := time.Now()
+	return cJSON(c.userInfo(ctx, jid, started))
+}
+
+// userInfo collects everything WhatsApp lets us know about a user: about
+// text, verified business name and business profile, phone number (unless
+// hidden behind a privacy @lid) and a full-size profile picture. Every part is
+// best-effort; a failure in one lookup never hides the others.
+func (c *client) userInfo(ctx context.Context, jid types.JID, started time.Time) bridgeEvent {
+	event := bridgeEvent{Type: "user_info", JID: canonicalJIDString(c, ctx, jid)}
+
+	phoneJID := types.EmptyJID
+	switch jid.Server {
+	case types.DefaultUserServer:
+		phoneJID = jid
+	case types.HiddenUserServer:
+		if c.wa.Store != nil && c.wa.Store.LIDs != nil {
+			if pn, err := c.wa.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !pn.IsEmpty() {
+				phoneJID = pn
+			}
+		}
+	}
+	if !phoneJID.IsEmpty() {
+		event.Phone = "+" + phoneJID.User
+	} else if jid.Server == types.HiddenUserServer {
+		event.PhoneHidden = true
+	}
+
+	event.DisplayName = participantName(c, ctx, jid, phoneJID, "")
+
+	lookup := jid
+	if !phoneJID.IsEmpty() {
+		lookup = phoneJID
+	}
+	parts := 0
+	if infos, err := c.wa.GetUserInfo(ctx, []types.JID{lookup}); err != nil {
+		c.log("get WhatsApp user info failed jid=%s: %v", lookup.String(), err)
+	} else {
+		for key, info := range infos {
+			if key.User != lookup.User {
+				continue
+			}
+			parts++
+			event.About = strings.TrimSpace(info.Status)
+			if info.VerifiedName != nil {
+				event.IsBusiness = true
+				if info.VerifiedName.Details != nil {
+					event.VerifiedName = strings.TrimSpace(info.VerifiedName.Details.GetVerifiedName())
+				}
+			}
+		}
+	}
+	if event.IsBusiness {
+		if profile, err := c.wa.GetBusinessProfile(ctx, lookup); err != nil {
+			c.log("get WhatsApp business profile failed jid=%s: %v", lookup.String(), err)
+		} else if profile != nil {
+			parts++
+			event.BusinessEmail = strings.TrimSpace(profile.Email)
+			event.BusinessAddress = strings.TrimSpace(profile.Address)
+			for _, category := range profile.Categories {
+				if name := strings.TrimSpace(category.Name); name != "" {
+					event.BusinessCategories = append(event.BusinessCategories, name)
+				}
+			}
+		}
+	}
+	if info, err := c.wa.GetProfilePictureInfo(ctx, lookup, &whatsmeow.GetProfilePictureParams{Preview: false}); err == nil && info != nil && info.URL != "" {
+		if path, err := c.downloadProfilePicture(ctx, "full", lookup.String(), info.ID, info.URL); err == nil {
+			parts++
+			event.AvatarFullPath = path
+		}
+	}
+	c.log("fetched WhatsApp user info jid=%s parts=%d business=%t phone_hidden=%t elapsed_ms=%d",
+		event.JID, parts, event.IsBusiness, event.PhoneHidden, time.Since(started).Milliseconds())
+	return event
 }
 
 var (
@@ -278,6 +533,7 @@ func C_Connect(clientID C.uint64_t) C.uint8_t {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	logger := c.waLogger()
+	applyCachedWAVersion(c)
 	// Present as a browser companion. WhatsApp's passkey-protected linking is a
 	// web.whatsapp.com feature; the platform type feeds the final
 	// encrypted_pairing_request key-derivation salt ("Companion Pairing <type>
@@ -1040,7 +1296,7 @@ func (c *client) memberAvatarPath(ctx context.Context, primary, alternate types.
 	if err != nil || info == nil || info.URL == "" {
 		return ""
 	}
-	path, err := c.downloadProfilePicture(ctx, target.String(), info.ID, info.URL)
+	path, err := c.downloadProfilePicture(ctx, "preview", target.String(), info.ID, info.URL)
 	if err != nil {
 		return ""
 	}
@@ -1050,6 +1306,51 @@ func (c *client) memberAvatarPath(ctx context.Context, primary, alternate types.
 type markReadEntry struct {
 	ID        string `json:"id"`
 	SenderJID string `json:"sender_jid"`
+}
+
+// markReadRequest is the C_MarkRead payload. Legacy callers send a bare
+// array of entries; newer callers send this object so they can also ask the
+// bridge to clear a manual "mark as unread" flag through app state.
+type markReadRequest struct {
+	Entries           []markReadEntry `json:"entries"`
+	ClearMarkedUnread bool            `json:"clear_marked_unread,omitempty"`
+	LastID            string          `json:"last_id,omitempty"`
+	LastFromMe        bool            `json:"last_from_me,omitempty"`
+	LastSenderJID     string          `json:"last_sender_jid,omitempty"`
+	LastTimestampMS   int64           `json:"last_timestamp_ms,omitempty"`
+}
+
+func parseMarkReadRequest(raw string) (markReadRequest, error) {
+	trimmed := strings.TrimSpace(raw)
+	var request markReadRequest
+	if strings.HasPrefix(trimmed, "[") {
+		err := json.Unmarshal([]byte(trimmed), &request.Entries)
+		return request, err
+	}
+	err := json.Unmarshal([]byte(trimmed), &request)
+	return request, err
+}
+
+// buildClearMarkedUnreadPatch builds the regular_low app-state mutation that
+// marks the chat read on every linked client, clearing a manual unread flag
+// that read receipts alone never clear.
+func buildClearMarkedUnreadPatch(chat types.JID, request markReadRequest) appstate.PatchInfo {
+	var lastTs time.Time
+	if request.LastTimestampMS > 0 {
+		lastTs = time.UnixMilli(request.LastTimestampMS)
+	}
+	var key *waCommon.MessageKey
+	if request.LastID != "" {
+		key = &waCommon.MessageKey{
+			RemoteJID: proto.String(chat.String()),
+			FromMe:    proto.Bool(request.LastFromMe),
+			ID:        proto.String(request.LastID),
+		}
+		if chat.Server == types.GroupServer && !request.LastFromMe && request.LastSenderJID != "" {
+			key.Participant = proto.String(request.LastSenderJID)
+		}
+	}
+	return appstate.BuildMarkChatAsRead(chat, true, lastTs, key)
 }
 
 //export C_MarkRead
@@ -1073,10 +1374,11 @@ func C_MarkRead(clientID C.uint64_t, chatJID *C.char, messagesJSON *C.char) *C.c
 	if err != nil || chat.IsEmpty() {
 		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp chat JID: %v", err)})
 	}
-	var entries []markReadEntry
-	if err := json.Unmarshal([]byte(C.GoString(messagesJSON)), &entries); err != nil {
+	request, err := parseMarkReadRequest(C.GoString(messagesJSON))
+	if err != nil {
 		return cJSON(bridgeEvent{Type: "error", Message: fmt.Sprintf("invalid WhatsApp mark-read payload: %v", err)})
 	}
+	entries := request.Entries
 
 	// Group receipts by sender: group chats require one receipt per
 	// participant, while DMs use the chat JID itself.
@@ -1091,7 +1393,18 @@ func C_MarkRead(clientID C.uint64_t, chatJID *C.char, messagesJSON *C.char) *C.c
 		}
 		bySender[entry.SenderJID] = append(bySender[entry.SenderJID], types.MessageID(entry.ID))
 	}
+	clearFlag := func() {
+		if !request.ClearMarkedUnread {
+			return
+		}
+		if err := c.wa.SendAppState(context.Background(), buildClearMarkedUnreadPatch(chat, request)); err != nil {
+			c.log("clear WhatsApp marked-unread flag failed chat=%s: %v", chat.String(), err)
+			return
+		}
+		c.log("cleared WhatsApp marked-unread flag chat=%s", chat.String())
+	}
 	if len(senderOrder) == 0 {
+		clearFlag()
 		return cJSON(bridgeEvent{Type: "read", ChatJID: chat.String()})
 	}
 
@@ -1111,8 +1424,9 @@ func C_MarkRead(clientID C.uint64_t, chatJID *C.char, messagesJSON *C.char) *C.c
 		}
 		marked += len(ids)
 	}
+	clearFlag()
 	canonicalChat := canonicalJID(c, context.Background(), chat)
-	c.log("marked WhatsApp chat read chat=%s messages=%d", chat.String(), marked)
+	c.log("marked WhatsApp chat read chat=%s messages=%d senders=%d", chat.String(), marked, len(senderOrder))
 	return cJSON(bridgeEvent{Type: "read", ChatJID: canonicalChat.String()})
 }
 
@@ -1154,6 +1468,7 @@ func C_Disconnect(clientID C.uint64_t) {
 	if !ok {
 		return
 	}
+	c.closed.Store(true)
 	c.cancelCableSession()
 	if c.cancel != nil {
 		c.cancel()
@@ -1362,6 +1677,12 @@ func (c *client) syncChatMuteSettings(ctx context.Context) {
 	if _, err := c.wa.DangerousInternals().FetchAppState(ctx, appstate.WAPatchRegularHigh, false, true); err != nil {
 		c.log("sync WhatsApp mute app state failed: %v", err)
 	}
+	// Mark-as-read / mark-as-unread actions live in regular_low. Without an
+	// explicit fetch they only arrive when the server happens to push a
+	// server_sync notification, so reads done elsewhere could be missed.
+	if _, err := c.wa.DangerousInternals().FetchAppState(ctx, appstate.WAPatchRegularLow, false, true); err != nil {
+		c.log("sync WhatsApp read-state app state failed: %v", err)
+	}
 }
 
 func emitProfileEvent(c *client, ctx context.Context, jid types.JID, name string, avatarPath string, isGroup bool, muted *bool) {
@@ -1416,21 +1737,35 @@ func emitSelfReadReceipt(c *client, evt *events.Receipt) {
 	if !isSelfRead {
 		return
 	}
-	emitChatReadEvent(c, evt.Chat)
+	emitChatReadEvent(c, evt.Chat, evt.Timestamp)
 }
 
 // emitMarkChatAsRead forwards app-state "chat marked read" actions performed
 // on the user's other WhatsApp clients.
+// A "mark as unread" action is forwarded as a manual-unread chat_unread
+// snapshot (count 1) so the badge also appears in chat-cli.
 func emitMarkChatAsRead(c *client, evt *events.MarkChatAsRead) {
-	if evt == nil || evt.JID.IsEmpty() || evt.Action == nil || !evt.Action.GetRead() {
+	if evt == nil || evt.JID.IsEmpty() || evt.Action == nil {
 		return
 	}
-	emitChatReadEvent(c, evt.JID)
+	if !evt.Action.GetRead() {
+		emitChatUnreadSnapshot(c, context.Background(), evt.JID, 1, evt.Timestamp, true)
+		return
+	}
+	emitChatReadEvent(c, evt.JID, evt.Timestamp)
 }
 
-func emitChatReadEvent(c *client, chatJID types.JID) {
+func emitChatReadEvent(c *client, chatJID types.JID, at time.Time) {
 	canonical := canonicalJID(c, context.Background(), chatJID)
-	emit(bridgeEvent{Type: "read", ChatJID: canonical.String()})
+	emit(chatReadEvent(canonical, at))
+}
+
+func chatReadEvent(chat types.JID, at time.Time) bridgeEvent {
+	event := bridgeEvent{Type: "read", ChatJID: chat.String()}
+	if !at.IsZero() {
+		event.ReadUpTo = at.UTC().Format(time.RFC3339Nano)
+	}
+	return event
 }
 
 // conversationUnreadCount resolves the unread badge a conversation should show
@@ -1455,10 +1790,21 @@ func conversationUnreadCount(conv *waHistorySync.Conversation) uint32 {
 // is the phone's source-of-truth read state and is allowed to lower an
 // inflated count (e.g. after an offline reconnect replays messages the user
 // had already read on their phone).
-func emitChatUnread(c *client, ctx context.Context, chatJID types.JID, count uint32) {
+func emitChatUnreadSnapshot(c *client, ctx context.Context, chatJID types.JID, count uint32, asOf time.Time, markedUnread bool) {
 	canonical := canonicalJID(c, ctx, chatJID)
+	emit(chatUnreadEvent(canonical, count, asOf, markedUnread))
+}
+
+func chatUnreadEvent(chat types.JID, count uint32, asOf time.Time, markedUnread bool) bridgeEvent {
 	unread := count
-	emit(bridgeEvent{Type: "chat_unread", ChatJID: canonical.String(), UnreadCount: &unread})
+	if markedUnread && unread == 0 {
+		unread = 1
+	}
+	event := bridgeEvent{Type: "chat_unread", ChatJID: chat.String(), UnreadCount: &unread, MarkedUnread: markedUnread}
+	if !asOf.IsZero() {
+		event.AsOf = asOf.UTC().Format(time.RFC3339Nano)
+	}
+	return event
 }
 
 func handleWhatsAppEvent(c *client, evt interface{}) {
@@ -1482,6 +1828,9 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 			c.offlineSync.Store(false)
 			c.log("offline sync completed after %d events", v.Count)
 		}
+		// Lets the consumer reconcile read state for chats that may have
+		// been read on the phone while this client was offline.
+		emit(bridgeEvent{Type: "offline_sync_completed"})
 	case *events.Mute:
 		emitMuteEvent(c, v)
 	case *events.HistorySync:
@@ -1501,6 +1850,8 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 			muted := chatMuted(c, context.Background(), v.JID)
 			emitProfileEvent(c, context.Background(), v.JID, v.Name.Name, "", true, &muted)
 		}
+	case *events.Presence:
+		emitPresenceEvent(c, v)
 	case *events.Receipt:
 		emitSelfReadReceipt(c, v)
 	case *events.MarkChatAsRead:
@@ -1543,11 +1894,23 @@ func handleWhatsAppEvent(c *client, evt interface{}) {
 		if c != nil {
 			c.cancelCableSession()
 		}
-		emit(bridgeEvent{Type: "disconnected", Reason: "logged out"})
+		for _, out := range permanentDisconnectEvents(v) {
+			emit(out)
+		}
 	case *events.Disconnected:
 		emit(bridgeEvent{Type: "disconnected"})
-	case *events.StreamReplaced:
-		emit(bridgeEvent{Type: "disconnected", Reason: "stream replaced"})
+	case *events.ClientOutdated:
+		// whatsmeow treats this as an expected disconnect and emits no
+		// Disconnected event; without this case syncing stops silently.
+		if c != nil && !c.closed.Load() {
+			go c.recoverClientOutdated()
+		}
+	case events.PermanentDisconnect:
+		// StreamReplaced, TemporaryBan, ConnectFailure, CATRefreshError and
+		// any future event whatsmeow will not auto-reconnect from.
+		for _, out := range permanentDisconnectEvents(v) {
+			emit(out)
+		}
 	default:
 		// Diagnostic only (gated behind the same env as whatsmeow logging):
 		// surface event types the bridge ignores. The phone-side "Logging
@@ -1615,7 +1978,9 @@ func emitHistorySync(c *client, evt *events.HistorySync) {
 		// Report the phone's authoritative unread count so the consumer can
 		// reconcile any locally-accumulated count (e.g. offline-backlog replay
 		// that re-counted messages the user had already read on their phone).
-		emitChatUnread(c, ctx, chatJID, conversationUnreadCount(conv))
+		// as_of is the conversation's newest message, so the consumer can
+		// discard snapshots that predate a read it already performed.
+		emitChatUnreadSnapshot(c, ctx, chatJID, conversationUnreadCount(conv), lastMessageAt, conv.GetMarkedAsUnread() && conv.GetUnreadCount() == 0)
 		go c.fetchAndEmitProfile(ctx, chatJID, chatName, isGroup)
 
 		for _, message := range parsedMessages {
@@ -1765,6 +2130,7 @@ func emitMessageEvent(c *client, message *events.Message, eventType string) {
 	} else {
 		applyMedia(c, message.Info.ID, messagePayload, &event)
 	}
+	applyQuotedReply(c, ctx, message, messagePayload, chatJID, &event)
 	if shouldSkipUnsupportedDisplayMessage(event) {
 		return
 	}
@@ -2303,7 +2669,7 @@ func (c *client) fetchAndEmitProfile(ctx context.Context, jid types.JID, name st
 		return
 	}
 
-	path, err := c.downloadProfilePicture(ctx, jid.String(), info.ID, info.URL)
+	path, err := c.downloadProfilePicture(ctx, "full", jid.String(), info.ID, info.URL)
 	if err != nil {
 		muted := chatMuted(c, ctx, jid)
 		emitProfileEvent(c, ctx, jid, name, "", isGroup, &muted)
@@ -2313,15 +2679,28 @@ func (c *client) fetchAndEmitProfile(ctx context.Context, jid types.JID, name st
 	emitProfileEvent(c, ctx, jid, name, path, isGroup, &muted)
 }
 
-func (c *client) downloadProfilePicture(ctx context.Context, jid, pictureID, url string) (string, error) {
+// profilePictureCacheKey builds the cache identity of a downloaded profile
+// picture. WhatsApp reuses the same picture ID for the low-resolution preview
+// and the full image, so the variant must be part of the key or whichever
+// download lands first would be served for both sizes.
+func profilePictureCacheKey(variant, jid, pictureID, url string) string {
+	if variant == "" {
+		variant = "full"
+	}
+	// "v2:" retires cache files written before variants were keyed, when a
+	// preview could have been stored under the full-size key.
+	if pictureID == "" {
+		return "v2:" + variant + ":" + jid + ":" + url
+	}
+	return "v2:" + variant + ":" + jid + ":" + pictureID
+}
+
+func (c *client) downloadProfilePicture(ctx context.Context, variant, jid, pictureID, url string) (string, error) {
 	dir := profileCacheDir(c.dbPath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	key := "full:" + jid + ":" + pictureID
-	if pictureID == "" {
-		key = "full:" + jid + ":" + url
-	}
+	key := profilePictureCacheKey(variant, jid, pictureID, url)
 	digest := sha256.Sum256([]byte(key))
 	path := filepath.Join(dir, hex.EncodeToString(digest[:])+".jpg")
 	if _, err := os.Stat(path); err == nil {
@@ -2341,12 +2720,24 @@ func (c *client) downloadProfilePicture(ctx context.Context, jid, pictureID, url
 		return "", fmt.Errorf("profile picture download returned HTTP %d", resp.StatusCode)
 	}
 
-	file, err := os.Create(path)
+	// Write to a temp file and rename so a concurrent reader never sees a
+	// truncated image and a failed download never poisons the cache.
+	tmp, err := os.CreateTemp(dir, "avatar-*.tmp")
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
-	if _, err := io.Copy(file, resp.Body); err != nil {
+	tmpPath := tmp.Name()
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return "", err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
 		return "", err
 	}
 	return path, nil
@@ -2781,29 +3172,183 @@ func whatsappCacheRoot() string {
 // messageMentionedJID returns the list of JIDs mentioned in the message via the
 // protocol ContextInfo, across the common message variants that carry it.
 func messageMentionedJID(message *waProto.Message) []string {
-	message = displayableMessage(message)
-	if message == nil {
-		return nil
-	}
-	var info *waProto.ContextInfo
-	switch {
-	case message.GetExtendedTextMessage() != nil:
-		info = message.GetExtendedTextMessage().GetContextInfo()
-	case message.GetImageMessage() != nil:
-		info = message.GetImageMessage().GetContextInfo()
-	case message.GetVideoMessage() != nil:
-		info = message.GetVideoMessage().GetContextInfo()
-	case message.GetAudioMessage() != nil:
-		info = message.GetAudioMessage().GetContextInfo()
-	case message.GetDocumentMessage() != nil:
-		info = message.GetDocumentMessage().GetContextInfo()
-	case message.GetStickerMessage() != nil:
-		info = message.GetStickerMessage().GetContextInfo()
-	}
+	info := messageContextInfo(message)
 	if info == nil {
 		return nil
 	}
 	return info.GetMentionedJID()
+}
+
+// messageContextInfo returns the protocol ContextInfo carried by whichever
+// content variant the (unwrapped) message uses. ContextInfo holds quoted-reply
+// links, mentions and the forwarded flag, so every inbound feature that reads
+// them goes through this single helper.
+func messageContextInfo(message *waProto.Message) *waProto.ContextInfo {
+	message = displayableMessage(message)
+	if message == nil {
+		return nil
+	}
+	switch {
+	case message.GetExtendedTextMessage() != nil:
+		return message.GetExtendedTextMessage().GetContextInfo()
+	case message.GetImageMessage() != nil:
+		return message.GetImageMessage().GetContextInfo()
+	case message.GetVideoMessage() != nil:
+		return message.GetVideoMessage().GetContextInfo()
+	case message.GetAudioMessage() != nil:
+		return message.GetAudioMessage().GetContextInfo()
+	case message.GetDocumentMessage() != nil:
+		return message.GetDocumentMessage().GetContextInfo()
+	case message.GetStickerMessage() != nil:
+		return message.GetStickerMessage().GetContextInfo()
+	case message.GetLocationMessage() != nil:
+		return message.GetLocationMessage().GetContextInfo()
+	case message.GetLiveLocationMessage() != nil:
+		return message.GetLiveLocationMessage().GetContextInfo()
+	case message.GetContactMessage() != nil:
+		return message.GetContactMessage().GetContextInfo()
+	case message.GetContactsArrayMessage() != nil:
+		return message.GetContactsArrayMessage().GetContextInfo()
+	case message.GetPollCreationMessage() != nil:
+		return message.GetPollCreationMessage().GetContextInfo()
+	case message.GetPollCreationMessageV2() != nil:
+		return message.GetPollCreationMessageV2().GetContextInfo()
+	case message.GetPollCreationMessageV3() != nil:
+		return message.GetPollCreationMessageV3().GetContextInfo()
+	case message.GetButtonsResponseMessage() != nil:
+		return message.GetButtonsResponseMessage().GetContextInfo()
+	case message.GetListResponseMessage() != nil:
+		return message.GetListResponseMessage().GetContextInfo()
+	case message.GetTemplateButtonReplyMessage() != nil:
+		return message.GetTemplateButtonReplyMessage().GetContextInfo()
+	}
+	return nil
+}
+
+// quotedReply is the bridge-side view of a quoted-reply link.
+type quotedReply struct {
+	ID        string
+	SenderJID types.JID
+	Text      string
+}
+
+// messageQuotedReply extracts the quoted-reply link from an inbound message.
+// Returns ok=false for non-replies and for replies to status broadcasts,
+// which have no message in the chat to point at. For DMs without an explicit
+// participant the quoted author is the chat peer.
+func messageQuotedReply(message *waProto.Message, chat types.JID) (quotedReply, bool) {
+	info := messageContextInfo(message)
+	if info == nil {
+		return quotedReply{}, false
+	}
+	id := strings.TrimSpace(info.GetStanzaID())
+	if id == "" {
+		return quotedReply{}, false
+	}
+	if remote := info.GetRemoteJID(); remote != "" {
+		if parsed, err := types.ParseJID(remote); err == nil && parsed.Server == types.BroadcastServer {
+			return quotedReply{}, false
+		}
+	}
+	sender := types.EmptyJID
+	if participant := strings.TrimSpace(info.GetParticipant()); participant != "" {
+		if parsed, err := types.ParseJID(participant); err == nil {
+			sender = parsed
+		}
+	}
+	if sender.IsEmpty() && chat.Server != types.GroupServer {
+		sender = chat
+	}
+	text := ""
+	if quoted := info.GetQuotedMessage(); quoted != nil {
+		text = quotedSnippet(quoted)
+	}
+	return quotedReply{ID: id, SenderJID: sender, Text: text}, true
+}
+
+// quotedSnippet renders a short, single-line preview of quoted content,
+// using human labels for media instead of bracketed placeholders.
+func quotedSnippet(message *waProto.Message) string {
+	message = displayableMessage(message)
+	if message == nil {
+		return ""
+	}
+	label := func(caption, fallback string) string {
+		if caption = strings.TrimSpace(caption); caption != "" {
+			return caption
+		}
+		return fallback
+	}
+	var text string
+	switch {
+	case message.GetConversation() != "":
+		text = message.GetConversation()
+	case message.GetExtendedTextMessage() != nil:
+		text = message.GetExtendedTextMessage().GetText()
+	case message.GetImageMessage() != nil:
+		text = label(message.GetImageMessage().GetCaption(), "Photo")
+	case message.GetVideoMessage() != nil:
+		text = label(message.GetVideoMessage().GetCaption(), "Video")
+	case message.GetAudioMessage() != nil:
+		if message.GetAudioMessage().GetPTT() {
+			text = "Voice message"
+		} else {
+			text = "Audio"
+		}
+	case message.GetDocumentMessage() != nil:
+		doc := message.GetDocumentMessage()
+		text = label(doc.GetCaption(), label(doc.GetFileName(), "Document"))
+	case message.GetStickerMessage() != nil:
+		text = "Sticker"
+	case message.GetLocationMessage() != nil, message.GetLiveLocationMessage() != nil:
+		text = "Location"
+	case message.GetContactMessage() != nil, message.GetContactsArrayMessage() != nil:
+		text = "Contact"
+	case pollCreation(message) != nil:
+		text = "Poll: " + pollCreation(message).GetName()
+	}
+	return strings.Join(strings.Fields(text), " ")
+}
+
+// applyQuotedReply fills the reply fields of an outgoing bridge event,
+// resolving the quoted author to a canonical JID and display name ("You"
+// for the signed-in account).
+func applyQuotedReply(c *client, ctx context.Context, message *events.Message, payload *waProto.Message, chatJID types.JID, event *bridgeEvent) {
+	if info := messageContextInfo(payload); info != nil && info.GetIsForwarded() {
+		event.IsForwarded = true
+	}
+	reply, ok := messageQuotedReply(payload, chatJID)
+	if !ok {
+		return
+	}
+	event.ReplyToID = reply.ID
+	event.ReplyToText = reply.Text
+	if quoted := messageContextInfo(payload).GetQuotedMessage(); quoted != nil && c != nil {
+		event.ReplyToText = quotedSnippetWithMentions(c, ctx, quoted, event.ReplyToText)
+	}
+	if reply.SenderJID.IsEmpty() {
+		return
+	}
+	ownPN, ownLID := types.EmptyJID, types.EmptyJID
+	if c != nil && c.wa != nil && c.wa.Store != nil {
+		ownPN, ownLID = c.wa.Store.GetJID(), c.wa.Store.GetLID()
+	}
+	if isOwnParticipant(ownPN, ownLID, reply.SenderJID) {
+		event.ReplyToSenderJID = "me"
+		event.ReplyToSenderName = "You"
+		return
+	}
+	event.ReplyToSenderJID = canonicalJID(c, ctx, reply.SenderJID).String()
+	event.ReplyToSenderName = participantName(c, ctx, reply.SenderJID, types.EmptyJID, "")
+}
+
+// quotedSnippetWithMentions rewrites @<jid-user> tokens in a quoted text
+// snippet to contact names, mirroring how message bodies are displayed.
+func quotedSnippetWithMentions(c *client, ctx context.Context, quoted *waProto.Message, snippet string) string {
+	if snippet == "" {
+		return snippet
+	}
+	return resolveMentions(c, ctx, snippet, messageMentionedJID(quoted))
 }
 
 // messageMentionsUser reports whether the authenticated user (ownJID) is among

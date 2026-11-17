@@ -68,6 +68,9 @@ pub enum ProviderEvent {
     /// state.
     ChatMarkedRead {
         chat_id: ChatId,
+        /// When known, the time up to which the chat was read (receipt or
+        /// app-state action timestamp). Advances the chat's read watermark.
+        read_up_to: Option<Timestamp>,
     },
     /// Authoritative unread count for a chat, reported by the provider from the
     /// platform's own conversation metadata (e.g. WhatsApp history-sync
@@ -81,6 +84,13 @@ pub enum ProviderEvent {
     ChatUnreadSynced {
         chat_id: ChatId,
         unread_count: u32,
+        /// Newest message/action time the snapshot reflects. A snapshot that
+        /// would *raise* the count is ignored when it is not newer than the
+        /// chat's read watermark (stale phone metadata). `None` = unknown.
+        as_of: Option<Timestamp>,
+        /// The user explicitly flagged the chat unread on another client
+        /// (WhatsApp "mark as unread"). Always applied.
+        marked_unread: bool,
     },
     ChatMerged {
         from_chat_id: ChatId,
@@ -102,6 +112,12 @@ pub enum ProviderEvent {
         chat_id: ChatId,
         sender: PlatformId,
         is_typing: bool,
+    },
+    /// A user's online state / last seen changed (pushed by platforms that
+    /// support presence subscriptions, such as WhatsApp).
+    Presence {
+        platform_id: PlatformId,
+        presence: Presence,
     },
     NetworkActivity {
         direction: NetworkActivityDirection,

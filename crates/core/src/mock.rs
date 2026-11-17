@@ -1,9 +1,10 @@
 use crate::{
     Account, Card, CardAction, CardColor, CardField, CardKind, CardSource, Chat, ChatDetails,
     ChatId, ChatKind, ChatMember, ChatMemberRole, ChatMembership, ContactProfile, Content,
-    EventBus, LinkPreview, Media, Mention, Message, MessageId, OutboundContent, OutboundMentions,
-    Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider, ProviderEvent,
-    ProviderId, Reaction, Receipt, ReceiptKind, Sender, Timestamp, resolve_mention_tokens,
+    EventBus, LinkPreview, MarkReadRequest, Media, Mention, Message, MessageId, OutboundContent,
+    OutboundMentions, Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Presence,
+    PresenceState, PresenceSupport, Provider, ProviderEvent, ProviderId, Reaction, Receipt,
+    ReceiptKind, Sender, Timestamp, resolve_mention_tokens,
 };
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -26,6 +27,8 @@ pub struct MockProvider {
     chats: Arc<Vec<Chat>>,
     messages: Arc<RwLock<Vec<Message>>>,
     sent_mentions: Arc<RwLock<Vec<Vec<Mention>>>>,
+    mark_read_requests: Arc<RwLock<Vec<(ChatId, MarkReadRequest)>>>,
+    presence_requests: Arc<RwLock<Vec<PlatformId>>>,
     events: EventBus,
     /// Optional edit window, to exercise providers like WhatsApp that only
     /// allow editing recent messages.
@@ -51,6 +54,8 @@ impl MockProvider {
             chats,
             messages,
             sent_mentions: Arc::new(RwLock::new(Vec::new())),
+            mark_read_requests: Arc::new(RwLock::new(Vec::new())),
+            presence_requests: Arc::new(RwLock::new(Vec::new())),
             events: EventBus::new(),
             edit_window: None,
         }
@@ -78,6 +83,30 @@ impl MockProvider {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Every `mark_read` request received, in call order. Lets tests assert
+    /// exactly which messages the UI acknowledged.
+    pub fn mark_read_requests(&self) -> Vec<(ChatId, MarkReadRequest)> {
+        self.mark_read_requests
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Every user whose presence was requested, in call order. Lets tests
+    /// assert presence is fetched lazily for a bounded set of users.
+    pub fn presence_requests(&self) -> Vec<PlatformId> {
+        self.presence_requests
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Publishes an event on this provider's bus, as a real provider would
+    /// when the platform pushes an update (for example presence).
+    pub fn emit_event(&self, event: ProviderEvent) -> usize {
+        self.events.send(event)
     }
 
     pub fn ensure_mock_assets(&self) -> Result<()> {
@@ -213,6 +242,7 @@ impl Provider for MockProvider {
             reply_to: reply_to.map(|message| message.id.clone()),
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: None,
             receipts: Vec::new(),
             is_from_me: true,
             mentions_me: false,
@@ -234,7 +264,11 @@ impl Provider for MockProvider {
         }
     }
 
-    async fn mark_read(&self, _chat_id: &ChatId, _up_to: &MessageId) -> Result<()> {
+    async fn mark_read(&self, chat_id: &ChatId, request: &MarkReadRequest) -> Result<()> {
+        self.mark_read_requests
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((chat_id.clone(), request.clone()));
         Ok(())
     }
 
@@ -390,6 +424,36 @@ impl Provider for MockProvider {
                 display_name: Some(sender.display_name),
                 ..ContactProfile::default()
             }))
+    }
+
+    fn presence_support(&self) -> PresenceSupport {
+        PresenceSupport::Pushed
+    }
+
+    async fn presence(&self, platform_id: &PlatformId) -> Result<Option<Presence>> {
+        self.presence_requests
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(platform_id.clone());
+        Ok(mock_presence(platform_id.as_ref()))
+    }
+}
+
+/// Seeded presence: some members online, some with a last-seen time, one who
+/// hides it, and the rest unknown (no snapshot yet).
+fn mock_presence(platform_id: &str) -> Option<Presence> {
+    let now = Utc::now();
+    match platform_id {
+        "alice" | "sam" => Some(Presence::new(PresenceState::Online, now)),
+        "priya" => Some(Presence {
+            last_seen: Some(now - Duration::minutes(42)),
+            ..Presence::new(PresenceState::Offline, now)
+        }),
+        "alex" => Some(Presence {
+            last_seen_hidden: true,
+            ..Presence::new(PresenceState::Offline, now)
+        }),
+        _ => None,
     }
 }
 
@@ -606,6 +670,7 @@ fn chat_from_seed(account: &ProviderId, seed: ChatSeed<'_>, now: Timestamp) -> C
         muted: seed.muted,
         pinned: seed.pinned,
         last_message_at: Some(now - Duration::minutes(seed.last_seen_minutes_ago)),
+        last_read_at: None,
         last_message_preview: Some(arc_str(seed.preview)),
         thread_id: None,
     }
@@ -1483,6 +1548,7 @@ fn message(account: &ProviderId, seed: MessageSeed<'_>) -> Message {
         reply_to: seed.reply_to.map(arc_str),
         thread_id: seed.thread_id.map(arc_str),
         reactions: seed.reactions,
+        reply_preview: None,
         receipts: seed.receipts,
         is_from_me: seed.is_from_me,
         mentions_me: seed.mentions_me,
@@ -1697,6 +1763,23 @@ fn mock_contact_profile(platform_id: &str) -> Option<ContactProfile> {
             phone: Some(arc_str("+1 555-0102")),
             timezone: Some(arc_str("Europe/Lisbon")),
             is_business: true,
+            ..ContactProfile::default()
+        }),
+        "priya" => Some(ContactProfile {
+            display_name: Some(arc_str("Priya Shah")),
+            handle: Some(arc_str("@priya")),
+            title: Some(arc_str("Design Lead")),
+            phone: Some(arc_str("+1 555-0147")),
+            email: Some(arc_str("priya@example.com")),
+            timezone: Some(arc_str("Asia/Kolkata")),
+            facts: vec![(arc_str("Pronouns"), arc_str("she/her"))],
+            ..ContactProfile::default()
+        }),
+        "sam" => Some(ContactProfile {
+            display_name: Some(arc_str("Sam")),
+            handle: Some(arc_str("@sam")),
+            title: Some(arc_str("Engineering Manager")),
+            email: Some(arc_str("sam@example.com")),
             ..ContactProfile::default()
         }),
         "release-bot" => Some(ContactProfile {

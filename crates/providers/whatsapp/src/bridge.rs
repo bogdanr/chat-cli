@@ -83,6 +83,8 @@ unsafe extern "C" {
     ) -> *mut c_char;
     fn C_SearchContacts(client_id: u64, query: *const c_char, limit: i32) -> *mut c_char;
     fn C_GroupMembers(client_id: u64, chat_jid: *const c_char) -> *mut c_char;
+    fn C_UserInfo(client_id: u64, user_jid: *const c_char) -> *mut c_char;
+    fn C_SubscribePresence(client_id: u64, user_jid: *const c_char) -> *mut c_char;
     fn C_FireSyntheticMessage(message: *const c_char) -> u8;
     fn C_FreeString(value: *mut c_char);
     fn C_Disconnect(client_id: u64);
@@ -301,6 +303,24 @@ pub fn search_contacts(handle: ClientHandle, query: &str, limit: usize) -> anyho
 pub fn group_members(handle: ClientHandle, chat_jid: &str) -> anyhow::Result<String> {
     let chat_jid = CString::new(chat_jid)?;
     let response = unsafe { C_GroupMembers(handle, chat_jid.as_ptr()) };
+    take_c_string(response)
+}
+
+/// Fetches the about text, business details, phone number and full-size
+/// avatar for one user as a JSON `user_info` bridge event. Performs network IO;
+/// call from a blocking worker.
+pub fn user_info(handle: ClientHandle, user_jid: &str) -> anyhow::Result<String> {
+    let user_jid = CString::new(user_jid)?;
+    let response = unsafe { C_UserInfo(handle, user_jid.as_ptr()) };
+    take_c_string(response)
+}
+
+/// Subscribes to a user's presence (bounded and de-duplicated in the bridge)
+/// and returns the latest known snapshot as a `presence`, `presence_pending`
+/// or `presence_disabled` event. Later changes arrive through the callback.
+pub fn subscribe_presence(handle: ClientHandle, user_jid: &str) -> anyhow::Result<String> {
+    let user_jid = CString::new(user_jid)?;
+    let response = unsafe { C_SubscribePresence(handle, user_jid.as_ptr()) };
     take_c_string(response)
 }
 

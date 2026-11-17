@@ -141,6 +141,49 @@ pub struct Chat {
     pub last_message_at: Option<Timestamp>,
     pub last_message_preview: Option<Arc<str>>,
     pub thread_id: Option<Arc<str>>,
+    /// Read watermark: timestamp of the newest message the user has read in
+    /// this chat, on any client. Never moves backwards. Used to decide which
+    /// inbound messages still need a read receipt and to reject stale unread
+    /// snapshots from the platform (`None` = unknown, accept snapshots).
+    pub last_read_at: Option<Timestamp>,
+}
+
+impl Chat {
+    /// Advances the read watermark, never moving it backwards. Returns true
+    /// when the watermark changed.
+    pub fn advance_read_watermark(&mut self, read_at: Option<Timestamp>) -> bool {
+        match (read_at, self.last_read_at) {
+            (Some(next), Some(current)) if next <= current => false,
+            (Some(next), _) => {
+                self.last_read_at = Some(next);
+                true
+            }
+            (None, _) => false,
+        }
+    }
+}
+
+/// One inbound message being acknowledged by [`MarkReadRequest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadTarget {
+    pub id: MessageId,
+    /// Platform id of the message author (WhatsApp group receipts are sent per
+    /// participant).
+    pub sender: PlatformId,
+    pub timestamp: Timestamp,
+}
+
+/// Explicit read acknowledgement built by the UI from the messages the user
+/// has actually seen, so providers never have to guess targets from their own
+/// (possibly empty, e.g. after a restart) in-memory caches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MarkReadRequest {
+    /// Newest message read (inbound or outbound) in the chat.
+    pub up_to: Option<MessageId>,
+    /// Timestamp of `up_to`; becomes the chat's read watermark.
+    pub up_to_at: Option<Timestamp>,
+    /// Bounded, oldest-first list of inbound messages being acknowledged.
+    pub messages: Vec<ReadTarget>,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +278,10 @@ pub struct Message {
     pub edited_at: Option<Timestamp>,
     pub content: Content,
     pub reply_to: Option<MessageId>,
+    /// Snapshot of the message `reply_to` quotes (sender + snippet), captured
+    /// by the provider when the reply arrives. Lets the quote box render even
+    /// when the original is outside the loaded window or was never synced.
+    pub reply_preview: Option<QuotedPreview>,
     pub thread_id: Option<Arc<str>>,
     pub reactions: Vec<Reaction>,
     pub receipts: Vec<Receipt>,
@@ -247,6 +294,27 @@ pub struct Message {
     /// notification-eligible.
     pub mentions_me: bool,
     pub platform_data: PlatformData,
+}
+
+impl Message {
+    /// True when this message is a WhatsApp-style quoted reply: it references
+    /// another message inline but does not open a thread. Slack and ClickUp
+    /// replies are threads and keep their thread summaries/unread tracking.
+    pub fn is_quote_reply(&self) -> bool {
+        self.reply_to.is_some() && self.platform_data.whatsapp.is_some()
+    }
+}
+
+/// Provider-captured preview of a quoted (replied-to) message.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuotedPreview {
+    /// Platform id of the quoted message's author, when known.
+    pub sender_id: Option<PlatformId>,
+    /// Display name of the quoted message's author.
+    pub sender_name: Arc<str>,
+    /// Single-line snippet of the quoted content (text, caption, or a media
+    /// label such as "Photo").
+    pub snippet: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
@@ -411,8 +479,81 @@ pub struct ContactProfile {
     pub is_business: bool,
     /// The account is deactivated/deleted.
     pub is_deactivated: bool,
+    /// Full-resolution avatar on disk, when the provider can fetch one that is
+    /// larger than the list thumbnail carried on [`Sender::avatar`]. Used when
+    /// the user enlarges an avatar.
+    pub avatar_full: Option<PathBuf>,
+    /// The phone number exists but the platform hides it (WhatsApp privacy
+    /// `@lid` identities). Lets the UI say "hidden" instead of omitting it.
+    pub phone_hidden: bool,
     /// Ordered platform-specific labeled facts for anything not modeled above.
     pub facts: Vec<(Arc<str>, Arc<str>)>,
+}
+
+/// Coarse online state reported by a platform for a user.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum PresenceState {
+    /// Currently online / active.
+    Online,
+    /// Signed in but idle (Slack "away").
+    Away,
+    /// Not online.
+    Offline,
+    /// The platform has not reported anything (yet).
+    #[default]
+    Unknown,
+}
+
+impl PresenceState {
+    /// Short human label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Online => "Online",
+            Self::Away => "Away",
+            Self::Offline => "Offline",
+            Self::Unknown => "Unknown",
+        }
+    }
+}
+
+/// How a provider delivers presence, so the UI can explain what it shows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PresenceSupport {
+    /// The platform (or this integration) exposes no presence.
+    #[default]
+    Unsupported,
+    /// Presence is pushed after subscribing (WhatsApp). Includes last seen.
+    Pushed,
+    /// Presence must be polled and carries no last-seen time (Slack).
+    Polled,
+    /// Supported by the platform but turned off locally (for example
+    /// `CHATCLI_WHATSAPP_NO_PRESENCE`).
+    Disabled,
+}
+
+/// A platform-reported presence snapshot for one user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Presence {
+    pub state: PresenceState,
+    /// When the user was last online, when the platform shares it.
+    pub last_seen: Option<Timestamp>,
+    /// The platform reported the user offline without a last-seen time
+    /// because the user hides it. Distinguishes "hidden" from "never".
+    pub last_seen_hidden: bool,
+    /// When this snapshot was produced locally (drives cache TTLs).
+    pub fetched_at: Timestamp,
+}
+
+impl Presence {
+    /// A presence snapshot with no last-seen information.
+    pub fn new(state: PresenceState, fetched_at: Timestamp) -> Self {
+        Self {
+            state,
+            last_seen: None,
+            last_seen_hidden: false,
+            fetched_at,
+        }
+    }
 }
 
 impl ContactProfile {
@@ -429,6 +570,7 @@ impl ContactProfile {
             || self.is_bot
             || self.is_business
             || self.is_deactivated
+            || self.phone_hidden
             || !self.facts.is_empty()
     }
 }

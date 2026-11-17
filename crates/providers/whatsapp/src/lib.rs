@@ -1,18 +1,19 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chat_core::{
-    Account, AuthChallenge, Chat, ChatDetails, ChatId, ChatKind, ChatMember, ChatMemberRole,
-    ChatMembership, ContactProfile, Content, DiscoveryAction, DiscoveryCapabilities,
-    DiscoveryResult, DiscoveryResultKind, EventBus, Media, Mention, Message, MessageId,
-    NetworkActivityDirection, NetworkActivityKind, OutboundCapabilities, OutboundContent,
-    OutboundMentions, Platform, PlatformData, PlatformId, Poll, PollOption, PollVote, Provider,
-    ProviderEvent, ProviderId, Reaction, Sender, Timestamp, WhatsAppData, can_edit_message,
+    Account, AccountNoticeSeverity, AuthChallenge, Chat, ChatDetails, ChatId, ChatKind, ChatMember,
+    ChatMemberRole, ChatMembership, ContactProfile, Content, DiscoveryAction,
+    DiscoveryCapabilities, DiscoveryResult, DiscoveryResultKind, EventBus, MarkReadRequest, Media,
+    Mention, Message, MessageId, NetworkActivityDirection, NetworkActivityKind,
+    OutboundCapabilities, OutboundContent, OutboundMentions, Platform, PlatformData, PlatformId,
+    Poll, PollOption, PollVote, Presence, PresenceState, PresenceSupport, Provider, ProviderEvent,
+    ProviderId, QuotedPreview, Reaction, Sender, Timestamp, WhatsAppData, can_edit_message,
     resolve_mention_tokens, rewrite_mention_tokens,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -31,6 +32,10 @@ const WHATSAPP_ON_DEMAND_HISTORY_WAIT: Duration = Duration::from_millis(12_000);
 const WHATSAPP_ON_DEMAND_HISTORY_POLL: Duration = Duration::from_millis(250);
 /// Upper bound on how many read receipts a single mark-read call sends.
 const WHATSAPP_MARK_READ_MAX_MESSAGES: usize = 100;
+/// Most recent unread chats re-checked against the phone after an offline
+/// catch-up, and the spacing between their on-demand history requests.
+const WHATSAPP_UNREAD_RECONCILE_MAX_CHATS: usize = 20;
+const WHATSAPP_UNREAD_RECONCILE_SPACING: Duration = Duration::from_millis(1_500);
 /// Mirrors whatsmeow's `EditWindow` (20 minutes after sending).
 const WHATSAPP_EDIT_WINDOW_MINUTES: i64 = 20;
 
@@ -51,6 +56,9 @@ pub struct WhatsAppProvider {
     messages: Arc<RwLock<Vec<Message>>>,
     profiles: Arc<RwLock<HashMap<PlatformId, Sender>>>,
     pending_reactions: Arc<RwLock<HashMap<MessageId, Vec<PendingReaction>>>>,
+    /// Chats manually flagged "unread" on another client. Reading them here
+    /// must also clear the flag through app state, not just send receipts.
+    marked_unread: Arc<RwLock<HashSet<ChatId>>>,
     log_path: Arc<Option<PathBuf>>,
     events: EventBus,
     connected: AtomicBool,
@@ -116,6 +124,7 @@ impl WhatsAppProvider {
             muted: true,
             pinned: false,
             last_message_at: None,
+            last_read_at: None,
             last_message_preview: None,
             thread_id: None,
         };
@@ -130,6 +139,7 @@ impl WhatsAppProvider {
             messages: Arc::new(RwLock::new(Vec::new())),
             profiles: Arc::new(RwLock::new(HashMap::new())),
             pending_reactions: Arc::new(RwLock::new(HashMap::new())),
+            marked_unread: Arc::new(RwLock::new(HashSet::new())),
             log_path: Arc::new(options.log_path),
             events: EventBus::new(),
             connected: AtomicBool::new(false),
@@ -155,9 +165,11 @@ impl WhatsAppProvider {
         let messages = Arc::clone(&self.messages);
         let profiles = Arc::clone(&self.profiles);
         let pending_reactions = Arc::clone(&self.pending_reactions);
+        let marked_unread = Arc::clone(&self.marked_unread);
         let log_path = Arc::clone(&self.log_path);
         let events = self.events.clone();
         let next_message = Arc::clone(&self.next_message);
+        let handle = self.handle;
 
         let task = tokio::spawn(async move {
             while let Some(raw_event) = rx.recv().await {
@@ -168,9 +180,11 @@ impl WhatsAppProvider {
                     messages: &messages,
                     profiles: &profiles,
                     pending_reactions: &pending_reactions,
+                    marked_unread: &marked_unread,
                     log_path: log_path.as_ref().as_ref(),
                     events: &events,
                     next_message: &next_message,
+                    handle: Some(handle),
                 };
                 forward_bridge_event(&context, &raw_event);
             }
@@ -547,6 +561,7 @@ impl Provider for WhatsAppProvider {
             reply_to: reply_to.map(|message| message.id.clone()),
             thread_id: None,
             reactions: Vec::new(),
+            reply_preview: reply_to.map(whatsapp_local_quoted_preview),
             receipts: Vec::new(),
             is_from_me: true,
             mentions_me: false,
@@ -649,57 +664,45 @@ impl Provider for WhatsAppProvider {
         bail!("WhatsApp media download is not wired yet")
     }
 
-    async fn mark_read(&self, chat_id: &ChatId, up_to: &MessageId) -> Result<()> {
+    async fn mark_read(&self, chat_id: &ChatId, request: &MarkReadRequest) -> Result<()> {
         // Clear the cached unread for this chat first so later chat snapshots
         // report it as read instead of re-inflating the count through the
         // sidebar's max() merge.
-        let unread_count = {
-            let mut chats = lock_rw_write(&self.chats);
-            match chats.get_mut(chat_id) {
-                Some(chat) => {
-                    let unread = chat.unread_count;
-                    chat.unread_count = 0;
-                    unread
-                }
-                None => 0,
-            }
-        };
+        if let Some(chat) = lock_rw_write(&self.chats).get_mut(chat_id) {
+            chat.unread_count = 0;
+        }
+        let clear_marked_unread = lock_rw_write(&self.marked_unread).remove(chat_id);
 
         let chat_jid = whatsapp_jid_from_chat_id(chat_id);
         if chat_jid.is_empty() {
             return Ok(());
         }
 
-        // Send read receipts for the most recent inbound messages so the chat
-        // also shows as read on the user's other WhatsApp clients. The bridge
-        // call does network IO, so it runs detached on a blocking worker and
-        // never delays the caller.
-        let entries = {
-            let messages = lock_rw_read(&self.messages);
-            let up_to_timestamp = messages
-                .iter()
-                .find(|message| message.id == *up_to)
-                .map(|message| message.timestamp);
-            let limit = (unread_count.max(1) as usize).min(WHATSAPP_MARK_READ_MAX_MESSAGES);
-            let mut entries = messages
-                .iter()
-                .rev()
-                .filter(|message| message.chat_id == *chat_id && !message.is_from_me)
-                .filter(|message| up_to_timestamp.is_none_or(|up_to| message.timestamp <= up_to))
-                .take(limit)
-                .map(|message| MarkReadEntry {
-                    id: message.id.to_string(),
-                    sender_jid: message.sender.platform_id.to_string(),
-                })
-                .collect::<Vec<_>>();
-            entries.reverse();
-            entries
-        };
-        if entries.is_empty() {
+        // Acknowledge exactly the inbound messages the UI says were read,
+        // so receipts never target the wrong (or no) message after a restart.
+        // The bridge call does network IO, so it runs detached on a blocking
+        // worker and never delays the caller.
+        let payload = build_mark_read_payload(
+            request,
+            clear_marked_unread,
+            &lock_rw_read(&self.messages),
+            chat_id,
+        );
+        if payload.entries.is_empty() && !payload.clear_marked_unread {
+            log_provider_event(
+                self.log_path.as_ref().as_ref(),
+                &format!("read_sync.provider_send chat={chat_jid} skipped=no_targets"),
+            );
             return Ok(());
         }
-
-        let payload = serde_json::to_string(&entries)?;
+        let receipt_count = payload.entries.len();
+        let sender_groups = payload
+            .entries
+            .iter()
+            .map(|entry| entry.sender_jid.as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        let payload = serde_json::to_string(&payload)?;
         let handle = self.handle;
         let events = self.events.clone();
         let log_path = Arc::clone(&self.log_path);
@@ -723,11 +726,20 @@ impl Provider for WhatsAppProvider {
                         direction: NetworkActivityDirection::Rx,
                         kind: NetworkActivityKind::Receipt,
                     });
+                    log_provider_event(
+                        log_path.as_ref().as_ref(),
+                        &format!(
+                            "read_sync.provider_send ok chat={chat_jid} receipts={receipt_count} \
+                             sender_groups={sender_groups} cleared_marked_unread={clear_marked_unread}"
+                        ),
+                    );
                 }
                 Err(error) => {
                     log_provider_event(
                         log_path.as_ref().as_ref(),
-                        &format!("mark-read failed chat={chat_jid}: {error}"),
+                        &format!(
+                            "read_sync.provider_send error chat={chat_jid} receipts={receipt_count}: {error}"
+                        ),
                     );
                 }
             }
@@ -861,9 +873,11 @@ impl Provider for WhatsAppProvider {
                 messages: &self.messages,
                 profiles: &self.profiles,
                 pending_reactions: &self.pending_reactions,
+                marked_unread: &self.marked_unread,
                 log_path: self.log_path.as_ref().as_ref(),
                 events: &self.events,
                 next_message: &self.next_message,
+                handle: None,
             },
             event,
         );
@@ -1109,15 +1123,157 @@ impl Provider for WhatsAppProvider {
                     .map(|message| message.sender.display_name.clone())
             });
         let phone = whatsapp_phone_from_jid(platform_id);
-        if display_name.is_none() && phone.is_none() {
-            return Ok(None);
-        }
-        Ok(Some(ContactProfile {
+        let local = ContactProfile {
             display_name,
             phone,
             ..ContactProfile::default()
-        }))
+        };
+
+        // Ask the bridge for the rich profile (about, business details,
+        // phone behind a @lid, full-size avatar). Failures degrade to the
+        // locally known name/phone instead of surfacing an error.
+        let jid = normalize_whatsapp_jid(platform_id);
+        if jid.contains("@g.us") || jid == BRIDGE_SENDER_ID {
+            return Ok(non_empty_profile(local));
+        }
+        let handle = self.handle;
+        self.emit_network_activity(NetworkActivityDirection::Tx, NetworkActivityKind::Other);
+        let raw = tokio::task::spawn_blocking(move || bridge::user_info(handle, &jid)).await?;
+        self.emit_network_activity(NetworkActivityDirection::Rx, NetworkActivityKind::Other);
+        let remote = match raw {
+            Ok(raw) if raw.trim_start().starts_with('{') => match BridgeEvent::decode(&raw) {
+                Ok(event) if event.kind == "user_info" => Some(event),
+                Ok(event) => {
+                    log_provider_event(
+                        self.log_path.as_ref().as_ref(),
+                        &format!(
+                            "whatsapp user_info failed jid={platform_id}: {}",
+                            event.message.unwrap_or_default()
+                        ),
+                    );
+                    None
+                }
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        let profile = match remote {
+            Some(event) => merge_whatsapp_user_info(local, event),
+            None => local,
+        };
+        Ok(non_empty_profile(profile))
     }
+
+    fn presence_support(&self) -> PresenceSupport {
+        if std::env::var_os("CHATCLI_WHATSAPP_NO_PRESENCE").is_some() {
+            PresenceSupport::Disabled
+        } else {
+            PresenceSupport::Pushed
+        }
+    }
+
+    async fn presence(&self, platform_id: &PlatformId) -> Result<Option<Presence>> {
+        if self.presence_support() != PresenceSupport::Pushed {
+            return Ok(None);
+        }
+        let jid = normalize_whatsapp_jid(platform_id);
+        if jid.contains("@g.us") || jid == BRIDGE_SENDER_ID {
+            return Ok(None);
+        }
+        let handle = self.handle;
+        let raw =
+            tokio::task::spawn_blocking(move || bridge::subscribe_presence(handle, &jid)).await??;
+        if !raw.trim_start().starts_with('{') {
+            return Ok(None);
+        }
+        let event = BridgeEvent::decode(&raw)?;
+        match event.kind.as_str() {
+            "presence" => Ok(presence_from_bridge_event(&event, Utc::now()).map(|(_, p)| p)),
+            "presence_pending" | "presence_disabled" => Ok(None),
+            "error" => bail!(
+                "{}",
+                event
+                    .message
+                    .unwrap_or_else(|| "WhatsApp presence subscription failed".to_owned())
+            ),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `None` when the profile carries nothing worth showing.
+fn non_empty_profile(profile: ContactProfile) -> Option<ContactProfile> {
+    (profile.has_detail() || profile.display_name.is_some() || profile.avatar_full.is_some())
+        .then_some(profile)
+}
+
+/// Converts a bridge `presence` event into the domain presence model.
+/// WhatsApp reports "offline" without a last-seen time when the user hides
+/// it, which is surfaced as `last_seen_hidden`.
+fn presence_from_bridge_event(
+    event: &BridgeEvent,
+    now: Timestamp,
+) -> Option<(PlatformId, Presence)> {
+    let jid = event
+        .jid
+        .as_deref()
+        .map(str::trim)
+        .filter(|jid| !jid.is_empty())?;
+    let state = match event.profile.presence_state.as_deref() {
+        Some("online") => PresenceState::Online,
+        Some("offline") => PresenceState::Offline,
+        _ => PresenceState::Unknown,
+    };
+    let last_seen = event
+        .profile
+        .last_seen
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let mut presence = Presence::new(state, now);
+    presence.last_seen_hidden = state == PresenceState::Offline && last_seen.is_none();
+    presence.last_seen = last_seen;
+    Some((arc_str(normalize_whatsapp_jid(jid)), presence))
+}
+
+/// Overlays a bridge `user_info` response on the locally known profile.
+fn merge_whatsapp_user_info(mut profile: ContactProfile, event: BridgeEvent) -> ContactProfile {
+    let fields = event.profile;
+    let clean = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(arc_str)
+    };
+    if profile.display_name.is_none() {
+        profile.display_name = clean(fields.display_name);
+    }
+    if let Some(phone) = clean(fields.phone) {
+        profile.phone = Some(phone);
+    }
+    profile.phone_hidden = profile.phone.is_none() && fields.phone_hidden;
+    profile.about = clean(fields.about);
+    profile.is_business = fields.is_business;
+    if let Some(verified) = clean(fields.verified_name) {
+        profile.facts.push((arc_str("Verified name"), verified));
+    }
+    profile.email = clean(fields.business_email);
+    if let Some(address) = clean(fields.business_address) {
+        profile.facts.push((arc_str("Address"), address));
+    }
+    let categories = fields
+        .business_categories
+        .iter()
+        .map(|category| category.trim())
+        .filter(|category| !category.is_empty())
+        .collect::<Vec<_>>();
+    if !categories.is_empty() {
+        profile
+            .facts
+            .push((arc_str("Category"), arc_str(categories.join(", "))));
+    }
+    profile.avatar_full = fields.avatar_full_path.filter(|path| path.is_file());
+    profile
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1132,6 +1288,73 @@ struct BridgeReaction {
 struct MarkReadEntry {
     id: String,
     sender_jid: String,
+}
+
+/// `C_MarkRead` payload: the receipts to send plus, when the chat was
+/// manually flagged unread elsewhere, the newest message key used to clear
+/// that flag through a `regular_low` app-state patch.
+#[derive(Clone, Debug, Default, Serialize)]
+struct MarkReadPayload {
+    entries: Vec<MarkReadEntry>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    clear_marked_unread: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    last_id: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    last_from_me: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    last_sender_jid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_timestamp_ms: Option<i64>,
+}
+
+fn build_mark_read_payload(
+    request: &MarkReadRequest,
+    clear_marked_unread: bool,
+    cached_messages: &[Message],
+    chat_id: &ChatId,
+) -> MarkReadPayload {
+    let skip = request
+        .messages
+        .len()
+        .saturating_sub(WHATSAPP_MARK_READ_MAX_MESSAGES);
+    let entries = request
+        .messages
+        .iter()
+        .skip(skip)
+        .filter(|target| !target.id.is_empty())
+        .map(|target| MarkReadEntry {
+            id: target.id.to_string(),
+            sender_jid: target.sender.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let mut payload = MarkReadPayload {
+        entries,
+        clear_marked_unread,
+        last_timestamp_ms: request.up_to_at.map(|at| at.timestamp_millis()),
+        ..MarkReadPayload::default()
+    };
+    if !clear_marked_unread {
+        return payload;
+    }
+    // Prefer the exact newest message (it may be outbound); fall back to the
+    // newest acknowledged inbound message.
+    let up_to = request.up_to.as_ref().and_then(|up_to| {
+        cached_messages
+            .iter()
+            .find(|message| message.chat_id == *chat_id && message.id == *up_to)
+    });
+    if let Some(message) = up_to {
+        payload.last_id = message.id.to_string();
+        payload.last_from_me = message.is_from_me;
+        payload.last_sender_jid = message.sender.platform_id.to_string();
+        payload.last_timestamp_ms = Some(message.timestamp.timestamp_millis());
+    } else if let Some(target) = request.messages.last() {
+        payload.last_id = target.id.to_string();
+        payload.last_sender_jid = target.sender.to_string();
+        payload.last_timestamp_ms = Some(target.timestamp.timestamp_millis());
+    }
+    payload
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -1163,6 +1386,10 @@ struct BridgeEvent {
     event: Option<String>,
     message: Option<String>,
     reason: Option<String>,
+    /// `notice` events: headline; the body is carried in `message`.
+    title: Option<String>,
+    /// `notice` events: `"system_alert"` or `"info"` (default).
+    severity: Option<String>,
     jid: Option<String>,
     id: Option<String>,
     canonical_jid: Option<String>,
@@ -1185,6 +1412,13 @@ struct BridgeEvent {
     unread_count: Option<u32>,
     last_message_at: Option<String>,
     last_message_preview: Option<String>,
+    /// `read` events: receipt / app-state action time (RFC 3339).
+    read_up_to: Option<String>,
+    /// `chat_unread` events: newest message/action time the count reflects.
+    as_of: Option<String>,
+    /// `chat_unread` events: the chat was manually marked unread.
+    #[serde(default)]
+    marked_unread: bool,
     content_type: Option<String>,
     media_id: Option<String>,
     media_file_name: Option<String>,
@@ -1221,6 +1455,38 @@ struct BridgeEvent {
     group_only_admins_edit: bool,
     group_disappearing_seconds: Option<u32>,
     edited_at: Option<String>,
+    /// Quoted-reply link read from the inbound message's ContextInfo.
+    reply_to_id: Option<String>,
+    reply_to_sender_jid: Option<String>,
+    reply_to_sender_name: Option<String>,
+    reply_to_text: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_forwarded: bool,
+    /// `user_info` / `presence` payload fields.
+    #[serde(flatten)]
+    profile: BridgeProfileFields,
+}
+
+/// Contact-profile and presence fields carried by `user_info` responses and
+/// `presence` events from the Go bridge.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+struct BridgeProfileFields {
+    display_name: Option<String>,
+    about: Option<String>,
+    verified_name: Option<String>,
+    phone: Option<String>,
+    #[serde(default)]
+    phone_hidden: bool,
+    avatar_full_path: Option<PathBuf>,
+    #[serde(default)]
+    is_business: bool,
+    business_email: Option<String>,
+    business_address: Option<String>,
+    #[serde(default)]
+    business_categories: Vec<String>,
+    presence_state: Option<String>,
+    last_seen: Option<String>,
 }
 
 impl BridgeEvent {
@@ -1234,6 +1500,8 @@ impl BridgeEvent {
                 event: None,
                 message: None,
                 reason: None,
+                title: None,
+                severity: None,
                 jid: None,
                 id: None,
                 canonical_jid: None,
@@ -1253,6 +1521,9 @@ impl BridgeEvent {
                 unread_count: None,
                 last_message_at: None,
                 last_message_preview: None,
+                read_up_to: None,
+                as_of: None,
+                marked_unread: false,
                 content_type: None,
                 media_id: None,
                 media_file_name: None,
@@ -1280,8 +1551,61 @@ impl BridgeEvent {
                 group_only_admins_edit: false,
                 group_disappearing_seconds: None,
                 edited_at: None,
+                reply_to_id: None,
+                reply_to_sender_jid: None,
+                reply_to_sender_name: None,
+                reply_to_text: None,
+                is_forwarded: false,
+                profile: BridgeProfileFields::default(),
             })
         }
+    }
+
+    /// The quoted-reply link carried by a message event, as the domain
+    /// `reply_to` id plus a render-ready snapshot of the quoted message.
+    fn quoted_reply(&self) -> Option<(MessageId, QuotedPreview)> {
+        let id = self
+            .reply_to_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())?;
+        let sender_id = self
+            .reply_to_sender_jid
+            .as_deref()
+            .filter(|jid| !jid.is_empty())
+            .map(|jid| {
+                if jid == "me" {
+                    arc_str("me")
+                } else {
+                    arc_str(normalize_whatsapp_jid(jid))
+                }
+            });
+        let sender_name = self
+            .reply_to_sender_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                sender_id
+                    .as_deref()
+                    .filter(|jid| *jid != "me")
+                    .map(sender_name_from_jid)
+            })
+            .unwrap_or_else(|| "Reply".to_owned());
+        let snippet = self
+            .reply_to_text
+            .as_deref()
+            .map(chat_core::markup::chat_markup_to_markdown)
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "Message".to_owned());
+        Some((
+            arc_str(id),
+            QuotedPreview {
+                sender_id,
+                sender_name: arc_str(sender_name),
+                snippet: arc_str(snippet),
+            },
+        ))
     }
 
     fn timestamp(&self) -> Option<Timestamp> {
@@ -1289,6 +1613,14 @@ impl BridgeEvent {
             .as_deref()
             .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
             .map(|value| value.with_timezone(&Utc))
+    }
+
+    fn read_up_to(&self) -> Option<Timestamp> {
+        parse_bridge_rfc3339(self.read_up_to.as_deref())
+    }
+
+    fn as_of(&self) -> Option<Timestamp> {
+        parse_bridge_rfc3339(self.as_of.as_deref())
     }
 
     fn last_message_timestamp(&self) -> Option<Timestamp> {
@@ -1313,9 +1645,38 @@ struct BridgeForwardContext<'a> {
     messages: &'a Arc<RwLock<Vec<Message>>>,
     profiles: &'a Arc<RwLock<HashMap<PlatformId, Sender>>>,
     pending_reactions: &'a Arc<RwLock<HashMap<MessageId, Vec<PendingReaction>>>>,
+    marked_unread: &'a Arc<RwLock<HashSet<ChatId>>>,
     log_path: Option<&'a PathBuf>,
     events: &'a EventBus,
     next_message: &'a AtomicU64,
+    /// Bridge client used for follow-up requests (unread reconciliation).
+    /// `None` for synchronous, request-scoped contexts.
+    handle: Option<bridge::ClientHandle>,
+}
+
+/// Maps a bridge `notice` event (for example "WhatsApp stopped syncing"
+/// after a permanent disconnect) to an account notice the UI surfaces.
+fn account_notice_from_bridge_event(event: &BridgeEvent) -> Option<ProviderEvent> {
+    let body = event
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty())?;
+    let title = event
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("WhatsApp");
+    let severity = match event.severity.as_deref() {
+        Some("system_alert") => AccountNoticeSeverity::SystemAlert,
+        _ => AccountNoticeSeverity::Info,
+    };
+    Some(ProviderEvent::AccountNotice {
+        title: arc_str(title),
+        body: arc_str(body),
+        severity,
+    })
 }
 
 fn context_account_id(context: &BridgeForwardContext<'_>) -> ProviderId {
@@ -1499,10 +1860,39 @@ fn forward_bridge_event(context: &BridgeForwardContext<'_>, raw_event: &str) {
         "chat_unread" => {
             forward_chat_unread_event(context, event);
         }
+        "offline_sync_completed" => {
+            schedule_unread_reconcile(context);
+        }
+        "presence" => {
+            if let Some((platform_id, presence)) = presence_from_bridge_event(&event, Utc::now()) {
+                context.events.send(ProviderEvent::Presence {
+                    platform_id,
+                    presence,
+                });
+            }
+        }
         "disconnected" => {
             context
                 .events
                 .send(ProviderEvent::Disconnected(event.reason.map(arc_str)));
+        }
+        "reconnecting" => {
+            context.events.send(ProviderEvent::Reconnecting);
+            if let Some(reason) = event.reason.filter(|reason| !reason.trim().is_empty()) {
+                emit_bridge_status_message(
+                    &context_account_id(context),
+                    context.inbox_chat,
+                    context.messages,
+                    context.events,
+                    context.next_message,
+                    format!("WhatsApp reconnecting: {reason}"),
+                );
+            }
+        }
+        "notice" => {
+            if let Some(notice) = account_notice_from_bridge_event(&event) {
+                context.events.send(notice);
+            }
         }
         "error" => {
             emit_bridge_status_message(
@@ -1616,7 +2006,12 @@ fn forward_message_event(
     let text = chat_core::markup::chat_markup_to_markdown(&text);
     let content = content_from_event(&event, text);
     let is_placeholder_message = is_empty_message_placeholder(&content);
+    let quoted = event.quoted_reply();
     if !is_placeholder_message {
+        let (reply_to, reply_preview) = match quoted {
+            Some((id, preview)) => (Some(id), Some(preview)),
+            None => (None, None),
+        };
         let mut message = Message {
             id: message_id.clone(),
             chat_id: chat_id.clone(),
@@ -1625,9 +2020,10 @@ fn forward_message_event(
             timestamp,
             edited_at: None,
             content,
-            reply_to: None,
+            reply_to,
             thread_id: None,
             reactions: reactions_from_event(&event),
+            reply_preview,
             receipts: Vec::new(),
             is_from_me: event.from_me,
             mentions_me: event.mentions_me,
@@ -1688,9 +2084,19 @@ fn forward_read_event(context: &BridgeForwardContext<'_>, event: BridgeEvent) {
     if let Some(chat) = lock_rw_write(context.chats).get_mut(&chat_id) {
         chat.unread_count = 0;
     }
-    context
-        .events
-        .send(ProviderEvent::ChatMarkedRead { chat_id });
+    lock_rw_write(context.marked_unread).remove(&chat_id);
+    let read_up_to = event.read_up_to();
+    log_provider_event(
+        context.log_path,
+        &format!(
+            "read_sync.remote_read source=whatsapp chat={chat_id} read_up_to={}",
+            read_up_to.map(|at| at.to_rfc3339()).unwrap_or_default()
+        ),
+    );
+    context.events.send(ProviderEvent::ChatMarkedRead {
+        chat_id,
+        read_up_to,
+    });
 }
 
 /// Handles a bridge "chat_unread" event: WhatsApp reported the phone's
@@ -1712,10 +2118,126 @@ fn forward_chat_unread_event(context: &BridgeForwardContext<'_>, event: BridgeEv
     if let Some(chat) = lock_rw_write(context.chats).get_mut(&chat_id) {
         chat.unread_count = unread_count;
     }
+    {
+        let mut marked = lock_rw_write(context.marked_unread);
+        if event.marked_unread {
+            marked.insert(chat_id.clone());
+        } else if unread_count == 0 {
+            marked.remove(&chat_id);
+        }
+    }
     context.events.send(ProviderEvent::ChatUnreadSynced {
         chat_id,
         unread_count,
+        as_of: event.as_of(),
+        marked_unread: event.marked_unread,
     });
+}
+
+/// After an offline catch-up, ask the phone for the authoritative unread
+/// state of the most recent unread chats: on-demand history responses carry
+/// each conversation's `UnreadCount`, which lowers badges for chats read on
+/// the phone while chat-cli was closed. Bounded and spaced out so the phone
+/// is never flooded; runs entirely off the forwarder.
+fn schedule_unread_reconcile(context: &BridgeForwardContext<'_>) {
+    let Some(handle) = context.handle else {
+        return;
+    };
+    let targets = unread_reconcile_targets(
+        &lock_rw_read(context.chats),
+        &lock_rw_read(context.messages),
+        WHATSAPP_UNREAD_RECONCILE_MAX_CHATS,
+    );
+    log_provider_event(
+        context.log_path,
+        &format!("read_sync.reconcile_scheduled chats={}", targets.len()),
+    );
+    if targets.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let log_path = context.log_path.cloned();
+    let events = context.events.clone();
+    runtime.spawn(async move {
+        let mut errors = 0usize;
+        for (index, target) in targets.into_iter().enumerate() {
+            if index > 0 {
+                sleep(WHATSAPP_UNREAD_RECONCILE_SPACING).await;
+            }
+            events.send(ProviderEvent::NetworkActivity {
+                direction: NetworkActivityDirection::Tx,
+                kind: NetworkActivityKind::History,
+            });
+            let outcome = tokio::task::spawn_blocking(move || {
+                bridge::request_history(
+                    handle,
+                    &target.chat_jid,
+                    target.anchor_id.as_ref(),
+                    target.anchor_from_me,
+                    target.anchor_timestamp,
+                    1,
+                )
+            })
+            .await;
+            if !matches!(outcome, Ok(Ok(_))) {
+                errors += 1;
+            }
+        }
+        log_provider_event(
+            log_path.as_ref(),
+            &format!("read_sync.reconcile_done errors={errors}"),
+        );
+    });
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnreadReconcileTarget {
+    chat_jid: String,
+    anchor_id: MessageId,
+    anchor_from_me: bool,
+    anchor_timestamp: i64,
+}
+
+/// Picks the most recently active chats that still show unread messages and
+/// have a known newest message to anchor the on-demand request on.
+fn unread_reconcile_targets(
+    chats: &HashMap<ChatId, Chat>,
+    messages: &[Message],
+    limit: usize,
+) -> Vec<UnreadReconcileTarget> {
+    let mut unread = chats
+        .values()
+        .filter(|chat| chat.unread_count > 0)
+        .collect::<Vec<_>>();
+    unread.sort_by_key(|chat| std::cmp::Reverse(chat.last_message_at));
+    unread
+        .into_iter()
+        .filter_map(|chat| {
+            let chat_jid = whatsapp_jid_from_chat_id(&chat.id);
+            if chat_jid.is_empty() {
+                return None;
+            }
+            let anchor = messages
+                .iter()
+                .filter(|message| message.chat_id == chat.id)
+                .max_by_key(|message| message.timestamp)?;
+            Some(UnreadReconcileTarget {
+                chat_jid,
+                anchor_id: anchor.id.clone(),
+                anchor_from_me: anchor.is_from_me,
+                anchor_timestamp: anchor.timestamp.timestamp(),
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
+fn parse_bridge_rfc3339(value: Option<&str>) -> Option<Timestamp> {
+    value
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
 }
 
 fn emit_bridge_status_message(
@@ -1746,6 +2268,7 @@ fn emit_bridge_status_message(
         reply_to: None,
         thread_id: None,
         reactions: Vec::new(),
+        reply_preview: None,
         receipts: Vec::new(),
         is_from_me: false,
         mentions_me: false,
@@ -1800,6 +2323,7 @@ fn upsert_chat_preview(
         muted: update.muted.unwrap_or(false),
         pinned: false,
         last_message_at: None,
+        last_read_at: None,
         last_message_preview: None,
         thread_id: None,
     });
@@ -1890,6 +2414,30 @@ fn content_preview(content: &Content) -> Arc<str> {
         Content::Poll(poll) => arc_str(format!("Poll: {}", poll.question)),
         Content::Deleted => arc_str("Deleted message"),
         Content::Unsupported(description) => description.clone(),
+    }
+}
+
+/// Snapshot of a locally known message being replied to from chat-cli, so the
+/// outgoing reply renders its quote even after the original leaves memory.
+fn whatsapp_local_quoted_preview(message: &Message) -> QuotedPreview {
+    let snippet = content_preview(&message.content);
+    let snippet = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    QuotedPreview {
+        sender_id: Some(if message.is_from_me {
+            arc_str("me")
+        } else {
+            message.sender.platform_id.clone()
+        }),
+        sender_name: if message.is_from_me {
+            arc_str("You")
+        } else {
+            message.sender.display_name.clone()
+        },
+        snippet: arc_str(if snippet.is_empty() {
+            "Message"
+        } else {
+            &snippet
+        }),
     }
 }
 
@@ -2693,6 +3241,7 @@ fn forward_profile_event(
                 muted: event.muted.unwrap_or(false),
                 pinned: false,
                 last_message_at: activity_at,
+                last_read_at: None,
                 last_message_preview: activity_at.and(activity_preview),
                 thread_id: None,
             };
@@ -2820,7 +3369,7 @@ fn lock_rw_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chat_core::Provider;
+    use chat_core::{Provider, ReadTarget};
     use std::{fs, sync::OnceLock, time::Duration};
 
     static FFI_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -2998,6 +3547,174 @@ mod tests {
         assert!(!plain.mentions_me);
         Ok(())
     }
+
+    #[test]
+    fn bridge_event_maps_quoted_reply_to_reply_link_and_preview() -> Result<()> {
+        let reply = BridgeEvent::decode(
+            r#"{"type":"message","id":"r1","chat_jid":"40747086008@s.whatsapp.net","from_me":true,"text":"Voiam să-ți amintesc de asta","reply_to_id":"ORIG1","reply_to_sender_jid":"40747086008:3@s.whatsapp.net","reply_to_sender_name":"Cristina","reply_to_text":"  *Bună*\n Cristina "}"#,
+        )?;
+        let (id, preview) = reply.quoted_reply().expect("quoted reply");
+        assert_eq!(id.as_ref(), "ORIG1");
+        assert_eq!(
+            preview.sender_id.as_deref(),
+            Some("40747086008@s.whatsapp.net")
+        );
+        assert_eq!(preview.sender_name.as_ref(), "Cristina");
+        assert_eq!(preview.snippet.as_ref(), "**Bună** Cristina");
+
+        let own_quote = BridgeEvent::decode(
+            r#"{"type":"history","id":"r2","chat_jid":"1@s.whatsapp.net","reply_to_id":"ORIG2","reply_to_sender_jid":"me","reply_to_sender_name":"You"}"#,
+        )?;
+        let (_, preview) = own_quote.quoted_reply().expect("own quoted reply");
+        assert_eq!(preview.sender_id.as_deref(), Some("me"));
+        assert_eq!(preview.sender_name.as_ref(), "You");
+        assert_eq!(preview.snippet.as_ref(), "Message");
+
+        let plain = BridgeEvent::decode(
+            r#"{"type":"message","id":"p","chat_jid":"1@s.whatsapp.net","text":"hi","reply_to_id":"  "}"#,
+        )?;
+        assert!(plain.quoted_reply().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_notice_event_maps_to_account_notice() -> Result<()> {
+        let alert = BridgeEvent::decode(
+            r#"{"type":"notice","title":"WhatsApp stopped syncing","message":"Update chat-cli.","severity":"system_alert"}"#,
+        )?;
+        match account_notice_from_bridge_event(&alert) {
+            Some(ProviderEvent::AccountNotice {
+                title,
+                body,
+                severity,
+            }) => {
+                assert_eq!(title.as_ref(), "WhatsApp stopped syncing");
+                assert_eq!(body.as_ref(), "Update chat-cli.");
+                assert_eq!(severity, AccountNoticeSeverity::SystemAlert);
+            }
+            other => panic!("expected account notice, got {other:?}"),
+        }
+
+        let info = BridgeEvent::decode(r#"{"type":"notice","message":"heads up"}"#)?;
+        match account_notice_from_bridge_event(&info) {
+            Some(ProviderEvent::AccountNotice {
+                title, severity, ..
+            }) => {
+                assert_eq!(title.as_ref(), "WhatsApp");
+                assert_eq!(severity, AccountNoticeSeverity::Info);
+            }
+            other => panic!("expected info notice, got {other:?}"),
+        }
+
+        let empty = BridgeEvent::decode(r#"{"type":"notice","title":"x","message":"  "}"#)?;
+        assert!(account_notice_from_bridge_event(&empty).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_presence_event_maps_state_last_seen_and_hidden() -> Result<()> {
+        let now = Utc::now();
+        let seen = BridgeEvent::decode(
+            r#"{"type":"presence","jid":"447700900123:4@s.whatsapp.net","presence_state":"offline","last_seen":"2026-01-02T03:04:05Z"}"#,
+        )?;
+        let (id, presence) = presence_from_bridge_event(&seen, now).expect("presence");
+        assert_eq!(id.as_ref(), "447700900123@s.whatsapp.net");
+        assert_eq!(presence.state, PresenceState::Offline);
+        assert_eq!(
+            presence.last_seen.map(|value| value.to_rfc3339()),
+            Some("2026-01-02T03:04:05+00:00".to_owned())
+        );
+        assert!(!presence.last_seen_hidden);
+
+        let hidden = BridgeEvent::decode(
+            r#"{"type":"presence","jid":"1@s.whatsapp.net","presence_state":"offline"}"#,
+        )?;
+        let (_, presence) = presence_from_bridge_event(&hidden, now).expect("presence");
+        assert!(presence.last_seen_hidden);
+
+        let online = BridgeEvent::decode(
+            r#"{"type":"presence","jid":"1@s.whatsapp.net","presence_state":"online"}"#,
+        )?;
+        let (_, presence) = presence_from_bridge_event(&online, now).expect("presence");
+        assert_eq!(presence.state, PresenceState::Online);
+        assert!(!presence.last_seen_hidden);
+
+        let no_jid = BridgeEvent::decode(r#"{"type":"presence","presence_state":"online"}"#)?;
+        assert!(presence_from_bridge_event(&no_jid, now).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn whatsapp_user_info_merges_business_details_and_hidden_phone() -> Result<()> {
+        let event = BridgeEvent::decode(
+            r#"{"type":"user_info","jid":"123@lid","display_name":"Shop","about":" Open 9-5 ","phone_hidden":true,"is_business":true,"verified_name":"Shop Ltd","business_email":"hi@shop.test","business_address":"1 High St","business_categories":["Retail"," ","Food"],"avatar_full_path":"/nonexistent/avatar.jpg"}"#,
+        )?;
+        let profile = merge_whatsapp_user_info(ContactProfile::default(), event);
+        assert_eq!(profile.display_name.as_deref(), Some("Shop"));
+        assert_eq!(profile.about.as_deref(), Some("Open 9-5"));
+        assert!(profile.phone_hidden);
+        assert!(profile.phone.is_none());
+        assert!(profile.is_business);
+        assert_eq!(profile.email.as_deref(), Some("hi@shop.test"));
+        let facts = profile
+            .facts
+            .iter()
+            .map(|(label, value)| format!("{label}={value}"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            vec![
+                "Verified name=Shop Ltd",
+                "Address=1 High St",
+                "Category=Retail, Food"
+            ]
+        );
+        // A missing avatar file is never advertised as a full-size avatar.
+        assert!(profile.avatar_full.is_none());
+
+        let local = ContactProfile {
+            display_name: Some(arc_str("Alan")),
+            phone: Some(arc_str("+44")),
+            ..ContactProfile::default()
+        };
+        let event = BridgeEvent::decode(
+            r#"{"type":"user_info","jid":"44@s.whatsapp.net","display_name":"Other","phone_hidden":true}"#,
+        )?;
+        let profile = merge_whatsapp_user_info(local, event);
+        assert_eq!(profile.display_name.as_deref(), Some("Alan"));
+        assert_eq!(profile.phone.as_deref(), Some("+44"));
+        assert!(
+            !profile.phone_hidden,
+            "a known phone is never reported hidden"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn whatsapp_contact_profile_and_presence_use_bridge() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:user-info")?;
+        provider.connect().await?;
+        let id: PlatformId = arc_str("447700900123@s.whatsapp.net");
+
+        let profile = provider.contact_profile(&id).await?.expect("profile");
+        assert_eq!(profile.display_name.as_deref(), Some("Alan Turing"));
+        assert_eq!(profile.phone.as_deref(), Some("+447700900123"));
+        assert_eq!(
+            profile.about.as_deref(),
+            Some("Hey there! I am using WhatsApp.")
+        );
+
+        if provider.presence_support() == PresenceSupport::Pushed {
+            let presence = provider.presence(&id).await?.expect("presence");
+            assert_eq!(presence.state, PresenceState::Offline);
+            assert!(presence.last_seen.is_some());
+        }
+        assert!(provider.presence(&arc_str("1@g.us")).await?.is_none());
+        provider.disconnect().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn whatsapp_provider_connects_and_exposes_bridge_inbox() -> Result<()> {
         let _guard = ffi_test_guard().await;
@@ -3466,6 +4183,7 @@ mod tests {
                 ProviderEvent::ChatUnreadSynced {
                     chat_id: id,
                     unread_count,
+                    ..
                 } if id == chat_id => break unread_count,
                 _ => continue,
             }
@@ -3485,6 +4203,7 @@ mod tests {
                 ProviderEvent::ChatUnreadSynced {
                     chat_id: id,
                     unread_count,
+                    ..
                 } if id == chat_id => break unread_count,
                 _ => continue,
             }
@@ -3696,7 +4415,20 @@ mod tests {
         // Marking the chat read must clear the cached unread so later chat
         // snapshots report it as read instead of re-inflating via the sidebar
         // max() merge.
-        provider.mark_read(&chat_id, &arc_str("unread-1")).await?;
+        provider
+            .mark_read(
+                &chat_id,
+                &MarkReadRequest {
+                    up_to: Some(arc_str("unread-1")),
+                    up_to_at: None,
+                    messages: vec![ReadTarget {
+                        id: arc_str("unread-1"),
+                        sender: arc_str("999@s.whatsapp.net"),
+                        timestamp: Utc::now(),
+                    }],
+                },
+            )
+            .await?;
 
         let read_chat = provider
             .chats()
@@ -3705,6 +4437,166 @@ mod tests {
             .find(|chat| chat.id == chat_id)
             .expect("read chat present");
         assert_eq!(read_chat.unread_count, 0);
+
+        provider.disconnect().await?;
+        Ok(())
+    }
+
+    fn read_target(id: &str, sender: &str, minute: u32) -> ReadTarget {
+        ReadTarget {
+            id: arc_str(id),
+            sender: arc_str(sender),
+            timestamp: chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 10, 8, 9, minute, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn mark_read_payload_uses_explicit_targets_and_caps_to_newest() {
+        let chat_id = arc_str("whatsapp:120363157988526102@g.us");
+        let mut messages = (0..(WHATSAPP_MARK_READ_MAX_MESSAGES + 5))
+            .map(|index| read_target(&format!("m{index}"), "1@s.whatsapp.net", 0))
+            .collect::<Vec<_>>();
+        messages.push(read_target("last", "2@lid", 1));
+        let request = MarkReadRequest {
+            up_to: Some(arc_str("last")),
+            up_to_at: Some(messages.last().unwrap().timestamp),
+            messages,
+        };
+        let payload = build_mark_read_payload(&request, false, &[], &chat_id);
+        assert_eq!(payload.entries.len(), WHATSAPP_MARK_READ_MAX_MESSAGES);
+        let last = payload.entries.last().unwrap();
+        assert_eq!(
+            (last.id.as_str(), last.sender_jid.as_str()),
+            ("last", "2@lid")
+        );
+        assert!(!payload.clear_marked_unread);
+        assert!(payload.last_id.is_empty());
+    }
+
+    #[test]
+    fn mark_read_payload_carries_clear_flag_key_from_newest_target() {
+        let chat_id = arc_str("whatsapp:1@s.whatsapp.net");
+        let request = MarkReadRequest {
+            up_to: Some(arc_str("not-cached")),
+            up_to_at: None,
+            messages: vec![read_target("a", "1@s.whatsapp.net", 1)],
+        };
+        let payload = build_mark_read_payload(&request, true, &[], &chat_id);
+        assert!(payload.clear_marked_unread);
+        assert_eq!(payload.last_id, "a");
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains(r#""clear_marked_unread":true"#), "{json}");
+    }
+
+    #[test]
+    fn unread_reconcile_targets_pick_recent_unread_chats_with_anchor() {
+        let account = arc_str(PROVIDER_ID);
+        let make_chat = |id: &str, unread: u32, minute: u32| Chat {
+            id: arc_str(id),
+            account: account.clone(),
+            platform: Platform::WhatsApp,
+            name: arc_str(id),
+            avatar: None,
+            is_group: false,
+            kind: ChatKind::Direct,
+            membership: ChatMembership::Joined,
+            is_shared: false,
+            unread_count: unread,
+            muted: false,
+            pinned: false,
+            last_message_at: Some(read_target("x", "x", minute).timestamp),
+            last_read_at: None,
+            last_message_preview: None,
+            thread_id: None,
+        };
+        let mut chats = HashMap::new();
+        for chat in [
+            make_chat("whatsapp:1@s.whatsapp.net", 2, 1),
+            make_chat("whatsapp:2@s.whatsapp.net", 1, 5),
+            make_chat("whatsapp:3@s.whatsapp.net", 0, 9),
+            make_chat("whatsapp:4@s.whatsapp.net", 3, 7),
+        ] {
+            chats.insert(chat.id.clone(), chat);
+        }
+        let message = |id: &str, chat: &str| Message {
+            id: arc_str(id),
+            chat_id: arc_str(chat),
+            account: account.clone(),
+            sender: Sender {
+                platform_id: arc_str("1@s.whatsapp.net"),
+                display_name: arc_str("Peer"),
+                avatar: None,
+            },
+            timestamp: read_target("x", "x", 1).timestamp,
+            edited_at: None,
+            content: Content::Text(arc_str("hi")),
+            reply_to: None,
+            thread_id: None,
+            reactions: Vec::new(),
+            reply_preview: None,
+            receipts: Vec::new(),
+            is_from_me: false,
+            mentions_me: false,
+            platform_data: PlatformData::default(),
+        };
+        let messages = vec![
+            message("a1", "whatsapp:1@s.whatsapp.net"),
+            message("b1", "whatsapp:2@s.whatsapp.net"),
+            message("c1", "whatsapp:3@s.whatsapp.net"),
+        ];
+        let targets = unread_reconcile_targets(&chats, &messages, 5);
+        // Chat 4 has no known anchor message; chat 3 is already read.
+        let jids = targets
+            .iter()
+            .map(|target| target.chat_jid.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(jids, vec!["2@s.whatsapp.net", "1@s.whatsapp.net"]);
+        assert_eq!(unread_reconcile_targets(&chats, &messages, 1).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_forwards_read_watermark_and_manual_unread_flag() -> Result<()> {
+        let _guard = ffi_test_guard().await;
+        let provider = WhatsAppProvider::new("test:read-watermark")?;
+        let mut events = provider.events();
+        provider.connect().await?;
+        let chat_id = arc_str("whatsapp:777@s.whatsapp.net");
+
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"chat_unread","chat_jid":"777@s.whatsapp.net","unread_count":1,"marked_unread":true,"as_of":"2026-10-08T09:30:00Z"}"#
+        )?);
+        let (marked, as_of) = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::ChatUnreadSynced {
+                    chat_id: id,
+                    marked_unread,
+                    as_of,
+                    ..
+                } if id == chat_id => break (marked_unread, as_of),
+                _ => continue,
+            }
+        };
+        assert!(marked);
+        assert_eq!(
+            as_of.map(|at| at.to_rfc3339()).as_deref(),
+            Some("2026-10-08T09:30:00+00:00")
+        );
+        assert!(lock_rw_read(&provider.marked_unread).contains(&chat_id));
+
+        assert!(bridge::fire_synthetic_message(
+            r#"{"type":"read","chat_jid":"777@s.whatsapp.net","read_up_to":"2026-10-08T09:31:00Z"}"#
+        )?);
+        let read_up_to = loop {
+            match tokio::time::timeout(Duration::from_secs(1), events.recv()).await?? {
+                ProviderEvent::ChatMarkedRead {
+                    chat_id: id,
+                    read_up_to,
+                } if id == chat_id => break read_up_to,
+                _ => continue,
+            }
+        };
+        assert!(read_up_to.is_some());
+        assert!(!lock_rw_read(&provider.marked_unread).contains(&chat_id));
 
         provider.disconnect().await?;
         Ok(())

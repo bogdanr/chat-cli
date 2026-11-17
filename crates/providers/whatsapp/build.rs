@@ -31,6 +31,7 @@ fn main() {
     println!("cargo:rerun-if-changed=go/cable_session.go");
     println!("cargo:rerun-if-changed=go/cable_ble_linux.go");
     println!("cargo:rerun-if-changed=go/cable_ble_other.go");
+    println!("cargo:rerun-if-changed=go/connection_recovery.go");
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=whatsapp_bridge");
 
